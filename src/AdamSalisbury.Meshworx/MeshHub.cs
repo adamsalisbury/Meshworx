@@ -125,7 +125,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         var connection = new ClientConnection(clientId, tcpClient, stream);
 
         _clients.TryAdd(clientId, connection);
-        Console.WriteLine("Client " + clientId + "connected");
+        _logger.LogInformation("Client {ClientId} connected", clientId);
         try
         {
             var idBytes = clientId.ToByteArray();
@@ -168,6 +168,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             _clients.TryRemove(clientId, out _);
             connection.Dispose();
+            _logger.LogInformation("Client {ClientId} disconnected", clientId);
         }
     }
 

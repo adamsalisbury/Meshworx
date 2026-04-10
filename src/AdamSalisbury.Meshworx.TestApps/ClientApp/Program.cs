@@ -1,11 +1,10 @@
 ﻿// See https://aka.ms/new-console-template for more information
-using System.Reflection;
 using AdamSalisbury.Meshworx;
 using Microsoft.Extensions.Logging;
 
 Console.WriteLine("Starting Client");
 
-using var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole());
+using var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole().SetMinimumLevel(LogLevel.Information));
 var typedLogger = loggerFactory.CreateLogger<MeshClient>();
 var meshClient = new MeshClient(typedLogger);
 

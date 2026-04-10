@@ -37,6 +37,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 throw new InvalidOperationException("Already connected to a hub.");
             }
 
+            _logger.LogInformation("Connecting to hub at {Host}:{Port}", host, port);
             _tcpClient = new TcpClient();
             await _tcpClient.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
             _stream = _tcpClient.GetStream();
@@ -54,6 +55,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             }
 
             Id = new Guid(frame.Value.Payload);
+            _logger.LogInformation("Connected to hub at {Host}:{Port} with id {ClientId}", host, port, Id);
 
             _cts = new CancellationTokenSource();
             _receiveLoopTask = ReceiveLoopAsync(_cts.Token);

@@ -4,7 +4,7 @@ using Microsoft.Extensions.Logging;
 
 Console.WriteLine("Starting Hub");
 
-using var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole());
+using var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole().SetMinimumLevel(LogLevel.Information));
 var typedLogger = loggerFactory.CreateLogger<MeshHub>();
 
 var meshHub = new MeshHub(typedLogger, 22001);
