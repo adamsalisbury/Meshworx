@@ -3,25 +3,28 @@ using System.Net;
 using System.Net.Sockets;
 using AdamSalisbury.Meshworx.Interfaces;
 using AdamSalisbury.Meshworx.Internal;
+using Microsoft.Extensions.Logging;
 
 namespace AdamSalisbury.Meshworx;
 
 public sealed class MeshHub : IMeshHub, IAsyncDisposable
 {
+    private readonly ILogger<MeshHub> _logger;
     private readonly IPEndPoint _endPoint;
     private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
     private Task? _acceptLoopTask;
 
-    public MeshHub(IPEndPoint endPoint)
+    public MeshHub(ILogger<MeshHub> logger, IPEndPoint endPoint)
     {
         ArgumentNullException.ThrowIfNull(endPoint);
+        _logger = logger;
         _endPoint = endPoint;
     }
 
-    public MeshHub(int port)
-        : this(new IPEndPoint(IPAddress.Any, port))
+    public MeshHub(ILogger<MeshHub> logger, int port)
+        : this(logger, new IPEndPoint(IPAddress.Any, port))
     {
     }
 

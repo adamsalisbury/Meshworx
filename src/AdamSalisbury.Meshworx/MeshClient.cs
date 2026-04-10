@@ -1,16 +1,23 @@
 using System.Net.Sockets;
 using AdamSalisbury.Meshworx.Interfaces;
 using AdamSalisbury.Meshworx.Internal;
+using Microsoft.Extensions.Logging;
 
 namespace AdamSalisbury.Meshworx;
 
 public sealed class MeshClient : IMeshClient, IAsyncDisposable
 {
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly ILogger<MeshClient> _logger;
     private TcpClient? _tcpClient;
     private NetworkStream? _stream;
     private CancellationTokenSource? _cts;
     private Task? _receiveLoopTask;
+
+    public MeshClient(ILogger<MeshClient> logger)
+    {
+        _logger = logger;
+    }
 
     /// <inheritdoc/>
     public Guid Id { get; private set; }
@@ -23,34 +30,51 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     {
         ArgumentException.ThrowIfNullOrEmpty(host);
 
-        if (_tcpClient is not null)
+        try
         {
-            throw new InvalidOperationException("Already connected to a hub.");
+            if (_tcpClient is not null)
+            {
+                throw new InvalidOperationException("Already connected to a hub.");
+            }
+
+            _tcpClient = new TcpClient();
+            await _tcpClient.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
+            _stream = _tcpClient.GetStream();
+
+            (MessageType Type, byte[] Payload)? frame = await MeshFrameCodec.ReadFrameAsync(
+                _stream,
+                cancellationToken).ConfigureAwait(false);
+
+            if (frame is null
+                || frame.Value.Type != MessageType.RegistrationComplete
+                || frame.Value.Payload.Length != 16)
+            {
+                CleanUp();
+                throw new InvalidOperationException("Failed to register with the hub.");
+            }
+
+            Id = new Guid(frame.Value.Payload);
+
+            _cts = new CancellationTokenSource();
+            _receiveLoopTask = ReceiveLoopAsync(_cts.Token);
         }
-
-        _tcpClient = new TcpClient();
-        await _tcpClient.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
-        _stream = _tcpClient.GetStream();
-
-        (MessageType Type, byte[] Payload)? frame = await MeshFrameCodec.ReadFrameAsync(
-            _stream,
-            cancellationToken).ConfigureAwait(false);
-
-        if (frame is null
-            || frame.Value.Type != MessageType.RegistrationComplete
-            || frame.Value.Payload.Length != 16)
+        catch (Exception exception)
         {
-            _stream.Dispose();
-            _tcpClient.Dispose();
-            _tcpClient = null;
-            _stream = null;
-            throw new InvalidOperationException("Failed to register with the hub.");
+            _logger.LogError(exception, "Failed to connect to hub");
+            throw;
         }
+    }
 
-        Id = new Guid(frame.Value.Payload);
+    private void CleanUp()
+    {
+        _stream?.Dispose();
+        _tcpClient?.Dispose();
+        _cts?.Dispose();
 
-        _cts = new CancellationTokenSource();
-        _receiveLoopTask = ReceiveLoopAsync(_cts.Token);
+        _stream = null;
+        _tcpClient = null;
+        _cts = null;
+        _receiveLoopTask = null;
     }
 
     /// <inheritdoc/>
@@ -74,18 +98,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                //HUMANTODO
+                // CancelationToken triggered
             }
         }
 
-        _stream?.Dispose();
-        _tcpClient.Dispose();
-        _cts?.Dispose();
-
-        _stream = null;
-        _tcpClient = null;
-        _cts = null;
-        _receiveLoopTask = null;
+        CleanUp();
         Id = Guid.Empty;
     }
 
@@ -153,13 +170,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 }
             }
         }
-        catch (OperationCanceledException)
+        catch (Exception ex) when (ex is IOException or OperationCanceledException)
         {
-            //HUMANTODO
-        }
-        catch (IOException)
-        {
-            //HUMANTODO
+            _logger.LogError(ex, "Exiting receive loop. Likely cancellation token received.");
         }
     }
 }
