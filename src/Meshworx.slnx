@@ -3,5 +3,8 @@
     <Project Path="AdamSalisbury.Meshworx.TestApps/ClientApp/ClientApp.csproj" />
     <Project Path="AdamSalisbury.Meshworx.TestApps/HubApp/HubApp.csproj" />
   </Folder>
+  <Folder Name="/Tests/">
+    <Project Path="Tests/AdamSalisbury.Meshworx.UnitTests/AdamSalisbury.Meshworx.UnitTests.csproj" />
+  </Folder>
   <Project Path="AdamSalisbury.Meshworx/AdamSalisbury.Meshworx.csproj" />
 </Solution>

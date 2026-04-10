@@ -1,4 +1,6 @@
-namespace AdamSalisbury.Meshworx.Interfaces;
+using AdamSalisbury.Meshworx.Transport;
+
+namespace AdamSalisbury.Meshworx;
 
 public interface IMeshClient
 {
@@ -13,14 +15,13 @@ public interface IMeshClient
     string Name { get; }
 
     /// <summary>
-    /// Connects to a hub at the specified endpoint and completes the registration handshake.
+    /// Connects to a hub via the specified transport and completes the registration handshake.
     /// </summary>
-    /// <param name="host">The hostname or IP address of the hub.</param>
-    /// <param name="port">The TCP port the hub is listening on.</param>
+    /// <param name="transport">A connected transport to use for communication with the hub.</param>
     /// <param name="clientName">The unique name of this client.</param>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
     /// <exception cref="InvalidOperationException">The client is already connected.</exception>
-    Task ConnectAsync(string host, int port, string clientName, CancellationToken cancellationToken = default);
+    Task ConnectAsync(ITransport transport, string clientName, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Disconnects from the hub and releases all associated resources.

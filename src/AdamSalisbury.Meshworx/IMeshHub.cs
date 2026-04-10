@@ -1,4 +1,4 @@
-namespace AdamSalisbury.Meshworx.Interfaces;
+namespace AdamSalisbury.Meshworx;
 
 public interface IMeshHub
 {

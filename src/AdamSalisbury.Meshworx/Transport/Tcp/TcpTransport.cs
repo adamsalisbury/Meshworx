@@ -1,0 +1,123 @@
+using System.Buffers.Binary;
+using System.Net.Sockets;
+
+namespace AdamSalisbury.Meshworx.Transport.Tcp;
+
+/// <summary>
+/// An <see cref="ITransport"/> implementation that communicates over TCP using length-prefixed framing.
+/// </summary>
+/// <remarks>
+/// Each message is transmitted as a 4-byte big-endian length header followed by the payload bytes.
+/// Write operations are internally synchronised, so concurrent calls to
+/// <see cref="SendAsync"/> from multiple threads are safe.
+/// </remarks>
+public sealed class TcpTransport : ITransport
+{
+    private const int HeaderSize = 4;
+    private const int MaxPayloadSize = 1024 * 1024;
+
+    private readonly TcpClient _tcpClient;
+    private readonly NetworkStream _stream;
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+
+    internal TcpTransport(TcpClient tcpClient)
+    {
+        _tcpClient = tcpClient;
+        _stream = tcpClient.GetStream();
+    }
+
+    /// <summary>
+    /// Creates a new <see cref="TcpTransport"/> by connecting to the specified remote endpoint.
+    /// </summary>
+    /// <param name="host">The hostname or IP address of the remote endpoint.</param>
+    /// <param name="port">The TCP port of the remote endpoint.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <returns>A connected <see cref="TcpTransport"/> ready for use.</returns>
+    public static async Task<TcpTransport> ConnectAsync(
+        string host,
+        int port,
+        CancellationToken cancellationToken = default)
+    {
+        var tcpClient = new TcpClient();
+        try
+        {
+            await tcpClient.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
+            return new TcpTransport(tcpClient);
+        }
+        catch
+        {
+            tcpClient.Dispose();
+            throw;
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task SendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+    {
+        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var header = new byte[HeaderSize];
+            BinaryPrimitives.WriteInt32BigEndian(header, data.Length);
+
+            await _stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
+
+            if (data.Length > 0)
+            {
+                await _stream.WriteAsync(data, cancellationToken).ConfigureAwait(false);
+            }
+
+            await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task<byte[]?> ReceiveAsync(CancellationToken cancellationToken = default)
+    {
+        var header = await ReadBytesAsync(HeaderSize, cancellationToken).ConfigureAwait(false);
+        if (header is null)
+        {
+            return null;
+        }
+
+        int payloadLength = BinaryPrimitives.ReadInt32BigEndian(header);
+
+        if (payloadLength is < 0 or > MaxPayloadSize)
+        {
+            throw new InvalidOperationException($"Invalid payload length: {payloadLength}");
+        }
+
+        if (payloadLength == 0)
+        {
+            return [];
+        }
+
+        return await ReadBytesAsync(payloadLength, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async ValueTask DisposeAsync()
+    {
+        _writeLock.Dispose();
+        await _stream.DisposeAsync().ConfigureAwait(false);
+        _tcpClient.Dispose();
+    }
+
+    private async Task<byte[]?> ReadBytesAsync(int count, CancellationToken cancellationToken)
+    {
+        var buffer = new byte[count];
+        try
+        {
+            await _stream.ReadExactlyAsync(buffer, cancellationToken).ConfigureAwait(false);
+            return buffer;
+        }
+        catch (EndOfStreamException)
+        {
+            return null;
+        }
+    }
+}

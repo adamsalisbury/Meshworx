@@ -1,17 +1,14 @@
-using System.Net.Sockets;
 using System.Text;
-using AdamSalisbury.Meshworx.Interfaces;
 using AdamSalisbury.Meshworx.Internal;
+using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
 
 namespace AdamSalisbury.Meshworx;
 
 public sealed class MeshClient : IMeshClient, IAsyncDisposable
 {
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly ILogger<MeshClient> _logger;
-    private TcpClient? _tcpClient;
-    private NetworkStream? _stream;
+    private ITransport? _transport;
     private CancellationTokenSource? _cts;
     private Task? _receiveLoopTask;
 
@@ -30,44 +27,39 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
 
     /// <inheritdoc/>
-    public async Task ConnectAsync(string host, int port, string clientName, CancellationToken cancellationToken = default)
+    public async Task ConnectAsync(ITransport transport, string clientName, CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrEmpty(host);
+        ArgumentNullException.ThrowIfNull(transport);
         ArgumentException.ThrowIfNullOrEmpty(clientName);
 
         try
         {
-            if (_tcpClient is not null)
+            if (_transport is not null)
             {
                 throw new InvalidOperationException("Already connected to a hub.");
             }
 
-            _logger.LogInformation("Connecting to hub at {Host}:{Port}", host, port);
-            _tcpClient = new TcpClient();
-            await _tcpClient.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
-            _stream = _tcpClient.GetStream();
+            _transport = transport;
 
-            await MeshFrameCodec.WriteFrameAsync(
-                _stream,
-                MessageType.RegistrationRequest,
-                Encoding.UTF8.GetBytes(clientName),
-                cancellationToken).ConfigureAwait(false);
+            byte[] nameBytes = Encoding.UTF8.GetBytes(clientName);
+            var requestPayload = new byte[1 + nameBytes.Length];
+            requestPayload[0] = (byte)MessageType.RegistrationRequest;
+            nameBytes.CopyTo(requestPayload, 1);
+            await _transport.SendAsync(requestPayload, cancellationToken).ConfigureAwait(false);
 
-            (MessageType Type, byte[] Payload)? frame = await MeshFrameCodec.ReadFrameAsync(
-                _stream,
-                cancellationToken).ConfigureAwait(false);
+            byte[]? responseData = await _transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
 
-            if (frame is null
-                || frame.Value.Type != MessageType.RegistrationComplete
-                || frame.Value.Payload.Length != 16)
+            if (responseData is null
+                || responseData.Length != 17
+                || (MessageType)responseData[0] != MessageType.RegistrationComplete)
             {
-                CleanUp();
+                await CleanUpAsync().ConfigureAwait(false);
                 throw new InvalidOperationException("Failed to register with the hub.");
             }
 
-            Id = new Guid(frame.Value.Payload);
+            Id = new Guid(responseData.AsSpan(1, 16));
             Name = clientName;
-            _logger.LogInformation("Connected to hub at {Host}:{Port} with id {ClientId}", host, port, Id);
+            _logger.LogInformation("Connected to hub with id {ClientId}", Id);
 
             _cts = new CancellationTokenSource();
             _receiveLoopTask = ReceiveLoopAsync(_cts.Token);
@@ -79,22 +71,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
     }
 
-    private void CleanUp()
-    {
-        _stream?.Dispose();
-        _tcpClient?.Dispose();
-        _cts?.Dispose();
-
-        _stream = null;
-        _tcpClient = null;
-        _cts = null;
-        _receiveLoopTask = null;
-    }
-
     /// <inheritdoc/>
     public async Task DisconnectAsync(CancellationToken cancellationToken = default)
     {
-        if (_tcpClient is null)
+        if (_transport is null)
         {
             return;
         }
@@ -112,11 +92,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                // CancelationToken triggered
+                // CancellationToken triggered
             }
         }
 
-        CleanUp();
+        await CleanUpAsync().ConfigureAwait(false);
         Id = Guid.Empty;
         Name = string.Empty;
     }
@@ -127,28 +107,17 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         ReadOnlyMemory<byte> message,
         CancellationToken cancellationToken = default)
     {
-        if (_stream is null)
+        if (_transport is null)
         {
             throw new InvalidOperationException("Not connected to a hub.");
         }
 
-        var payload = new byte[16 + message.Length];
-        recipientId.TryWriteBytes(payload);
-        message.CopyTo(payload.AsMemory(16));
+        var payload = new byte[1 + 16 + message.Length];
+        payload[0] = (byte)MessageType.SendMessage;
+        recipientId.TryWriteBytes(payload.AsSpan(1));
+        message.CopyTo(payload.AsMemory(17));
 
-        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
-        {
-            await MeshFrameCodec.WriteFrameAsync(
-                _stream,
-                MessageType.SendMessage,
-                payload,
-                cancellationToken).ConfigureAwait(false);
-        }
-        finally
-        {
-            _writeLock.Release();
-        }
+        await _transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -160,7 +129,19 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await DisconnectAsync().ConfigureAwait(false);
-        _writeLock.Dispose();
+    }
+
+    private async Task CleanUpAsync()
+    {
+        if (_transport is not null)
+        {
+            await _transport.DisposeAsync().ConfigureAwait(false);
+        }
+
+        _cts?.Dispose();
+        _transport = null;
+        _cts = null;
+        _receiveLoopTask = null;
     }
 
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
@@ -169,19 +150,18 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                (MessageType Type, byte[] Payload)? frame = await MeshFrameCodec.ReadFrameAsync(
-                    _stream!,
-                    cancellationToken).ConfigureAwait(false);
+                byte[]? data = await _transport!.ReceiveAsync(cancellationToken).ConfigureAwait(false);
 
-                if (frame is null)
+                if (data is null)
                 {
                     break;
                 }
 
-                if (frame.Value.Type == MessageType.DeliverMessage && frame.Value.Payload.Length >= 16)
+                if (data.Length >= 17
+                    && (MessageType)data[0] == MessageType.DeliverMessage)
                 {
-                    var senderId = new Guid(frame.Value.Payload.AsSpan(0, 16));
-                    ReadOnlyMemory<byte> messageData = frame.Value.Payload.AsMemory(16);
+                    var senderId = new Guid(data.AsSpan(1, 16));
+                    ReadOnlyMemory<byte> messageData = data.AsMemory(17);
 
                     MessageReceived?.Invoke(this, new MessageReceivedEventArgs
                     {
