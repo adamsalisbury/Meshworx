@@ -354,15 +354,105 @@ public sealed class MeshClientTests
     // GetClientIdByName
 
     /// <summary>
-    /// When GetClientIdByName is called, a NotImplementedException is thrown because the method is not yet implemented.
+    /// When GetClientIdByName is called on a client that is not connected to a hub, an InvalidOperationException is thrown.
     /// </summary>
     [Fact]
-    public async Task GetClientIdByName_Called_ThrowsNotImplementedException()
+    public async Task GetClientIdByName_NotConnected_ThrowsInvalidOperationException()
     {
         var fixture = new MeshClientFixture();
 
-        await Assert.ThrowsAsync<NotImplementedException>(
+        await Assert.ThrowsAsync<InvalidOperationException>(
             () => fixture.Client.GetClientIdByName("test"));
+    }
+
+    /// <summary>
+    /// When GetClientIdByName is called with a null name, an ArgumentNullException is thrown.
+    /// </summary>
+    [Fact]
+    public async Task GetClientIdByName_NullName_ThrowsArgumentNullException()
+    {
+        var fixture = new MeshClientFixture();
+
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => fixture.Client.GetClientIdByName(null!));
+    }
+
+    /// <summary>
+    /// When GetClientIdByName is called with an empty name, an ArgumentException is thrown.
+    /// </summary>
+    [Fact]
+    public async Task GetClientIdByName_EmptyName_ThrowsArgumentException()
+    {
+        var fixture = new MeshClientFixture();
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Client.GetClientIdByName(string.Empty));
+    }
+
+    /// <summary>
+    /// When the hub responds with a found result, GetClientIdByName returns the Guid from the response.
+    /// </summary>
+    [Fact]
+    public async Task GetClientIdByName_HubReturnsFound_ReturnsGuid()
+    {
+        var fixture = new MeshClientFixture();
+        var expectedId = Guid.NewGuid();
+        fixture.SetupWithLookupResponse(MeshClientFixture.CreateLookupFoundResponse(expectedId));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+        Guid? result = await fixture.Client.GetClientIdByName("Other");
+
+        Assert.Equal(expectedId, result);
+    }
+
+    /// <summary>
+    /// When the hub responds with a not-found result, GetClientIdByName returns null.
+    /// </summary>
+    [Fact]
+    public async Task GetClientIdByName_HubReturnsNotFound_ReturnsNull()
+    {
+        var fixture = new MeshClientFixture();
+        fixture.SetupWithLookupResponse(MeshClientFixture.CreateLookupNotFoundResponse());
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+        Guid? result = await fixture.Client.GetClientIdByName("Unknown");
+
+        Assert.Null(result);
+    }
+
+    /// <summary>
+    /// When GetClientIdByName is called, the client sends a ClientLookupRequest containing the requested name encoded as UTF-8.
+    /// </summary>
+    [Fact]
+    public async Task GetClientIdByName_Connected_SendsLookupRequest()
+    {
+        var fixture = new MeshClientFixture();
+        var lookupTcs = new TaskCompletionSource<byte[]?>();
+        byte[]? lookupPayload = null;
+        int sendCount = 0;
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                if (Interlocked.Increment(ref sendCount) == 2)
+                {
+                    lookupPayload = data.ToArray();
+                    lookupTcs.TrySetResult(MeshClientFixture.CreateLookupNotFoundResponse());
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        fixture.Transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(fixture.CreateRegistrationResponse())
+            .Returns(lookupTcs.Task)
+            .ReturnsAsync((byte[]?)null);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+        await fixture.Client.GetClientIdByName("Target");
+
+        Assert.NotNull(lookupPayload);
+        Assert.Equal(0x06, lookupPayload[0]);
+        Assert.Equal("Target", System.Text.Encoding.UTF8.GetString(lookupPayload.AsSpan(1)));
     }
 
     // ReceiveLoop (tested indirectly via MessageReceived event)

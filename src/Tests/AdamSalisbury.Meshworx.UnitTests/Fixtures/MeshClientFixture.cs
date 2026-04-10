@@ -51,6 +51,41 @@ internal sealed class MeshClientFixture
         sequence.ReturnsAsync((byte[]?)null);
     }
 
+    public static byte[] CreateLookupFoundResponse(Guid clientId)
+    {
+        var response = new byte[18];
+        response[0] = 0x07; // ClientLookupResponse
+        response[1] = 0x01; // found
+        clientId.TryWriteBytes(response.AsSpan(2));
+        return response;
+    }
+
+    public static byte[] CreateLookupNotFoundResponse()
+    {
+        return [0x07, 0x00]; // ClientLookupResponse, not found
+    }
+
+    public void SetupWithLookupResponse(byte[] lookupResponse)
+    {
+        var lookupTcs = new TaskCompletionSource<byte[]?>();
+        int sendCount = 0;
+
+        Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((_, _) =>
+            {
+                if (Interlocked.Increment(ref sendCount) == 2)
+                {
+                    lookupTcs.TrySetResult(lookupResponse);
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        Transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(CreateRegistrationResponse())
+            .Returns(lookupTcs.Task)
+            .ReturnsAsync((byte[]?)null);
+    }
+
     public async Task ConnectAsync(string clientName = "TestClient")
     {
         SetupSuccessfulRegistration();

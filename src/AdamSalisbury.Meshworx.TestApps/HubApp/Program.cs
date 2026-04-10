@@ -1,16 +1,14 @@
-// See https://aka.ms/new-console-template for more information
 using AdamSalisbury.Meshworx;
 using AdamSalisbury.Meshworx.Transport.Tcp;
 using Microsoft.Extensions.Logging;
 
-Console.WriteLine("Starting Hub");
+using var loggerFactory = LoggerFactory.Create(builder =>
+    builder.AddConsole().SetMinimumLevel(LogLevel.Information));
 
-using var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole().SetMinimumLevel(LogLevel.Information));
-var typedLogger = loggerFactory.CreateLogger<MeshHub>();
-
+var logger = loggerFactory.CreateLogger<MeshHub>();
 var listener = new TcpTransportListener(22001);
-var meshHub = new MeshHub(typedLogger, listener);
-await meshHub.StartAsync().ConfigureAwait(false);
+await using var hub = new MeshHub(logger, listener);
 
-Console.WriteLine("Hit Enter to Exit");
+await hub.StartAsync();
+Console.WriteLine("Hub is running on port 22001. Press Enter to stop.");
 Console.ReadLine();

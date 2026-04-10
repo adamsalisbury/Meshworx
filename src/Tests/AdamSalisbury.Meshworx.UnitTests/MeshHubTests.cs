@@ -543,6 +543,73 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    // HandleClient — client lookup
+
+    /// <summary>
+    /// When a client sends a lookup request for a name that is registered, the hub responds with a found indicator and the matching client's Guid.
+    /// </summary>
+    [Fact]
+    public async Task HandleClient_LookupRequestForExistingName_SendsFoundResponse()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var clientA = await fixture.RegisterClientAsync("ClientA");
+        var clientB = await fixture.RegisterClientAsync("ClientB");
+
+        var lookupResponseTcs = new TaskCompletionSource<byte[]>();
+        clientB.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => lookupResponseTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes("ClientA");
+        var lookupRequest = new byte[1 + nameBytes.Length];
+        lookupRequest[0] = 0x06; // ClientLookupRequest
+        nameBytes.CopyTo(lookupRequest, 1);
+
+        clientB.DisconnectTcs.SetResult(lookupRequest);
+
+        byte[] response = await lookupResponseTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x07, response[0]);
+        Assert.Equal(0x01, response[1]);
+        var foundId = new Guid(response.AsSpan(2, 16));
+        Assert.Equal(clientA.Id, foundId);
+
+        clientA.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a client sends a lookup request for a name that is not registered, the hub responds with a not-found indicator.
+    /// </summary>
+    [Fact]
+    public async Task HandleClient_LookupRequestForUnknownName_SendsNotFoundResponse()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterClientAsync();
+
+        var lookupResponseTcs = new TaskCompletionSource<byte[]>();
+        client.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => lookupResponseTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes("NobodyHere");
+        var lookupRequest = new byte[1 + nameBytes.Length];
+        lookupRequest[0] = 0x06;
+        nameBytes.CopyTo(lookupRequest, 1);
+
+        client.DisconnectTcs.SetResult(lookupRequest);
+
+        byte[] response = await lookupResponseTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x07, response[0]);
+        Assert.Equal(0x00, response[1]);
+        Assert.Equal(2, response.Length);
+
+        await fixture.Hub.StopAsync();
+    }
+
     // HandleClient — message filtering
 
     /// <summary>

@@ -8,9 +8,11 @@ namespace AdamSalisbury.Meshworx;
 public sealed class MeshClient : IMeshClient, IAsyncDisposable
 {
     private readonly ILogger<MeshClient> _logger;
+    private readonly SemaphoreSlim _lookupLock = new(1, 1);
     private ITransport? _transport;
     private CancellationTokenSource? _cts;
     private Task? _receiveLoopTask;
+    private TaskCompletionSource<Guid?>? _pendingLookup;
 
     public MeshClient(ILogger<MeshClient> logger)
     {
@@ -129,14 +131,39 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
-    public Task<Guid?> GetClientIdByName(string name, CancellationToken cancellationToken = default)
+    public async Task<Guid?> GetClientIdByName(string name, CancellationToken cancellationToken = default)
     {
-        throw new NotImplementedException();
+        ArgumentException.ThrowIfNullOrEmpty(name);
+
+        if (_transport is null)
+        {
+            throw new InvalidOperationException("Not connected to a hub.");
+        }
+
+        await _lookupLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            _pendingLookup = new TaskCompletionSource<Guid?>();
+
+            byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+            var payload = new byte[1 + nameBytes.Length];
+            payload[0] = (byte)MessageType.ClientLookupRequest;
+            nameBytes.CopyTo(payload, 1);
+            await _transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+
+            return await _pendingLookup.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _pendingLookup = null;
+            _lookupLock.Release();
+        }
     }
 
     public async ValueTask DisposeAsync()
     {
         await DisconnectAsync().ConfigureAwait(false);
+        _lookupLock.Dispose();
     }
 
     private async Task CleanUpAsync()
@@ -176,6 +203,18 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         SenderId = senderId,
                         Data = messageData,
                     });
+                }
+                else if (data.Length >= 2
+                    && (MessageType)data[0] == MessageType.ClientLookupResponse)
+                {
+                    if (data[1] == 0x01 && data.Length >= 18)
+                    {
+                        _pendingLookup?.TrySetResult(new Guid(data.AsSpan(2, 16)));
+                    }
+                    else
+                    {
+                        _pendingLookup?.TrySetResult(null);
+                    }
                 }
             }
         }

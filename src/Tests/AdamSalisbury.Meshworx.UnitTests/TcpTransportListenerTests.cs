@@ -11,10 +11,12 @@ public sealed class TcpTransportListenerTests
     [Fact]
     public async Task StartAsync_AlreadyRunning_ThrowsInvalidOperationException()
     {
-        await using var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
-        await listener.StartAsync();
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await listener.StartAsync().ConfigureAwait(false);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => listener.StartAsync());
+
+        await listener.DisposeAsync().ConfigureAwait(false);
     }
 
     /// <summary>
@@ -23,9 +25,11 @@ public sealed class TcpTransportListenerTests
     [Fact]
     public async Task AcceptAsync_NotStarted_ThrowsInvalidOperationException()
     {
-        await using var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => listener.AcceptAsync());
+
+        await listener.DisposeAsync().ConfigureAwait(false);
     }
 
     /// <summary>

@@ -157,6 +157,28 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     await RouteMessageAsync(clientId, recipientId, messageData, cancellationToken)
                         .ConfigureAwait(false);
                 }
+                else if (data.Length >= 2
+                    && (MessageType)data[0] == MessageType.ClientLookupRequest)
+                {
+                    string lookupName = Encoding.UTF8.GetString(data.AsSpan(1));
+                    ClientConnection? found = _clients.Values.FirstOrDefault(
+                        c => string.Equals(c.Name, lookupName, StringComparison.Ordinal));
+
+                    byte[] lookupResponse;
+                    if (found is not null)
+                    {
+                        lookupResponse = new byte[18];
+                        lookupResponse[0] = (byte)MessageType.ClientLookupResponse;
+                        lookupResponse[1] = 0x01;
+                        found.Id.TryWriteBytes(lookupResponse.AsSpan(2));
+                    }
+                    else
+                    {
+                        lookupResponse = [(byte)MessageType.ClientLookupResponse, 0x00];
+                    }
+
+                    await transport.SendAsync(lookupResponse, cancellationToken).ConfigureAwait(false);
+                }
             }
         }
         catch (OperationCanceledException)
