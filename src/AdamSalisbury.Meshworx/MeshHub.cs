@@ -25,6 +25,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     {
     }
 
+    /// <inheritdoc/>
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -42,6 +43,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         return Task.CompletedTask;
     }
 
+    /// <inheritdoc/>
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
         if (_listener is null)
@@ -64,6 +66,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
+                //HUMANTODO
             }
         }
 
@@ -79,6 +82,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _acceptLoopTask = null;
     }
 
+    /// <inheritdoc/>
     public bool IsClientRegistered(Guid clientId)
     {
         return _clients.ContainsKey(clientId);
@@ -118,10 +122,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         var connection = new ClientConnection(clientId, tcpClient, stream);
 
         _clients.TryAdd(clientId, connection);
-
+        Console.WriteLine("Client " + clientId + "connected");
         try
         {
-            byte[] idBytes = clientId.ToByteArray();
+            var idBytes = clientId.ToByteArray();
             await MeshFrameCodec.WriteFrameAsync(
                 stream,
                 MessageType.RegistrationComplete,
@@ -151,9 +155,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
+            //HUMANTODO
         }
         catch (IOException)
         {
+            //HUMANTODO
         }
         finally
         {
@@ -198,8 +204,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         public ClientConnection(Guid id, TcpClient tcpClient, NetworkStream stream)
         {
-            Id = id;
             _tcpClient = tcpClient;
+
+            Id = id;
             Stream = stream;
             WriteSemaphore = new SemaphoreSlim(1, 1);
         }

@@ -1,3 +1,7 @@
 <Solution>
+  <Folder Name="/AdamSalisbury.Meshworx.TestApps/">
+    <Project Path="AdamSalisbury.Meshworx.TestApps/ClientApp/ClientApp.csproj" />
+    <Project Path="AdamSalisbury.Meshworx.TestApps/HubApp/HubApp.csproj" />
+  </Folder>
   <Project Path="AdamSalisbury.Meshworx/AdamSalisbury.Meshworx.csproj" />
 </Solution>

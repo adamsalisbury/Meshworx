@@ -12,10 +12,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private CancellationTokenSource? _cts;
     private Task? _receiveLoopTask;
 
+    /// <inheritdoc/>
     public Guid Id { get; private set; }
 
+    /// <inheritdoc/>
     public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
 
+    /// <inheritdoc/>
     public async Task ConnectAsync(string host, int port, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(host);
@@ -50,6 +53,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         _receiveLoopTask = ReceiveLoopAsync(_cts.Token);
     }
 
+    /// <inheritdoc/>
     public async Task DisconnectAsync(CancellationToken cancellationToken = default)
     {
         if (_tcpClient is null)
@@ -70,6 +74,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
+                //HUMANTODO
             }
         }
 
@@ -84,6 +89,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         Id = Guid.Empty;
     }
 
+    /// <inheritdoc/>
     public async Task SendAsync(
         Guid recipientId,
         ReadOnlyMemory<byte> message,
@@ -149,9 +155,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
+            //HUMANTODO
         }
         catch (IOException)
         {
+            //HUMANTODO
         }
     }
 }
