@@ -8,7 +8,7 @@ using var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole().S
 var typedLogger = loggerFactory.CreateLogger<MeshClient>();
 var meshClient = new MeshClient(typedLogger);
 
-await meshClient.ConnectAsync("localhost", 22001).ConfigureAwait(false);
+await meshClient.ConnectAsync("localhost", 22001, "TestClient").ConfigureAwait(false);
 
 Console.WriteLine("Hit Enter to Exit");
 Console.ReadLine();

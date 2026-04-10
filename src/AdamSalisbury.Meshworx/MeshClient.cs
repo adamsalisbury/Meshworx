@@ -1,4 +1,5 @@
 using System.Net.Sockets;
+using System.Text;
 using AdamSalisbury.Meshworx.Interfaces;
 using AdamSalisbury.Meshworx.Internal;
 using Microsoft.Extensions.Logging;
@@ -23,12 +24,16 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public Guid Id { get; private set; }
 
     /// <inheritdoc/>
+    public string Name { get; private set; } = string.Empty;
+
+    /// <inheritdoc/>
     public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
 
     /// <inheritdoc/>
-    public async Task ConnectAsync(string host, int port, CancellationToken cancellationToken = default)
+    public async Task ConnectAsync(string host, int port, string clientName, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(host);
+        ArgumentException.ThrowIfNullOrEmpty(clientName);
 
         try
         {
@@ -41,6 +46,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             _tcpClient = new TcpClient();
             await _tcpClient.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
             _stream = _tcpClient.GetStream();
+
+            await MeshFrameCodec.WriteFrameAsync(
+                _stream,
+                MessageType.RegistrationRequest,
+                Encoding.UTF8.GetBytes(clientName),
+                cancellationToken).ConfigureAwait(false);
 
             (MessageType Type, byte[] Payload)? frame = await MeshFrameCodec.ReadFrameAsync(
                 _stream,
@@ -55,6 +66,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             }
 
             Id = new Guid(frame.Value.Payload);
+            Name = clientName;
             _logger.LogInformation("Connected to hub at {Host}:{Port} with id {ClientId}", host, port, Id);
 
             _cts = new CancellationTokenSource();
@@ -106,6 +118,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         CleanUp();
         Id = Guid.Empty;
+        Name = string.Empty;
     }
 
     /// <inheritdoc/>
@@ -136,6 +149,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             _writeLock.Release();
         }
+    }
+
+    /// <inheritdoc/>
+    public Task<Guid?> GetClientIdByName(string name, CancellationToken cancellationToken = default)
+    {
+        throw new NotImplementedException();
     }
 
     public async ValueTask DisposeAsync()

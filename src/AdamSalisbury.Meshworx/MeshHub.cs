@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using AdamSalisbury.Meshworx.Interfaces;
 using AdamSalisbury.Meshworx.Internal;
 using Microsoft.Extensions.Logging;
@@ -122,10 +123,23 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     {
         var clientId = Guid.NewGuid();
         NetworkStream stream = tcpClient.GetStream();
-        var connection = new ClientConnection(clientId, tcpClient, stream);
+
+        (MessageType Type, byte[] Payload)? registrationFrame = await MeshFrameCodec.ReadFrameAsync(
+            stream,
+            cancellationToken).ConfigureAwait(false);
+
+        if (registrationFrame is null
+            || registrationFrame.Value.Type != MessageType.RegistrationRequest)
+        {
+            tcpClient.Dispose();
+            return;
+        }
+
+        string clientName = Encoding.UTF8.GetString(registrationFrame.Value.Payload);
+        var connection = new ClientConnection(clientId, clientName, tcpClient, stream);
 
         _clients.TryAdd(clientId, connection);
-        _logger.LogInformation("Client {ClientId} connected", clientId);
+        _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
         try
         {
             var idBytes = clientId.ToByteArray();
@@ -206,16 +220,18 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     {
         private readonly TcpClient _tcpClient;
 
-        public ClientConnection(Guid id, TcpClient tcpClient, NetworkStream stream)
+        public ClientConnection(Guid id, string name, TcpClient tcpClient, NetworkStream stream)
         {
             _tcpClient = tcpClient;
 
             Id = id;
+            Name = name;
             Stream = stream;
             WriteSemaphore = new SemaphoreSlim(1, 1);
         }
 
         public Guid Id { get; }
+        public string Name { get; }
         public NetworkStream Stream { get; }
         public SemaphoreSlim WriteSemaphore { get; }
 
