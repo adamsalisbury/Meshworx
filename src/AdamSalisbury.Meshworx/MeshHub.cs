@@ -116,6 +116,18 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
 
         string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(1));
+
+        bool nameExists = _clients.Values.Any(
+            c => string.Equals(c.Name, clientName, StringComparison.Ordinal));
+
+        if (nameExists)
+        {
+            byte[] errorPayload = [(byte)MessageType.Error, (byte)RegistrationErrorCode.DuplicateClientName];
+            await transport.SendAsync(errorPayload, cancellationToken).ConfigureAwait(false);
+            await transport.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+
         var connection = new ClientConnection(clientId, clientName, transport);
 
         _clients.TryAdd(clientId, connection);

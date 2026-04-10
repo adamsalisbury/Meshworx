@@ -16,14 +16,19 @@ public sealed class TcpTransport : ITransport
     private const int HeaderSize = 4;
     private const int MaxPayloadSize = 1024 * 1024;
 
-    private readonly TcpClient _tcpClient;
-    private readonly NetworkStream _stream;
+    private readonly TcpClient? _tcpClient;
+    private readonly Stream _stream;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
     internal TcpTransport(TcpClient tcpClient)
     {
         _tcpClient = tcpClient;
         _stream = tcpClient.GetStream();
+    }
+
+    internal TcpTransport(Stream stream)
+    {
+        _stream = stream;
     }
 
     /// <summary>
@@ -104,7 +109,7 @@ public sealed class TcpTransport : ITransport
     {
         _writeLock.Dispose();
         await _stream.DisposeAsync().ConfigureAwait(false);
-        _tcpClient.Dispose();
+        _tcpClient?.Dispose();
     }
 
     private async Task<byte[]?> ReadBytesAsync(int count, CancellationToken cancellationToken)

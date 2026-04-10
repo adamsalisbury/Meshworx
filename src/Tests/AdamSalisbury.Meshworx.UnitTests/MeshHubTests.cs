@@ -286,6 +286,116 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    // HandleClient — duplicate name refusal
+
+    /// <summary>
+    /// When a client attempts to register with a name that is already taken, the hub sends an Error response containing the DuplicateClientName error code.
+    /// </summary>
+    [Fact]
+    public async Task HandleClient_DuplicateClientName_SendsErrorResponse()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var existing = await fixture.RegisterClientAsync("Alpha");
+
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+        var disposedTcs = new TaskCompletionSource();
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Alpha"));
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+        transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]);
+        Assert.Equal(0x01, sentData[1]);
+
+        existing.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a client is refused registration due to a duplicate name, the transport is disposed.
+    /// </summary>
+    [Fact]
+    public async Task HandleClient_DuplicateClientName_DisposesTransport()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var existing = await fixture.RegisterClientAsync("Alpha");
+
+        var transport = MeshHubFixture.CreateMockTransport();
+        var disposedTcs = new TaskCompletionSource();
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Alpha"));
+        transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        transport.Verify(t => t.DisposeAsync(), Times.Once);
+
+        existing.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a client is refused registration due to a duplicate name, only the original client remains in the registry.
+    /// </summary>
+    [Fact]
+    public async Task HandleClient_DuplicateClientName_DoesNotRegisterSecondClient()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var existing = await fixture.RegisterClientAsync("Alpha");
+
+        var transport = MeshHubFixture.CreateMockTransport();
+        var disposedTcs = new TaskCompletionSource();
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Alpha"));
+        transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.True(fixture.Hub.IsClientRegistered(existing.Id));
+
+        existing.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When two clients register with different names, both are accepted and appear in the registry.
+    /// </summary>
+    [Fact]
+    public async Task HandleClient_UniqueClientNames_BothRegister()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var clientA = await fixture.RegisterClientAsync("Alpha");
+        var clientB = await fixture.RegisterClientAsync("Beta");
+
+        Assert.True(fixture.Hub.IsClientRegistered(clientA.Id));
+        Assert.True(fixture.Hub.IsClientRegistered(clientB.Id));
+
+        clientA.Disconnect();
+        clientB.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // HandleClient — client lifecycle
 
     /// <summary>

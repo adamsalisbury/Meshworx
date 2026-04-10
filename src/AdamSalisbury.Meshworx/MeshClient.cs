@@ -49,6 +49,14 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
             byte[]? responseData = await _transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
 
+            if (responseData is { Length: >= 2 }
+                && (MessageType)responseData[0] == MessageType.Error)
+            {
+                var errorCode = (RegistrationErrorCode)responseData[1];
+                await CleanUpAsync().ConfigureAwait(false);
+                throw new RegistrationRefusedException(errorCode);
+            }
+
             if (responseData is null
                 || responseData.Length != 17
                 || (MessageType)responseData[0] != MessageType.RegistrationComplete)

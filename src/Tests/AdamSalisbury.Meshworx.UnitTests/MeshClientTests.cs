@@ -192,6 +192,72 @@ public sealed class MeshClientTests
         Assert.True(transportDisposed);
     }
 
+    // ConnectAsync — error response
+
+    /// <summary>
+    /// When the hub returns an Error response during registration, a RegistrationRefusedException is thrown containing the error code from the payload.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_HubReturnsError_ThrowsRegistrationRefusedException()
+    {
+        var fixture = new MeshClientFixture();
+        byte[] errorResponse = [0x05, 0x01]; // Error + DuplicateClientName
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(errorResponse);
+
+        var exception = await Assert.ThrowsAsync<RegistrationRefusedException>(
+            () => fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient"));
+
+        Assert.Equal(RegistrationErrorCode.DuplicateClientName, exception.ErrorCode);
+    }
+
+    /// <summary>
+    /// When the hub returns an Error response during registration, the transport is disposed as part of cleanup.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_HubReturnsError_DisposesTransport()
+    {
+        var fixture = new MeshClientFixture();
+        bool transportDisposed = false;
+        byte[] errorResponse = [0x05, 0x01];
+
+        fixture.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => transportDisposed = true)
+            .Returns(ValueTask.CompletedTask);
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(errorResponse);
+
+        await Assert.ThrowsAsync<RegistrationRefusedException>(
+            () => fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient"));
+
+        Assert.True(transportDisposed);
+    }
+
+    /// <summary>
+    /// When the hub returns an Error response with trailing bytes beyond the error code, the client still correctly extracts the error code and throws RegistrationRefusedException.
+    /// </summary>
+    [Fact]
+    public async Task ConnectAsync_HubReturnsErrorWithExtraBytes_ThrowsRegistrationRefusedException()
+    {
+        var fixture = new MeshClientFixture();
+        byte[] errorResponse = [0x05, 0x01, 0xFF, 0xFF]; // extra trailing bytes
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(errorResponse);
+
+        var exception = await Assert.ThrowsAsync<RegistrationRefusedException>(
+            () => fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient"));
+
+        Assert.Equal(RegistrationErrorCode.DuplicateClientName, exception.ErrorCode);
+    }
+
     // DisconnectAsync
 
     /// <summary>
