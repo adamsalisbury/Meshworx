@@ -107,9 +107,9 @@ public sealed class TcpTransport : ITransport
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
-        _writeLock.Dispose();
         await _stream.DisposeAsync().ConfigureAwait(false);
         _tcpClient?.Dispose();
+        _writeLock.Dispose();
     }
 
     private async Task<byte[]?> ReadBytesAsync(int count, CancellationToken cancellationToken)
