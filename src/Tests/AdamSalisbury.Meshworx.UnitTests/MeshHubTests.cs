@@ -680,6 +680,166 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    // HandleClient — transport errors
+
+    /// <summary>
+    /// When a registered client's transport throws an IOException during the receive loop, the client
+    /// is removed from the registry and its transport is disposed.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_IOExceptionDuringReceiveLoop_RemovesClientFromRegistry()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterMultiMessageClientAsync();
+
+        Assert.True(fixture.Hub.IsClientRegistered(client.Id));
+
+        var disposedTcs = new TaskCompletionSource();
+        client.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        // Reconfigure ReceiveAsync to throw IOException on the next read.
+        client.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IOException("Connection reset"));
+
+        // Trigger the reconfigured mock by writing a dummy value into the channel —
+        // the channel-based mock was replaced above, so the hub's next ReceiveAsync call
+        // will throw IOException.
+        client.EnqueueMessage([]);
+
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.False(fixture.Hub.IsClientRegistered(client.Id));
+        client.Transport.Verify(t => t.DisposeAsync(), Times.AtLeastOnce);
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a recipient's transport throws an IOException during message delivery, the sending client's
+    /// handler catches the exception and the sender is removed from the registry.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_SendAsyncFailsDuringRouting_RemovesSendingClient()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterMultiMessageClientAsync("Recipient");
+
+        // Make the recipient's transport throw on the next SendAsync (the delivery attempt).
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IOException("Recipient pipe broken"));
+
+        var senderDisposedTcs = new TaskCompletionSource();
+        sender.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => senderDisposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        // Send a message from sender to recipient — the IOException propagates into the sender's handler.
+        var sendPayload = new byte[1 + 16 + 3];
+        sendPayload[0] = 0x02; // SendMessage
+        recipient.Id.TryWriteBytes(sendPayload.AsSpan(1));
+        new byte[] { 1, 2, 3 }.CopyTo(sendPayload, 17);
+        sender.EnqueueMessage(sendPayload);
+
+        await senderDisposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.False(fixture.Hub.IsClientRegistered(sender.Id));
+
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    // HandleClient — concurrent registration
+
+    /// <summary>
+    /// When ten clients register concurrently, all are accepted with unique identifiers and appear
+    /// in the registry.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_TenConcurrentRegistrations_AllRegisteredWithUniqueIds()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var registrationTasks = Enumerable.Range(0, 10)
+            .Select(i => fixture.RegisterClientAsync($"Client{i}"))
+            .ToList();
+
+        RegisteredClient[] clients = await Task.WhenAll(registrationTasks);
+
+        var uniqueIds = clients.Select(c => c.Id).ToHashSet();
+        Assert.Equal(10, uniqueIds.Count);
+
+        foreach (RegisteredClient client in clients)
+        {
+            Assert.True(fixture.Hub.IsClientRegistered(client.Id));
+            client.Disconnect();
+        }
+
+        await fixture.Hub.StopAsync();
+    }
+
+    // RouteMessage — multiple messages
+
+    /// <summary>
+    /// When a client sends three messages to another client, all three are delivered in order
+    /// with the correct payloads.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task RouteMessage_ThreeConsecutiveMessages_AllDeliveredInOrder()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var clientA = await fixture.RegisterMultiMessageClientAsync("ClientA");
+        var clientB = await fixture.RegisterMultiMessageClientAsync("ClientB");
+
+        var deliveredMessages = new List<byte[]>();
+        var allDeliveredTcs = new TaskCompletionSource();
+
+        clientB.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                deliveredMessages.Add(data.ToArray());
+                if (deliveredMessages.Count == 3)
+                {
+                    allDeliveredTcs.TrySetResult();
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        byte[][] messages = [[1, 2], [3, 4, 5], [6]];
+
+        foreach (byte[] messageContent in messages)
+        {
+            var sendPayload = new byte[1 + 16 + messageContent.Length];
+            sendPayload[0] = 0x02; // SendMessage
+            clientB.Id.TryWriteBytes(sendPayload.AsSpan(1));
+            messageContent.CopyTo(sendPayload, 17);
+            clientA.EnqueueMessage(sendPayload);
+        }
+
+        await allDeliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(3, deliveredMessages.Count);
+
+        for (int i = 0; i < messages.Length; i++)
+        {
+            Assert.Equal(0x03, deliveredMessages[i][0]);
+            var senderId = new Guid(deliveredMessages[i].AsSpan(1, 16));
+            Assert.Equal(clientA.Id, senderId);
+            Assert.Equal(messages[i], deliveredMessages[i][17..]);
+        }
+
+        clientA.Disconnect();
+        clientB.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // DisposeAsync
 
     /// <summary>

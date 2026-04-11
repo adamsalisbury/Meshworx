@@ -11,6 +11,8 @@ public sealed class TcpTransportListener : ITransportListener
     private readonly IPEndPoint _endPoint;
     private TcpListener? _listener;
 
+    internal EndPoint? LocalEndPoint => _listener?.LocalEndpoint;
+
     public TcpTransportListener(IPEndPoint endPoint)
     {
         ArgumentNullException.ThrowIfNull(endPoint);

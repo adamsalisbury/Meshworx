@@ -72,6 +72,35 @@ internal sealed class MeshHubFixture
 
         return new RegisteredClient(clientId, transport, disconnectTcs, responseData);
     }
+
+    public async Task<MultiMessageRegisteredClient> RegisterMultiMessageClientAsync(string name = "TestClient")
+    {
+        var transport = CreateMockTransport();
+        var registrationCompleteTcs = new TaskCompletionSource<byte[]>();
+        var messageChannel = Channel.CreateUnbounded<byte[]?>();
+
+        // Queue the registration request as the first message.
+        await messageChannel.Writer.WriteAsync(CreateRegistrationRequest(name)).ConfigureAwait(false);
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await messageChannel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => registrationCompleteTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        EnqueueClient(transport.Object);
+
+        byte[] responseData = await registrationCompleteTcs.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        var clientId = new Guid(responseData.AsSpan(1, 16));
+
+        while (!Hub.IsClientRegistered(clientId))
+        {
+            await Task.Yield();
+        }
+
+        return new MultiMessageRegisteredClient(clientId, transport, messageChannel, responseData);
+    }
 }
 
 internal sealed class RegisteredClient(
@@ -86,4 +115,20 @@ internal sealed class RegisteredClient(
     public byte[] RegistrationResponse { get; } = registrationResponse;
 
     public void Disconnect() => DisconnectTcs.TrySetResult(null);
+}
+
+internal sealed class MultiMessageRegisteredClient(
+    Guid id,
+    Mock<ITransport> transport,
+    Channel<byte[]?> messageChannel,
+    byte[] registrationResponse)
+{
+    public Guid Id { get; } = id;
+    public Mock<ITransport> Transport { get; } = transport;
+    public Channel<byte[]?> MessageChannel { get; } = messageChannel;
+    public byte[] RegistrationResponse { get; } = registrationResponse;
+
+    public void EnqueueMessage(byte[] message) => MessageChannel.Writer.TryWrite(message);
+
+    public void Disconnect() => MessageChannel.Writer.TryWrite(null);
 }

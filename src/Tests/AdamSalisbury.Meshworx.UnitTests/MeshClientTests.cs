@@ -580,6 +580,32 @@ public sealed class MeshClientTests
         fixture.Transport.Verify(t => t.DisposeAsync(), Times.Once);
     }
 
+    // ReceiveLoop — transport errors
+
+    /// <summary>
+    /// When the transport throws an IOException during the receive loop, the loop exits cleanly
+    /// and the client can be disconnected without error.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_IOExceptionDuringReceive_ExitsLoopCleanly()
+    {
+        var fixture = new MeshClientFixture();
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+
+        fixture.Transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(fixture.CreateRegistrationResponse())
+            .ThrowsAsync(new IOException("Connection reset"));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        // The receive loop has already faulted via IOException — disconnect should still work.
+        await fixture.Client.DisconnectAsync();
+
+        Assert.Equal(Guid.Empty, fixture.Client.Id);
+    }
+
     // DisposeAsync
 
     /// <summary>

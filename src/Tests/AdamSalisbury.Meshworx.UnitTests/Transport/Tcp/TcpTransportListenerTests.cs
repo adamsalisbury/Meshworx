@@ -1,7 +1,7 @@
 using System.Net;
 using AdamSalisbury.Meshworx.Transport.Tcp;
 
-namespace AdamSalisbury.Meshworx.UnitTests;
+namespace AdamSalisbury.Meshworx.UnitTests.Transport.Tcp;
 
 public sealed class TcpTransportListenerTests
 {
