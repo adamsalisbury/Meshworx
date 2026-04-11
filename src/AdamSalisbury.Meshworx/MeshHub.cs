@@ -11,6 +11,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly ILogger<MeshHub> _logger;
     private readonly ITransportListener _listener;
     private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
+    private readonly ConcurrentDictionary<string, Guid> _clientNames = new();
     private CancellationTokenSource? _cts;
     private Task? _acceptLoopTask;
 
@@ -61,6 +62,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             await client.DisposeAsync().ConfigureAwait(false);
         }
 
+        _clientNames.Clear();
         _clients.Clear();
         _cts.Dispose();
         _cts = null;
@@ -117,10 +119,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(1));
 
-        bool nameExists = _clients.Values.Any(
-            c => string.Equals(c.Name, clientName, StringComparison.Ordinal));
-
-        if (nameExists)
+        if (!_clientNames.TryAdd(clientName, clientId))
         {
             byte[] errorPayload = [(byte)MessageType.Error, (byte)RegistrationErrorCode.DuplicateClientName];
             await transport.SendAsync(errorPayload, cancellationToken).ConfigureAwait(false);
@@ -191,6 +190,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
         finally
         {
+            _clientNames.TryRemove(clientName, out _);
             _clients.TryRemove(clientId, out _);
             await connection.DisposeAsync().ConfigureAwait(false);
             _logger.LogInformation("Client {ClientId} disconnected", clientId);
