@@ -99,7 +99,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 break;
             }
 
-            _ = HandleClientAsync(transport, cancellationToken);
+            _ = HandleClientAsync(transport, cancellationToken)
+                .ContinueWith(
+                    t => _logger.LogError(t.Exception, "Unhandled exception in client handler"),
+                    TaskContinuationOptions.OnlyOnFaulted);
         }
     }
 
