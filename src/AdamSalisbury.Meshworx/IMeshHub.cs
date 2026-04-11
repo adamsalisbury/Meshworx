@@ -1,6 +1,6 @@
 namespace AdamSalisbury.Meshworx;
 
-public interface IMeshHub
+public interface IMeshHub : IAsyncDisposable
 {
     /// <summary>
     /// Starts the hub, binding to its configured endpoint and accepting client connections.

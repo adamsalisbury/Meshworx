@@ -3,7 +3,7 @@ using AdamSalisbury.Meshworx.Transport;
 
 namespace AdamSalisbury.Meshworx;
 
-public interface IMeshClient
+public interface IMeshClient : IAsyncDisposable
 {
     /// <summary>
     /// Gets the unique identifier assigned to this client by the hub during registration.
@@ -38,6 +38,10 @@ public interface IMeshClient
     /// <summary>
     /// Sends a message to another client via the hub.
     /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget. The method completes once the hub has
+    /// accepted the message, but provides no guarantee that the recipient received it.
+    /// </remarks>
     /// <param name="recipientId">The unique identifier of the target client.</param>
     /// <param name="message">The message payload to deliver.</param>
     /// <param name="cancellationToken">A token to cancel the operation.</param>

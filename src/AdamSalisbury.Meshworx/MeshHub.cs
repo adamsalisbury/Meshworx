@@ -1,6 +1,6 @@
-using System.Buffers;
 using System.Collections.Concurrent;
 using System.Text;
+using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
@@ -73,11 +73,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             }
         }
 
-        foreach (ClientConnection client in _clients.Values)
-        {
-            await client.DisposeAsync().ConfigureAwait(false);
-        }
-
+        // Wait for all handler tasks to complete — each handler disposes its own client
+        // connection in its finally block, so no separate disposal loop is needed.
         try
         {
             await Task.WhenAll(_handlerTasks.Keys).WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -102,6 +99,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         return _clients.ContainsKey(clientId);
     }
 
+    /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
         await StopAsync().ConfigureAwait(false);
@@ -145,6 +143,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     {
         var clientId = Guid.NewGuid();
         ClientConnection? connection = null;
+        Task? sendLoopTask = null;
+        CancellationTokenSource? clientCts = null;
 
         try
         {
@@ -192,9 +192,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
             _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
 
-            while (!cancellationToken.IsCancellationRequested)
+            clientCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            sendLoopTask = SendLoopAsync(connection, clientCts);
+
+            while (!clientCts.Token.IsCancellationRequested)
             {
-                byte[]? data = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
+                byte[]? data = await transport.ReceiveAsync(clientCts.Token).ConfigureAwait(false);
 
                 if (data is null)
                 {
@@ -207,8 +210,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     var recipientId = new Guid(data.AsSpan(1, 16));
                     ReadOnlyMemory<byte> messageData = data.AsMemory(17);
 
-                    await RouteMessageAsync(clientId, recipientId, messageData, cancellationToken)
-                        .ConfigureAwait(false);
+                    RouteMessage(clientId, recipientId, messageData);
                 }
                 else if (data.Length >= 2
                     && (MessageType)data[0] == MessageType.ClientLookupRequest)
@@ -229,7 +231,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                         lookupResponse = [(byte)MessageType.ClientLookupResponse, 0x00];
                     }
 
-                    await transport.SendAsync(lookupResponse, cancellationToken).ConfigureAwait(false);
+                    await transport.SendAsync(lookupResponse, clientCts.Token).ConfigureAwait(false);
                 }
                 else if ((MessageType)data[0] == MessageType.Disconnect)
                 {
@@ -248,6 +250,27 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
         finally
         {
+            connection?.OutboundQueue.Writer.TryComplete();
+
+            if (clientCts is not null)
+            {
+                await clientCts.CancelAsync().ConfigureAwait(false);
+            }
+
+            if (sendLoopTask is not null)
+            {
+                try
+                {
+                    await sendLoopTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected during shutdown.
+                }
+            }
+
+            clientCts?.Dispose();
+
             if (connection is not null)
             {
                 _clientNames.TryRemove(connection.Name, out _);
@@ -262,11 +285,34 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
     }
 
-    private async Task RouteMessageAsync(
+    private async Task SendLoopAsync(ClientConnection connection, CancellationTokenSource clientCts)
+    {
+        try
+        {
+            await foreach (byte[] payload in connection.OutboundQueue.Reader
+                .ReadAllAsync(clientCts.Token).ConfigureAwait(false))
+            {
+                await connection.Transport.SendAsync(payload, clientCts.Token).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected during shutdown.
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            _logger.LogWarning(
+                ex,
+                "Send loop for client {ClientId} terminated due to transport error",
+                connection.Id);
+            await clientCts.CancelAsync().ConfigureAwait(false);
+        }
+    }
+
+    private void RouteMessage(
         Guid senderId,
         Guid recipientId,
-        ReadOnlyMemory<byte> messageData,
-        CancellationToken cancellationToken)
+        ReadOnlyMemory<byte> messageData)
     {
         if (!_clients.TryGetValue(recipientId, out ClientConnection? recipient))
         {
@@ -277,46 +323,41 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return;
         }
 
-        int payloadSize = 1 + 16 + messageData.Length;
-        byte[] deliveryPayload = ArrayPool<byte>.Shared.Rent(payloadSize);
-        try
-        {
-            deliveryPayload[0] = (byte)MessageType.DeliverMessage;
-            senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
-            messageData.CopyTo(deliveryPayload.AsMemory(17));
+        var deliveryPayload = new byte[1 + 16 + messageData.Length];
+        deliveryPayload[0] = (byte)MessageType.DeliverMessage;
+        senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
+        messageData.CopyTo(deliveryPayload.AsMemory(17));
 
-            await recipient.Transport
-                .SendAsync(deliveryPayload.AsMemory(0, payloadSize), cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        if (!recipient.OutboundQueue.Writer.TryWrite(deliveryPayload))
         {
             _logger.LogWarning(
-                ex,
-                "Delivery to {RecipientId} failed, evicting recipient",
-                recipientId);
-            _clients.TryRemove(recipientId, out _);
-            _clientNames.TryRemove(recipient.Name, out _);
-            await recipient.DisposeAsync().ConfigureAwait(false);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(deliveryPayload);
+                "Outbound queue for {RecipientId} is full, message from {SenderId} dropped",
+                recipientId,
+                senderId);
         }
     }
 
     private sealed class ClientConnection(Guid id, string name, ITransport transport) : IAsyncDisposable
     {
+        private const int OutboundQueueCapacity = 1024;
         private int _disposed;
 
         public Guid Id { get; } = id;
         public string Name { get; } = name;
         public ITransport Transport { get; } = transport;
 
+        public Channel<byte[]> OutboundQueue { get; } = Channel.CreateBounded<byte[]>(
+            new BoundedChannelOptions(OutboundQueueCapacity)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+            });
+
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 0)
             {
+                OutboundQueue.Writer.TryComplete();
                 await Transport.DisposeAsync().ConfigureAwait(false);
             }
         }

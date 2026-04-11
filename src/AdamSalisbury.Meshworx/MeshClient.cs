@@ -10,9 +10,14 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private readonly ILogger<MeshClient> _logger;
     private readonly Lock _stateLock = new();
     private readonly SemaphoreSlim _lookupLock = new(1, 1);
+    private ConnectionState _state = ConnectionState.Disconnected;
     private ITransport? _transport;
     private CancellationTokenSource? _cts;
     private Task? _receiveLoopTask;
+
+    // Single-slot pending lookup, serialised by _lookupLock. If a lookup is cancelled
+    // via CancellationToken, the hub's response is consumed and discarded by the
+    // receive loop on its next iteration.
     private TaskCompletionSource<Guid?>? _pendingLookup;
 
     public MeshClient(ILogger<MeshClient> logger)
@@ -45,11 +50,17 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         lock (_stateLock)
         {
-            if (_transport is not null)
+            if (_state is not ConnectionState.Disconnected)
             {
-                throw new InvalidOperationException("Already connected to a hub.");
+                throw new InvalidOperationException(_state switch
+                {
+                    ConnectionState.Connecting => "A connection attempt is already in progress.",
+                    ConnectionState.Disconnecting => "A disconnect is in progress.",
+                    _ => "Already connected to a hub.",
+                });
             }
 
+            _state = ConnectionState.Connecting;
             _transport = transport;
         }
 
@@ -84,10 +95,20 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
             _cts = new CancellationTokenSource();
             _receiveLoopTask = ReceiveLoopAsync(_cts.Token);
+
+            lock (_stateLock)
+            {
+                _state = ConnectionState.Connected;
+            }
         }
         catch (Exception exception)
         {
             await CleanUpAsync().ConfigureAwait(false);
+
+            lock (_stateLock)
+            {
+                _state = ConnectionState.Disconnected;
+            }
 
             if (exception is RegistrationRefusedException or InvalidOperationException)
             {
@@ -111,20 +132,21 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         lock (_stateLock)
         {
-            transport = _transport;
-            cts = _cts;
-            receiveLoopTask = _receiveLoopTask;
-
-            if (transport is null)
+            if (_state is not ConnectionState.Connected)
             {
                 return;
             }
+
+            _state = ConnectionState.Disconnecting;
+            transport = _transport;
+            cts = _cts;
+            receiveLoopTask = _receiveLoopTask;
         }
 
         try
         {
             byte[] disconnectPayload = [(byte)MessageType.Disconnect];
-            await transport.SendAsync(disconnectPayload, cancellationToken).ConfigureAwait(false);
+            await transport!.SendAsync(disconnectPayload, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
         {
@@ -154,6 +176,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             Id = Guid.Empty;
             Name = string.Empty;
+            _state = ConnectionState.Disconnected;
         }
     }
 
@@ -167,7 +190,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         lock (_stateLock)
         {
-            transport = _transport ?? throw new InvalidOperationException("Not connected to a hub.");
+            if (_state is not ConnectionState.Connected)
+            {
+                throw new InvalidOperationException("Not connected to a hub.");
+            }
+
+            transport = _transport!;
         }
 
         var payload = new byte[1 + 16 + message.Length];
@@ -187,7 +215,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         lock (_stateLock)
         {
-            transport = _transport ?? throw new InvalidOperationException("Not connected to a hub.");
+            if (_state is not ConnectionState.Connected)
+            {
+                throw new InvalidOperationException("Not connected to a hub.");
+            }
+
+            transport = _transport!;
         }
 
         await _lookupLock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -218,6 +251,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
     }
 
+    /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
         await DisconnectAsync().ConfigureAwait(false);
@@ -309,5 +343,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             _logger.LogDebug(ex, "Receive loop terminated: transport disposed");
         }
+    }
+
+    private enum ConnectionState
+    {
+        Disconnected,
+        Connecting,
+        Connected,
+        Disconnecting,
     }
 }

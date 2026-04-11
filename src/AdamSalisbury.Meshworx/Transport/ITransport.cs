@@ -6,6 +6,11 @@ namespace AdamSalisbury.Meshworx.Transport;
 /// <remarks>
 /// Implementations are responsible for their own message framing. Callers send and receive
 /// complete messages as opaque byte payloads. The transport does not interpret the content.
+/// <para>
+/// Implementations must support concurrent calls to <see cref="SendAsync"/>. However,
+/// <see cref="ReceiveAsync"/> assumes a single reader — callers must not invoke it
+/// concurrently from multiple threads.
+/// </para>
 /// </remarks>
 public interface ITransport : IAsyncDisposable
 {
