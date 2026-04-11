@@ -14,9 +14,10 @@ public sealed class MeshHubTests
     /// <summary>
     /// When the MeshHub is constructed with a null logger, an ArgumentNullException is thrown.
     /// </summary>
-    [Fact]
-    public void Constructor_NullLogger_ThrowsArgumentNullException()
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_NullLogger_ThrowsArgumentNullException()
     {
+        await Task.CompletedTask;
         var listener = new Mock<ITransportListener>();
 
         Assert.Throws<ArgumentNullException>(() => new MeshHub(null!, listener.Object));
@@ -25,9 +26,10 @@ public sealed class MeshHubTests
     /// <summary>
     /// When the MeshHub is constructed with a null listener, an ArgumentNullException is thrown.
     /// </summary>
-    [Fact]
-    public void Constructor_NullListener_ThrowsArgumentNullException()
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_NullListener_ThrowsArgumentNullException()
     {
+        await Task.CompletedTask;
         var logger = new Mock<ILogger<MeshHub>>();
 
         Assert.Throws<ArgumentNullException>(() => new MeshHub(logger.Object, null!));
@@ -38,7 +40,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When StartAsync is called on a hub that is not running, the underlying transport listener is started.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task StartAsync_NotRunning_StartsListener()
     {
         var fixture = new MeshHubFixture();
@@ -52,7 +54,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When StartAsync is called but the hub is already running, an InvalidOperationException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task StartAsync_AlreadyRunning_ThrowsInvalidOperationException()
     {
         var fixture = new MeshHubFixture();
@@ -68,7 +70,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When StopAsync is called on a hub that is not running, it returns without error.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task StopAsync_NotRunning_ReturnsWithoutError()
     {
         var fixture = new MeshHubFixture();
@@ -79,7 +81,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When StopAsync is called on a running hub with connected clients, all client connections are disposed.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task StopAsync_Running_DisposesAllClientConnections()
     {
         var fixture = new MeshHubFixture();
@@ -95,7 +97,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When StopAsync is called on a running hub, the client registry is cleared so that no clients are reported as registered.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task StopAsync_Running_ClearsClientRegistry()
     {
         var fixture = new MeshHubFixture();
@@ -115,7 +117,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When IsClientRegistered is called with the identifier of a connected client, it returns true.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task IsClientRegistered_RegisteredClient_ReturnsTrue()
     {
         var fixture = new MeshHubFixture();
@@ -131,7 +133,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When IsClientRegistered is called with a Guid that does not match any connected client, it returns false.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task IsClientRegistered_UnregisteredClient_ReturnsFalse()
     {
         var fixture = new MeshHubFixture();
@@ -144,7 +146,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a valid RegistrationRequest, the hub registers the client so that IsClientRegistered returns true for the assigned identifier.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_ValidRegistration_RegistersClient()
     {
         var fixture = new MeshHubFixture();
@@ -160,7 +162,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a valid RegistrationRequest, the hub responds with a RegistrationComplete message.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_ValidRegistration_SendsRegistrationComplete()
     {
         var fixture = new MeshHubFixture();
@@ -176,7 +178,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a valid RegistrationRequest, the RegistrationComplete response contains the Guid assigned to that client.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_ValidRegistration_ResponseContainsClientId()
     {
         var fixture = new MeshHubFixture();
@@ -195,7 +197,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client's transport returns null during the registration read, the transport is disposed and no client is registered.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_NullRegistrationData_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -220,7 +222,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a first frame with an unexpected message type, the transport is disposed and no client is registered.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_InvalidMessageType_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -246,7 +248,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends registration data shorter than two bytes, the transport is disposed and no client is registered.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_RegistrationDataTooShort_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -272,7 +274,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client's registration is rejected for any reason, no entry is added to the client registry.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_RegistrationRejected_ClientNotRegistered()
     {
         var fixture = new MeshHubFixture();
@@ -302,7 +304,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client attempts to register with a name that is already taken, the hub sends an Error response containing the DuplicateClientName error code.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_DuplicateClientName_SendsErrorResponse()
     {
         var fixture = new MeshHubFixture();
@@ -335,7 +337,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client is refused registration due to a duplicate name, the transport is disposed.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_DuplicateClientName_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -363,7 +365,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client is refused registration due to a duplicate name, only the original client remains in the registry.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_DuplicateClientName_DoesNotRegisterSecondClient()
     {
         var fixture = new MeshHubFixture();
@@ -391,7 +393,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When two clients register with different names, both are accepted and appear in the registry.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_UniqueClientNames_BothRegister()
     {
         var fixture = new MeshHubFixture();
@@ -412,7 +414,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a registered client disconnects by the transport returning null, the client is removed from the registry.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_ClientDisconnects_RemovesFromRegistry()
     {
         var fixture = new MeshHubFixture();
@@ -437,7 +439,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a registered client disconnects, its transport connection is disposed.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_ClientDisconnects_DisposesConnection()
     {
         var fixture = new MeshHubFixture();
@@ -462,7 +464,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a message to a registered recipient, the hub delivers a payload containing the DeliverMessage type byte, the sender's Guid, and the original message data.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task RouteMessage_RecipientExists_DeliversCorrectPayload()
     {
         var fixture = new MeshHubFixture();
@@ -495,7 +497,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a message is delivered to a recipient, the payload contains the sender's Guid so the recipient knows who sent the message.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task RouteMessage_RecipientExists_PayloadContainsSenderId()
     {
         var fixture = new MeshHubFixture();
@@ -526,7 +528,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a message to a Guid that does not match any registered client, the message is silently dropped without error.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task RouteMessage_RecipientDoesNotExist_SilentlyDrops()
     {
         var fixture = new MeshHubFixture();
@@ -559,7 +561,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a lookup request for a name that is registered, the hub responds with a found indicator and the matching client's Guid.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_LookupRequestForExistingName_SendsFoundResponse()
     {
         var fixture = new MeshHubFixture();
@@ -593,7 +595,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a lookup request for a name that is not registered, the hub responds with a not-found indicator.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_LookupRequestForUnknownName_SendsNotFoundResponse()
     {
         var fixture = new MeshHubFixture();
@@ -626,7 +628,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When the hub receives a frame from a client with an unrecognised message type, the frame is ignored and no routing occurs.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_WrongMessageType_IgnoresFrame()
     {
         var fixture = new MeshHubFixture();
@@ -654,7 +656,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When the hub receives a frame from a client shorter than 17 bytes, the frame is ignored and no routing occurs.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task HandleClient_MessageTooShort_IgnoresFrame()
     {
         var fixture = new MeshHubFixture();
@@ -683,7 +685,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When DisposeAsync is called on a running hub, the hub is stopped and all client connections are cleaned up.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task DisposeAsync_Running_StopsHub()
     {
         var fixture = new MeshHubFixture();
@@ -699,7 +701,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When DisposeAsync is called, the underlying transport listener is disposed.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task DisposeAsync_Running_DisposesListener()
     {
         var fixture = new MeshHubFixture();

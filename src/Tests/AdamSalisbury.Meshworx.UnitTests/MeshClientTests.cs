@@ -13,9 +13,10 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the MeshClient is constructed with a null logger, an ArgumentNullException is thrown.
     /// </summary>
-    [Fact]
-    public void Constructor_NullLogger_ThrowsArgumentNullException()
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_NullLogger_ThrowsArgumentNullException()
     {
+        await Task.CompletedTask;
         Assert.Throws<ArgumentNullException>(() => new MeshClient(null!));
     }
 
@@ -24,7 +25,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When ConnectAsync is called with a null transport, an ArgumentNullException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_NullTransport_ThrowsArgumentNullException()
     {
         var fixture = new MeshClientFixture();
@@ -36,7 +37,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When ConnectAsync is called with a null client name, an ArgumentNullException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_NullClientName_ThrowsArgumentNullException()
     {
         var fixture = new MeshClientFixture();
@@ -48,7 +49,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When ConnectAsync is called with an empty client name, an ArgumentException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_EmptyClientName_ThrowsArgumentException()
     {
         var fixture = new MeshClientFixture();
@@ -62,7 +63,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When ConnectAsync is called but the client is already connected to a hub, an InvalidOperationException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_AlreadyConnected_ThrowsInvalidOperationException()
     {
         var fixture = new MeshClientFixture();
@@ -79,7 +80,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When ConnectAsync completes the handshake, the first message sent to the transport is a RegistrationRequest containing the client name encoded as UTF-8.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_ValidRegistration_SendsRegistrationRequest()
     {
         var fixture = new MeshClientFixture();
@@ -103,7 +104,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When ConnectAsync receives a valid RegistrationComplete response, the client's Id property is set to the Guid contained in the response payload.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_ValidRegistration_SetsIdFromResponse()
     {
         var fixture = new MeshClientFixture();
@@ -115,7 +116,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When ConnectAsync completes successfully, the client's Name property is set to the client name that was provided.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_ValidRegistration_SetsName()
     {
         var fixture = new MeshClientFixture();
@@ -129,7 +130,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the hub returns null during the registration handshake, an InvalidOperationException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_HubReturnsNull_ThrowsInvalidOperationException()
     {
         var fixture = new MeshClientFixture();
@@ -146,7 +147,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the hub returns a response with an unexpected message type during the registration handshake, an InvalidOperationException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_HubReturnsWrongMessageType_ThrowsInvalidOperationException()
     {
         var fixture = new MeshClientFixture();
@@ -166,7 +167,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the hub returns a response whose payload length does not match the expected 17 bytes, an InvalidOperationException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_HubReturnsWrongPayloadLength_ThrowsInvalidOperationException()
     {
         var fixture = new MeshClientFixture();
@@ -184,7 +185,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the registration handshake fails, the transport is disposed as part of cleanup.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_RegistrationFails_DisposesTransport()
     {
         var fixture = new MeshClientFixture();
@@ -209,7 +210,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the hub returns an Error response during registration, a RegistrationRefusedException is thrown containing the error code from the payload.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_HubReturnsError_ThrowsRegistrationRefusedException()
     {
         var fixture = new MeshClientFixture();
@@ -229,7 +230,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the hub returns an Error response during registration, the transport is disposed as part of cleanup.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_HubReturnsError_DisposesTransport()
     {
         var fixture = new MeshClientFixture();
@@ -253,7 +254,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the hub returns an Error response with trailing bytes beyond the error code, the client still correctly extracts the error code and throws RegistrationRefusedException.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ConnectAsync_HubReturnsErrorWithExtraBytes_ThrowsRegistrationRefusedException()
     {
         var fixture = new MeshClientFixture();
@@ -275,7 +276,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When DisconnectAsync is called on a client that is not connected, it returns without error.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task DisconnectAsync_NotConnected_ReturnsWithoutError()
     {
         var fixture = new MeshClientFixture();
@@ -286,7 +287,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When DisconnectAsync is called on a connected client, the Id property is reset to Guid.Empty.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task DisconnectAsync_Connected_ResetsIdToEmpty()
     {
         var fixture = new MeshClientFixture();
@@ -300,7 +301,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When DisconnectAsync is called on a connected client, the Name property is reset to an empty string.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task DisconnectAsync_Connected_ResetsNameToEmpty()
     {
         var fixture = new MeshClientFixture();
@@ -314,7 +315,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When DisconnectAsync is called on a connected client, the underlying transport is disposed.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task DisconnectAsync_Connected_DisposesTransport()
     {
         var fixture = new MeshClientFixture();
@@ -330,7 +331,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When SendAsync is called on a client that is not connected to a hub, an InvalidOperationException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task SendAsync_NotConnected_ThrowsInvalidOperationException()
     {
         var fixture = new MeshClientFixture();
@@ -342,7 +343,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When SendAsync is called on a connected client, the payload sent to the transport contains the SendMessage type byte, followed by the recipient Guid, followed by the message bytes.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task SendAsync_Connected_SendsCorrectPayloadFormat()
     {
         var fixture = new MeshClientFixture();
@@ -368,7 +369,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When GetClientIdByNameAsync is called on a client that is not connected to a hub, an InvalidOperationException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task GetClientIdByNameAsync_NotConnected_ThrowsInvalidOperationException()
     {
         var fixture = new MeshClientFixture();
@@ -380,7 +381,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When GetClientIdByNameAsync is called with a null name, an ArgumentNullException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task GetClientIdByNameAsync_NullName_ThrowsArgumentNullException()
     {
         var fixture = new MeshClientFixture();
@@ -392,7 +393,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When GetClientIdByNameAsync is called with an empty name, an ArgumentException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task GetClientIdByNameAsync_EmptyName_ThrowsArgumentException()
     {
         var fixture = new MeshClientFixture();
@@ -404,7 +405,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the hub responds with a found result, GetClientIdByNameAsync returns the Guid from the response.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task GetClientIdByNameAsync_HubReturnsFound_ReturnsGuid()
     {
         var fixture = new MeshClientFixture();
@@ -420,7 +421,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the hub responds with a not-found result, GetClientIdByNameAsync returns null.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task GetClientIdByNameAsync_HubReturnsNotFound_ReturnsNull()
     {
         var fixture = new MeshClientFixture();
@@ -435,7 +436,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When GetClientIdByNameAsync is called, the client sends a ClientLookupRequest containing the requested name encoded as UTF-8.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task GetClientIdByNameAsync_Connected_SendsLookupRequest()
     {
         var fixture = new MeshClientFixture();
@@ -472,7 +473,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the receive loop processes a valid DeliverMessage frame, the MessageReceived event is raised.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveLoop_DeliverMessageReceived_RaisesMessageReceivedEvent()
     {
         var fixture = new MeshClientFixture();
@@ -490,7 +491,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the receive loop raises a MessageReceived event, the event args contain the correct sender Guid extracted from the delivered message.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveLoop_DeliverMessageReceived_EventContainsCorrectSenderId()
     {
         var fixture = new MeshClientFixture();
@@ -510,7 +511,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the receive loop raises a MessageReceived event, the event args contain the correct message data extracted from the delivered message.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveLoop_DeliverMessageReceived_EventContainsCorrectData()
     {
         var fixture = new MeshClientFixture();
@@ -530,7 +531,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the receive loop processes a frame with an unrecognised message type, the MessageReceived event is not raised.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveLoop_WrongMessageType_DoesNotRaiseEvent()
     {
         var fixture = new MeshClientFixture();
@@ -550,7 +551,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the receive loop processes a frame shorter than 17 bytes, the MessageReceived event is not raised.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveLoop_MessageTooShort_DoesNotRaiseEvent()
     {
         var fixture = new MeshClientFixture();
@@ -568,7 +569,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When the receive loop receives null from the transport, the loop exits cleanly without raising an event.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveLoop_NullReceived_ExitsLoop()
     {
         var fixture = new MeshClientFixture();
@@ -584,7 +585,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// When DisposeAsync is called on a connected client, it disconnects from the hub and disposes the transport.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task DisposeAsync_Connected_Disconnects()
     {
         var fixture = new MeshClientFixture();

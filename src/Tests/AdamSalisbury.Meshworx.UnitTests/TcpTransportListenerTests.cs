@@ -8,7 +8,7 @@ public sealed class TcpTransportListenerTests
     /// <summary>
     /// When StartAsync is called on a listener that is already running, an InvalidOperationException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task StartAsync_AlreadyRunning_ThrowsInvalidOperationException()
     {
         var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
@@ -22,7 +22,7 @@ public sealed class TcpTransportListenerTests
     /// <summary>
     /// When AcceptAsync is called before the listener has been started, an InvalidOperationException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task AcceptAsync_NotStarted_ThrowsInvalidOperationException()
     {
         var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
@@ -35,7 +35,7 @@ public sealed class TcpTransportListenerTests
     /// <summary>
     /// When DisposeAsync is called on a started listener, the listener is stopped and subsequent calls to AcceptAsync throw InvalidOperationException.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task DisposeAsync_AfterStart_AcceptAsyncThrowsInvalidOperationException()
     {
         var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));

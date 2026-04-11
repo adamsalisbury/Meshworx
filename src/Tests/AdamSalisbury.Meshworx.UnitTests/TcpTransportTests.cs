@@ -10,7 +10,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When SendAsync is called with a non-empty payload, the stream receives a 4-byte big-endian length header followed by the payload bytes.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task SendAsync_NonEmptyPayload_WritesLengthPrefixedFrame()
     {
         var stream = new MemoryStream();
@@ -27,7 +27,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When SendAsync is called with an empty payload, the stream receives a 4-byte header encoding zero length and no payload bytes.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task SendAsync_EmptyPayload_WritesZeroLengthHeader()
     {
         var stream = new MemoryStream();
@@ -43,7 +43,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When SendAsync is called with a 256-byte payload, the length header correctly encodes the value 256 in big-endian format.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task SendAsync_LargePayload_WritesCorrectLengthHeader()
     {
         var stream = new MemoryStream();
@@ -62,7 +62,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When ReceiveAsync reads a valid length-prefixed frame from the stream, it returns the payload bytes without the header.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveAsync_ValidFrame_ReturnsPayload()
     {
         var stream = new MemoryStream();
@@ -79,7 +79,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When ReceiveAsync reads a frame with a zero-length payload, it returns an empty array rather than null.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveAsync_EmptyPayload_ReturnsEmptyArray()
     {
         var stream = new MemoryStream();
@@ -96,7 +96,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When ReceiveAsync encounters a closed stream before any header bytes can be read, it returns null to signal disconnection.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveAsync_StreamClosed_ReturnsNull()
     {
         var stream = new MemoryStream();
@@ -110,7 +110,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When the stream closes after the header is read but before the full payload is delivered, ReceiveAsync returns null.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveAsync_StreamClosedDuringPayload_ReturnsNull()
     {
         var stream = new MemoryStream();
@@ -129,7 +129,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When ReceiveAsync reads a header containing a negative payload length, an InvalidOperationException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveAsync_NegativePayloadLength_ThrowsInvalidOperationException()
     {
         var stream = new MemoryStream();
@@ -146,7 +146,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When ReceiveAsync reads a header containing a payload length exceeding the maximum allowed size, an InvalidOperationException is thrown.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task ReceiveAsync_PayloadExceedsMaxSize_ThrowsInvalidOperationException()
     {
         var stream = new MemoryStream();
@@ -165,7 +165,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When a payload is sent and then received on the same stream, the received data matches the original payload exactly.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task SendThenReceive_RoundTrip_ReturnsOriginalPayload()
     {
         var stream = new MemoryStream();
@@ -182,7 +182,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When multiple messages are sent sequentially, they can be received in the same order with correct payloads.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task SendThenReceive_MultipleMessages_ReturnsAllInOrder()
     {
         var stream = new MemoryStream();
@@ -208,7 +208,7 @@ public sealed class TcpTransportTests
     /// <summary>
     /// When DisposeAsync is called, the underlying stream is disposed so that further operations on it throw.
     /// </summary>
-    [Fact]
+    [Fact(Timeout = 1000)]
     public async Task DisposeAsync_DisposesUnderlyingStream()
     {
         var stream = new MemoryStream();
