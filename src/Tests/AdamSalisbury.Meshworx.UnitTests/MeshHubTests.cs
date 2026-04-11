@@ -1,3 +1,4 @@
+using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.UnitTests.Fixtures;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -9,6 +10,17 @@ public sealed class MeshHubTests
     private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
 
     // Constructor
+
+    /// <summary>
+    /// When the MeshHub is constructed with a null logger, an ArgumentNullException is thrown.
+    /// </summary>
+    [Fact]
+    public void Constructor_NullLogger_ThrowsArgumentNullException()
+    {
+        var listener = new Mock<ITransportListener>();
+
+        Assert.Throws<ArgumentNullException>(() => new MeshHub(null!, listener.Object));
+    }
 
     /// <summary>
     /// When the MeshHub is constructed with a null listener, an ArgumentNullException is thrown.

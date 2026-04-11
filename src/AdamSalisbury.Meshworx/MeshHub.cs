@@ -18,6 +18,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
     public MeshHub(ILogger<MeshHub> logger, ITransportListener listener)
     {
+        ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
         _logger = logger;
         _listener = listener;

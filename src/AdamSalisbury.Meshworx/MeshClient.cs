@@ -16,6 +16,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
     public MeshClient(ILogger<MeshClient> logger)
     {
+        ArgumentNullException.ThrowIfNull(logger);
         _logger = logger;
     }
 

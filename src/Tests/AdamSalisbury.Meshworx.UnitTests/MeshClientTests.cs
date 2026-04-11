@@ -8,6 +8,17 @@ namespace AdamSalisbury.Meshworx.UnitTests;
 
 public sealed class MeshClientTests
 {
+    // Constructor
+
+    /// <summary>
+    /// When the MeshClient is constructed with a null logger, an ArgumentNullException is thrown.
+    /// </summary>
+    [Fact]
+    public void Constructor_NullLogger_ThrowsArgumentNullException()
+    {
+        Assert.Throws<ArgumentNullException>(() => new MeshClient(null!));
+    }
+
     // ConnectAsync — argument validation
 
     /// <summary>
