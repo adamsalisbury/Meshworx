@@ -75,8 +75,8 @@ public sealed class MeshHubTests
         await fixture.Hub.StartAsync();
         var client = await fixture.RegisterClientAsync();
 
-        await fixture.Hub.StopAsync();
         client.Disconnect();
+        await fixture.Hub.StopAsync();
 
         client.Transport.Verify(t => t.DisposeAsync(), Times.AtLeastOnce);
     }
@@ -93,8 +93,8 @@ public sealed class MeshHubTests
 
         Assert.True(fixture.Hub.IsClientRegistered(client.Id));
 
-        await fixture.Hub.StopAsync();
         client.Disconnect();
+        await fixture.Hub.StopAsync();
 
         Assert.False(fixture.Hub.IsClientRegistered(client.Id));
     }
@@ -679,8 +679,8 @@ public sealed class MeshHubTests
         await fixture.Hub.StartAsync();
         var client = await fixture.RegisterClientAsync();
 
-        await fixture.Hub.DisposeAsync();
         client.Disconnect();
+        await fixture.Hub.DisposeAsync();
 
         Assert.False(fixture.Hub.IsClientRegistered(client.Id));
     }

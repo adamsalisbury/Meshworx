@@ -12,6 +12,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly ITransportListener _listener;
     private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
     private readonly ConcurrentDictionary<string, Guid> _clientNames = new();
+    private readonly ConcurrentBag<Task> _handlerTasks = [];
     private CancellationTokenSource? _cts;
     private Task? _acceptLoopTask;
 
@@ -62,6 +63,16 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             await client.DisposeAsync().ConfigureAwait(false);
         }
 
+        try
+        {
+            await Task.WhenAll(_handlerTasks).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            //HUMANTODO
+        }
+
+        _handlerTasks.Clear();
         _clientNames.Clear();
         _clients.Clear();
         _cts.Dispose();
@@ -99,10 +110,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 break;
             }
 
-            _ = HandleClientAsync(transport, cancellationToken)
-                .ContinueWith(
-                    t => _logger.LogError(t.Exception, "Unhandled exception in client handler"),
-                    TaskContinuationOptions.OnlyOnFaulted);
+            var handlerTask = HandleClientAsync(transport, cancellationToken);
+            _handlerTasks.Add(handlerTask);
+            _ = handlerTask.ContinueWith(
+                t => _logger.LogError(t.Exception, "Unhandled exception in client handler"),
+                TaskContinuationOptions.OnlyOnFaulted);
         }
     }
 
