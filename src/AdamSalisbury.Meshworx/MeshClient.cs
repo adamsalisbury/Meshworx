@@ -223,9 +223,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 }
             }
         }
-        catch (Exception ex) when (ex is IOException or OperationCanceledException)
+        catch (OperationCanceledException)
         {
-            _logger.LogError(ex, "Exiting receive loop. Likely cancellation token received.");
+            _logger.LogDebug("Receive loop cancelled");
+        }
+        catch (IOException ex)
+        {
+            _logger.LogWarning(ex, "Receive loop terminated due to transport error");
         }
     }
 }
