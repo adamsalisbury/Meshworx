@@ -1,5 +1,5 @@
 using System.Text;
-using AdamSalisbury.Meshworx.Internal;
+using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
 

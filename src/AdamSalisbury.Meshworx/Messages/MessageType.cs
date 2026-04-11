@@ -1,4 +1,4 @@
-namespace AdamSalisbury.Meshworx.Internal;
+namespace AdamSalisbury.Meshworx.Messages;
 
 internal enum MessageType : byte
 {

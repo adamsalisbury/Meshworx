@@ -1,4 +1,4 @@
-namespace AdamSalisbury.Meshworx;
+namespace AdamSalisbury.Meshworx.Messages;
 
 public sealed class MessageReceivedEventArgs : EventArgs
 {
