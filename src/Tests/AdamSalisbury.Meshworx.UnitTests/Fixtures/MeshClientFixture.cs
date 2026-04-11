@@ -1,4 +1,3 @@
-using System.Text;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
 using Moq;

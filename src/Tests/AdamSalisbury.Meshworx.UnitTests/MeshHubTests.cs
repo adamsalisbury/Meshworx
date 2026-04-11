@@ -1,4 +1,3 @@
-using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.UnitTests.Fixtures;
 using Microsoft.Extensions.Logging;
 using Moq;
