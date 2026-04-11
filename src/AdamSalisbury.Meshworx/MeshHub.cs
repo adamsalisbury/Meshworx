@@ -55,7 +55,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                //HUMANTODO
+                // Expected when the cancellation token is triggered during shutdown.
             }
         }
 
@@ -198,7 +198,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            //HUMANTODO
+            // Expected when the cancellation token is triggered during shutdown.
         }
         catch (IOException)
         {
