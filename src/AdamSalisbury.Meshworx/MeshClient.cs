@@ -74,6 +74,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             _cts = new CancellationTokenSource();
             _receiveLoopTask = ReceiveLoopAsync(_cts.Token);
         }
+        catch (Exception exception) when (exception is RegistrationRefusedException or InvalidOperationException)
+        {
+            _logger.LogWarning(exception, "Failed to connect to hub");
+            throw;
+        }
         catch (Exception exception)
         {
             _logger.LogError(exception, "Failed to connect to hub");
