@@ -9,4 +9,5 @@ internal enum MessageType : byte
     Error = 0x05,
     ClientLookupRequest = 0x06,
     ClientLookupResponse = 0x07,
+    Disconnect = 0x08,
 }

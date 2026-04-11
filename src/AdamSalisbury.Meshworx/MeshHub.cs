@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
@@ -12,7 +13,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly ITransportListener _listener;
     private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
     private readonly ConcurrentDictionary<string, Guid> _clientNames = new();
-    private readonly ConcurrentBag<Task> _handlerTasks = [];
+    private readonly ConcurrentDictionary<Task, byte> _handlerTasks = new();
     private CancellationTokenSource? _cts;
     private Task? _acceptLoopTask;
 
@@ -45,13 +46,26 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return;
         }
 
+        byte[] disconnectPayload = [(byte)MessageType.Disconnect];
+        foreach (ClientConnection client in _clients.Values)
+        {
+            try
+            {
+                await client.Transport.SendAsync(disconnectPayload, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
+            {
+                // Best-effort disconnect notification; the client may already be gone.
+            }
+        }
+
         await _cts.CancelAsync().ConfigureAwait(false);
 
         if (_acceptLoopTask is not null)
         {
             try
             {
-                await _acceptLoopTask.ConfigureAwait(false);
+                await _acceptLoopTask.WaitAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -66,7 +80,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         try
         {
-            await Task.WhenAll(_handlerTasks).ConfigureAwait(false);
+            await Task.WhenAll(_handlerTasks.Keys).WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (Exception)
         {
@@ -113,10 +127,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             }
 
             var handlerTask = HandleClientAsync(transport, cancellationToken);
-            _handlerTasks.Add(handlerTask);
+            _handlerTasks.TryAdd(handlerTask, 0);
             _ = handlerTask.ContinueWith(
-                t => _logger.LogError(t.Exception, "Unhandled exception in client handler"),
-                TaskContinuationOptions.OnlyOnFaulted);
+                t =>
+                {
+                    _handlerTasks.TryRemove(t, out _);
+                    if (t.IsFaulted)
+                    {
+                        _logger.LogError(t.Exception, "Unhandled exception in client handler");
+                    }
+                },
+                TaskScheduler.Default);
         }
     }
 
@@ -130,13 +151,29 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             byte[]? registrationData = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
 
             if (registrationData is null
-                || registrationData.Length < 2
+                || registrationData.Length < 3
                 || (MessageType)registrationData[0] != MessageType.RegistrationRequest)
             {
                 return;
             }
 
-            string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(1));
+            if (registrationData[1] != Protocol.Version)
+            {
+                byte[] versionError =
+                    [(byte)MessageType.Error, (byte)RegistrationErrorCode.UnsupportedProtocolVersion];
+                await transport.SendAsync(versionError, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(2));
+
+            if (clientName.Length > Protocol.MaxClientNameLength)
+            {
+                byte[] nameTooLongError =
+                    [(byte)MessageType.Error, (byte)RegistrationErrorCode.ClientNameTooLong];
+                await transport.SendAsync(nameTooLongError, cancellationToken).ConfigureAwait(false);
+                return;
+            }
 
             if (!_clientNames.TryAdd(clientName, clientId))
             {
@@ -146,13 +183,13 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             }
 
             connection = new ClientConnection(clientId, clientName, transport);
+            _clients.TryAdd(clientId, connection);
 
             var responsePayload = new byte[17];
             responsePayload[0] = (byte)MessageType.RegistrationComplete;
             clientId.TryWriteBytes(responsePayload.AsSpan(1));
             await transport.SendAsync(responsePayload, cancellationToken).ConfigureAwait(false);
 
-            _clients.TryAdd(clientId, connection);
             _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
 
             while (!cancellationToken.IsCancellationRequested)
@@ -177,11 +214,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     && (MessageType)data[0] == MessageType.ClientLookupRequest)
                 {
                     string lookupName = Encoding.UTF8.GetString(data.AsSpan(1));
-                    ClientConnection? found = _clients.Values.FirstOrDefault(
-                        c => string.Equals(c.Name, lookupName, StringComparison.Ordinal));
 
                     byte[] lookupResponse;
-                    if (found is not null)
+                    if (_clientNames.TryGetValue(lookupName, out Guid foundId)
+                        && _clients.TryGetValue(foundId, out ClientConnection? found))
                     {
                         lookupResponse = new byte[18];
                         lookupResponse[0] = (byte)MessageType.ClientLookupResponse;
@@ -194,6 +230,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     }
 
                     await transport.SendAsync(lookupResponse, cancellationToken).ConfigureAwait(false);
+                }
+                else if ((MessageType)data[0] == MessageType.Disconnect)
+                {
+                    _logger.LogDebug("Client {ClientId} sent disconnect", clientId);
+                    break;
                 }
             }
         }
@@ -236,19 +277,48 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return;
         }
 
-        var deliveryPayload = new byte[1 + 16 + messageData.Length];
-        deliveryPayload[0] = (byte)MessageType.DeliverMessage;
-        senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
-        messageData.CopyTo(deliveryPayload.AsMemory(17));
+        int payloadSize = 1 + 16 + messageData.Length;
+        byte[] deliveryPayload = ArrayPool<byte>.Shared.Rent(payloadSize);
+        try
+        {
+            deliveryPayload[0] = (byte)MessageType.DeliverMessage;
+            senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
+            messageData.CopyTo(deliveryPayload.AsMemory(17));
 
-        await recipient.Transport.SendAsync(deliveryPayload, cancellationToken).ConfigureAwait(false);
+            await recipient.Transport
+                .SendAsync(deliveryPayload.AsMemory(0, payloadSize), cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            _logger.LogWarning(
+                ex,
+                "Delivery to {RecipientId} failed, evicting recipient",
+                recipientId);
+            _clients.TryRemove(recipientId, out _);
+            _clientNames.TryRemove(recipient.Name, out _);
+            await recipient.DisposeAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(deliveryPayload);
+        }
     }
 
-    private sealed record ClientConnection(Guid Id, string Name, ITransport Transport) : IAsyncDisposable
+    private sealed class ClientConnection(Guid id, string name, ITransport transport) : IAsyncDisposable
     {
+        private int _disposed;
+
+        public Guid Id { get; } = id;
+        public string Name { get; } = name;
+        public ITransport Transport { get; } = transport;
+
         public async ValueTask DisposeAsync()
         {
-            await Transport.DisposeAsync().ConfigureAwait(false);
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                await Transport.DisposeAsync().ConfigureAwait(false);
+            }
         }
     }
 }

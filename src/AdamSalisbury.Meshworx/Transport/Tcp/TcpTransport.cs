@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Net.Sockets;
 
@@ -46,6 +47,7 @@ public sealed class TcpTransport : ITransport
         var tcpClient = new TcpClient();
         try
         {
+            tcpClient.NoDelay = true;
             await tcpClient.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
             return new TcpTransport(tcpClient);
         }
@@ -59,24 +61,27 @@ public sealed class TcpTransport : ITransport
     /// <inheritdoc/>
     public async Task SendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
-        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        int frameSize = HeaderSize + data.Length;
+        byte[] frame = ArrayPool<byte>.Shared.Rent(frameSize);
         try
         {
-            var header = new byte[HeaderSize];
-            BinaryPrimitives.WriteInt32BigEndian(header, data.Length);
+            BinaryPrimitives.WriteInt32BigEndian(frame, data.Length);
+            data.Span.CopyTo(frame.AsSpan(HeaderSize));
 
-            await _stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
-
-            if (data.Length > 0)
+            await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
             {
-                await _stream.WriteAsync(data, cancellationToken).ConfigureAwait(false);
+                await _stream.WriteAsync(frame.AsMemory(0, frameSize), cancellationToken).ConfigureAwait(false);
+                await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
-
-            await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+            finally
+            {
+                _writeLock.Release();
+            }
         }
         finally
         {
-            _writeLock.Release();
+            ArrayPool<byte>.Shared.Return(frame);
         }
     }
 

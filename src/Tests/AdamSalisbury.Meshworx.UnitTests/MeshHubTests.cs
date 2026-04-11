@@ -246,7 +246,7 @@ public sealed class MeshHubTests
     }
 
     /// <summary>
-    /// When a client sends registration data shorter than two bytes, the transport is disposed and no client is registered.
+    /// When a client sends registration data shorter than three bytes, the transport is disposed and no client is registered.
     /// </summary>
     [Fact(Timeout = 1000)]
     public async Task HandleClient_RegistrationDataTooShort_DisposesTransport()
@@ -255,7 +255,7 @@ public sealed class MeshHubTests
         var transport = MeshHubFixture.CreateMockTransport();
         var disposedTcs = new TaskCompletionSource();
 
-        byte[] tooShort = [0x04]; // RegistrationRequest type but only 1 byte (< 2)
+        byte[] tooShort = [0x04]; // RegistrationRequest type but only 1 byte (< 3)
         transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(tooShort);
         transport.Setup(t => t.DisposeAsync())
@@ -387,6 +387,82 @@ public sealed class MeshHubTests
         Assert.True(fixture.Hub.IsClientRegistered(existing.Id));
 
         existing.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    // HandleClient — unsupported protocol version
+
+    /// <summary>
+    /// When a client sends a registration request with an unsupported protocol version, the hub sends
+    /// an Error response containing the UnsupportedProtocolVersion error code.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_UnsupportedProtocolVersion_SendsErrorResponse()
+    {
+        var fixture = new MeshHubFixture();
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+        var disposedTcs = new TaskCompletionSource();
+
+        byte[] badVersion = [0x04, 0xFF, 0x41]; // RegistrationRequest + bad version + 'A'
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(badVersion);
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+        transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x02, sentData[1]); // UnsupportedProtocolVersion
+
+        await fixture.Hub.StopAsync();
+    }
+
+    // HandleClient — client name too long
+
+    /// <summary>
+    /// When a client sends a registration request with a name exceeding the maximum allowed length,
+    /// the hub sends an Error response containing the ClientNameTooLong error code.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_ClientNameTooLong_SendsErrorResponse()
+    {
+        var fixture = new MeshHubFixture();
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+        var disposedTcs = new TaskCompletionSource();
+
+        string longName = new('A', 257);
+        byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(longName);
+        var payload = new byte[2 + nameBytes.Length];
+        payload[0] = 0x04; // RegistrationRequest
+        payload[1] = 0x01; // Protocol version
+        nameBytes.CopyTo(payload, 2);
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(payload);
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+        transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x03, sentData[1]); // ClientNameTooLong
+
         await fixture.Hub.StopAsync();
     }
 
@@ -718,38 +794,41 @@ public sealed class MeshHubTests
     }
 
     /// <summary>
-    /// When a recipient's transport throws an IOException during message delivery, the sending client's
-    /// handler catches the exception and the sender is removed from the registry.
+    /// When a recipient's transport throws an IOException during message delivery, the recipient
+    /// is evicted from the registry and the sender remains connected.
     /// </summary>
     [Fact(Timeout = 1000)]
-    public async Task HandleClient_SendAsyncFailsDuringRouting_RemovesSendingClient()
+    public async Task HandleClient_RecipientTransportFailsDuringRouting_EvictsRecipient()
     {
         var fixture = new MeshHubFixture();
         await fixture.Hub.StartAsync();
         var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
         var recipient = await fixture.RegisterMultiMessageClientAsync("Recipient");
 
+        // Track when the recipient's transport is disposed (indicating eviction).
+        var recipientDisposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => recipientDisposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
         // Make the recipient's transport throw on the next SendAsync (the delivery attempt).
         recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new IOException("Recipient pipe broken"));
 
-        var senderDisposedTcs = new TaskCompletionSource();
-        sender.Transport.Setup(t => t.DisposeAsync())
-            .Callback(() => senderDisposedTcs.TrySetResult())
-            .Returns(ValueTask.CompletedTask);
-
-        // Send a message from sender to recipient — the IOException propagates into the sender's handler.
+        // Send a message from sender to recipient — the IOException is caught by RouteMessageAsync,
+        // which evicts the recipient rather than killing the sender.
         var sendPayload = new byte[1 + 16 + 3];
         sendPayload[0] = 0x02; // SendMessage
         recipient.Id.TryWriteBytes(sendPayload.AsSpan(1));
         new byte[] { 1, 2, 3 }.CopyTo(sendPayload, 17);
         sender.EnqueueMessage(sendPayload);
 
-        await senderDisposedTcs.Task.WaitAsync(WaitTimeout);
+        await recipientDisposedTcs.Task.WaitAsync(WaitTimeout);
 
-        Assert.False(fixture.Hub.IsClientRegistered(sender.Id));
+        Assert.False(fixture.Hub.IsClientRegistered(recipient.Id));
+        Assert.True(fixture.Hub.IsClientRegistered(sender.Id));
 
-        recipient.Disconnect();
+        sender.Disconnect();
         await fixture.Hub.StopAsync();
     }
 

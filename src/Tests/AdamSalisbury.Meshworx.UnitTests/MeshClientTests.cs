@@ -98,7 +98,8 @@ public sealed class MeshClientTests
 
         Assert.NotNull(sentData);
         Assert.Equal(0x04, sentData[0]);
-        Assert.Equal("TestClient", Encoding.UTF8.GetString(sentData.AsSpan(1)));
+        Assert.Equal(0x01, sentData[1]);
+        Assert.Equal("TestClient", Encoding.UTF8.GetString(sentData.AsSpan(2)));
     }
 
     /// <summary>

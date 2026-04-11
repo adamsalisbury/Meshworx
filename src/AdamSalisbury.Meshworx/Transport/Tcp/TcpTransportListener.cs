@@ -49,6 +49,7 @@ public sealed class TcpTransportListener : ITransportListener
         }
 
         TcpClient tcpClient = await _listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
+        tcpClient.NoDelay = true;
         return new TcpTransport(tcpClient);
     }
 
