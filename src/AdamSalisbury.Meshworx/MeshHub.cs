@@ -242,19 +242,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         await recipient.Transport.SendAsync(deliveryPayload, cancellationToken).ConfigureAwait(false);
     }
 
-    private sealed class ClientConnection : IAsyncDisposable
+    private sealed record ClientConnection(Guid Id, string Name, ITransport Transport) : IAsyncDisposable
     {
-        public ClientConnection(Guid id, string name, ITransport transport)
-        {
-            Id = id;
-            Name = name;
-            Transport = transport;
-        }
-
-        public Guid Id { get; }
-        public string Name { get; }
-        public ITransport Transport { get; }
-
         public async ValueTask DisposeAsync()
         {
             await Transport.DisposeAsync().ConfigureAwait(false);
