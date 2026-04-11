@@ -106,33 +106,33 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private async Task HandleClientAsync(ITransport transport, CancellationToken cancellationToken)
     {
         var clientId = Guid.NewGuid();
+        ClientConnection? connection = null;
 
-        byte[]? registrationData = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
-
-        if (registrationData is null
-            || registrationData.Length < 2
-            || (MessageType)registrationData[0] != MessageType.RegistrationRequest)
-        {
-            await transport.DisposeAsync().ConfigureAwait(false);
-            return;
-        }
-
-        string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(1));
-
-        if (!_clientNames.TryAdd(clientName, clientId))
-        {
-            byte[] errorPayload = [(byte)MessageType.Error, (byte)RegistrationErrorCode.DuplicateClientName];
-            await transport.SendAsync(errorPayload, cancellationToken).ConfigureAwait(false);
-            await transport.DisposeAsync().ConfigureAwait(false);
-            return;
-        }
-
-        var connection = new ClientConnection(clientId, clientName, transport);
-
-        _clients.TryAdd(clientId, connection);
-        _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
         try
         {
+            byte[]? registrationData = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
+
+            if (registrationData is null
+                || registrationData.Length < 2
+                || (MessageType)registrationData[0] != MessageType.RegistrationRequest)
+            {
+                return;
+            }
+
+            string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(1));
+
+            if (!_clientNames.TryAdd(clientName, clientId))
+            {
+                byte[] errorPayload = [(byte)MessageType.Error, (byte)RegistrationErrorCode.DuplicateClientName];
+                await transport.SendAsync(errorPayload, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            connection = new ClientConnection(clientId, clientName, transport);
+
+            _clients.TryAdd(clientId, connection);
+            _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
+
             var responsePayload = new byte[17];
             responsePayload[0] = (byte)MessageType.RegistrationComplete;
             clientId.TryWriteBytes(responsePayload.AsSpan(1));
@@ -190,10 +190,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
         finally
         {
-            _clientNames.TryRemove(clientName, out _);
-            _clients.TryRemove(clientId, out _);
-            await connection.DisposeAsync().ConfigureAwait(false);
-            _logger.LogInformation("Client {ClientId} disconnected", clientId);
+            if (connection is not null)
+            {
+                _clientNames.TryRemove(connection.Name, out _);
+                _clients.TryRemove(clientId, out _);
+                await connection.DisposeAsync().ConfigureAwait(false);
+                _logger.LogInformation("Client {ClientId} disconnected", clientId);
+            }
+            else
+            {
+                await transport.DisposeAsync().ConfigureAwait(false);
+            }
         }
     }
 
