@@ -70,7 +70,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
         catch (Exception)
         {
-            //HUMANTODO
+            // Handler task exceptions are already logged individually via ContinueWith.
+            // This catch prevents WhenAll from propagating during shutdown.
         }
 
         _handlerTasks.Clear();
@@ -200,9 +201,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             // Expected when the cancellation token is triggered during shutdown.
         }
-        catch (IOException)
+        catch (IOException ex)
         {
-            //HUMANTODO
+            _logger.LogWarning(ex, "Client {ClientId} transport error", clientId);
         }
         finally
         {
