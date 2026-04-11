@@ -187,11 +187,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
+        ITransport transport = _transport ?? throw new InvalidOperationException("Transport is not initialised.");
+
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                byte[]? data = await _transport!.ReceiveAsync(cancellationToken).ConfigureAwait(false);
+                byte[]? data = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
 
                 if (data is null)
                 {
