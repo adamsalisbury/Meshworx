@@ -131,7 +131,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
-    public async Task<Guid?> GetClientIdByName(string name, CancellationToken cancellationToken = default)
+    public async Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);
 

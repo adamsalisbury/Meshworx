@@ -81,7 +81,7 @@ while (true)
         continue;
     }
 
-    Guid? recipientId = await client.GetClientIdByName(recipientName);
+    Guid? recipientId = await client.GetClientIdByNameAsync(recipientName);
     if (recipientId is null)
     {
         Console.WriteLine($"No client named \"{recipientName}\" is connected.");

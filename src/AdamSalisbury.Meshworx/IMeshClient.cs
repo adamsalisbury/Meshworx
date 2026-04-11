@@ -51,7 +51,7 @@ public interface IMeshClient
     /// <param name="cancellationToken">A token to cancel the operation.</param>
     /// <returns>Guid? value representing the client's Id, or null if no client by that name is found.</returns>
     /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
-    Task<Guid?> GetClientIdByName(string name, CancellationToken cancellationToken = default);
+    Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Raised when a message is received from another client.
