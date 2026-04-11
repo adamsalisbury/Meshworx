@@ -227,6 +227,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     {
         if (!_clients.TryGetValue(recipientId, out ClientConnection? recipient))
         {
+            _logger.LogDebug(
+                "Message from {SenderId} dropped: recipient {RecipientId} not found",
+                senderId,
+                recipientId);
             return;
         }
 
