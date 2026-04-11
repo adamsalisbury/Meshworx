@@ -18,7 +18,12 @@ public interface IMeshClient
     /// <summary>
     /// Connects to a hub via the specified transport and completes the registration handshake.
     /// </summary>
-    /// <param name="transport">A connected transport to use for communication with the hub.</param>
+    /// <remarks>
+    /// The client takes ownership of the transport. It will be disposed when the client
+    /// disconnects or if the handshake fails. The caller must not use or dispose the
+    /// transport after calling this method.
+    /// </remarks>
+    /// <param name="transport">A connected transport to use for communication with the hub. Ownership is transferred to the client.</param>
     /// <param name="clientName">The unique name of this client.</param>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
     /// <exception cref="InvalidOperationException">The client is already connected.</exception>
