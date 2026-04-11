@@ -65,6 +65,11 @@ internal sealed class MeshHubFixture
         byte[] responseData = await registrationCompleteTcs.Task.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         var clientId = new Guid(responseData.AsSpan(1, 16));
 
+        while (!Hub.IsClientRegistered(clientId))
+        {
+            await Task.Yield();
+        }
+
         return new RegisteredClient(clientId, transport, disconnectTcs, responseData);
     }
 }

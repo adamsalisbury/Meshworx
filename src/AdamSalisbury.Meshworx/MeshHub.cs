@@ -130,13 +130,13 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
             connection = new ClientConnection(clientId, clientName, transport);
 
-            _clients.TryAdd(clientId, connection);
-            _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
-
             var responsePayload = new byte[17];
             responsePayload[0] = (byte)MessageType.RegistrationComplete;
             clientId.TryWriteBytes(responsePayload.AsSpan(1));
             await transport.SendAsync(responsePayload, cancellationToken).ConfigureAwait(false);
+
+            _clients.TryAdd(clientId, connection);
+            _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
 
             while (!cancellationToken.IsCancellationRequested)
             {
