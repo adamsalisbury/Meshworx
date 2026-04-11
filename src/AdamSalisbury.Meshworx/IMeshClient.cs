@@ -45,7 +45,7 @@ public interface IMeshClient
     Task SendAsync(Guid recipientId, ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Queries the hub for a client's Id based on it's name
+    /// Queries the hub for a client's Id based on its name
     /// </summary>
     /// <param name="name">The name of the client for which the Id should be retrieved.</param>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
