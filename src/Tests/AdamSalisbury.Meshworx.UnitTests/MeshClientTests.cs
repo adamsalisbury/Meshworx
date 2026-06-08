@@ -1,4 +1,5 @@
 using System.Text;
+using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.UnitTests.Fixtures;
@@ -98,7 +99,7 @@ public sealed class MeshClientTests
 
         Assert.NotNull(sentData);
         Assert.Equal(0x04, sentData[0]);
-        Assert.Equal(0x01, sentData[1]);
+        Assert.Equal(0x02, sentData[1]);
         Assert.Equal("TestClient", Encoding.UTF8.GetString(sentData.AsSpan(2)));
     }
 
@@ -466,7 +467,7 @@ public sealed class MeshClientTests
 
         Assert.NotNull(lookupPayload);
         Assert.Equal(0x06, lookupPayload[0]);
-        Assert.Equal("Target", System.Text.Encoding.UTF8.GetString(lookupPayload.AsSpan(1)));
+        Assert.Equal("Target", System.Text.Encoding.UTF8.GetString(lookupPayload.AsSpan(5)));
     }
 
     // ReceiveLoop (tested indirectly via MessageReceived event)
@@ -622,5 +623,85 @@ public sealed class MeshClientTests
 
         Assert.Equal(Guid.Empty, fixture.Client.Id);
         fixture.Transport.Verify(t => t.DisposeAsync(), Times.Once);
+    }
+
+    // Regression tests
+
+    /// <summary>
+    /// When the receive loop processes an empty frame, the frame is ignored without faulting the loop,
+    /// so a subsequent DeliverMessage is still raised as an event.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_EmptyFrame_IsIgnoredAndLoopContinues()
+    {
+        var fixture = new MeshClientFixture();
+        byte[] deliverPayload = fixture.CreateDeliverMessagePayload(Guid.NewGuid(), [1, 2, 3]);
+        fixture.SetupSuccessfulRegistration([], deliverPayload);
+
+        bool eventRaised = false;
+        fixture.Client.MessageReceived += (_, _) => eventRaised = true;
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        Assert.True(eventRaised);
+    }
+
+    /// <summary>
+    /// When a MessageReceived handler throws, the receive loop survives so subsequent messages
+    /// are still delivered to handlers.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_HandlerThrows_DoesNotHaltDelivery()
+    {
+        var fixture = new MeshClientFixture();
+        byte[] firstPayload = fixture.CreateDeliverMessagePayload(Guid.NewGuid(), [1]);
+        byte[] secondPayload = fixture.CreateDeliverMessagePayload(Guid.NewGuid(), [2]);
+        fixture.SetupSuccessfulRegistration(firstPayload, secondPayload);
+
+        int handlerInvocations = 0;
+        fixture.Client.MessageReceived += (_, _) =>
+        {
+            Interlocked.Increment(ref handlerInvocations);
+            throw new InvalidOperationException("Handler failure");
+        };
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        Assert.Equal(2, handlerInvocations);
+    }
+
+    /// <summary>
+    /// When a lookup response carries a correlation id that does not match the pending request,
+    /// it is discarded, and only the response with the matching correlation id resolves the lookup.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task GetClientIdByNameAsync_StaleCorrelationId_IsDiscarded()
+    {
+        var fixture = new MeshClientFixture();
+        var expectedId = Guid.NewGuid();
+
+        var receiveChannel = Channel.CreateUnbounded<byte[]?>();
+        receiveChannel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        int sendCount = 0;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((_, _) =>
+            {
+                // The first lookup of a fresh client uses correlation id 0.
+                if (Interlocked.Increment(ref sendCount) == 2)
+                {
+                    receiveChannel.Writer.TryWrite(MeshClientFixture.CreateLookupFoundResponse(Guid.NewGuid(), correlationId: 99));
+                    receiveChannel.Writer.TryWrite(MeshClientFixture.CreateLookupFoundResponse(expectedId, correlationId: 0));
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await receiveChannel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+        Guid? result = await fixture.Client.GetClientIdByNameAsync("Target");
+
+        Assert.Equal(expectedId, result);
     }
 }

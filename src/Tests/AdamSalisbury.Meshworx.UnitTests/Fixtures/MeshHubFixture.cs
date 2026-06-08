@@ -28,7 +28,7 @@ internal sealed class MeshHubFixture
         byte[] nameBytes = Encoding.UTF8.GetBytes(name);
         var payload = new byte[2 + nameBytes.Length];
         payload[0] = 0x04; // RegistrationRequest
-        payload[1] = 0x01; // Protocol version
+        payload[1] = 0x02; // Protocol version
         nameBytes.CopyTo(payload, 2);
         return payload;
     }

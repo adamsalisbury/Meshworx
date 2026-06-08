@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Text;
 using System.Threading.Channels;
@@ -204,6 +205,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     break;
                 }
 
+                if (data.Length == 0)
+                {
+                    // Empty frames carry no opcode; ignore rather than indexing data[0].
+                    continue;
+                }
+
                 if (data.Length >= 17
                     && (MessageType)data[0] == MessageType.SendMessage)
                 {
@@ -212,23 +219,28 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
                     RouteMessage(clientId, recipientId, messageData);
                 }
-                else if (data.Length >= 2
+                else if (data.Length >= 5
                     && (MessageType)data[0] == MessageType.ClientLookupRequest)
                 {
-                    string lookupName = Encoding.UTF8.GetString(data.AsSpan(1));
+                    int correlationId = BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(1, 4));
+                    string lookupName = Encoding.UTF8.GetString(data.AsSpan(5));
 
                     byte[] lookupResponse;
                     if (_clientNames.TryGetValue(lookupName, out Guid foundId)
                         && _clients.TryGetValue(foundId, out ClientConnection? found))
                     {
-                        lookupResponse = new byte[18];
+                        lookupResponse = new byte[22];
                         lookupResponse[0] = (byte)MessageType.ClientLookupResponse;
-                        lookupResponse[1] = 0x01;
-                        found.Id.TryWriteBytes(lookupResponse.AsSpan(2));
+                        BinaryPrimitives.WriteInt32BigEndian(lookupResponse.AsSpan(1, 4), correlationId);
+                        lookupResponse[5] = 0x01;
+                        found.Id.TryWriteBytes(lookupResponse.AsSpan(6));
                     }
                     else
                     {
-                        lookupResponse = [(byte)MessageType.ClientLookupResponse, 0x00];
+                        lookupResponse = new byte[6];
+                        lookupResponse[0] = (byte)MessageType.ClientLookupResponse;
+                        BinaryPrimitives.WriteInt32BigEndian(lookupResponse.AsSpan(1, 4), correlationId);
+                        lookupResponse[5] = 0x00;
                     }
 
                     await transport.SendAsync(lookupResponse, clientCts.Token).ConfigureAwait(false);

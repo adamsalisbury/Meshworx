@@ -443,7 +443,7 @@ public sealed class MeshHubTests
         byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(longName);
         var payload = new byte[2 + nameBytes.Length];
         payload[0] = 0x04; // RegistrationRequest
-        payload[1] = 0x01; // Protocol version
+        payload[1] = 0x02; // Protocol version
         nameBytes.CopyTo(payload, 2);
 
         transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
@@ -635,6 +635,42 @@ public sealed class MeshHubTests
     // HandleClient — client lookup
 
     /// <summary>
+    /// When the hub receives an empty frame, it is ignored without faulting the receive loop,
+    /// so a subsequent SendMessage from the same client is still routed.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_EmptyFrame_IsIgnoredAndRoutingContinues()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient");
+
+        var deliveredTcs = new TaskCompletionSource<byte[]>();
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => deliveredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        // An empty frame must be ignored rather than crashing the loop ...
+        sender.EnqueueMessage([]);
+
+        // ... so this subsequent message is still routed to the recipient.
+        var sendPayload = new byte[1 + 16 + 3];
+        sendPayload[0] = 0x02; // SendMessage
+        recipient.Id.TryWriteBytes(sendPayload.AsSpan(1));
+        new byte[] { 1, 2, 3 }.CopyTo(sendPayload, 17);
+        sender.EnqueueMessage(sendPayload);
+
+        byte[] deliveredData = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x03, deliveredData[0]); // DeliverMessage
+
+        sender.Disconnect();
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
     /// When a client sends a lookup request for a name that is registered, the hub responds with a found indicator and the matching client's Guid.
     /// </summary>
     [Fact(Timeout = 1000)]
@@ -651,17 +687,19 @@ public sealed class MeshHubTests
             .Returns(Task.CompletedTask);
 
         byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes("ClientA");
-        var lookupRequest = new byte[1 + nameBytes.Length];
+        var lookupRequest = new byte[5 + nameBytes.Length];
         lookupRequest[0] = 0x06; // ClientLookupRequest
-        nameBytes.CopyTo(lookupRequest, 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(lookupRequest.AsSpan(1, 4), 42);
+        nameBytes.CopyTo(lookupRequest, 5);
 
         clientB.DisconnectTcs.SetResult(lookupRequest);
 
         byte[] response = await lookupResponseTcs.Task.WaitAsync(WaitTimeout);
 
         Assert.Equal(0x07, response[0]);
-        Assert.Equal(0x01, response[1]);
-        var foundId = new Guid(response.AsSpan(2, 16));
+        Assert.Equal(42, System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(response.AsSpan(1, 4)));
+        Assert.Equal(0x01, response[5]);
+        var foundId = new Guid(response.AsSpan(6, 16));
         Assert.Equal(clientA.Id, foundId);
 
         clientA.Disconnect();
@@ -684,17 +722,19 @@ public sealed class MeshHubTests
             .Returns(Task.CompletedTask);
 
         byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes("NobodyHere");
-        var lookupRequest = new byte[1 + nameBytes.Length];
+        var lookupRequest = new byte[5 + nameBytes.Length];
         lookupRequest[0] = 0x06;
-        nameBytes.CopyTo(lookupRequest, 1);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(lookupRequest.AsSpan(1, 4), 7);
+        nameBytes.CopyTo(lookupRequest, 5);
 
         client.DisconnectTcs.SetResult(lookupRequest);
 
         byte[] response = await lookupResponseTcs.Task.WaitAsync(WaitTimeout);
 
         Assert.Equal(0x07, response[0]);
-        Assert.Equal(0x00, response[1]);
-        Assert.Equal(2, response.Length);
+        Assert.Equal(7, System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(response.AsSpan(1, 4)));
+        Assert.Equal(0x00, response[5]);
+        Assert.Equal(6, response.Length);
 
         await fixture.Hub.StopAsync();
     }

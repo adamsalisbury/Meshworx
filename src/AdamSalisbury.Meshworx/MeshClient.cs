@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
@@ -15,10 +16,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private CancellationTokenSource? _cts;
     private Task? _receiveLoopTask;
 
-    // Single-slot pending lookup, serialised by _lookupLock. If a lookup is cancelled
-    // via CancellationToken, the hub's response is consumed and discarded by the
-    // receive loop on its next iteration.
-    private TaskCompletionSource<Guid?>? _pendingLookup;
+    // Single-slot pending lookup, serialised by _lookupLock. Each request carries a
+    // correlation id echoed by the hub; the receive loop only completes the pending
+    // lookup when the ids match, so a response from a cancelled request cannot resolve
+    // a subsequent lookup with a stale result.
+    private PendingLookup? _pendingLookup;
+    private int _lookupCorrelationId;
 
     public MeshClient(ILogger<MeshClient> logger)
     {
@@ -226,15 +229,19 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         await _lookupLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            _pendingLookup = new TaskCompletionSource<Guid?>();
+            // _lookupLock serialises lookups, so a plain increment is sufficient.
+            int correlationId = unchecked(_lookupCorrelationId++);
+            var completion = new TaskCompletionSource<Guid?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingLookup = new PendingLookup(correlationId, completion);
 
             byte[] nameBytes = Encoding.UTF8.GetBytes(name);
-            var payload = new byte[1 + nameBytes.Length];
+            var payload = new byte[1 + 4 + nameBytes.Length];
             payload[0] = (byte)MessageType.ClientLookupRequest;
-            nameBytes.CopyTo(payload, 1);
+            BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(1, 4), correlationId);
+            nameBytes.CopyTo(payload, 5);
             await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
 
-            return await _pendingLookup.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -300,28 +307,53 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     break;
                 }
 
+                if (data.Length == 0)
+                {
+                    // Empty frames carry no opcode; ignore rather than indexing data[0].
+                    continue;
+                }
+
                 if (data.Length >= 17
                     && (MessageType)data[0] == MessageType.DeliverMessage)
                 {
                     var senderId = new Guid(data.AsSpan(1, 16));
                     ReadOnlyMemory<byte> messageData = data.AsMemory(17);
 
-                    MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                    try
                     {
-                        SenderId = senderId,
-                        Data = messageData,
-                    });
+                        MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                        {
+                            SenderId = senderId,
+                            Data = messageData,
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        // A throwing subscriber must not tear down the receive loop and
+                        // silently halt all further delivery. This is a callback boundary.
+                        _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                    }
                 }
-                else if (data.Length >= 2
+                else if (data.Length >= 6
                     && (MessageType)data[0] == MessageType.ClientLookupResponse)
                 {
-                    if (data[1] == 0x01 && data.Length >= 18)
+                    int correlationId = BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(1, 4));
+                    PendingLookup? pending = _pendingLookup;
+
+                    if (pending is null || pending.CorrelationId != correlationId)
                     {
-                        _pendingLookup?.TrySetResult(new Guid(data.AsSpan(2, 16)));
+                        // Stale or unsolicited response (e.g. from a cancelled lookup); discard.
+                        _logger.LogDebug(
+                            "Discarding lookup response with unmatched correlation id {CorrelationId}",
+                            correlationId);
+                    }
+                    else if (data[5] == 0x01 && data.Length >= 22)
+                    {
+                        pending.Completion.TrySetResult(new Guid(data.AsSpan(6, 16)));
                     }
                     else
                     {
-                        _pendingLookup?.TrySetResult(null);
+                        pending.Completion.TrySetResult(null);
                     }
                 }
                 else if ((MessageType)data[0] == MessageType.Disconnect)
@@ -352,4 +384,6 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         Connected,
         Disconnecting,
     }
+
+    private sealed record PendingLookup(int CorrelationId, TaskCompletionSource<Guid?> Completion);
 }

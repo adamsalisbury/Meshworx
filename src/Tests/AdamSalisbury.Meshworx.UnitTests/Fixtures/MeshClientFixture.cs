@@ -50,18 +50,23 @@ internal sealed class MeshClientFixture
         sequence.ReturnsAsync((byte[]?)null);
     }
 
-    public static byte[] CreateLookupFoundResponse(Guid clientId)
+    public static byte[] CreateLookupFoundResponse(Guid clientId, int correlationId = 0)
     {
-        var response = new byte[18];
+        var response = new byte[22];
         response[0] = 0x07; // ClientLookupResponse
-        response[1] = 0x01; // found
-        clientId.TryWriteBytes(response.AsSpan(2));
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(response.AsSpan(1, 4), correlationId);
+        response[5] = 0x01; // found
+        clientId.TryWriteBytes(response.AsSpan(6));
         return response;
     }
 
-    public static byte[] CreateLookupNotFoundResponse()
+    public static byte[] CreateLookupNotFoundResponse(int correlationId = 0)
     {
-        return [0x07, 0x00]; // ClientLookupResponse, not found
+        var response = new byte[6];
+        response[0] = 0x07; // ClientLookupResponse
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(response.AsSpan(1, 4), correlationId);
+        response[5] = 0x00; // not found
+        return response;
     }
 
     public void SetupWithLookupResponse(byte[] lookupResponse)
