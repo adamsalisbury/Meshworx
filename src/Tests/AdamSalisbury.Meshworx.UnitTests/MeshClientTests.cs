@@ -742,6 +742,25 @@ public sealed class MeshClientTests
     // Heartbeat
 
     /// <summary>
+    /// When an idle timeout is configured and no frame arrives from the hub within it, the client
+    /// treats the connection as lost and raises Disconnected with the ConnectionLost reason.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task ReceiveLoop_IdleTimeoutElapses_RaisesDisconnectedConnectionLost()
+    {
+        var fixture = new MeshClientFixture(idleTimeout: TimeSpan.FromMilliseconds(100));
+        fixture.SetupSuccessfulRegistration(); // registers, then no further frames arrive
+
+        var reasonTcs = new TaskCompletionSource<DisconnectReason>();
+        fixture.Client.Disconnected += (_, e) => reasonTcs.TrySetResult(e.Reason);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        DisconnectReason reason = await reasonTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(DisconnectReason.ConnectionLost, reason);
+    }
+
+    /// <summary>
     /// When the hub sends a Ping frame, the client replies with a Pong frame so the hub can
     /// confirm the client is alive.
     /// </summary>

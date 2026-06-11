@@ -11,10 +11,10 @@ internal sealed class MeshClientFixture
     public MeshClient Client { get; }
     public Guid AssignedId { get; } = Guid.NewGuid();
 
-    public MeshClientFixture()
+    public MeshClientFixture(TimeSpan? idleTimeout = null)
     {
         var logger = new Mock<ILogger<MeshClient>>();
-        Client = new MeshClient(logger.Object);
+        Client = new MeshClient(logger.Object, idleTimeout);
         Transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
     }
 

@@ -29,10 +29,26 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private PendingLookup? _pendingLookup;
     private int _lookupCorrelationId;
 
-    public MeshClient(ILogger<MeshClient> logger)
+    private readonly TimeSpan? _idleTimeout;
+
+    /// <param name="logger">The logger used to record client activity.</param>
+    /// <param name="idleTimeout">
+    /// The maximum time the client will wait without receiving any frame from the hub before treating
+    /// the connection as lost and raising <see cref="Disconnected"/>. Set this above the hub's heartbeat
+    /// interval so the hub's pings keep the connection alive. Defaults to <see langword="null"/> (no timeout).
+    /// </param>
+    public MeshClient(ILogger<MeshClient> logger, TimeSpan? idleTimeout = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
+
+        if (idleTimeout is { } timeout && timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(idleTimeout), "The idle timeout must be positive.");
+        }
+
         _logger = logger;
+        _idleTimeout = idleTimeout;
     }
 
     /// <inheritdoc/>
@@ -325,7 +341,30 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                byte[]? data = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
+                byte[]? data;
+
+                if (_idleTimeout is null)
+                {
+                    data = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    using var readCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    readCts.CancelAfter(_idleTimeout.Value);
+                    try
+                    {
+                        data = await transport.ReceiveAsync(readCts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                        when (readCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                    {
+                        _logger.LogWarning(
+                            "No frame received from the hub within {Timeout}; treating the connection as lost",
+                            _idleTimeout);
+                        reason = DisconnectReason.ConnectionLost;
+                        break;
+                    }
+                }
 
                 if (data is null)
                 {
