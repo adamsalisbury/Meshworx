@@ -903,6 +903,29 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    // AcceptLoop — resilience
+
+    /// <summary>
+    /// When accepting one connection throws a transient error, the accept loop survives and
+    /// continues to accept subsequent clients rather than tearing down the hub.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task AcceptLoop_TransientAcceptFailure_ContinuesAcceptingClients()
+    {
+        var fixture = new MeshHubFixture();
+        fixture.FailNextAccept(new IOException("transient accept failure"));
+
+        await fixture.Hub.StartAsync();
+
+        // The first accept throws; the loop must recover and accept this client.
+        var client = await fixture.RegisterClientAsync("AfterFailure");
+
+        Assert.True(fixture.Hub.IsClientRegistered(client.Id));
+
+        client.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // HandleClient — concurrent registration
 
     /// <summary>

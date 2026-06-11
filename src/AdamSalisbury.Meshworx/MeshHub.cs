@@ -141,6 +141,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             {
                 break;
             }
+            catch (Exception ex)
+            {
+                // A single connection failing to be accepted — a peer resetting the moment it
+                // connects, or a transient socket error — must not tear down the accept loop and
+                // stop the hub serving every future client. Log and keep listening. This is the
+                // background service's top-level loop, so catching broadly here is intentional.
+                _logger.LogWarning(ex, "Failed to accept an incoming connection; continuing to listen");
+                continue;
+            }
 
             var handlerTask = HandleClientAsync(transport, cancellationToken);
             _handlerTasks.TryAdd(handlerTask, 0);

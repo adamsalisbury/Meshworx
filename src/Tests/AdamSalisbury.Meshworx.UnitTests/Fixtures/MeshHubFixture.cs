@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Transport;
@@ -9,6 +10,7 @@ namespace AdamSalisbury.Meshworx.UnitTests.Fixtures;
 internal sealed class MeshHubFixture
 {
     private readonly Channel<ITransport> _pendingAccepts = Channel.CreateUnbounded<ITransport>();
+    private readonly ConcurrentQueue<Exception> _acceptFailures = new();
 
     public Mock<ITransportListener> Listener { get; } = new();
     public MeshHub Hub { get; }
@@ -19,8 +21,25 @@ internal sealed class MeshHubFixture
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         Listener.Setup(l => l.DisposeAsync()).Returns(ValueTask.CompletedTask);
         Listener.Setup(l => l.AcceptAsync(It.IsAny<CancellationToken>()))
-            .Returns<CancellationToken>(async ct => await _pendingAccepts.Reader.ReadAsync(ct).ConfigureAwait(false));
+            .Returns<CancellationToken>(async ct =>
+            {
+                if (_acceptFailures.TryDequeue(out Exception? failure))
+                {
+                    throw failure;
+                }
+
+                return await _pendingAccepts.Reader.ReadAsync(ct).ConfigureAwait(false);
+            });
         Hub = new MeshHub(logger.Object, Listener.Object, registrationTimeout);
+    }
+
+    /// <summary>
+    /// Causes the next call to the listener's AcceptAsync to throw the given exception before
+    /// any queued client is accepted. Used to simulate a transient accept failure.
+    /// </summary>
+    public void FailNextAccept(Exception exception)
+    {
+        _acceptFailures.Enqueue(exception);
     }
 
     public static byte[] CreateRegistrationRequest(string name = "TestClient")

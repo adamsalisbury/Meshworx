@@ -49,8 +49,19 @@ public sealed class TcpTransportListener : ITransportListener
         }
 
         TcpClient tcpClient = await _listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
-        tcpClient.NoDelay = true;
-        return new TcpTransport(tcpClient);
+        try
+        {
+            tcpClient.NoDelay = true;
+            return new TcpTransport(tcpClient);
+        }
+        catch
+        {
+            // Setting NoDelay or acquiring the stream can fail if the peer reset the
+            // connection immediately after it was accepted. Dispose the socket rather
+            // than leaking it, then let the caller's accept loop continue.
+            tcpClient.Dispose();
+            throw;
+        }
     }
 
     /// <inheritdoc/>
