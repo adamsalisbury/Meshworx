@@ -84,6 +84,9 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
 - **Messaging.** `SendAsync(recipientId, payload)` hands the message to the hub, which delivers
   it to the recipient's `MessageReceived` event. If the recipient is unknown the message is
   silently dropped.
+- **Broadcast.** `BroadcastAsync(payload)` delivers the message to every other connected client
+  (never echoed back to the sender). Recipients receive it through `MessageReceived` exactly as
+  they would a directly addressed message.
 - **Disconnect.** Calling `DisconnectAsync` is graceful and does not raise `Disconnected`. The
   `Disconnected` event fires only for unexpected endings — the hub closing the connection
   (`RemoteDisconnect`) or the transport failing (`ConnectionLost`). After it fires the client
@@ -136,6 +139,7 @@ Protocol version: **2**.
 | `RegistrationComplete` | `0x01` | hub → client | assigned client id (16 bytes) |
 | `Error` | `0x05` | hub → client | registration error code (1 byte) |
 | `SendMessage` | `0x02` | client → hub | recipient id (16 bytes), message bytes |
+| `BroadcastMessage` | `0x0B` | client → hub | message bytes |
 | `DeliverMessage` | `0x03` | hub → client | sender id (16 bytes), message bytes |
 | `ClientLookupRequest` | `0x06` | client → hub | correlation id (4 bytes, big-endian), UTF-8 name |
 | `ClientLookupResponse` | `0x07` | hub → client | correlation id (4 bytes), found flag (1 byte), id (16 bytes if found) |

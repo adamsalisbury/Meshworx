@@ -255,6 +255,28 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public async Task BroadcastAsync(ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default)
+    {
+        ITransport transport;
+
+        lock (_stateLock)
+        {
+            if (_state is not ConnectionState.Connected)
+            {
+                throw new InvalidOperationException("Not connected to a hub.");
+            }
+
+            transport = _transport!;
+        }
+
+        var payload = new byte[1 + message.Length];
+        payload[0] = (byte)MessageType.BroadcastMessage;
+        message.CopyTo(payload.AsMemory(1));
+
+        await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
     public async Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);

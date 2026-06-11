@@ -826,6 +826,55 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    // BroadcastMessage
+
+    /// <summary>
+    /// When a client broadcasts a message, the hub delivers it to every other registered client but
+    /// not back to the sender.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task BroadcastMessage_DeliversToAllOtherClients()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var first = await fixture.RegisterClientAsync("First");
+        var second = await fixture.RegisterClientAsync("Second");
+
+        var firstTcs = new TaskCompletionSource<byte[]>();
+        first.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((d, _) => firstTcs.TrySetResult(d.ToArray()))
+            .Returns(Task.CompletedTask);
+        var secondTcs = new TaskCompletionSource<byte[]>();
+        second.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((d, _) => secondTcs.TrySetResult(d.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        var messageContent = new byte[] { 1, 2, 3 };
+        var broadcastFrame = new byte[1 + messageContent.Length];
+        broadcastFrame[0] = 0x0B; // BroadcastMessage
+        messageContent.CopyTo(broadcastFrame, 1);
+        sender.EnqueueMessage(broadcastFrame);
+
+        byte[] firstData = await firstTcs.Task.WaitAsync(WaitTimeout);
+        byte[] secondData = await secondTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x03, firstData[0]); // DeliverMessage
+        Assert.Equal(sender.Id, new Guid(firstData.AsSpan(1, 16)));
+        Assert.Equal(messageContent, firstData[17..]);
+        Assert.Equal(0x03, secondData[0]);
+        Assert.Equal(messageContent, secondData[17..]);
+
+        // The sender's transport only ever saw its own RegistrationComplete — never the broadcast.
+        sender.Transport.Verify(
+            t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()), Times.Once);
+
+        sender.Disconnect();
+        first.Disconnect();
+        second.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // HandleClient — client lookup
 
     /// <summary>

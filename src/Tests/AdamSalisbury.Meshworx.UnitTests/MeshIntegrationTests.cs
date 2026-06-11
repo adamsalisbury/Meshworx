@@ -61,6 +61,44 @@ public sealed class MeshIntegrationTests
     }
 
     /// <summary>
+    /// A broadcast from one client is delivered to every other connected client over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_BroadcastReachesAllOtherClients()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var sender = CreateClient();
+        await using var first = CreateClient();
+        await using var second = CreateClient();
+
+        await sender.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Sender");
+        await first.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "First");
+        await second.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Second");
+
+        var firstTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        first.MessageReceived += (_, e) => firstTcs.TrySetResult(e);
+        var secondTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        second.MessageReceived += (_, e) => secondTcs.TrySetResult(e);
+
+        byte[] payload = Encoding.UTF8.GetBytes("everyone");
+        await sender.BroadcastAsync(payload);
+
+        MessageReceivedEventArgs firstReceived = await firstTcs.Task.WaitAsync(WaitTimeout);
+        MessageReceivedEventArgs secondReceived = await secondTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(sender.Id, firstReceived.SenderId);
+        Assert.Equal(payload, firstReceived.Data.ToArray());
+        Assert.Equal(sender.Id, secondReceived.SenderId);
+        Assert.Equal(payload, secondReceived.Data.ToArray());
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
     /// A lookup for a name that is not registered returns null over the real protocol.
     /// </summary>
     [Fact(Timeout = 10000)]

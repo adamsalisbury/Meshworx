@@ -12,4 +12,5 @@ internal enum MessageType : byte
     Disconnect = 0x08,
     Ping = 0x09,
     Pong = 0x0A,
+    BroadcastMessage = 0x0B,
 }

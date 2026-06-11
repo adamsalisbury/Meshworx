@@ -367,6 +367,43 @@ public sealed class MeshClientTests
         Assert.Equal(message, sentData[17..]);
     }
 
+    // BroadcastAsync
+
+    /// <summary>
+    /// When BroadcastAsync is called on a client that is not connected to a hub, an InvalidOperationException is thrown.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task BroadcastAsync_NotConnected_ThrowsInvalidOperationException()
+    {
+        var fixture = new MeshClientFixture();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => fixture.Client.BroadcastAsync(new byte[] { 1 }));
+    }
+
+    /// <summary>
+    /// When BroadcastAsync is called on a connected client, the payload sent to the transport is the
+    /// BroadcastMessage type byte followed by the message bytes.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task BroadcastAsync_Connected_SendsBroadcastFrame()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        var message = new byte[] { 9, 8, 7 };
+        await fixture.Client.BroadcastAsync(message);
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x0B, sentData[0]); // BroadcastMessage
+        Assert.Equal(message, sentData[1..]);
+    }
+
     // GetClientIdByNameAsync
 
     /// <summary>

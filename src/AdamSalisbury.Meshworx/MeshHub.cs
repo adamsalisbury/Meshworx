@@ -362,6 +362,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
                     RouteMessage(clientId, recipientId, messageData);
                 }
+                else if ((MessageType)data[0] == MessageType.BroadcastMessage)
+                {
+                    BroadcastMessage(clientId, data.AsMemory(1));
+                }
                 else if (data.Length >= 5
                     && (MessageType)data[0] == MessageType.ClientLookupRequest)
                 {
@@ -516,6 +520,33 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 "Outbound queue for {RecipientId} is full, message from {SenderId} dropped",
                 recipientId,
                 senderId);
+        }
+    }
+
+    private void BroadcastMessage(Guid senderId, ReadOnlyMemory<byte> messageData)
+    {
+        // Build the delivery frame once and share it across every recipient's queue. The send
+        // loops only read the array, so concurrent reads of this never-mutated buffer are safe.
+        var deliveryPayload = new byte[1 + 16 + messageData.Length];
+        deliveryPayload[0] = (byte)MessageType.DeliverMessage;
+        senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
+        messageData.CopyTo(deliveryPayload.AsMemory(17));
+
+        foreach (KeyValuePair<Guid, ClientConnection> entry in _clients)
+        {
+            if (entry.Key == senderId)
+            {
+                // A broadcast is not echoed back to its sender.
+                continue;
+            }
+
+            if (!entry.Value.OutboundQueue.Writer.TryWrite(deliveryPayload))
+            {
+                _logger.LogWarning(
+                    "Outbound queue for {RecipientId} is full, broadcast from {SenderId} dropped",
+                    entry.Key,
+                    senderId);
+            }
         }
     }
 

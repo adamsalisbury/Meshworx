@@ -49,6 +49,19 @@ public interface IMeshClient : IAsyncDisposable
     Task SendAsync(Guid recipientId, ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Broadcasts a message to every other client currently registered with the hub.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget, mirroring <see cref="SendAsync"/>. The message is
+    /// not echoed back to the sender. Recipients receive it through <see cref="MessageReceived"/> and
+    /// cannot distinguish it from a directly addressed message.
+    /// </remarks>
+    /// <param name="message">The message payload to broadcast.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    Task BroadcastAsync(ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Queries the hub for a client's Id based on its name
     /// </summary>
     /// <param name="name">The name of the client for which the Id should be retrieved.</param>
