@@ -57,6 +57,37 @@ public sealed class TcpTransportTests
         Assert.Equal(256, BinaryPrimitives.ReadInt32BigEndian(written.AsSpan(0, 4)));
     }
 
+    /// <summary>
+    /// When SendAsync is called with a payload larger than the maximum frame size, an ArgumentException
+    /// is thrown up front rather than emitting a frame the peer would reject.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_PayloadExceedsMaxSize_ThrowsArgumentException()
+    {
+        var stream = new MemoryStream();
+        var transport = new TcpTransport(stream);
+        var oversized = new byte[(1024 * 1024) + 1];
+
+        await Assert.ThrowsAsync<ArgumentException>(() => transport.SendAsync(oversized));
+        Assert.Empty(stream.ToArray());
+    }
+
+    /// <summary>
+    /// When SendAsync is called with a payload exactly at the maximum frame size, the frame is written
+    /// successfully.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_PayloadAtMaxSize_WritesFrame()
+    {
+        var stream = new MemoryStream();
+        var transport = new TcpTransport(stream);
+        var atLimit = new byte[1024 * 1024];
+
+        await transport.SendAsync(atLimit);
+
+        Assert.Equal(4 + (1024 * 1024), stream.ToArray().Length);
+    }
+
     // ReceiveAsync — framing
 
     /// <summary>

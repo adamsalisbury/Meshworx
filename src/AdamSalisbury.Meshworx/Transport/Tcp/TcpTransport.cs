@@ -61,6 +61,17 @@ public sealed class TcpTransport : ITransport
     /// <inheritdoc/>
     public async Task SendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
+        // Reject oversized payloads up front. The receiving peer enforces the same limit and
+        // would otherwise treat the frame as corrupt and drop the connection — a clear
+        // ArgumentException to the caller is far better than a surprise disconnect. This also
+        // guards the frameSize addition below against integer overflow.
+        if (data.Length > MaxPayloadSize)
+        {
+            throw new ArgumentException(
+                $"Payload size {data.Length} exceeds the maximum frame payload of {MaxPayloadSize} bytes.",
+                nameof(data));
+        }
+
         int frameSize = HeaderSize + data.Length;
         byte[] frame = ArrayPool<byte>.Shared.Rent(frameSize);
         try
