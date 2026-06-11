@@ -196,6 +196,76 @@ public sealed class MeshIntegrationTests
     }
 
     /// <summary>
+    /// With heartbeats enabled, a responsive client (one that replies to pings) stays connected across
+    /// several heartbeat intervals, exercised end-to-end over the in-memory transport.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_ResponsiveClient_SurvivesHeartbeats()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(
+            new Mock<ILogger<MeshHub>>().Object,
+            listener,
+            heartbeatInterval: TimeSpan.FromMilliseconds(50),
+            maxMissedHeartbeats: 3);
+        await hub.StartAsync();
+
+        await using var client = CreateClient();
+        await client.ConnectAsync(listener.Connect(), "Responsive");
+
+        // Wait well past the eviction window (4 missed intervals ≈ 200 ms). A real client replies to
+        // each ping with a pong, so it must remain connected and registered.
+        await Task.Delay(TimeSpan.FromMilliseconds(400));
+
+        Assert.True(client.IsConnected);
+        Assert.True(hub.IsClientRegistered(client.Id));
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// With heartbeats enabled, a client that registers but never replies to pings is evicted by the
+    /// hub, exercised end-to-end over the in-memory transport with a raw, unresponsive endpoint.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_SilentClient_IsEvictedByHeartbeat()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(
+            new Mock<ILogger<MeshHub>>().Object,
+            listener,
+            heartbeatInterval: TimeSpan.FromMilliseconds(50),
+            maxMissedHeartbeats: 2);
+        await hub.StartAsync();
+
+        // A raw endpoint that completes registration by hand, then goes silent (never replies to pings).
+        var raw = listener.Connect();
+        byte[] nameBytes = Encoding.UTF8.GetBytes("Silent");
+        var registration = new byte[2 + nameBytes.Length];
+        registration[0] = 0x04; // RegistrationRequest
+        registration[1] = 0x02; // protocol version
+        nameBytes.CopyTo(registration, 2);
+        await raw.SendAsync(registration);
+
+        byte[]? response = await raw.ReceiveAsync().WaitAsync(WaitTimeout);
+        Assert.NotNull(response);
+        Assert.Equal(0x01, response[0]); // RegistrationComplete
+        var clientId = new Guid(response.AsSpan(1, 16));
+        Assert.True(hub.IsClientRegistered(clientId));
+
+        // The endpoint never sends another frame, so the hub evicts it after the missed intervals.
+        while (hub.IsClientRegistered(clientId))
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(10));
+        }
+
+        Assert.False(hub.IsClientRegistered(clientId));
+
+        await raw.DisposeAsync();
+        await hub.StopAsync();
+    }
+
+    /// <summary>
     /// The full hub and client stack works over the in-memory transport, confirming the transport
     /// abstraction is pluggable: a message is routed between two clients without any sockets.
     /// </summary>
