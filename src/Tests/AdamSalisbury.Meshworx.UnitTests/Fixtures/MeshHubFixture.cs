@@ -13,14 +13,14 @@ internal sealed class MeshHubFixture
     public Mock<ITransportListener> Listener { get; } = new();
     public MeshHub Hub { get; }
 
-    public MeshHubFixture()
+    public MeshHubFixture(TimeSpan? registrationTimeout = null)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         Listener.Setup(l => l.DisposeAsync()).Returns(ValueTask.CompletedTask);
         Listener.Setup(l => l.AcceptAsync(It.IsAny<CancellationToken>()))
             .Returns<CancellationToken>(async ct => await _pendingAccepts.Reader.ReadAsync(ct).ConfigureAwait(false));
-        Hub = new MeshHub(logger.Object, Listener.Object);
+        Hub = new MeshHub(logger.Object, Listener.Object, registrationTimeout);
     }
 
     public static byte[] CreateRegistrationRequest(string name = "TestClient")

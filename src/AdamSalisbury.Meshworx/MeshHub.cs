@@ -10,20 +10,37 @@ namespace AdamSalisbury.Meshworx;
 
 public sealed class MeshHub : IMeshHub, IAsyncDisposable
 {
+    private static readonly TimeSpan DefaultRegistrationTimeout = TimeSpan.FromSeconds(10);
+
     private readonly ILogger<MeshHub> _logger;
     private readonly ITransportListener _listener;
+    private readonly TimeSpan _registrationTimeout;
     private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
     private readonly ConcurrentDictionary<string, Guid> _clientNames = new();
     private readonly ConcurrentDictionary<Task, byte> _handlerTasks = new();
     private CancellationTokenSource? _cts;
     private Task? _acceptLoopTask;
 
-    public MeshHub(ILogger<MeshHub> logger, ITransportListener listener)
+    /// <param name="logger">The logger used to record hub activity.</param>
+    /// <param name="listener">The transport listener that accepts incoming client connections.</param>
+    /// <param name="registrationTimeout">
+    /// The maximum time a newly accepted connection is given to complete registration before it is
+    /// dropped. Guards against connections that accept but never register. Defaults to 10 seconds.
+    /// </param>
+    public MeshHub(ILogger<MeshHub> logger, ITransportListener listener, TimeSpan? registrationTimeout = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
+
+        if (registrationTimeout is { } timeout && timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(registrationTimeout), "The registration timeout must be positive.");
+        }
+
         _logger = logger;
         _listener = listener;
+        _registrationTimeout = registrationTimeout ?? DefaultRegistrationTimeout;
     }
 
     /// <inheritdoc/>
@@ -149,7 +166,24 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         try
         {
-            byte[]? registrationData = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
+            byte[]? registrationData;
+            using (var registrationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+            {
+                registrationCts.CancelAfter(_registrationTimeout);
+                try
+                {
+                    registrationData = await transport.ReceiveAsync(registrationCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                    when (registrationCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogDebug(
+                        "Client {ClientId} did not complete registration within {Timeout}; dropping connection",
+                        clientId,
+                        _registrationTimeout);
+                    return;
+                }
+            }
 
             if (registrationData is null
                 || registrationData.Length < 3

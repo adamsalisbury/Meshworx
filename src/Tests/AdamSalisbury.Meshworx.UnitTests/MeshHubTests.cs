@@ -299,6 +299,37 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    /// <summary>
+    /// When an accepted connection does not send its registration request within the configured
+    /// timeout, the hub drops the connection by disposing the transport.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task HandleClient_RegistrationTimesOut_DisposesTransport()
+    {
+        var fixture = new MeshHubFixture(TimeSpan.FromMilliseconds(100));
+        var transport = MeshHubFixture.CreateMockTransport();
+        var disposedTcs = new TaskCompletionSource();
+
+        // The client connects but never sends anything — ReceiveAsync blocks until cancelled.
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct =>
+            {
+                await Task.Delay(Timeout.Infinite, ct).ConfigureAwait(false);
+                return null;
+            });
+        transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+        transport.Verify(t => t.DisposeAsync(), Times.Once);
+
+        await fixture.Hub.StopAsync();
+    }
+
     // HandleClient — duplicate name refusal
 
     /// <summary>
