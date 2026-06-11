@@ -479,6 +479,37 @@ public sealed class MeshClientTests
             () => fixture.Client.JoinGroupAsync(string.Empty));
     }
 
+    /// <summary>
+    /// When the receive loop processes a DeliverGroupMessage frame, the GroupMessageReceived event is
+    /// raised with the sender id, the group name, and the message data.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_DeliverGroupMessage_RaisesGroupMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+        var message = new byte[] { 1, 2, 3 };
+        byte[] nameBytes = Encoding.UTF8.GetBytes("team");
+
+        var frame = new byte[1 + 16 + 2 + nameBytes.Length + message.Length];
+        frame[0] = 0x0F; // DeliverGroupMessage
+        senderId.TryWriteBytes(frame.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(17, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(frame, 19);
+        message.CopyTo(frame, 19 + nameBytes.Length);
+        fixture.SetupSuccessfulRegistration(frame);
+
+        GroupMessageReceivedEventArgs? args = null;
+        fixture.Client.GroupMessageReceived += (_, e) => args = e;
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        Assert.NotNull(args);
+        Assert.Equal(senderId, args.SenderId);
+        Assert.Equal("team", args.GroupName);
+        Assert.Equal(message, args.Data.ToArray());
+    }
+
     // GetClientIdByNameAsync
 
     /// <summary>

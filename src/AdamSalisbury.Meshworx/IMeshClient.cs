@@ -90,7 +90,7 @@ public interface IMeshClient : IAsyncDisposable
     /// <remarks>
     /// Delivery is best-effort and fire-and-forget. The message is not echoed back to the sender, and
     /// the sender need not be a member of the group. Recipients receive it through
-    /// <see cref="MessageReceived"/> and cannot distinguish it from a directly addressed message.
+    /// <see cref="GroupMessageReceived"/>, which carries the group name.
     /// </remarks>
     /// <param name="groupName">The name of the group to send to.</param>
     /// <param name="message">The message payload to deliver.</param>
@@ -108,9 +108,15 @@ public interface IMeshClient : IAsyncDisposable
     Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Raised when a message is received from another client.
+    /// Raised when a directly addressed or broadcast message is received from another client.
     /// </summary>
     event EventHandler<MessageReceivedEventArgs> MessageReceived;
+
+    /// <summary>
+    /// Raised when a message sent to a group this client is a member of is received. Unlike
+    /// <see cref="MessageReceived"/>, the event carries the name of the group the message was sent to.
+    /// </summary>
+    event EventHandler<GroupMessageReceivedEventArgs> GroupMessageReceived;
 
     /// <summary>
     /// Raised when the connection to the hub ends for a reason other than a local call to

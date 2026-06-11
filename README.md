@@ -90,7 +90,8 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
 - **Groups.** A client `JoinGroupAsync(name)`/`LeaveGroupAsync(name)` to control its membership,
   and `SendToGroupAsync(name, payload)` delivers to every other member of that group. Groups are
   created on first join and removed once empty; a client is removed from all its groups when it
-  disconnects. As with broadcast, recipients receive group messages through `MessageReceived`.
+  disconnects. Recipients receive group messages through the `GroupMessageReceived` event, which —
+  unlike `MessageReceived` — carries the name of the group the message was sent to.
 - **Disconnect.** Calling `DisconnectAsync` is graceful and does not raise `Disconnected`. The
   `Disconnected` event fires only for unexpected endings — the hub closing the connection
   (`RemoteDisconnect`) or the transport failing (`ConnectionLost`). After it fires the client
@@ -148,6 +149,7 @@ Protocol version: **2**.
 | `LeaveGroup` | `0x0D` | client → hub | UTF-8 group name |
 | `GroupMessage` | `0x0E` | client → hub | group-name length (2 bytes, big-endian), UTF-8 group name, message bytes |
 | `DeliverMessage` | `0x03` | hub → client | sender id (16 bytes), message bytes |
+| `DeliverGroupMessage` | `0x0F` | hub → client | sender id (16 bytes), group-name length (2 bytes, big-endian), UTF-8 group name, message bytes |
 | `ClientLookupRequest` | `0x06` | client → hub | correlation id (4 bytes, big-endian), UTF-8 name |
 | `ClientLookupResponse` | `0x07` | hub → client | correlation id (4 bytes), found flag (1 byte), id (16 bytes if found) |
 | `Disconnect` | `0x08` | either | none |

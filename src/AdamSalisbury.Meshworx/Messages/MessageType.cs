@@ -16,4 +16,5 @@ internal enum MessageType : byte
     JoinGroup = 0x0C,
     LeaveGroup = 0x0D,
     GroupMessage = 0x0E,
+    DeliverGroupMessage = 0x0F,
 }

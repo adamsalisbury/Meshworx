@@ -115,8 +115,8 @@ public sealed class MeshIntegrationTests
         await sender.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Sender");
         await member.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Member");
 
-        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
-        member.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+        var receivedTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        member.GroupMessageReceived += (_, e) => receivedTcs.TrySetResult(e);
 
         await member.JoinGroupAsync("team");
         // A lookup round-trip on the member's connection is a barrier: because the hub processes a
@@ -126,8 +126,9 @@ public sealed class MeshIntegrationTests
         byte[] payload = Encoding.UTF8.GetBytes("team update");
         await sender.SendToGroupAsync("team", payload);
 
-        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        GroupMessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
         Assert.Equal(sender.Id, received.SenderId);
+        Assert.Equal("team", received.GroupName);
         Assert.Equal(payload, received.Data.ToArray());
 
         await hub.StopAsync();
@@ -150,21 +151,24 @@ public sealed class MeshIntegrationTests
         await sender.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Sender");
         await member.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Member");
 
-        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
-        member.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+        var directTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        member.MessageReceived += (_, e) => directTcs.TrySetResult(e);
+        var groupTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        member.GroupMessageReceived += (_, e) => groupTcs.TrySetResult(e);
 
         await member.JoinGroupAsync("team");
         await member.LeaveGroupAsync("team");
         await member.GetClientIdByNameAsync("Sender"); // barrier: join and leave both applied
 
         // Send to the now-empty group, then a direct message. The hub processes the sender's frames
-        // in order, so the member's queue receives the direct message and — if the group delivery
-        // correctly skipped the ex-member — nothing else. The first message it sees must be the direct one.
+        // in order, so any (incorrect) group delivery would be enqueued before the direct message.
+        // Receiving the direct message therefore proves the group message was not delivered.
         await sender.SendToGroupAsync("team", Encoding.UTF8.GetBytes("group"));
         await sender.SendAsync(member.Id, Encoding.UTF8.GetBytes("direct"));
 
-        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        MessageReceivedEventArgs received = await directTcs.Task.WaitAsync(WaitTimeout);
         Assert.Equal("direct", Encoding.UTF8.GetString(received.Data.Span));
+        Assert.False(groupTcs.Task.IsCompleted, "Group message was delivered to a client that left the group.");
 
         await hub.StopAsync();
     }

@@ -666,11 +666,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return;
         }
 
-        // One shared, never-mutated delivery frame across every recipient's queue (see BroadcastMessage).
-        var deliveryPayload = new byte[1 + 16 + messageData.Length];
-        deliveryPayload[0] = (byte)MessageType.DeliverMessage;
+        // One shared, never-mutated delivery frame across every recipient's queue (see
+        // BroadcastMessage). The frame carries the group name so recipients know its origin.
+        byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
+        var deliveryPayload = new byte[1 + 16 + 2 + nameBytes.Length + messageData.Length];
+        deliveryPayload[0] = (byte)MessageType.DeliverGroupMessage;
         senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
-        messageData.CopyTo(deliveryPayload.AsMemory(17));
+        BinaryPrimitives.WriteUInt16BigEndian(deliveryPayload.AsSpan(17, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(deliveryPayload, 19);
+        messageData.CopyTo(deliveryPayload.AsMemory(19 + nameBytes.Length));
 
         foreach (Guid recipientId in recipients)
         {

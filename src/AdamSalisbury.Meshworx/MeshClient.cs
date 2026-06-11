@@ -61,6 +61,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
 
     /// <inheritdoc/>
+    public event EventHandler<GroupMessageReceivedEventArgs>? GroupMessageReceived;
+
+    /// <inheritdoc/>
     public event EventHandler<DisconnectedEventArgs>? Disconnected;
 
     /// <inheritdoc/>
@@ -498,6 +501,33 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         // A throwing subscriber must not tear down the receive loop and
                         // silently halt all further delivery. This is a callback boundary.
                         _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                    }
+                }
+                else if (data.Length >= 19
+                    && (MessageType)data[0] == MessageType.DeliverGroupMessage)
+                {
+                    var senderId = new Guid(data.AsSpan(1, 16));
+                    int nameLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(17, 2));
+
+                    if (data.Length >= 19 + nameLength)
+                    {
+                        string groupName = Encoding.UTF8.GetString(data.AsSpan(19, nameLength));
+                        ReadOnlyMemory<byte> messageData = data.AsMemory(19 + nameLength);
+
+                        try
+                        {
+                            GroupMessageReceived?.Invoke(this, new GroupMessageReceivedEventArgs
+                            {
+                                SenderId = senderId,
+                                GroupName = groupName,
+                                Data = messageData,
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            // Callback boundary — a throwing subscriber must not halt the loop.
+                            _logger.LogError(ex, "A GroupMessageReceived handler threw an exception");
+                        }
                     }
                 }
                 else if (data.Length >= 6
