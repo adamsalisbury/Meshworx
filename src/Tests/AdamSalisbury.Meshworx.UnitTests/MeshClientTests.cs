@@ -828,4 +828,39 @@ public sealed class MeshClientTests
 
         Assert.False(eventRaised);
     }
+
+    /// <summary>
+    /// When a MessageReceived handler disconnects the client, DisconnectAsync must not deadlock by
+    /// waiting on the receive loop it is being invoked from.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task DisconnectAsync_CalledFromMessageReceivedHandler_DoesNotDeadlock()
+    {
+        var fixture = new MeshClientFixture();
+
+        var receiveChannel = Channel.CreateUnbounded<byte[]?>();
+        receiveChannel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await receiveChannel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        var handlerDone = new TaskCompletionSource();
+        fixture.Client.MessageReceived += (_, _) =>
+        {
+            // A synchronous handler that disconnects in response to a message: this blocks on the
+            // receive loop's own task, which previously deadlocked.
+            fixture.Client.DisconnectAsync().GetAwaiter().GetResult();
+            handlerDone.TrySetResult();
+        };
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        // Deliver the message after connect so the handler runs on the assigned receive-loop task.
+        receiveChannel.Writer.TryWrite(fixture.CreateDeliverMessagePayload(Guid.NewGuid(), [1]));
+
+        await handlerDone.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(Guid.Empty, fixture.Client.Id);
+    }
 }

@@ -11,6 +11,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private readonly ILogger<MeshClient> _logger;
     private readonly Lock _stateLock = new();
     private readonly SemaphoreSlim _lookupLock = new(1, 1);
+
+    // Set true within the receive loop's execution flow (AsyncLocal flows to the synchronous
+    // event handlers it invokes, but never back to external callers). DisconnectAsync reads it
+    // to avoid awaiting the receive loop from inside the receive loop, which would deadlock.
+    private readonly AsyncLocal<bool> _inReceiveLoop = new();
+
     private ConnectionState _state = ConnectionState.Disconnected;
     private ITransport? _transport;
     private CancellationTokenSource? _cts;
@@ -168,7 +174,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             await cts.CancelAsync().ConfigureAwait(false);
         }
 
-        if (receiveLoopTask is not null)
+        // If DisconnectAsync was invoked from within the receive loop (for example, from a
+        // MessageReceived handler), awaiting the loop's own task here would deadlock. We have
+        // already signalled cancellation, so the loop unwinds on its own; skip the await.
+        if (receiveLoopTask is not null && !_inReceiveLoop.Value)
         {
             try
             {
@@ -296,6 +305,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
+        // Mark this execution flow as the receive loop so a DisconnectAsync call made from a
+        // handler invoked below does not deadlock by awaiting this very loop.
+        _inReceiveLoop.Value = true;
+
         ITransport transport;
 
         lock (_stateLock)
