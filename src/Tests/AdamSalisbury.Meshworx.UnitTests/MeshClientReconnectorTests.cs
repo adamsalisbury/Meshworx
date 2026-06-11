@@ -1,3 +1,5 @@
+using System.Text;
+using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.Transport.InMemory;
 using AdamSalisbury.Meshworx.Transport.Tcp;
@@ -190,6 +192,60 @@ public sealed class MeshClientReconnectorTests
 
         Assert.True(client.IsConnected);
         Assert.True(secondHub.IsClientRegistered(client.Id));
+
+        await secondHub.StopAsync();
+    }
+
+    /// <summary>
+    /// After a reconnect, the managed client still delivers messages: a handler subscribed once keeps
+    /// firing, proving the receive loop restarts and subscriptions persist across reconnection.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task DeliversMessages_AfterReconnect()
+    {
+        var firstListener = new InMemoryTransportListener();
+        var firstHub = CreateHub(firstListener);
+        await firstHub.StartAsync();
+        var listenerHolder = new[] { firstListener };
+
+        await using var aliceClient = CreateClient();
+
+        // Subscribe once, before any reconnect.
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        aliceClient.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await using var reconnector = new MeshClientReconnector(
+            aliceClient,
+            "Alice",
+            _ => Task.FromResult<ITransport>(Volatile.Read(ref listenerHolder[0]).Connect()),
+            retryDelay: TimeSpan.FromMilliseconds(50),
+            connectTimeout: TimeSpan.FromSeconds(2));
+
+        var reconnectedTcs = new TaskCompletionSource();
+        reconnector.Reconnected += (_, _) => reconnectedTcs.TrySetResult();
+        await reconnector.StartAsync();
+
+        // Move to a replacement hub and force a reconnect.
+        var secondListener = new InMemoryTransportListener();
+        await using var secondHub = CreateHub(secondListener);
+        await secondHub.StartAsync();
+        Volatile.Write(ref listenerHolder[0], secondListener);
+        await firstHub.StopAsync();
+        await firstHub.DisposeAsync();
+        await reconnectedTcs.Task.WaitAsync(WaitTimeout);
+
+        // A new sender on the replacement hub looks Alice up and sends her a message.
+        await using var bob = CreateClient();
+        await bob.ConnectAsync(secondListener.Connect(), "Bob");
+        Guid? aliceId = await bob.GetClientIdByNameAsync("Alice");
+        Assert.Equal(aliceClient.Id, aliceId);
+
+        byte[] payload = Encoding.UTF8.GetBytes("hi after reconnect");
+        await bob.SendAsync(aliceId!.Value, payload);
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(bob.Id, received.SenderId);
+        Assert.Equal(payload, received.Data.ToArray());
 
         await secondHub.StopAsync();
     }
