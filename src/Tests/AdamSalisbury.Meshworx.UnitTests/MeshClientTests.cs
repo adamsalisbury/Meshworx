@@ -704,4 +704,38 @@ public sealed class MeshClientTests
 
         Assert.Equal(expectedId, result);
     }
+
+    /// <summary>
+    /// When the connection drops while a lookup is in flight, the pending GetClientIdByNameAsync
+    /// is faulted rather than hanging indefinitely, even when no cancellation token is supplied.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task GetClientIdByNameAsync_ConnectionDropsWhilePending_ThrowsInsteadOfHanging()
+    {
+        var fixture = new MeshClientFixture();
+
+        var receiveChannel = Channel.CreateUnbounded<byte[]?>();
+        receiveChannel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        int sendCount = 0;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((_, _) =>
+            {
+                // When the lookup request is sent, simulate the hub closing the connection
+                // (null frame) before any lookup response is returned.
+                if (Interlocked.Increment(ref sendCount) == 2)
+                {
+                    receiveChannel.Writer.TryWrite(null);
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await receiveChannel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => fixture.Client.GetClientIdByNameAsync("Target"));
+    }
 }

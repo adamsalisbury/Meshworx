@@ -375,6 +375,15 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             _logger.LogDebug(ex, "Receive loop terminated: transport disposed");
         }
+        finally
+        {
+            // The receive loop is the only thing that completes a pending lookup. If it
+            // terminates for any reason before the response arrives, fault the waiter so
+            // callers using a default (non-cancellable) token are not left hanging — and
+            // so the held _lookupLock is released, unblocking subsequent lookups.
+            _pendingLookup?.Completion.TrySetException(
+                new InvalidOperationException("The connection was closed before the lookup completed."));
+        }
     }
 
     private enum ConnectionState
