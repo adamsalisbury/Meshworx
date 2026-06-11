@@ -6,8 +6,28 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <PropertyGroup Label="Package">
+    <Version>0.1.0</Version>
+    <Authors>Adam Salisbury</Authors>
+    <Company>Adam Salisbury</Company>
+    <Product>Meshworx</Product>
+    <Description>Flexible and unopinionated messaging library that routes named clients through a central hub over a pluggable transport.</Description>
+    <PackageTags>messaging;hub;mesh;networking;tcp</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/adamsalisbury/Meshworx</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/adamsalisbury/Meshworx</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
   <ItemGroup>
     <InternalsVisibleTo Include="AdamSalisbury.Meshworx.UnitTests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>
