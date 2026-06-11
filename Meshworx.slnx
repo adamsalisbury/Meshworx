@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AdamSalisbury.Meshworx/AdamSalisbury.Meshworx.csproj" />
+  </Folder>
+  <Folder Name="/src/AdamSalisbury.Meshworx.TestApps/">
+    <Project Path="src/AdamSalisbury.Meshworx.TestApps/ClientApp/ClientApp.csproj" />
+    <Project Path="src/AdamSalisbury.Meshworx.TestApps/HubApp/HubApp.csproj" />
+  </Folder>
+  <Folder Name="/src/Tests/">
+    <Project Path="src/Tests/AdamSalisbury.Meshworx.UnitTests/AdamSalisbury.Meshworx.UnitTests.csproj" />
+  </Folder>
+</Solution>
