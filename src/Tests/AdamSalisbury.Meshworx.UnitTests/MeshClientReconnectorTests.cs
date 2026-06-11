@@ -92,6 +92,42 @@ public sealed class MeshClientReconnectorTests
         await listener.DisposeAsync();
     }
 
+    /// <summary>
+    /// When the initial connection fails, StartAsync can be called again and succeed once a hub is
+    /// available, rather than being locked into a started-but-unconnected state.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task StartAsync_CanBeRetriedAfterInitialFailure()
+    {
+        // First target: a started listener with no hub, so the initial attempt times out.
+        var deadListener = new InMemoryTransportListener();
+        await deadListener.StartAsync();
+        var listenerHolder = new[] { deadListener };
+
+        await using var client = CreateClient();
+        await using var reconnector = new MeshClientReconnector(
+            client,
+            "Alice",
+            _ => Task.FromResult<ITransport>(Volatile.Read(ref listenerHolder[0]).Connect()),
+            connectTimeout: TimeSpan.FromMilliseconds(200));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => reconnector.StartAsync());
+        Assert.False(client.IsConnected);
+
+        // Point the factory at a live hub and retry.
+        var liveListener = new InMemoryTransportListener();
+        await using var hub = CreateHub(liveListener);
+        await hub.StartAsync();
+        Volatile.Write(ref listenerHolder[0], liveListener);
+
+        await reconnector.StartAsync();
+
+        Assert.True(client.IsConnected);
+        Assert.True(hub.IsClientRegistered(client.Id));
+
+        await hub.StopAsync();
+    }
+
     // Reconnection
 
     /// <summary>

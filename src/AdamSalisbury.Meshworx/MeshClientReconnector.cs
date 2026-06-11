@@ -102,12 +102,20 @@ public sealed class MeshClientReconnector : IAsyncDisposable
             throw new InvalidOperationException("The reconnector has already been started.");
         }
 
-        // Fail fast if the first connection cannot be made; the caller decides how to handle that.
-        using (var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+        try
         {
+            // Fail fast if the first connection cannot be made; the caller decides how to handle that.
+            using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             attemptCts.CancelAfter(_connectTimeout);
             ITransport transport = await _transportFactory(attemptCts.Token).ConfigureAwait(false);
             await Client.ConnectAsync(transport, _clientName, attemptCts.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            // The initial connection failed; allow StartAsync to be retried rather than locking the
+            // reconnector into a started-but-unconnected state.
+            Volatile.Write(ref _started, 0);
+            throw;
         }
 
         Client.Disconnected += OnDisconnected;
