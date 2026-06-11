@@ -121,7 +121,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             Name = clientName;
             _logger.LogInformation("Connected to hub with id {ClientId}", Id);
 
-            _cts = new CancellationTokenSource();
+            var cts = new CancellationTokenSource();
+            _cts = cts;
 
             // Mark connected before starting the loop: if the hub has already buffered a
             // disconnect, the loop can run synchronously to termination, and its teardown
@@ -131,7 +132,19 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 _state = ConnectionState.Connected;
             }
 
-            _receiveLoopTask = ReceiveLoopAsync(_cts.Token);
+            Task loopTask = ReceiveLoopAsync(cts.Token);
+
+            lock (_stateLock)
+            {
+                // The loop may have run to completion synchronously (a buffered disconnect), and a
+                // Disconnected handler may have reconnected from within it, replacing _cts. Only
+                // record the loop task while this connection is still the current one, so a stale
+                // synchronous loop never clobbers a newer connection established during teardown.
+                if (ReferenceEquals(_cts, cts))
+                {
+                    _receiveLoopTask = loopTask;
+                }
+            }
         }
         catch (Exception exception)
         {

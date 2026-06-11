@@ -3,6 +3,7 @@ using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.UnitTests.Fixtures;
+using Microsoft.Extensions.Logging;
 using Moq;
 
 namespace AdamSalisbury.Meshworx.UnitTests;
@@ -915,5 +916,78 @@ public sealed class MeshClientTests
 
         await handlerDone.Task.WaitAsync(TimeSpan.FromSeconds(1));
         Assert.Equal(Guid.Empty, fixture.Client.Id);
+    }
+
+    /// <summary>
+    /// A Disconnected handler may reconnect via ConnectAsync, and the resulting connection is the
+    /// current, usable one — subsequent sends go out on the new transport. Covers the documented
+    /// reconnect-from-handler contract, including the case where the first loop terminates
+    /// synchronously from a buffered disconnect.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task Disconnected_HandlerReconnects_EstablishesUsableConnection()
+    {
+        await using var client = new MeshClient(new Mock<ILogger<MeshClient>>().Object);
+        var secondId = Guid.NewGuid();
+
+        // First transport registers, then the hub immediately disconnects.
+        var firstTransport = new Mock<ITransport>();
+        firstTransport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
+        firstTransport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var firstChannel = Channel.CreateUnbounded<byte[]?>();
+        firstChannel.Writer.TryWrite(RegistrationComplete(Guid.NewGuid()));
+        firstChannel.Writer.TryWrite([0x08]); // Disconnect
+        firstTransport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await firstChannel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        // Second transport registers, then stays connected.
+        var secondTransport = new Mock<ITransport>();
+        secondTransport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
+        byte[]? lastSent = null;
+        secondTransport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((d, _) => lastSent = d.ToArray())
+            .Returns(Task.CompletedTask);
+        var secondChannel = Channel.CreateUnbounded<byte[]?>();
+        secondChannel.Writer.TryWrite(RegistrationComplete(secondId));
+        secondTransport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await secondChannel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        var reconnectedTcs = new TaskCompletionSource();
+        int disconnects = 0;
+        client.Disconnected += async (_, _) =>
+        {
+            if (Interlocked.Increment(ref disconnects) != 1)
+            {
+                return;
+            }
+
+            try
+            {
+                await client.ConnectAsync(secondTransport.Object, "Rejoiner");
+                reconnectedTcs.TrySetResult();
+            }
+            catch (Exception ex)
+            {
+                reconnectedTcs.TrySetException(ex);
+            }
+        };
+
+        await client.ConnectAsync(firstTransport.Object, "Rejoiner");
+        await reconnectedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(secondId, client.Id);
+
+        await client.SendAsync(Guid.NewGuid(), new byte[] { 7 });
+        Assert.NotNull(lastSent);
+        Assert.Equal(0x02, lastSent[0]); // SendMessage routed over the second transport
+    }
+
+    private static byte[] RegistrationComplete(Guid id)
+    {
+        var response = new byte[17];
+        response[0] = 0x01; // RegistrationComplete
+        id.TryWriteBytes(response.AsSpan(1));
+        return response;
     }
 }
