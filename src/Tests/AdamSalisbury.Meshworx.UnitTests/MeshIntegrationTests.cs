@@ -99,6 +99,77 @@ public sealed class MeshIntegrationTests
     }
 
     /// <summary>
+    /// A message sent to a group is delivered to its members over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_GroupMessageReachesGroupMembers()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var sender = CreateClient();
+        await using var member = CreateClient();
+
+        await sender.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Sender");
+        await member.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Member");
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        member.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await member.JoinGroupAsync("team");
+        // A lookup round-trip on the member's connection is a barrier: because the hub processes a
+        // client's frames in order, the join is guaranteed applied by the time this returns.
+        await member.GetClientIdByNameAsync("Sender");
+
+        byte[] payload = Encoding.UTF8.GetBytes("team update");
+        await sender.SendToGroupAsync("team", payload);
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(sender.Id, received.SenderId);
+        Assert.Equal(payload, received.Data.ToArray());
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// After a client leaves a group, group messages are no longer delivered to it over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_LeftGroupNoLongerReceivesGroupMessages()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var sender = CreateClient();
+        await using var member = CreateClient();
+
+        await sender.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Sender");
+        await member.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Member");
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        member.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await member.JoinGroupAsync("team");
+        await member.LeaveGroupAsync("team");
+        await member.GetClientIdByNameAsync("Sender"); // barrier: join and leave both applied
+
+        // Send to the now-empty group, then a direct message. The hub processes the sender's frames
+        // in order, so the member's queue receives the direct message and — if the group delivery
+        // correctly skipped the ex-member — nothing else. The first message it sees must be the direct one.
+        await sender.SendToGroupAsync("team", Encoding.UTF8.GetBytes("group"));
+        await sender.SendAsync(member.Id, Encoding.UTF8.GetBytes("direct"));
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal("direct", Encoding.UTF8.GetString(received.Data.Span));
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
     /// A lookup for a name that is not registered returns null over the real protocol.
     /// </summary>
     [Fact(Timeout = 10000)]

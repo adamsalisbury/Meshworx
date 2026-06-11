@@ -62,6 +62,43 @@ public interface IMeshClient : IAsyncDisposable
     Task BroadcastAsync(ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Joins the named group, so that messages sent to the group are delivered to this client.
+    /// </summary>
+    /// <remarks>
+    /// Groups are created implicitly on first join and removed once empty. Joining a group the client
+    /// is already a member of has no effect.
+    /// </remarks>
+    /// <param name="groupName">The name of the group to join.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    Task JoinGroupAsync(string groupName, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Leaves the named group, so that the client no longer receives messages sent to it.
+    /// </summary>
+    /// <remarks>
+    /// Leaving a group the client is not a member of has no effect.
+    /// </remarks>
+    /// <param name="groupName">The name of the group to leave.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    Task LeaveGroupAsync(string groupName, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a message to every other member of the named group.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget. The message is not echoed back to the sender, and
+    /// the sender need not be a member of the group. Recipients receive it through
+    /// <see cref="MessageReceived"/> and cannot distinguish it from a directly addressed message.
+    /// </remarks>
+    /// <param name="groupName">The name of the group to send to.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Queries the hub for a client's Id based on its name
     /// </summary>
     /// <param name="name">The name of the client for which the Id should be retrieved.</param>

@@ -277,6 +277,73 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public Task JoinGroupAsync(string groupName, CancellationToken cancellationToken = default)
+    {
+        return SendGroupMembershipAsync(MessageType.JoinGroup, groupName, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public Task LeaveGroupAsync(string groupName, CancellationToken cancellationToken = default)
+    {
+        return SendGroupMembershipAsync(MessageType.LeaveGroup, groupName, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public async Task SendToGroupAsync(
+        string groupName,
+        ReadOnlyMemory<byte> message,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(groupName);
+
+        ITransport transport = GetConnectedTransport();
+
+        byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
+        if (nameBytes.Length > ushort.MaxValue)
+        {
+            throw new ArgumentException("The group name is too long.", nameof(groupName));
+        }
+
+        var payload = new byte[1 + 2 + nameBytes.Length + message.Length];
+        payload[0] = (byte)MessageType.GroupMessage;
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(payload, 3);
+        message.CopyTo(payload.AsMemory(3 + nameBytes.Length));
+
+        await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task SendGroupMembershipAsync(
+        MessageType type,
+        string groupName,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(groupName);
+
+        ITransport transport = GetConnectedTransport();
+
+        byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
+        var payload = new byte[1 + nameBytes.Length];
+        payload[0] = (byte)type;
+        nameBytes.CopyTo(payload, 1);
+
+        await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    private ITransport GetConnectedTransport()
+    {
+        lock (_stateLock)
+        {
+            if (_state is not ConnectionState.Connected)
+            {
+                throw new InvalidOperationException("Not connected to a hub.");
+            }
+
+            return _transport!;
+        }
+    }
+
+    /// <inheritdoc/>
     public async Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(name);

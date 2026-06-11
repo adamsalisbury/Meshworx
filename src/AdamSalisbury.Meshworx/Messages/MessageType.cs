@@ -13,4 +13,7 @@ internal enum MessageType : byte
     Ping = 0x09,
     Pong = 0x0A,
     BroadcastMessage = 0x0B,
+    JoinGroup = 0x0C,
+    LeaveGroup = 0x0D,
+    GroupMessage = 0x0E,
 }

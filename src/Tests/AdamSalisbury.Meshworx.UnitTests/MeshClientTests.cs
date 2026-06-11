@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Text;
 using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Messages;
@@ -402,6 +403,80 @@ public sealed class MeshClientTests
         Assert.NotNull(sentData);
         Assert.Equal(0x0B, sentData[0]); // BroadcastMessage
         Assert.Equal(message, sentData[1..]);
+    }
+
+    // Groups
+
+    /// <summary>
+    /// When JoinGroupAsync is called on a connected client, the payload sent is the JoinGroup type byte
+    /// followed by the UTF-8 group name.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task JoinGroupAsync_Connected_SendsJoinGroupFrame()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.JoinGroupAsync("team");
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x0C, sentData[0]); // JoinGroup
+        Assert.Equal("team", Encoding.UTF8.GetString(sentData.AsSpan(1)));
+    }
+
+    /// <summary>
+    /// When SendToGroupAsync is called on a connected client, the payload is the GroupMessage type byte,
+    /// a 2-byte big-endian group-name length, the UTF-8 group name, then the message bytes.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendToGroupAsync_Connected_SendsGroupMessageFrame()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        var message = new byte[] { 5, 6 };
+        await fixture.Client.SendToGroupAsync("team", message);
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x0E, sentData[0]); // GroupMessage
+        int nameLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(1, 2));
+        Assert.Equal("team", Encoding.UTF8.GetString(sentData.AsSpan(3, nameLength)));
+        Assert.Equal(message, sentData[(3 + nameLength)..]);
+    }
+
+    /// <summary>
+    /// When a group operation is invoked on a disconnected client, an InvalidOperationException is thrown.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendToGroupAsync_NotConnected_ThrowsInvalidOperationException()
+    {
+        var fixture = new MeshClientFixture();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => fixture.Client.SendToGroupAsync("team", new byte[] { 1 }));
+    }
+
+    /// <summary>
+    /// When a group operation is invoked with an empty group name, an ArgumentException is thrown.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task JoinGroupAsync_EmptyGroupName_ThrowsArgumentException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Client.JoinGroupAsync(string.Empty));
     }
 
     // GetClientIdByNameAsync
