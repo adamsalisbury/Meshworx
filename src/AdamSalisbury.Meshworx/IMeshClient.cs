@@ -16,6 +16,21 @@ public interface IMeshClient : IAsyncDisposable
     string Name { get; }
 
     /// <summary>
+    /// Gets a value indicating whether the client is currently connected to a hub.
+    /// </summary>
+    bool IsConnected { get; }
+
+    /// <summary>
+    /// Gets the names of the groups this client has joined.
+    /// </summary>
+    /// <remarks>
+    /// The collection reflects the <see cref="JoinGroupAsync"/> and <see cref="LeaveGroupAsync"/> calls
+    /// made on the current connection and is cleared when the client disconnects. It is a snapshot taken
+    /// when the property is read.
+    /// </remarks>
+    IReadOnlyCollection<string> JoinedGroups { get; }
+
+    /// <summary>
     /// Connects to a hub via the specified transport and completes the registration handshake.
     /// </summary>
     /// <remarks>

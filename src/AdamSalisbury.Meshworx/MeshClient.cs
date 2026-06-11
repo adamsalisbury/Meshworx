@@ -29,6 +29,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private PendingLookup? _pendingLookup;
     private int _lookupCorrelationId;
 
+    private readonly Lock _groupMembershipLock = new();
+    private readonly HashSet<string> _joinedGroups = new(StringComparer.Ordinal);
+
     private readonly TimeSpan? _idleTimeout;
 
     /// <param name="logger">The logger used to record client activity.</param>
@@ -56,6 +59,30 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
     /// <inheritdoc/>
     public string Name { get; private set; } = string.Empty;
+
+    /// <inheritdoc/>
+    public bool IsConnected
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _state is ConnectionState.Connected;
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyCollection<string> JoinedGroups
+    {
+        get
+        {
+            lock (_groupMembershipLock)
+            {
+                return _joinedGroups.ToArray();
+            }
+        }
+    }
 
     /// <inheritdoc/>
     public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
@@ -280,15 +307,25 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
-    public Task JoinGroupAsync(string groupName, CancellationToken cancellationToken = default)
+    public async Task JoinGroupAsync(string groupName, CancellationToken cancellationToken = default)
     {
-        return SendGroupMembershipAsync(MessageType.JoinGroup, groupName, cancellationToken);
+        await SendGroupMembershipAsync(MessageType.JoinGroup, groupName, cancellationToken).ConfigureAwait(false);
+
+        lock (_groupMembershipLock)
+        {
+            _joinedGroups.Add(groupName);
+        }
     }
 
     /// <inheritdoc/>
-    public Task LeaveGroupAsync(string groupName, CancellationToken cancellationToken = default)
+    public async Task LeaveGroupAsync(string groupName, CancellationToken cancellationToken = default)
     {
-        return SendGroupMembershipAsync(MessageType.LeaveGroup, groupName, cancellationToken);
+        await SendGroupMembershipAsync(MessageType.LeaveGroup, groupName, cancellationToken).ConfigureAwait(false);
+
+        lock (_groupMembershipLock)
+        {
+            _joinedGroups.Remove(groupName);
+        }
     }
 
     /// <inheritdoc/>
@@ -414,6 +451,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             _transport = null;
             _cts = null;
             _receiveLoopTask = null;
+        }
+
+        lock (_groupMembershipLock)
+        {
+            _joinedGroups.Clear();
         }
 
         if (transport is not null)

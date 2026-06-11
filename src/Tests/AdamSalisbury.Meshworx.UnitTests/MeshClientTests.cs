@@ -510,6 +510,62 @@ public sealed class MeshClientTests
         Assert.Equal(message, args.Data.ToArray());
     }
 
+    // Connection state and group membership
+
+    /// <summary>
+    /// IsConnected reflects the connection lifecycle: false before connecting, true while connected,
+    /// and false again after disconnecting.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task IsConnected_ReflectsConnectionState()
+    {
+        var fixture = new MeshClientFixture();
+
+        Assert.False(fixture.Client.IsConnected);
+
+        await fixture.ConnectAsync();
+        Assert.True(fixture.Client.IsConnected);
+
+        await fixture.Client.DisconnectAsync();
+        Assert.False(fixture.Client.IsConnected);
+    }
+
+    /// <summary>
+    /// JoinedGroups reflects the groups the client has joined and left.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task JoinedGroups_TracksJoinsAndLeaves()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        Assert.Empty(fixture.Client.JoinedGroups);
+
+        await fixture.Client.JoinGroupAsync("a");
+        await fixture.Client.JoinGroupAsync("b");
+        Assert.Equal(2, fixture.Client.JoinedGroups.Count);
+        Assert.Contains("a", fixture.Client.JoinedGroups);
+        Assert.Contains("b", fixture.Client.JoinedGroups);
+
+        await fixture.Client.LeaveGroupAsync("a");
+        Assert.Equal("b", Assert.Single(fixture.Client.JoinedGroups));
+    }
+
+    /// <summary>
+    /// When the client disconnects, its joined-group membership is cleared.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task JoinedGroups_ClearedOnDisconnect()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+        await fixture.Client.JoinGroupAsync("a");
+
+        await fixture.Client.DisconnectAsync();
+
+        Assert.Empty(fixture.Client.JoinedGroups);
+    }
+
     // GetClientIdByNameAsync
 
     /// <summary>
