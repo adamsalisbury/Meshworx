@@ -1,5 +1,6 @@
 using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.Transport.InMemory;
+using AdamSalisbury.Meshworx.Transport.Tcp;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -42,6 +43,23 @@ public sealed class MeshClientReconnectorTests
         await using var client = CreateClient();
         Assert.Throws<ArgumentException>(
             () => new MeshClientReconnector(client, string.Empty, _ => Task.FromResult<ITransport>(null!)));
+    }
+
+    /// <summary>
+    /// The TCP transport-factory idiom shown in the README compiles and is accepted by the constructor.
+    /// The factory is never invoked here (StartAsync is not called), so no real connection is attempted.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_AcceptsTcpTransportFactoryFromDocumentation()
+    {
+        await using var client = CreateClient();
+
+        await using var reconnector = new MeshClientReconnector(
+            client,
+            "Alice",
+            async ct => (ITransport)await TcpTransport.ConnectAsync("localhost", 22001, ct));
+
+        Assert.False(client.IsConnected);
     }
 
     // StartAsync

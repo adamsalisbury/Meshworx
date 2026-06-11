@@ -106,7 +106,7 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
 await using var reconnector = new MeshClientReconnector(
     new MeshClient(logger),
     "Alice",
-    ct => TcpTransport.ConnectAsync("localhost", 22001, ct).ContinueWith(t => (ITransport)t.Result, ct));
+    async ct => (ITransport)await TcpTransport.ConnectAsync("localhost", 22001, ct));
 
 reconnector.Reconnected += async (_, _) =>
 {
