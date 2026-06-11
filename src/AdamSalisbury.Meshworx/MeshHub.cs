@@ -155,6 +155,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public int ConnectedClientCount => _clients.Count;
+
+    /// <inheritdoc/>
     public bool IsClientRegistered(Guid clientId)
     {
         return _clients.ContainsKey(clientId);

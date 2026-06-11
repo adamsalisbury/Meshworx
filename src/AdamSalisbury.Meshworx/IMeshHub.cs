@@ -16,6 +16,14 @@ public interface IMeshHub : IAsyncDisposable
     Task StopAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Gets the number of clients currently registered with the hub.
+    /// </summary>
+    /// <remarks>
+    /// The value is a point-in-time snapshot; clients may connect or disconnect concurrently.
+    /// </remarks>
+    int ConnectedClientCount { get; }
+
+    /// <summary>
     /// Determines whether a client with the specified identifier is currently registered.
     /// </summary>
     /// <param name="clientId">The unique identifier of the client to look up.</param>

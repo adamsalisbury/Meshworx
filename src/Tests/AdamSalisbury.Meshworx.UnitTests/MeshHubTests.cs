@@ -112,6 +112,41 @@ public sealed class MeshHubTests
         Assert.False(fixture.Hub.IsClientRegistered(client.Id));
     }
 
+    // ConnectedClientCount
+
+    /// <summary>
+    /// ConnectedClientCount reflects the number of registered clients, rising as clients register and
+    /// falling as they disconnect.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ConnectedClientCount_TracksRegisteredClients()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+
+        var clientA = await fixture.RegisterClientAsync("Alpha");
+        var clientB = await fixture.RegisterClientAsync("Beta");
+
+        Assert.Equal(2, fixture.Hub.ConnectedClientCount);
+
+        var disposedTcs = new TaskCompletionSource();
+        clientB.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        clientB.Disconnect();
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(1, fixture.Hub.ConnectedClientCount);
+
+        clientA.Disconnect();
+        await fixture.Hub.StopAsync();
+
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+    }
+
     // IsClientRegistered
 
     /// <summary>
