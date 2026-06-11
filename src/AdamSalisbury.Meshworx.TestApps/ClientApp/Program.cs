@@ -49,6 +49,14 @@ client.MessageReceived += (_, args) =>
     Console.Write("> ");
 };
 
+client.GroupMessageReceived += (_, args) =>
+{
+    string text = Encoding.UTF8.GetString(args.Data.Span);
+    Console.WriteLine();
+    Console.WriteLine($"[Group \"{args.GroupName}\" from {args.SenderId}]: {text}");
+    Console.Write("> ");
+};
+
 client.Disconnected += (_, args) =>
 {
     Console.WriteLine();
@@ -57,7 +65,12 @@ client.Disconnected += (_, args) =>
 
 // --- Send messages ---
 
-Console.WriteLine("Type a message in the format:  recipient-name: message");
+Console.WriteLine("Commands:");
+Console.WriteLine("  <name>: <message>      send a direct message");
+Console.WriteLine("  /all <message>         broadcast to every other client");
+Console.WriteLine("  /join <group>          join a group");
+Console.WriteLine("  /leave <group>         leave a group");
+Console.WriteLine("  /g <group> <message>   send a message to a group");
 Console.WriteLine("Press Enter on an empty line to quit.");
 Console.WriteLine();
 
@@ -71,10 +84,75 @@ while (true)
         break;
     }
 
-    int separatorIndex = input.IndexOf(':');
+    input = input.Trim();
+
+    if (input.StartsWith("/all ", StringComparison.Ordinal))
+    {
+        string message = input["/all ".Length..].Trim();
+        if (message.Length == 0)
+        {
+            Console.WriteLine("Message cannot be empty.");
+            continue;
+        }
+
+        await client.BroadcastAsync(Encoding.UTF8.GetBytes(message));
+        continue;
+    }
+
+    if (input.StartsWith("/join ", StringComparison.Ordinal))
+    {
+        string group = input["/join ".Length..].Trim();
+        if (group.Length == 0)
+        {
+            Console.WriteLine("Group name cannot be empty.");
+            continue;
+        }
+
+        await client.JoinGroupAsync(group);
+        Console.WriteLine($"Joined \"{group}\". Member of: {string.Join(", ", client.JoinedGroups)}");
+        continue;
+    }
+
+    if (input.StartsWith("/leave ", StringComparison.Ordinal))
+    {
+        string group = input["/leave ".Length..].Trim();
+        if (group.Length == 0)
+        {
+            Console.WriteLine("Group name cannot be empty.");
+            continue;
+        }
+
+        await client.LeaveGroupAsync(group);
+        Console.WriteLine($"Left \"{group}\".");
+        continue;
+    }
+
+    if (input.StartsWith("/g ", StringComparison.Ordinal))
+    {
+        string rest = input["/g ".Length..].Trim();
+        int spaceIndex = rest.IndexOf(' ', StringComparison.Ordinal);
+        if (spaceIndex < 1)
+        {
+            Console.WriteLine("Format: /g <group> <message>");
+            continue;
+        }
+
+        string group = rest[..spaceIndex];
+        string message = rest[(spaceIndex + 1)..].Trim();
+        if (message.Length == 0)
+        {
+            Console.WriteLine("Message cannot be empty.");
+            continue;
+        }
+
+        await client.SendToGroupAsync(group, Encoding.UTF8.GetBytes(message));
+        continue;
+    }
+
+    int separatorIndex = input.IndexOf(':', StringComparison.Ordinal);
     if (separatorIndex < 1)
     {
-        Console.WriteLine("Format: recipient-name: message");
+        Console.WriteLine("Unknown input. Use \"<name>: <message>\" or /all, /join, /leave, /g.");
         continue;
     }
 
