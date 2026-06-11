@@ -112,6 +112,80 @@ public sealed class MeshHubTests
         Assert.False(fixture.Hub.IsClientRegistered(client.Id));
     }
 
+    // ClientConnected / ClientDisconnected events
+
+    /// <summary>
+    /// When a client completes registration, the hub raises ClientConnected with the client's id and name.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_ValidRegistration_RaisesClientConnected()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var connectedTcs = new TaskCompletionSource<ClientConnectionEventArgs>();
+        fixture.Hub.ClientConnected += (_, e) => connectedTcs.TrySetResult(e);
+
+        var client = await fixture.RegisterClientAsync("Alpha");
+
+        ClientConnectionEventArgs args = await connectedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(client.Id, args.ClientId);
+        Assert.Equal("Alpha", args.ClientName);
+
+        client.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a registered client disconnects, the hub raises ClientDisconnected with the client's id and name.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_ClientDisconnects_RaisesClientDisconnected()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterClientAsync("Beta");
+
+        var disconnectedTcs = new TaskCompletionSource<ClientConnectionEventArgs>();
+        fixture.Hub.ClientDisconnected += (_, e) => disconnectedTcs.TrySetResult(e);
+
+        client.Disconnect();
+
+        ClientConnectionEventArgs args = await disconnectedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(client.Id, args.ClientId);
+        Assert.Equal("Beta", args.ClientName);
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a registration is refused, ClientConnected is not raised because no client was registered.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_RegistrationRejected_DoesNotRaiseClientConnected()
+    {
+        var fixture = new MeshHubFixture();
+        var transport = MeshHubFixture.CreateMockTransport();
+        var disposedTcs = new TaskCompletionSource();
+
+        bool connectedRaised = false;
+        fixture.Hub.ClientConnected += (_, _) => connectedRaised = true;
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync((byte[]?)null);
+        transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.False(connectedRaised);
+
+        await fixture.Hub.StopAsync();
+    }
+
     // ConnectedClientCount
 
     /// <summary>

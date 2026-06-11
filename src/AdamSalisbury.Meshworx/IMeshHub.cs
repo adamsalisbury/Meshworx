@@ -16,6 +16,24 @@ public interface IMeshHub : IAsyncDisposable
     Task StopAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Raised after a client completes registration and becomes reachable on the hub.
+    /// </summary>
+    /// <remarks>
+    /// Raised from the client's handler task, so handlers may be invoked concurrently for different
+    /// clients and must be thread-safe.
+    /// </remarks>
+    event EventHandler<ClientConnectionEventArgs> ClientConnected;
+
+    /// <summary>
+    /// Raised after a registered client disconnects and is removed from the hub.
+    /// </summary>
+    /// <remarks>
+    /// Raised from the client's handler task, so handlers may be invoked concurrently for different
+    /// clients and must be thread-safe.
+    /// </remarks>
+    event EventHandler<ClientConnectionEventArgs> ClientDisconnected;
+
+    /// <summary>
     /// Gets the number of clients currently registered with the hub.
     /// </summary>
     /// <remarks>

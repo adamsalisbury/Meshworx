@@ -155,6 +155,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public event EventHandler<ClientConnectionEventArgs>? ClientConnected;
+
+    /// <inheritdoc/>
+    public event EventHandler<ClientConnectionEventArgs>? ClientDisconnected;
+
+    /// <inheritdoc/>
     public int ConnectedClientCount => _clients.Count;
 
     /// <inheritdoc/>
@@ -290,6 +296,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             await transport.SendAsync(responsePayload, cancellationToken).ConfigureAwait(false);
 
             _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
+            RaiseClientEvent(ClientConnected, clientId, clientName, nameof(ClientConnected));
 
             clientCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             sendLoopTask = SendLoopAsync(connection, clientCts);
@@ -429,11 +436,34 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 _clients.TryRemove(clientId, out _);
                 await connection.DisposeAsync().ConfigureAwait(false);
                 _logger.LogInformation("Client {ClientId} disconnected", clientId);
+                RaiseClientEvent(ClientDisconnected, connection.Id, connection.Name, nameof(ClientDisconnected));
             }
             else
             {
                 await transport.DisposeAsync().ConfigureAwait(false);
             }
+        }
+    }
+
+    private void RaiseClientEvent(
+        EventHandler<ClientConnectionEventArgs>? handler,
+        Guid clientId,
+        string clientName,
+        string eventName)
+    {
+        if (handler is null)
+        {
+            return;
+        }
+
+        try
+        {
+            handler(this, new ClientConnectionEventArgs { ClientId = clientId, ClientName = clientName });
+        }
+        catch (Exception ex)
+        {
+            // A throwing subscriber must not fault the client handler task. Callback boundary.
+            _logger.LogError(ex, "A {EventName} handler threw an exception", eventName);
         }
     }
 
