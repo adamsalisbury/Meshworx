@@ -21,6 +21,7 @@ substituted.
 | `ITransport` | A bidirectional, message-oriented channel. Implementations own their framing. |
 | `ITransportListener` | Accepts inbound transport connections for the hub. |
 | `TcpTransport` / `TcpTransportListener` | TCP implementation using a 4-byte big-endian length prefix per frame. |
+| `InMemoryTransport` / `InMemoryTransportListener` | In-process implementation backed by channels, for hosting a hub and clients in one process and for fast, deterministic testing. |
 
 The hub never interprets message payloads — it only reads the routing header and forwards the
 body. Delivery is best-effort and fire-and-forget.
@@ -165,6 +166,18 @@ Implement `ITransport` (and `ITransportListener` for the hub) to run Meshworx ov
 message-oriented channel. Implementations are responsible for their own framing; the hub and
 client treat each `ReceiveAsync` result as one complete message. `SendAsync` must be safe to
 call concurrently; `ReceiveAsync` is single-reader.
+
+The bundled `InMemoryTransport` runs the entire stack in one process without sockets — clients
+connect by calling `InMemoryTransportListener.Connect()` instead of `TcpTransport.ConnectAsync`:
+
+```csharp
+var listener = new InMemoryTransportListener();
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+await using var client = new MeshClient(clientLogger);
+await client.ConnectAsync(listener.Connect(), "Alice");
+```
 
 ## Building and testing
 

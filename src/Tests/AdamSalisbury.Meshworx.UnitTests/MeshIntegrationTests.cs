@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
+using AdamSalisbury.Meshworx.Transport.InMemory;
 using AdamSalisbury.Meshworx.Transport.Tcp;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -190,6 +191,39 @@ public sealed class MeshIntegrationTests
         Guid? result = await client.GetClientIdByNameAsync("Nobody");
 
         Assert.Null(result);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// The full hub and client stack works over the in-memory transport, confirming the transport
+    /// abstraction is pluggable: a message is routed between two clients without any sockets.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task EndToEnd_MessageRoutedOverInMemoryTransport()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        await bob.ConnectAsync(listener.Connect(), "Bob");
+        await alice.ConnectAsync(listener.Connect(), "Alice");
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        bob.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        Guid? bobId = await alice.GetClientIdByNameAsync("Bob");
+        Assert.Equal(bob.Id, bobId);
+
+        byte[] payload = Encoding.UTF8.GetBytes("over memory");
+        await alice.SendAsync(bobId!.Value, payload);
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(alice.Id, received.SenderId);
+        Assert.Equal(payload, received.Data.ToArray());
 
         await hub.StopAsync();
     }
