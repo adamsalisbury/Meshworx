@@ -421,6 +421,60 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    // HandleClient — hub capacity
+
+    /// <summary>
+    /// When the hub has reached its configured maximum client count, a further registration is
+    /// refused with an Error response carrying the HubAtCapacity error code, and the client is
+    /// not added to the registry.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_HubAtCapacity_RefusesRegistration()
+    {
+        var fixture = new MeshHubFixture(maxClients: 1);
+        await fixture.Hub.StartAsync();
+        var existing = await fixture.RegisterClientAsync("First");
+
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+        var disposedTcs = new TaskCompletionSource();
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Second"));
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+        transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x04, sentData[1]); // HubAtCapacity
+
+        existing.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When the hub is constructed with a non-positive maximum client count, an
+    /// ArgumentOutOfRangeException is thrown.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_NonPositiveMaxClients_ThrowsArgumentOutOfRangeException()
+    {
+        await Task.CompletedTask;
+        var logger = new Mock<ILogger<MeshHub>>();
+        var listener = new Mock<ITransportListener>();
+
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => new MeshHub(logger.Object, listener.Object, maxClients: 0));
+    }
+
     // HandleClient — unsupported protocol version
 
     /// <summary>

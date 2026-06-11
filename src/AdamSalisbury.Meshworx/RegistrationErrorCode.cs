@@ -19,4 +19,9 @@ public enum RegistrationErrorCode : byte
     /// The client name exceeds the maximum allowed length.
     /// </summary>
     ClientNameTooLong = 0x03,
+
+    /// <summary>
+    /// The hub has reached its maximum number of registered clients and cannot accept more.
+    /// </summary>
+    HubAtCapacity = 0x04,
 }

@@ -15,6 +15,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly ILogger<MeshHub> _logger;
     private readonly ITransportListener _listener;
     private readonly TimeSpan _registrationTimeout;
+    private readonly int _maxClients;
     private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
     private readonly ConcurrentDictionary<string, Guid> _clientNames = new();
     private readonly ConcurrentDictionary<Task, byte> _handlerTasks = new();
@@ -27,7 +28,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// The maximum time a newly accepted connection is given to complete registration before it is
     /// dropped. Guards against connections that accept but never register. Defaults to 10 seconds.
     /// </param>
-    public MeshHub(ILogger<MeshHub> logger, ITransportListener listener, TimeSpan? registrationTimeout = null)
+    /// <param name="maxClients">
+    /// The maximum number of clients that may be registered at once. Further registration attempts are
+    /// refused with <see cref="RegistrationErrorCode.HubAtCapacity"/>. Defaults to unlimited.
+    /// </param>
+    public MeshHub(
+        ILogger<MeshHub> logger,
+        ITransportListener listener,
+        TimeSpan? registrationTimeout = null,
+        int? maxClients = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -38,9 +47,16 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 nameof(registrationTimeout), "The registration timeout must be positive.");
         }
 
+        if (maxClients is { } max && max <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxClients), "The maximum client count must be positive.");
+        }
+
         _logger = logger;
         _listener = listener;
         _registrationTimeout = registrationTimeout ?? DefaultRegistrationTimeout;
+        _maxClients = maxClients ?? int.MaxValue;
     }
 
     /// <inheritdoc/>
@@ -216,6 +232,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 byte[] nameTooLongError =
                     [(byte)MessageType.Error, (byte)RegistrationErrorCode.ClientNameTooLong];
                 await transport.SendAsync(nameTooLongError, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            if (_clients.Count >= _maxClients)
+            {
+                byte[] capacityError = [(byte)MessageType.Error, (byte)RegistrationErrorCode.HubAtCapacity];
+                await transport.SendAsync(capacityError, cancellationToken).ConfigureAwait(false);
+                _logger.LogWarning(
+                    "Refusing client {ClientId}: hub at capacity ({MaxClients} clients)", clientId, _maxClients);
                 return;
             }
 
