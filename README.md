@@ -97,6 +97,25 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
   `Disconnected` event fires only for unexpected endings — the hub closing the connection
   (`RemoteDisconnect`) or the transport failing (`ConnectionLost`). After it fires the client
   has reset and may reconnect from the handler.
+- **Auto-reconnect.** `MeshClientReconnector` wraps a client and keeps it connected: it does a
+  fail-fast initial connect, then transparently re-establishes the connection (bounded per attempt,
+  retried with a delay) whenever it drops, raising `Reconnected` so the application can restore
+  state such as group membership.
+
+```csharp
+await using var reconnector = new MeshClientReconnector(
+    new MeshClient(logger),
+    "Alice",
+    ct => TcpTransport.ConnectAsync("localhost", 22001, ct).ContinueWith(t => (ITransport)t.Result, ct));
+
+reconnector.Reconnected += async (_, _) =>
+{
+    foreach (string group in savedGroups) await reconnector.Client.JoinGroupAsync(group);
+};
+
+await reconnector.StartAsync();
+await reconnector.Client.SendAsync(recipientId, payload);
+```
 
 ## Configuration
 
