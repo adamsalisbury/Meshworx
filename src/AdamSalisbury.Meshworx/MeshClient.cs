@@ -39,6 +39,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
 
     /// <inheritdoc/>
+    public event EventHandler<DisconnectedEventArgs>? Disconnected;
+
+    /// <inheritdoc/>
     public async Task ConnectAsync(ITransport transport, string clientName, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(transport);
@@ -97,12 +100,16 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             _logger.LogInformation("Connected to hub with id {ClientId}", Id);
 
             _cts = new CancellationTokenSource();
-            _receiveLoopTask = ReceiveLoopAsync(_cts.Token);
 
+            // Mark connected before starting the loop: if the hub has already buffered a
+            // disconnect, the loop can run synchronously to termination, and its teardown
+            // only fires when it observes the Connected state.
             lock (_stateLock)
             {
                 _state = ConnectionState.Connected;
             }
+
+            _receiveLoopTask = ReceiveLoopAsync(_cts.Token);
         }
         catch (Exception exception)
         {
@@ -296,6 +303,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             transport = _transport ?? throw new InvalidOperationException("Transport is not initialised.");
         }
 
+        // Tracks why the loop ended, used when the termination is remote (not a local
+        // DisconnectAsync) to report a reason on the Disconnected event. Defaults to a lost
+        // connection; only an explicit hub disconnect message changes it.
+        var reason = DisconnectReason.ConnectionLost;
+
         try
         {
             while (!cancellationToken.IsCancellationRequested)
@@ -359,6 +371,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 else if ((MessageType)data[0] == MessageType.Disconnect)
                 {
                     _logger.LogInformation("Hub sent disconnect");
+                    reason = DisconnectReason.RemoteDisconnect;
                     break;
                 }
             }
@@ -383,6 +396,48 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             // so the held _lookupLock is released, unblocking subsequent lookups.
             _pendingLookup?.Completion.TrySetException(
                 new InvalidOperationException("The connection was closed before the lookup completed."));
+
+            await HandleReceiveLoopTerminationAsync(reason).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Tears the connection down and raises <see cref="Disconnected"/> when the receive loop
+    /// ends for a remote reason. If a local <see cref="DisconnectAsync"/> already moved the
+    /// client out of the connected state, that call owns cleanup and no event is raised.
+    /// </summary>
+    private async Task HandleReceiveLoopTerminationAsync(DisconnectReason reason)
+    {
+        lock (_stateLock)
+        {
+            // A local DisconnectAsync sets Disconnecting before cancelling the loop; if the
+            // state is anything other than Connected, the teardown is already being handled
+            // (or has happened) elsewhere and the application initiated it, so stay silent.
+            if (_state is not ConnectionState.Connected)
+            {
+                return;
+            }
+
+            _state = ConnectionState.Disconnecting;
+        }
+
+        await CleanUpAsync().ConfigureAwait(false);
+
+        lock (_stateLock)
+        {
+            Id = Guid.Empty;
+            Name = string.Empty;
+            _state = ConnectionState.Disconnected;
+        }
+
+        try
+        {
+            Disconnected?.Invoke(this, new DisconnectedEventArgs { Reason = reason });
+        }
+        catch (Exception ex)
+        {
+            // A throwing subscriber must not fault the receive loop task. Callback boundary.
+            _logger.LogError(ex, "A Disconnected handler threw an exception");
         }
     }
 

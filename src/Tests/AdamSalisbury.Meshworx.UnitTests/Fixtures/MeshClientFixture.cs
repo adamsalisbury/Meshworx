@@ -1,3 +1,4 @@
+using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -39,15 +40,22 @@ internal sealed class MeshClientFixture
         Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
-        var sequence = Transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
-            .ReturnsAsync(CreateRegistrationResponse());
+        // Model a live connection: yield the registration response then the scripted frames,
+        // and afterwards block on an empty (uncompleted) channel so the receive loop stays
+        // alive — exactly like a real transport awaiting more data. The blocking read honours
+        // the cancellation token, so DisconnectAsync cancels it cleanly. The channel is left
+        // uncompleted deliberately: returning null would now be interpreted as a lost
+        // connection and trigger teardown.
+        var channel = Channel.CreateUnbounded<byte[]?>();
+        channel.Writer.TryWrite(CreateRegistrationResponse());
 
         foreach (byte[] message in receiveLoopMessages)
         {
-            sequence = sequence.ReturnsAsync(message);
+            channel.Writer.TryWrite(message);
         }
 
-        sequence.ReturnsAsync((byte[]?)null);
+        Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct).ConfigureAwait(false));
     }
 
     public static byte[] CreateLookupFoundResponse(Guid clientId, int correlationId = 0)

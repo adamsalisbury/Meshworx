@@ -49,6 +49,12 @@ client.MessageReceived += (_, args) =>
     Console.Write("> ");
 };
 
+client.Disconnected += (_, args) =>
+{
+    Console.WriteLine();
+    Console.WriteLine($"[Disconnected from hub: {args.Reason}. Press Enter to exit.]");
+};
+
 // --- Send messages ---
 
 Console.WriteLine("Type a message in the format:  recipient-name: message");

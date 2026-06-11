@@ -61,4 +61,15 @@ public interface IMeshClient : IAsyncDisposable
     /// Raised when a message is received from another client.
     /// </summary>
     event EventHandler<MessageReceivedEventArgs> MessageReceived;
+
+    /// <summary>
+    /// Raised when the connection to the hub ends for a reason other than a local call to
+    /// <see cref="DisconnectAsync"/> — that is, when the hub closes the connection or the
+    /// underlying transport fails. It is not raised for application-initiated disconnects.
+    /// </summary>
+    /// <remarks>
+    /// When this event fires the client has already reset to a disconnected state, so the
+    /// handler may immediately attempt to reconnect via <see cref="ConnectAsync"/>.
+    /// </remarks>
+    event EventHandler<DisconnectedEventArgs> Disconnected;
 }

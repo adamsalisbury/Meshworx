@@ -738,4 +738,94 @@ public sealed class MeshClientTests
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => fixture.Client.GetClientIdByNameAsync("Target"));
     }
+
+    // Disconnected event
+
+    /// <summary>
+    /// When the hub sends a Disconnect frame, the Disconnected event is raised with the
+    /// RemoteDisconnect reason.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_HubSendsDisconnect_RaisesDisconnectedWithRemoteReason()
+    {
+        var fixture = new MeshClientFixture();
+        byte[] disconnectFrame = [0x08]; // Disconnect
+        fixture.SetupSuccessfulRegistration(disconnectFrame);
+
+        var reasonTcs = new TaskCompletionSource<DisconnectReason>();
+        fixture.Client.Disconnected += (_, e) => reasonTcs.TrySetResult(e.Reason);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        DisconnectReason reason = await reasonTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(DisconnectReason.RemoteDisconnect, reason);
+    }
+
+    /// <summary>
+    /// When the underlying transport reports the connection closed (ReceiveAsync returns null),
+    /// the Disconnected event is raised with the ConnectionLost reason.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_ConnectionClosed_RaisesDisconnectedWithConnectionLostReason()
+    {
+        var fixture = new MeshClientFixture();
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        fixture.Transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(fixture.CreateRegistrationResponse())
+            .ReturnsAsync((byte[]?)null);
+
+        var reasonTcs = new TaskCompletionSource<DisconnectReason>();
+        fixture.Client.Disconnected += (_, e) => reasonTcs.TrySetResult(e.Reason);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        DisconnectReason reason = await reasonTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(DisconnectReason.ConnectionLost, reason);
+    }
+
+    /// <summary>
+    /// When the connection is lost remotely, the client resets to a disconnected state so its
+    /// Id is cleared and further sends are rejected.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_ConnectionClosed_ResetsToDisconnectedState()
+    {
+        var fixture = new MeshClientFixture();
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        fixture.Transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(fixture.CreateRegistrationResponse())
+            .ReturnsAsync((byte[]?)null);
+
+        var disconnectedTcs = new TaskCompletionSource();
+        fixture.Client.Disconnected += (_, _) => disconnectedTcs.TrySetResult();
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+        await disconnectedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(Guid.Empty, fixture.Client.Id);
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }));
+    }
+
+    /// <summary>
+    /// When the application disconnects locally via DisconnectAsync, the Disconnected event is
+    /// not raised — it signals only unexpected, remote-initiated disconnects.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task DisconnectAsync_LocalDisconnect_DoesNotRaiseDisconnected()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        bool eventRaised = false;
+        fixture.Client.Disconnected += (_, _) => eventRaised = true;
+
+        await fixture.Client.DisconnectAsync();
+
+        Assert.False(eventRaised);
+    }
 }
