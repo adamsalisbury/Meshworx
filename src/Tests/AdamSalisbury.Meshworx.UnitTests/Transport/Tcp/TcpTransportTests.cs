@@ -127,10 +127,11 @@ public sealed class TcpTransportTests
     }
 
     /// <summary>
-    /// When ReceiveAsync reads a header containing a negative payload length, an InvalidOperationException is thrown.
+    /// When ReceiveAsync reads a header containing a negative payload length, an IOException is thrown
+    /// so receive loops treat the corrupt framing as a transport failure.
     /// </summary>
     [Fact(Timeout = 1000)]
-    public async Task ReceiveAsync_NegativePayloadLength_ThrowsInvalidOperationException()
+    public async Task ReceiveAsync_NegativePayloadLength_ThrowsIOException()
     {
         var stream = new MemoryStream();
         var header = new byte[4];
@@ -140,14 +141,15 @@ public sealed class TcpTransportTests
 
         var transport = new TcpTransport(stream);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => transport.ReceiveAsync());
+        await Assert.ThrowsAsync<IOException>(() => transport.ReceiveAsync());
     }
 
     /// <summary>
-    /// When ReceiveAsync reads a header containing a payload length exceeding the maximum allowed size, an InvalidOperationException is thrown.
+    /// When ReceiveAsync reads a header containing a payload length exceeding the maximum allowed size, an IOException is thrown
+    /// so receive loops treat the corrupt framing as a transport failure.
     /// </summary>
     [Fact(Timeout = 1000)]
-    public async Task ReceiveAsync_PayloadExceedsMaxSize_ThrowsInvalidOperationException()
+    public async Task ReceiveAsync_PayloadExceedsMaxSize_ThrowsIOException()
     {
         var stream = new MemoryStream();
         var header = new byte[4];
@@ -157,7 +159,7 @@ public sealed class TcpTransportTests
 
         var transport = new TcpTransport(stream);
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => transport.ReceiveAsync());
+        await Assert.ThrowsAsync<IOException>(() => transport.ReceiveAsync());
     }
 
     // Round-trip

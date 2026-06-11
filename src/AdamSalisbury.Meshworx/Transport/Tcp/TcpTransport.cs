@@ -98,7 +98,11 @@ public sealed class TcpTransport : ITransport
 
         if (payloadLength is < 0 or > MaxPayloadSize)
         {
-            throw new InvalidOperationException($"Invalid payload length: {payloadLength}");
+            // A corrupt or out-of-range length prefix means the stream framing is no longer
+            // trustworthy. Surface it as an I/O error so receive loops treat it as a transport
+            // failure and terminate the connection cleanly, rather than faulting on an
+            // unhandled exception type.
+            throw new IOException($"Invalid payload length: {payloadLength}");
         }
 
         if (payloadLength == 0)
