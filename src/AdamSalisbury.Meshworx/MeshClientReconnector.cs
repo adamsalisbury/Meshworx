@@ -39,6 +39,7 @@ public sealed class MeshClientReconnector : IAsyncDisposable
 
     private Task? _reconnectLoopTask;
     private int _started;
+    private int _disposed;
 
     /// <summary>
     /// Initialises a new <see cref="MeshClientReconnector"/>.
@@ -188,6 +189,11 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+        {
+            return;
+        }
+
         await _stopCts.CancelAsync().ConfigureAwait(false);
         Client.Disconnected -= OnDisconnected;
 

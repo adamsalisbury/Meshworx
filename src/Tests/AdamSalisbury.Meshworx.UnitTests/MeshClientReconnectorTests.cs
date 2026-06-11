@@ -179,6 +179,29 @@ public sealed class MeshClientReconnectorTests
     // DisposeAsync
 
     /// <summary>
+    /// Disposing the reconnector twice is safe and does not throw.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task DisposeAsync_CalledTwice_DoesNotThrow()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+
+        var client = CreateClient();
+        var reconnector = new MeshClientReconnector(
+            client, "Alice", _ => Task.FromResult<ITransport>(listener.Connect()));
+        await reconnector.StartAsync();
+
+        await reconnector.DisposeAsync();
+        await reconnector.DisposeAsync();
+
+        Assert.False(client.IsConnected);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
     /// When the reconnector is disposed, the managed client is disconnected.
     /// </summary>
     [Fact(Timeout = 5000)]
