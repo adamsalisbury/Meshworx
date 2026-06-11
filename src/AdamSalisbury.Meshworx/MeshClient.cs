@@ -381,6 +381,20 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         pending.Completion.TrySetResult(null);
                     }
                 }
+                else if ((MessageType)data[0] == MessageType.Ping)
+                {
+                    // The hub is probing liveness; reply so it knows we are still here. Best-effort:
+                    // if the send fails the connection is already gone and the loop will terminate.
+                    try
+                    {
+                        await transport.SendAsync(
+                            new[] { (byte)MessageType.Pong }, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+                    {
+                        // Connection is gone; the next receive will end the loop.
+                    }
+                }
                 else if ((MessageType)data[0] == MessageType.Disconnect)
                 {
                     _logger.LogInformation("Hub sent disconnect");

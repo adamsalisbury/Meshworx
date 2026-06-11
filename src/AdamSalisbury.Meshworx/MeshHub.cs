@@ -16,6 +16,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly ITransportListener _listener;
     private readonly TimeSpan _registrationTimeout;
     private readonly int _maxClients;
+    private readonly TimeSpan? _heartbeatInterval;
+    private readonly int _maxMissedHeartbeats;
     private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
     private readonly ConcurrentDictionary<string, Guid> _clientNames = new();
     private readonly ConcurrentDictionary<Task, byte> _handlerTasks = new();
@@ -32,11 +34,22 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// The maximum number of clients that may be registered at once. Further registration attempts are
     /// refused with <see cref="RegistrationErrorCode.HubAtCapacity"/>. Defaults to unlimited.
     /// </param>
+    /// <param name="heartbeatInterval">
+    /// How long a registered client may be idle before the hub probes it with a ping. A client that
+    /// fails to send any frame across <paramref name="maxMissedHeartbeats"/> consecutive intervals is
+    /// evicted, detecting half-open connections. Defaults to <see langword="null"/> (disabled).
+    /// </param>
+    /// <param name="maxMissedHeartbeats">
+    /// The number of consecutive idle intervals a client may go without sending any frame before it is
+    /// evicted. Only used when <paramref name="heartbeatInterval"/> is set. Defaults to 2.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
         TimeSpan? registrationTimeout = null,
-        int? maxClients = null)
+        int? maxClients = null,
+        TimeSpan? heartbeatInterval = null,
+        int maxMissedHeartbeats = 2)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -53,10 +66,24 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 nameof(maxClients), "The maximum client count must be positive.");
         }
 
+        if (heartbeatInterval is { } interval && interval <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(heartbeatInterval), "The heartbeat interval must be positive.");
+        }
+
+        if (maxMissedHeartbeats < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxMissedHeartbeats), "The maximum missed heartbeats must be at least one.");
+        }
+
         _logger = logger;
         _listener = listener;
         _registrationTimeout = registrationTimeout ?? DefaultRegistrationTimeout;
         _maxClients = maxClients ?? int.MaxValue;
+        _heartbeatInterval = heartbeatInterval;
+        _maxMissedHeartbeats = maxMissedHeartbeats;
     }
 
     /// <inheritdoc/>
@@ -264,14 +291,52 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             clientCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             sendLoopTask = SendLoopAsync(connection, clientCts);
 
+            int missedHeartbeats = 0;
+
             while (!clientCts.Token.IsCancellationRequested)
             {
-                byte[]? data = await transport.ReceiveAsync(clientCts.Token).ConfigureAwait(false);
+                byte[]? data;
+
+                if (_heartbeatInterval is null)
+                {
+                    data = await transport.ReceiveAsync(clientCts.Token).ConfigureAwait(false);
+                }
+                else
+                {
+                    using var readCts = CancellationTokenSource.CreateLinkedTokenSource(clientCts.Token);
+                    readCts.CancelAfter(_heartbeatInterval.Value);
+                    try
+                    {
+                        data = await transport.ReceiveAsync(readCts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                        when (readCts.IsCancellationRequested && !clientCts.Token.IsCancellationRequested)
+                    {
+                        missedHeartbeats++;
+                        if (missedHeartbeats > _maxMissedHeartbeats)
+                        {
+                            _logger.LogInformation(
+                                "Client {ClientId} did not respond to {Missed} heartbeats; evicting",
+                                clientId,
+                                _maxMissedHeartbeats);
+                            break;
+                        }
+
+                        // Probe liveness via the outbound queue so the ping serialises with any
+                        // other queued frames. A live client replies with a Pong (or any frame),
+                        // resetting the counter below.
+                        connection.OutboundQueue.Writer.TryWrite([(byte)MessageType.Ping]);
+                        continue;
+                    }
+                }
 
                 if (data is null)
                 {
                     break;
                 }
+
+                // Any received frame proves the client is alive.
+                missedHeartbeats = 0;
 
                 if (data.Length == 0)
                 {
@@ -312,6 +377,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     }
 
                     await transport.SendAsync(lookupResponse, clientCts.Token).ConfigureAwait(false);
+                }
+                else if ((MessageType)data[0] == MessageType.Pong)
+                {
+                    // Liveness reply to a heartbeat ping; the counter was already reset above.
                 }
                 else if ((MessageType)data[0] == MessageType.Disconnect)
                 {

@@ -10,4 +10,6 @@ internal enum MessageType : byte
     ClientLookupRequest = 0x06,
     ClientLookupResponse = 0x07,
     Disconnect = 0x08,
+    Ping = 0x09,
+    Pong = 0x0A,
 }

@@ -957,6 +957,64 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    // HandleClient — heartbeat
+
+    /// <summary>
+    /// When heartbeats are enabled and a client stays idle, the hub probes it with a Ping frame.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task HandleClient_IdleClientWithHeartbeatEnabled_SendsPing()
+    {
+        var fixture = new MeshHubFixture(
+            heartbeatInterval: TimeSpan.FromMilliseconds(50), maxMissedHeartbeats: 10);
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterMultiMessageClientAsync("Idle");
+
+        var pingTcs = new TaskCompletionSource();
+        client.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                if (data.Length >= 1 && data.Span[0] == 0x09) // Ping
+                {
+                    pingTcs.TrySetResult();
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        await pingTcs.Task.WaitAsync(WaitTimeout);
+
+        client.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When heartbeats are enabled and a client never sends any frame in response, the hub evicts it
+    /// after the configured number of missed intervals.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task HandleClient_ClientMissesHeartbeats_IsEvicted()
+    {
+        var fixture = new MeshHubFixture(
+            heartbeatInterval: TimeSpan.FromMilliseconds(50), maxMissedHeartbeats: 2);
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterMultiMessageClientAsync("Silent");
+
+        Assert.True(fixture.Hub.IsClientRegistered(client.Id));
+
+        var disposedTcs = new TaskCompletionSource();
+        client.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+        client.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask); // swallow pings, never reply
+
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.False(fixture.Hub.IsClientRegistered(client.Id));
+
+        await fixture.Hub.StopAsync();
+    }
+
     // AcceptLoop — resilience
 
     /// <summary>

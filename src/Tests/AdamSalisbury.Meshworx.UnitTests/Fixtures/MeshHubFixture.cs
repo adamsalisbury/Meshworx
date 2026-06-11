@@ -15,7 +15,11 @@ internal sealed class MeshHubFixture
     public Mock<ITransportListener> Listener { get; } = new();
     public MeshHub Hub { get; }
 
-    public MeshHubFixture(TimeSpan? registrationTimeout = null, int? maxClients = null)
+    public MeshHubFixture(
+        TimeSpan? registrationTimeout = null,
+        int? maxClients = null,
+        TimeSpan? heartbeatInterval = null,
+        int maxMissedHeartbeats = 2)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -30,7 +34,8 @@ internal sealed class MeshHubFixture
 
                 return await _pendingAccepts.Reader.ReadAsync(ct).ConfigureAwait(false);
             });
-        Hub = new MeshHub(logger.Object, Listener.Object, registrationTimeout, maxClients);
+        Hub = new MeshHub(
+            logger.Object, Listener.Object, registrationTimeout, maxClients, heartbeatInterval, maxMissedHeartbeats);
     }
 
     /// <summary>

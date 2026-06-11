@@ -739,6 +739,40 @@ public sealed class MeshClientTests
             () => fixture.Client.GetClientIdByNameAsync("Target"));
     }
 
+    // Heartbeat
+
+    /// <summary>
+    /// When the hub sends a Ping frame, the client replies with a Pong frame so the hub can
+    /// confirm the client is alive.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_HubSendsPing_ClientRepliesWithPong()
+    {
+        var fixture = new MeshClientFixture();
+        byte[] pingFrame = [0x09]; // Ping
+        fixture.SetupSuccessfulRegistration(pingFrame);
+
+        var pongTcs = new TaskCompletionSource<byte[]>();
+        int sendCount = 0;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                // The first send is the registration request; the next is the Pong reply.
+                if (Interlocked.Increment(ref sendCount) >= 2)
+                {
+                    pongTcs.TrySetResult(data.ToArray());
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        byte[] pong = await pongTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Single(pong);
+        Assert.Equal(0x0A, pong[0]); // Pong
+    }
+
     // Disconnected event
 
     /// <summary>
