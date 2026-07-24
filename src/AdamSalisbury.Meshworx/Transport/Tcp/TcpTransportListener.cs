@@ -186,11 +186,17 @@ public sealed class TcpTransportListener : ITransportListener
             {
                 return await handshaken.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
             }
-            catch (ChannelClosedException)
+            catch (ChannelClosedException ex)
             {
-                // The pump stopped because the listener was disposed. Surface it the way a disposed
-                // listener does, so the hub's accept loop ends rather than spinning.
-                throw new ObjectDisposedException(nameof(TcpTransportListener));
+                // The pump has stopped, either because the listener was disposed or because accepting
+                // failed outright; either way this listener will never produce another connection.
+                // Surface it as ObjectDisposedException, which the hub's accept loop treats as a reason
+                // to stop — rethrowing the underlying error instead would be logged and retried by that
+                // loop, spinning against a listener that is never coming back. The cause is preserved as
+                // the inner exception.
+                throw new ObjectDisposedException(
+                    $"The {nameof(TcpTransportListener)} is no longer accepting connections.",
+                    ex.InnerException ?? ex);
             }
         }
 
@@ -344,8 +350,12 @@ public sealed class TcpTransportListener : ITransportListener
             // The listener was stopped underneath the pending accept.
             writer.TryComplete();
         }
-        catch (SocketException ex)
+        catch (Exception ex)
         {
+            // Whatever went wrong, the channel must be completed: a reader blocked in AcceptAsync would
+            // otherwise wait for a pump that is never coming back. This is a background loop with no
+            // logger available, so completing the channel with the error is how the cause reaches the
+            // caller. Catching broadly here is deliberate, and mirrors the hub's own accept loop.
             writer.TryComplete(ex);
         }
         finally
