@@ -22,11 +22,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly ConcurrentDictionary<string, Guid> _clientNames = new();
     private readonly ConcurrentDictionary<Task, byte> _handlerTasks = new();
 
-    // Group membership is mutated far less often than messages are routed, so a single lock guarding
-    // plain collections is simpler and safe. Each connection also tracks the groups it joined so it
-    // can be removed from all of them on disconnect.
-    private readonly Lock _groupsLock = new();
-    private readonly Dictionary<string, HashSet<Guid>> _groups = new(StringComparer.Ordinal);
+    // Each group is guarded by its own lock, so traffic to distinct groups routes in parallel and
+    // only mutation of the same group contends. A group is created on first join and removed once
+    // empty. Each connection also tracks the groups it joined so it can be removed from all of them
+    // on disconnect; that set is only ever touched by the connection's own receive loop (and its
+    // teardown, which runs after the loop ends), so it needs no additional lock.
+    private readonly ConcurrentDictionary<string, Group> _groups = new(StringComparer.Ordinal);
     private CancellationTokenSource? _cts;
     private Task? _acceptLoopTask;
 
@@ -155,11 +156,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _handlerTasks.Clear();
         _clientNames.Clear();
         _clients.Clear();
-
-        lock (_groupsLock)
-        {
-            _groups.Clear();
-        }
+        _groups.Clear();
 
         _cts.Dispose();
         _cts = null;
@@ -624,19 +621,25 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return;
         }
 
-        lock (_groupsLock)
+        while (true)
         {
-            if (!_groups.TryGetValue(groupName, out HashSet<Guid>? members))
+            Group group = _groups.GetOrAdd(groupName, static _ => new Group());
+            lock (group.Lock)
             {
-                members = [];
-                _groups[groupName] = members;
+                if (group.Removed)
+                {
+                    // The group was emptied and removed between GetOrAdd and acquiring its lock;
+                    // retry so a live instance is used rather than resurrecting a dead one.
+                    continue;
+                }
+
+                group.Members.Add(connection.Id);
+                connection.Groups.Add(groupName);
             }
 
-            members.Add(connection.Id);
-            connection.Groups.Add(groupName);
+            _logger.LogDebug("Client {ClientId} joined group {GroupName}", connection.Id, groupName);
+            return;
         }
-
-        _logger.LogDebug("Client {ClientId} joined group {GroupName}", connection.Id, groupName);
     }
 
     private void LeaveGroup(ClientConnection connection, string groupName)
@@ -646,57 +649,67 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return;
         }
 
-        lock (_groupsLock)
-        {
-            RemoveMemberFromGroup(connection.Id, groupName);
-            connection.Groups.Remove(groupName);
-        }
+        RemoveMemberFromGroup(connection.Id, groupName);
+        connection.Groups.Remove(groupName);
 
         _logger.LogDebug("Client {ClientId} left group {GroupName}", connection.Id, groupName);
     }
 
     private void RemoveFromAllGroups(ClientConnection connection)
     {
-        lock (_groupsLock)
+        foreach (string groupName in connection.Groups)
         {
-            foreach (string groupName in connection.Groups)
-            {
-                RemoveMemberFromGroup(connection.Id, groupName);
-            }
-
-            connection.Groups.Clear();
+            RemoveMemberFromGroup(connection.Id, groupName);
         }
+
+        connection.Groups.Clear();
     }
 
-    // Must be called while holding _groupsLock.
     private void RemoveMemberFromGroup(Guid clientId, string groupName)
     {
-        if (_groups.TryGetValue(groupName, out HashSet<Guid>? members)
-            && members.Remove(clientId)
-            && members.Count == 0)
+        if (!_groups.TryGetValue(groupName, out Group? group))
         {
-            _groups.Remove(groupName);
+            return;
+        }
+
+        lock (group.Lock)
+        {
+            if (group.Members.Remove(clientId) && group.Members.Count == 0)
+            {
+                // Last member left: mark the group removed under its lock and take it out of the
+                // dictionary only if this exact instance is still mapped, so a group another thread
+                // created under the same name is never dropped.
+                group.Removed = true;
+                _groups.TryRemove(new KeyValuePair<string, Group>(groupName, group));
+            }
         }
     }
 
     private void SendToGroup(Guid senderId, string groupName, ReadOnlyMemory<byte> messageData)
     {
-        Guid[] recipients;
-        lock (_groupsLock)
+        if (!_groups.TryGetValue(groupName, out Group? group))
         {
-            if (!_groups.TryGetValue(groupName, out HashSet<Guid>? members) || members.Count == 0)
+            return;
+        }
+
+        Guid[] recipients;
+        lock (group.Lock)
+        {
+            if (group.Members.Count == 0)
             {
                 return;
             }
 
-            // Snapshot the membership so the queues can be written without holding the lock.
-            recipients = members.Count == 1 && members.Contains(senderId)
-                ? []
-                : members.Where(id => id != senderId).ToArray();
+            // Snapshot membership with a plain CopyTo — no LINQ closure or enumerator in the
+            // critical section — so the queues can be written without holding the lock. The sender
+            // is filtered out during delivery below rather than inside the lock.
+            recipients = new Guid[group.Members.Count];
+            group.Members.CopyTo(recipients);
         }
 
-        if (recipients.Length == 0)
+        if (recipients.Length == 1 && recipients[0] == senderId)
         {
+            // The sender is the only member; nothing to deliver and no frame to build.
             return;
         }
 
@@ -712,6 +725,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         foreach (Guid recipientId in recipients)
         {
+            if (recipientId == senderId)
+            {
+                // A group message is not echoed back to its sender.
+                continue;
+            }
+
             if (_clients.TryGetValue(recipientId, out ClientConnection? recipient)
                 && !recipient.OutboundQueue.Writer.TryWrite(deliveryPayload))
             {
@@ -721,6 +740,16 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     senderId);
             }
         }
+    }
+
+    // A single group's membership, guarded by its own lock. Removed is set true under Lock when the
+    // group is taken out of _groups so a concurrent join that already fetched this instance retries
+    // against a fresh one rather than resurrecting a dead group.
+    private sealed class Group
+    {
+        public Lock Lock { get; } = new();
+        public HashSet<Guid> Members { get; } = new();
+        public bool Removed { get; set; }
     }
 
     private sealed class ClientConnection(Guid id, string name, ITransport transport) : IAsyncDisposable
@@ -746,7 +775,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
 
         /// <summary>
-        /// The set of groups this client has joined. Only accessed under the hub's groups lock.
+        /// The set of groups this client has joined. Only ever touched by this connection's own
+        /// receive loop and its teardown (which runs after the loop ends), so it needs no lock.
         /// </summary>
         public HashSet<string> Groups { get; } = new(StringComparer.Ordinal);
 
