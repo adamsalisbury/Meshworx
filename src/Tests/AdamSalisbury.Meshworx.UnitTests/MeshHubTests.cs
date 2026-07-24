@@ -688,6 +688,39 @@ public sealed class MeshHubTests
     }
 
     /// <summary>
+    /// When the authenticator hangs, the hub refuses the client once the registration timeout elapses
+    /// rather than holding the connection open indefinitely.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task HandleClient_AuthenticatorHangs_RefusesAfterRegistrationTimeout()
+    {
+        var neverCompletes = new TaskCompletionSource<bool>();
+        var fixture = new MeshHubFixture(
+            registrationTimeout: TimeSpan.FromMilliseconds(100),
+            authenticator: (_, _) => new ValueTask<bool>(neverCompletes.Task));
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Alpha"));
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x05, sentData[1]); // AuthenticationFailed
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+
+        neverCompletes.TrySetResult(true); // release the abandoned authenticator task
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
     /// When the hub has an authenticator that accepts, the client is admitted, and the authenticator
     /// is given the client's name and the exact credential bytes it supplied.
     /// </summary>

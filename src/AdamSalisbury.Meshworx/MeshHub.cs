@@ -305,6 +305,18 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 return;
             }
 
+            // Refuse at-capacity connections before running the integrator's authenticator, so a
+            // connection flood cannot drive authentication work (or hold handler tasks on a slow
+            // authenticator) once the hub is already full.
+            if (_clients.Count >= _maxClients)
+            {
+                byte[] capacityError = [(byte)MessageType.Error, (byte)RegistrationErrorCode.HubAtCapacity];
+                await transport.SendAsync(capacityError, cancellationToken).ConfigureAwait(false);
+                _logger.LogWarning(
+                    "Refusing client {ClientId}: hub at capacity ({MaxClients} clients)", clientId, _maxClients);
+                return;
+            }
+
             if (_authenticator is not null
                 && !await AuthenticateAsync(
                         clientId, clientName, registrationData, registrationNameLength, cancellationToken)
@@ -312,15 +324,6 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             {
                 byte[] authError = [(byte)MessageType.Error, (byte)RegistrationErrorCode.AuthenticationFailed];
                 await transport.SendAsync(authError, cancellationToken).ConfigureAwait(false);
-                return;
-            }
-
-            if (_clients.Count >= _maxClients)
-            {
-                byte[] capacityError = [(byte)MessageType.Error, (byte)RegistrationErrorCode.HubAtCapacity];
-                await transport.SendAsync(capacityError, cancellationToken).ConfigureAwait(false);
-                _logger.LogWarning(
-                    "Refusing client {ClientId}: hub at capacity ({MaxClients} clients)", clientId, _maxClients);
                 return;
             }
 
@@ -520,7 +523,21 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         bool authenticated;
         try
         {
-            authenticated = await _authenticator!(context, cancellationToken).ConfigureAwait(false);
+            // Bound the authenticator by the registration timeout so a slow or hanging integrator
+            // callback cannot hold the handler task (and its connection) open indefinitely. WaitAsync
+            // abandons the wait even if the callback ignores the cancellation token.
+            authenticated = await _authenticator!(context, cancellationToken)
+                .AsTask()
+                .WaitAsync(_registrationTimeout, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning(
+                "Authenticator did not complete within {Timeout} for client {ClientName}; refusing registration",
+                _registrationTimeout,
+                clientName);
+            return false;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
