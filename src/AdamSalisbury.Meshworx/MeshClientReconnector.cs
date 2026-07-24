@@ -39,10 +39,13 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     private readonly Channel<byte> _reconnectSignals =
         Channel.CreateBounded<byte>(new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite });
 
-    // The groups the client belonged to when it last dropped, captured from the Disconnected event
-    // before the client clears its membership. Read by the reconnect loop to restore membership after a
-    // successful reconnect. A reference assignment is atomic; the loop only reads the latest snapshot.
-    private string[] _groupsToRestore = [];
+    // The groups awaiting restoration after a reconnect, guarded by _restoreLock. Disconnects union the
+    // client's last membership into this set; the reconnect loop drains it as each group is successfully
+    // re-joined. Union-then-drain (rather than overwrite) means a restore interrupted by a fresh drop
+    // leaves the not-yet-restored groups pending, so they survive to the next reconnect instead of being
+    // lost from the client's now-depleted live membership.
+    private readonly Lock _restoreLock = new();
+    private readonly HashSet<string> _pendingGroupRestore = new(StringComparer.Ordinal);
 
     private Task? _reconnectLoopTask;
     private int _started;
@@ -140,11 +143,18 @@ public sealed class MeshClientReconnector : IAsyncDisposable
 
     private void OnDisconnected(object? sender, DisconnectedEventArgs e)
     {
-        if (_restoreGroupMembership)
+        if (_restoreGroupMembership && e.JoinedGroups.Count > 0)
         {
-            // Capture the groups the client was in before it cleared them, so the reconnect loop can
-            // restore membership. Taken here rather than after reconnect because the client resets first.
-            _groupsToRestore = e.JoinedGroups.Count == 0 ? [] : [.. e.JoinedGroups];
+            // Union rather than overwrite: a restore interrupted by a fresh drop leaves groups still
+            // pending, and this disconnect only reports the client's now-depleted live membership.
+            // Adding to the pending set preserves those not-yet-restored groups instead of losing them.
+            lock (_restoreLock)
+            {
+                foreach (string group in e.JoinedGroups)
+                {
+                    _pendingGroupRestore.Add(group);
+                }
+            }
         }
 
         // Coalescing channel: signals the reconnect loop without blocking the client's receive loop.
@@ -213,10 +223,15 @@ public sealed class MeshClientReconnector : IAsyncDisposable
 
     private async Task RestoreGroupMembershipAsync(CancellationToken cancellationToken)
     {
-        string[] groups = _groupsToRestore;
-        if (groups.Length == 0)
+        string[] groups;
+        lock (_restoreLock)
         {
-            return;
+            if (_pendingGroupRestore.Count == 0)
+            {
+                return;
+            }
+
+            groups = [.. _pendingGroupRestore];
         }
 
         foreach (string group in groups)
@@ -229,11 +244,18 @@ public sealed class MeshClientReconnector : IAsyncDisposable
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                // The connection dropped again mid-restore, or the join otherwise failed. Stop here;
-                // the fresh disconnect raises another reconnect that will restore the remaining groups.
+                // The connection dropped again mid-restore, or the join otherwise failed. The group stays
+                // in the pending set (it is only removed on success below), so the reconnect that the
+                // drop triggers retries it. Stop this pass rather than hammering a likely-dead connection.
                 _logger.LogWarning(
-                    ex, "Failed to restore membership of group {GroupName} after reconnect", group);
+                    ex, "Failed to restore membership of group {GroupName} after reconnect; it remains pending", group);
                 return;
+            }
+
+            // Re-joined successfully: drop it from the pending set so a later reconnect need not repeat it.
+            lock (_restoreLock)
+            {
+                _pendingGroupRestore.Remove(group);
             }
         }
     }
