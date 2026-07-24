@@ -195,9 +195,14 @@ public sealed class TcpTransportTlsTests
 
     /// <summary>
     /// When a peer opens a TCP connection to a TLS listener and never starts a handshake, the listener
-    /// abandons it at the handshake timeout instead of holding the slot, and goes on to serve a genuine
-    /// client. This is the head-of-line blocking guard.
+    /// abandons that connection once the handshake timeout elapses, and goes on to serve a genuine client.
     /// </summary>
+    /// <remarks>
+    /// The abandonment is asserted directly — the silent peer's socket must see end of stream — because
+    /// the surviving-client half alone would pass even with no timeout at all. The starvation property
+    /// itself is covered by
+    /// <see cref="ServerTls_SilentPeersOutnumberHandshakeSlots_GenuineClientStillConnects"/>.
+    /// </remarks>
     [Fact(Timeout = 20000)]
     public async Task ServerTls_PeerNeverHandshakes_AbandonedAtTimeoutAndLaterClientStillAccepted()
     {
@@ -232,6 +237,16 @@ public sealed class TcpTransportTlsTests
             var payload = new byte[] { 7, 7, 7 };
             await clientTransport.SendAsync(payload).ConfigureAwait(false);
             Assert.Equal(payload, await serverTransport.ReceiveAsync().ConfigureAwait(false));
+
+            // The listener must have closed the silent peer once its handshake timed out. A read of zero
+            // bytes is end of stream; without the timeout this read would block until the test's deadline.
+            using var abandonedDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var discard = new byte[1];
+            int read = await silent.GetStream()
+                .ReadAsync(discard, abandonedDeadline.Token)
+                .ConfigureAwait(false);
+
+            Assert.Equal(0, read);
         }
         finally
         {
