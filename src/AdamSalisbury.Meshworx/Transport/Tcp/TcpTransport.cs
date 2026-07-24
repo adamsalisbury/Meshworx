@@ -10,9 +10,9 @@ namespace AdamSalisbury.Meshworx.Transport.Tcp;
 /// <remarks>
 /// Each message is transmitted as a 4-byte big-endian length header followed by the payload bytes.
 /// Write operations are internally synchronised, so concurrent calls to
-/// <see cref="SendAsync"/> from multiple threads are safe.
+/// <see cref="SendAsync(ReadOnlyMemory{byte}, CancellationToken)"/> from multiple threads are safe.
 /// </remarks>
-public sealed class TcpTransport : ITransport
+public sealed class TcpTransport : ITransport, IBatchSendTransport
 {
     private const int HeaderSize = 4;
     private const int MaxPayloadSize = 1024 * 1024;
@@ -83,6 +83,75 @@ public sealed class TcpTransport : ITransport
             try
             {
                 await _stream.WriteAsync(frame.AsMemory(0, frameSize), cancellationToken).ConfigureAwait(false);
+                await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(frame);
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Frames every message with its own length prefix and writes the whole batch with a single
+    /// buffered <see cref="Stream.WriteAsync(ReadOnlyMemory{byte}, CancellationToken)"/> and flush,
+    /// so a burst of queued frames costs one syscall and one flush instead of one per frame.
+    /// </remarks>
+    public async Task SendAsync(
+        IReadOnlyList<ReadOnlyMemory<byte>> messages,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+
+        if (messages.Count == 0)
+        {
+            return;
+        }
+
+        if (messages.Count == 1)
+        {
+            await SendAsync(messages[0], cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        long frameSize = 0;
+        for (int i = 0; i < messages.Count; i++)
+        {
+            int length = messages[i].Length;
+            if (length > MaxPayloadSize)
+            {
+                throw new ArgumentException(
+                    $"Payload size {length} exceeds the maximum frame payload of {MaxPayloadSize} bytes.",
+                    nameof(messages));
+            }
+
+            frameSize += HeaderSize + length;
+        }
+
+        // The send loop bounds a batch's total size, so frameSize is well within int range here; the
+        // cast is safe. Renting a single buffer keeps the whole batch to one write and one flush.
+        byte[] frame = ArrayPool<byte>.Shared.Rent((int)frameSize);
+        try
+        {
+            int offset = 0;
+            for (int i = 0; i < messages.Count; i++)
+            {
+                ReadOnlyMemory<byte> message = messages[i];
+                BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(offset), message.Length);
+                offset += HeaderSize;
+                message.Span.CopyTo(frame.AsSpan(offset));
+                offset += message.Length;
+            }
+
+            await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _stream.WriteAsync(frame.AsMemory(0, offset), cancellationToken).ConfigureAwait(false);
                 await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
             finally

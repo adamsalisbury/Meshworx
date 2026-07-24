@@ -487,14 +487,51 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
     }
 
+    // How many bytes of already-queued frames the send loop will coalesce into a single write before
+    // flushing. Small enough to bound the rented buffer, large enough to absorb fan-out bursts.
+    private const int SendCoalesceByteBudget = 64 * 1024;
+
     private async Task SendLoopAsync(ClientConnection connection, CancellationTokenSource clientCts)
     {
+        // Reused across the connection's lifetime so coalescing adds no per-frame allocation.
+        var batch = new List<ReadOnlyMemory<byte>>();
+
         try
         {
             await foreach (byte[] payload in connection.OutboundQueue.Reader
                 .ReadAllAsync(clientCts.Token).ConfigureAwait(false))
             {
-                await connection.Transport.SendAsync(payload, clientCts.Token).ConfigureAwait(false);
+                batch.Add(payload);
+                long batchBytes = payload.Length;
+
+                // Drain whatever is already queued so a fan-out burst becomes one write. TryRead never
+                // blocks, so a lone frame is sent immediately with no added latency; only frames already
+                // waiting are batched, and only up to the byte budget so the write stays bounded.
+                while (batchBytes < SendCoalesceByteBudget
+                    && connection.OutboundQueue.Reader.TryRead(out byte[]? next))
+                {
+                    batch.Add(next);
+                    batchBytes += next.Length;
+                }
+
+                if (batch.Count == 1)
+                {
+                    await connection.Transport.SendAsync(batch[0], clientCts.Token).ConfigureAwait(false);
+                }
+                else if (connection.Transport is IBatchSendTransport batchTransport)
+                {
+                    await batchTransport.SendAsync(batch, clientCts.Token).ConfigureAwait(false);
+                }
+                else
+                {
+                    // A transport without batching support still gets every frame, just one at a time.
+                    foreach (ReadOnlyMemory<byte> queuedFrame in batch)
+                    {
+                        await connection.Transport.SendAsync(queuedFrame, clientCts.Token).ConfigureAwait(false);
+                    }
+                }
+
+                batch.Clear();
             }
         }
         catch (OperationCanceledException)
