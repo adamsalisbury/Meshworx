@@ -43,7 +43,7 @@ Task SendAsync(IReadOnlyList<ReadOnlyMemory<byte>> messages, CancellationToken =
 ```
 
 An **optional capability**. The hub's send loop coalesces a burst of queued frames into one underlying
-write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:527-529`);
+write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:693-695`);
 transports that don't implement it just receive frames one at a time. It is deliberately **`internal`**:
 only the bundled `TcpTransport` benefits and only the in-assembly hub consumes it, so it stays off the
 public `ITransport` surface. Each element is delivered as its own message. **External transports cannot
@@ -94,18 +94,25 @@ the payload. `MaxPayloadSize = 1 MiB` (`:18`). See [protocol.md](protocol.md) fo
 
 ---
 
-## `TcpTransportListener` — `Transport/Tcp/TcpTransportListener.cs:9`
+## `TcpTransportListener` — `Transport/Tcp/TcpTransportListener.cs:10`
 
 `public sealed class TcpTransportListener : ITransportListener`.
 
-- Ctors: `(IPEndPoint)` or `(int port)` (binds `IPAddress.Any`, `:24`).
-- `StartAsync` (`:29`) is synchronous under the hood — creates and `Start()`s a `TcpListener`; throws
+- Ctors: `(IPEndPoint)` (`:16`) or `(int port)` (`:33`).
+  > **`(int port)` binds `IPAddress.Loopback`, not `IPAddress.Any`.** A hub created with the
+  > convenience constructor is reachable **only from the same host** — it will not accept connections
+  > from other machines, and a "why can't my remote client connect?" bug usually ends here. This is
+  > deliberate: the hub performs no authentication unless a `ClientAuthenticator` is supplied
+  > ([hub.md](hub.md#authentication)), so exposure is opt-in. To listen on another interface, pass an
+  > explicit `IPEndPoint` — `new TcpTransportListener(new IPEndPoint(IPAddress.Any, port))` — and do it
+  > knowingly. Changed together with protocol version 3; the `IPEndPoint` constructor is unchanged.
+- `StartAsync` (`:39`) is synchronous under the hood — creates and `Start()`s a `TcpListener`; throws
   if already running or if the token is already cancelled.
-- `AcceptAsync` (`:44`) awaits `AcceptTcpClientAsync`, sets `NoDelay`, wraps in a `TcpTransport`. If
+- `AcceptAsync` (`:55`) awaits `AcceptTcpClientAsync`, sets `NoDelay`, wraps in a `TcpTransport`. If
   setting `NoDelay`/getting the stream throws (peer reset immediately after accept), it **disposes the
   socket and rethrows** rather than leaking it — the hub's accept loop then logs and continues.
-- `DisposeAsync` (`:67`) stops the listener.
-- `internal EndPoint? LocalEndPoint` (`:13`) exposes the bound endpoint to tests (e.g. for ephemeral
+- `DisposeAsync` (`:79`) stops the listener.
+- `internal EndPoint? LocalEndPoint` (`:14`) exposes the bound endpoint to tests (e.g. for ephemeral
   port 0).
 
 ---

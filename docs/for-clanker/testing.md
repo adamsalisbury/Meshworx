@@ -11,12 +11,12 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 
 | File | Lines | Covers |
 |---|---|---|
-| `Fixtures/MeshHubFixture.cs` | 106 | Hub test harness (mock listener/transport, register helpers) |
+| `Fixtures/MeshHubFixture.cs` | 173 | Hub test harness (mock listener/transport, register helpers, authenticator pass-through) |
 | `Fixtures/MeshClientFixture.cs` | 106 | Client test harness (mock transport, scripted receive) |
-| `MeshHubTests.cs` | 1317 | Registration, routing, broadcast, groups, heartbeat, capacity, lifecycle |
-| `MeshClientTests.cs` | 1192 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events |
-| `MeshClientReconnectorTests.cs` | 302 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected` |
-| `MeshIntegrationTests.cs` | 324 | Hub + real clients over `InMemoryTransport`, end-to-end |
+| `MeshHubTests.cs` | 1588 | Registration, **authentication**, routing, broadcast, groups, heartbeat, capacity, lifecycle |
+| `MeshClientTests.cs` | 1367 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events |
+| `MeshClientReconnectorTests.cs` | 479 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay |
+| `MeshIntegrationTests.cs` | 327 | Hub + real clients over `InMemoryTransport`, end-to-end |
 | `Transport/InMemory/InMemoryTransportTests.cs` | 173 | Pair semantics, copy-on-send, close signalling |
 | `Transport/Tcp/TcpTransportTests.cs` | 342 | Framing, oversize rejection, invalid length, batch send |
 | `Transport/Tcp/TcpTransportLoopbackTests.cs` | 70 | Round-trip over a real stream |
@@ -39,6 +39,16 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 - **Fixture helpers build wire frames by hand** (`CreateRegistrationRequest`, `CreateDeliverMessagePayload`,
   `CreateLookupFound/NotFoundResponse`) with the raw opcodes — a useful cross-check of
   [protocol.md](protocol.md). If you change a frame layout, these helpers must change too.
+  `CreateRegistrationRequest(name, credential)` builds a **version 3** frame
+  (`[0x04][0x03][nameLen u16 BE][name][credential]`) and hard-codes the version byte, so a
+  `Protocol.Version` bump requires editing it (`Fixtures/MeshHubFixture.cs:60-72`).
+- **Test the authenticator through the hub, not in isolation.** `MeshHubFixture` takes `authenticator`
+  and `maxConcurrentAuthentications` pass-throughs, so the seam is exercised over the real registration
+  path. The `HandleClient_Authenticator*` tests in `MeshHubTests.cs` cover the outcomes worth copying:
+  rejection, throw, `OperationCanceledException` from inside the callback, a hanging callback refused at
+  `registrationTimeout`, concurrency bounded by the semaphore, and a successful admit carrying name plus
+  credential. `HandleClient_EmptyClientName_DropsConnectionWithoutRegistering` covers the malformed-frame
+  path.
 - Test names use `Method_State_ExpectedBehaviour` with underscores (hence `CA1707` suppressed).
 
 ### Minimal end-to-end pattern (integration style)
