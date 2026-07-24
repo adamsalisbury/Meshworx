@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Text;
 using System.Threading.Channels;
@@ -19,7 +20,9 @@ internal sealed class MeshHubFixture
         TimeSpan? registrationTimeout = null,
         int? maxClients = null,
         TimeSpan? heartbeatInterval = null,
-        int maxMissedHeartbeats = 2)
+        int maxMissedHeartbeats = 2,
+        ClientAuthenticator? authenticator = null,
+        int? maxConcurrentAuthentications = null)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -35,7 +38,14 @@ internal sealed class MeshHubFixture
                 return await _pendingAccepts.Reader.ReadAsync(ct).ConfigureAwait(false);
             });
         Hub = new MeshHub(
-            logger.Object, Listener.Object, registrationTimeout, maxClients, heartbeatInterval, maxMissedHeartbeats);
+            logger.Object,
+            Listener.Object,
+            registrationTimeout,
+            maxClients,
+            heartbeatInterval,
+            maxMissedHeartbeats,
+            authenticator,
+            maxConcurrentAuthentications);
     }
 
     /// <summary>
@@ -47,13 +57,17 @@ internal sealed class MeshHubFixture
         _acceptFailures.Enqueue(exception);
     }
 
-    public static byte[] CreateRegistrationRequest(string name = "TestClient")
+    public static byte[] CreateRegistrationRequest(string name = "TestClient", byte[]? credential = null)
     {
+        // Registration frame: [type][version][name length (2, big-endian)][name][credential].
+        credential ??= [];
         byte[] nameBytes = Encoding.UTF8.GetBytes(name);
-        var payload = new byte[2 + nameBytes.Length];
+        var payload = new byte[2 + 2 + nameBytes.Length + credential.Length];
         payload[0] = 0x04; // RegistrationRequest
-        payload[1] = 0x02; // Protocol version
-        nameBytes.CopyTo(payload, 2);
+        payload[1] = 0x03; // Protocol version
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(2, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(payload, 4);
+        credential.CopyTo(payload, 4 + nameBytes.Length);
         return payload;
     }
 

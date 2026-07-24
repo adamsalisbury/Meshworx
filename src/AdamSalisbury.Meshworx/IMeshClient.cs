@@ -40,9 +40,17 @@ public interface IMeshClient : IAsyncDisposable
     /// </remarks>
     /// <param name="transport">A connected transport to use for communication with the hub. Ownership is transferred to the client.</param>
     /// <param name="clientName">The unique name of this client.</param>
+    /// <param name="credential">
+    /// An opaque credential presented to the hub's authenticator, if it configured one. Empty by
+    /// default; the hub does not require it unless it was constructed with an authenticator.
+    /// </param>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
     /// <exception cref="InvalidOperationException">The client is already connected.</exception>
-    Task ConnectAsync(ITransport transport, string clientName, CancellationToken cancellationToken = default);
+    Task ConnectAsync(
+        ITransport transport,
+        string clientName,
+        ReadOnlyMemory<byte> credential = default,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Disconnects from the hub and releases all associated resources.

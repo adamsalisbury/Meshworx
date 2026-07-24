@@ -28,6 +28,7 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     private static readonly TimeSpan DefaultConnectTimeout = TimeSpan.FromSeconds(10);
 
     private readonly string _clientName;
+    private readonly ReadOnlyMemory<byte> _credential;
     private readonly Func<CancellationToken, Task<ITransport>> _transportFactory;
     private readonly TimeSpan _retryDelay;
     private readonly TimeSpan _connectTimeout;
@@ -65,6 +66,10 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     /// it to <see langword="false"/> to restore membership manually in a <see cref="Reconnected"/> handler.
     /// </param>
     /// <param name="logger">An optional logger.</param>
+    /// <param name="credential">
+    /// An opaque credential presented to the hub's authenticator on every connection attempt, including
+    /// reconnects. Empty by default.
+    /// </param>
     public MeshClientReconnector(
         IMeshClient client,
         string clientName,
@@ -72,7 +77,8 @@ public sealed class MeshClientReconnector : IAsyncDisposable
         TimeSpan? retryDelay = null,
         TimeSpan? connectTimeout = null,
         bool restoreGroupMembership = true,
-        ILogger<MeshClientReconnector>? logger = null)
+        ILogger<MeshClientReconnector>? logger = null,
+        ReadOnlyMemory<byte> credential = default)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentException.ThrowIfNullOrEmpty(clientName);
@@ -90,6 +96,7 @@ public sealed class MeshClientReconnector : IAsyncDisposable
 
         Client = client;
         _clientName = clientName;
+        _credential = credential;
         _transportFactory = transportFactory;
         _retryDelay = retryDelay ?? DefaultRetryDelay;
         _connectTimeout = connectTimeout ?? DefaultConnectTimeout;
@@ -127,7 +134,7 @@ public sealed class MeshClientReconnector : IAsyncDisposable
             using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             attemptCts.CancelAfter(_connectTimeout);
             ITransport transport = await _transportFactory(attemptCts.Token).ConfigureAwait(false);
-            await Client.ConnectAsync(transport, _clientName, attemptCts.Token).ConfigureAwait(false);
+            await Client.ConnectAsync(transport, _clientName, _credential, attemptCts.Token).ConfigureAwait(false);
         }
         catch
         {
@@ -206,7 +213,7 @@ public sealed class MeshClientReconnector : IAsyncDisposable
                 attemptCts.CancelAfter(_connectTimeout);
 
                 ITransport transport = await _transportFactory(attemptCts.Token).ConfigureAwait(false);
-                await Client.ConnectAsync(transport, _clientName, attemptCts.Token).ConfigureAwait(false);
+                await Client.ConnectAsync(transport, _clientName, _credential, attemptCts.Token).ConfigureAwait(false);
                 return;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

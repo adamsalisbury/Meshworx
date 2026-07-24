@@ -364,7 +364,11 @@ public sealed class MeshClientReconnectorTests
         transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
 
         var client = new Mock<IMeshClient>();
-        client.Setup(c => c.ConnectAsync(It.IsAny<ITransport>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        client.Setup(c => c.ConnectAsync(
+                It.IsAny<ITransport>(),
+                It.IsAny<string>(),
+                It.IsAny<ReadOnlyMemory<byte>>(),
+                It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         client.Setup(c => c.DisconnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         client.Setup(c => c.DisposeAsync()).Returns(ValueTask.CompletedTask);

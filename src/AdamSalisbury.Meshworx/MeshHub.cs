@@ -11,6 +11,7 @@ namespace AdamSalisbury.Meshworx;
 public sealed class MeshHub : IMeshHub, IAsyncDisposable
 {
     private static readonly TimeSpan DefaultRegistrationTimeout = TimeSpan.FromSeconds(10);
+    private const int DefaultMaxConcurrentAuthentications = 64;
 
     private readonly ILogger<MeshHub> _logger;
     private readonly ITransportListener _listener;
@@ -18,6 +19,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly int _maxClients;
     private readonly TimeSpan? _heartbeatInterval;
     private readonly int _maxMissedHeartbeats;
+    private readonly ClientAuthenticator? _authenticator;
+
+    // Caps how many integrator authenticator callbacks may run concurrently. Null when no authenticator
+    // is configured, since there is then no pre-authentication work to bound.
+    private readonly SemaphoreSlim? _authenticationSlots;
+
     private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
     private readonly ConcurrentDictionary<string, Guid> _clientNames = new();
     private readonly ConcurrentDictionary<Task, byte> _handlerTasks = new();
@@ -50,13 +57,30 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// The number of consecutive idle intervals a client may go without sending any frame before it is
     /// evicted. Only used when <paramref name="heartbeatInterval"/> is set. Defaults to 2.
     /// </param>
+    /// <param name="authenticator">
+    /// An optional callback invoked for each registration to decide whether the client may join, given
+    /// its name and the opaque credential it supplied. Returning <see langword="false"/> refuses the
+    /// client with <see cref="RegistrationErrorCode.AuthenticationFailed"/>. When <see langword="null"/>
+    /// (the default) the hub performs no authentication and admits any peer that completes the
+    /// handshake — in that case the hub must only be exposed to a trusted network.
+    /// </param>
+    /// <param name="maxConcurrentAuthentications">
+    /// The maximum number of <paramref name="authenticator"/> callbacks that may run at once. The
+    /// authenticator runs on unauthenticated input, so this bounds the work an unauthenticated peer can
+    /// cause by connecting. A connection that cannot obtain a slot within
+    /// <paramref name="registrationTimeout"/> is refused with
+    /// <see cref="RegistrationErrorCode.AuthenticationFailed"/>. Defaults to 64. Ignored when
+    /// <paramref name="authenticator"/> is <see langword="null"/>.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
         TimeSpan? registrationTimeout = null,
         int? maxClients = null,
         TimeSpan? heartbeatInterval = null,
-        int maxMissedHeartbeats = 2)
+        int maxMissedHeartbeats = 2,
+        ClientAuthenticator? authenticator = null,
+        int? maxConcurrentAuthentications = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -85,12 +109,26 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 nameof(maxMissedHeartbeats), "The maximum missed heartbeats must be at least one.");
         }
 
+        if (maxConcurrentAuthentications is { } maxAuthentications && maxAuthentications <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxConcurrentAuthentications),
+                "The maximum concurrent authentication count must be positive.");
+        }
+
         _logger = logger;
         _listener = listener;
         _registrationTimeout = registrationTimeout ?? DefaultRegistrationTimeout;
         _maxClients = maxClients ?? int.MaxValue;
         _heartbeatInterval = heartbeatInterval;
         _maxMissedHeartbeats = maxMissedHeartbeats;
+        _authenticator = authenticator;
+
+        if (authenticator is not null)
+        {
+            int slots = maxConcurrentAuthentications ?? DefaultMaxConcurrentAuthentications;
+            _authenticationSlots = new SemaphoreSlim(slots, slots);
+        }
     }
 
     /// <inheritdoc/>
@@ -183,6 +221,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     {
         await StopAsync().ConfigureAwait(false);
         await _listener.DisposeAsync().ConfigureAwait(false);
+        _authenticationSlots?.Dispose();
     }
 
     private async Task AcceptLoopAsync(CancellationToken cancellationToken)
@@ -256,8 +295,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 }
             }
 
+            // Registration frame: [type][version][name length (2, big-endian)][name][credential].
             if (registrationData is null
-                || registrationData.Length < 3
+                || registrationData.Length < 2
                 || (MessageType)registrationData[0] != MessageType.RegistrationRequest)
             {
                 return;
@@ -271,7 +311,22 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 return;
             }
 
-            string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(2));
+            if (registrationData.Length < 4)
+            {
+                // Too short to carry the 2-byte name length; malformed.
+                return;
+            }
+
+            int registrationNameLength = BinaryPrimitives.ReadUInt16BigEndian(registrationData.AsSpan(2, 2));
+            if (registrationNameLength == 0 || registrationData.Length < 4 + registrationNameLength)
+            {
+                // Malformed frame: the name is empty, or the declared name runs past the payload. An
+                // empty name is refused here rather than admitted, because it would otherwise reserve
+                // the empty string in the name registry. No in-box client can produce one.
+                return;
+            }
+
+            string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(4, registrationNameLength));
 
             if (clientName.Length > Protocol.MaxClientNameLength)
             {
@@ -281,6 +336,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 return;
             }
 
+            // Refuse at-capacity connections before running the integrator's authenticator, so a
+            // connection flood cannot drive authentication work (or hold handler tasks on a slow
+            // authenticator) once the hub is already full.
             if (_clients.Count >= _maxClients)
             {
                 byte[] capacityError = [(byte)MessageType.Error, (byte)RegistrationErrorCode.HubAtCapacity];
@@ -288,6 +346,34 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 _logger.LogWarning(
                     "Refusing client {ClientId}: hub at capacity ({MaxClients} clients)", clientId, _maxClients);
                 return;
+            }
+
+            if (_authenticator is not null)
+            {
+                if (!await AuthenticateAsync(
+                        clientId, clientName, registrationData, registrationNameLength, cancellationToken)
+                    .ConfigureAwait(false))
+                {
+                    byte[] authError = [(byte)MessageType.Error, (byte)RegistrationErrorCode.AuthenticationFailed];
+                    await transport.SendAsync(authError, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
+                // Authentication awaits the integrator's callback, so the capacity checked above may have
+                // been consumed by concurrent registrations while it ran. Re-check before reserving the
+                // name, otherwise a burst arriving during a slow authenticator all passes the first check
+                // and admits together, overshooting maxClients by the size of the burst.
+                if (_clients.Count >= _maxClients)
+                {
+                    byte[] lateCapacityError =
+                        [(byte)MessageType.Error, (byte)RegistrationErrorCode.HubAtCapacity];
+                    await transport.SendAsync(lateCapacityError, cancellationToken).ConfigureAwait(false);
+                    _logger.LogWarning(
+                        "Refusing client {ClientId}: hub reached capacity ({MaxClients} clients) during authentication",
+                        clientId,
+                        _maxClients);
+                    return;
+                }
             }
 
             if (!_clientNames.TryAdd(clientName, clientId))
@@ -468,6 +554,86 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             {
                 await transport.DisposeAsync().ConfigureAwait(false);
             }
+        }
+    }
+
+    private async Task<bool> AuthenticateAsync(
+        Guid clientId,
+        string clientName,
+        byte[] registrationData,
+        int nameLength,
+        CancellationToken cancellationToken)
+    {
+        // The authenticator runs on unauthenticated input, once per accepted connection, so an
+        // unauthenticated peer can drive it simply by connecting. Bound how many may run at once,
+        // otherwise a connection flood turns a deliberately expensive credential check into a
+        // denial of service. Waiting is bounded too: a connection that cannot get a slot within the
+        // registration timeout is refused as at-capacity rather than held indefinitely.
+        if (!await _authenticationSlots!.WaitAsync(_registrationTimeout, cancellationToken).ConfigureAwait(false))
+        {
+            _logger.LogWarning(
+                "Refusing client {ClientId} ({ClientName}): no authentication slot became available within {Timeout}",
+                clientId,
+                clientName,
+                _registrationTimeout);
+            return false;
+        }
+
+        try
+        {
+            // Copy the credential out of the registration frame so the context does not alias the larger
+            // inbound buffer, which is safer if a caller retains it beyond the call.
+            byte[] credential = registrationData.AsSpan(4 + nameLength).ToArray();
+            var context = new RegistrationContext { ClientName = clientName, Credential = credential };
+
+            bool authenticated;
+            try
+            {
+                // Bound the authenticator by the registration timeout so a slow or hanging integrator
+                // callback cannot hold the handler task (and its connection) open indefinitely. WaitAsync
+                // abandons the wait even if the callback ignores the cancellation token.
+                authenticated = await _authenticator!(context, cancellationToken)
+                    .AsTask()
+                    .WaitAsync(_registrationTimeout, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning(
+                    "Authenticator did not complete within {Timeout} for client {ClientName}; refusing registration",
+                    _registrationTimeout,
+                    clientName);
+                return false;
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // The cancellation came from inside the callback, not from hub shutdown — an HTTP call to
+                // an identity provider timing out is the common case. Treat it as a refusal, so the client
+                // gets AuthenticationFailed and the reason is logged, rather than letting it unwind to the
+                // handler's shutdown catch and drop the connection silently. Callback boundary.
+                _logger.LogWarning(
+                    "Authenticator was cancelled for client {ClientName}; refusing registration", clientName);
+                return false;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // A throwing authenticator must refuse the client, not fault the handler. Callback boundary.
+                _logger.LogError(
+                    ex, "Authenticator threw for client {ClientName}; refusing registration", clientName);
+                return false;
+            }
+
+            if (!authenticated)
+            {
+                _logger.LogWarning(
+                    "Refusing client {ClientId} ({ClientName}): authentication failed", clientId, clientName);
+            }
+
+            return authenticated;
+        }
+        finally
+        {
+            _authenticationSlots.Release();
         }
     }
 

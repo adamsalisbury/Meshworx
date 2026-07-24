@@ -19,8 +19,19 @@ public sealed class TcpTransportListener : ITransportListener
         _endPoint = endPoint;
     }
 
+    /// <summary>
+    /// Creates a listener bound to the loopback interface on the given port.
+    /// </summary>
+    /// <remarks>
+    /// Binds to <see cref="IPAddress.Loopback"/>, not every interface, so a hub created this way is not
+    /// exposed to other hosts by default. The hub has no built-in authentication unless a
+    /// <see cref="ClientAuthenticator"/> is supplied, so remote exposure should be an explicit choice —
+    /// use the <see cref="TcpTransportListener(IPEndPoint)"/> constructor with the desired address for
+    /// that.
+    /// </remarks>
+    /// <param name="port">The TCP port to listen on.</param>
     public TcpTransportListener(int port)
-        : this(new IPEndPoint(IPAddress.Any, port))
+        : this(new IPEndPoint(IPAddress.Loopback, port))
     {
     }
 

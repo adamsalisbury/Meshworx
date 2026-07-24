@@ -634,11 +634,7 @@ public sealed class MeshHubTests
         var disposedTcs = new TaskCompletionSource();
 
         string longName = new('A', 257);
-        byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(longName);
-        var payload = new byte[2 + nameBytes.Length];
-        payload[0] = 0x04; // RegistrationRequest
-        payload[1] = 0x02; // Protocol version
-        nameBytes.CopyTo(payload, 2);
+        byte[] payload = MeshHubFixture.CreateRegistrationRequest(longName);
 
         transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(payload);
@@ -657,6 +653,281 @@ public sealed class MeshHubTests
         Assert.Equal(0x05, sentData[0]); // Error
         Assert.Equal(0x03, sentData[1]); // ClientNameTooLong
 
+        await fixture.Hub.StopAsync();
+    }
+
+    // HandleClient — authentication
+
+    /// <summary>
+    /// When the hub has an authenticator that rejects the credential, registration is refused with the
+    /// AuthenticationFailed error code and the client is not registered.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_AuthenticatorRejects_SendsAuthenticationFailedError()
+    {
+        var fixture = new MeshHubFixture(authenticator: (_, _) => ValueTask.FromResult(false));
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Alpha", [0xDE, 0xAD]));
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x05, sentData[1]); // AuthenticationFailed
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When the authenticator hangs, the hub refuses the client once the registration timeout elapses
+    /// rather than holding the connection open indefinitely.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task HandleClient_AuthenticatorHangs_RefusesAfterRegistrationTimeout()
+    {
+        var neverCompletes = new TaskCompletionSource<bool>();
+        var fixture = new MeshHubFixture(
+            registrationTimeout: TimeSpan.FromMilliseconds(100),
+            authenticator: (_, _) => new ValueTask<bool>(neverCompletes.Task));
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Alpha"));
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x05, sentData[1]); // AuthenticationFailed
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+
+        neverCompletes.TrySetResult(true); // release the abandoned authenticator task
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When the authenticator throws, the client is refused with AuthenticationFailed rather than the
+    /// exception faulting the handler.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_AuthenticatorThrows_SendsAuthenticationFailedError()
+    {
+        var fixture = new MeshHubFixture(
+            authenticator: (_, _) => throw new InvalidOperationException("credential store unavailable"));
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Alpha"));
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x05, sentData[1]); // AuthenticationFailed
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When the authenticator throws a cancellation exception of its own — an outbound identity-provider
+    /// call timing out, for example — the client is refused with AuthenticationFailed rather than the
+    /// connection being dropped silently as though the hub were shutting down.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_AuthenticatorThrowsOperationCancelled_SendsAuthenticationFailedError()
+    {
+        var fixture = new MeshHubFixture(
+            authenticator: (_, _) => throw new TaskCanceledException("the identity provider timed out"));
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Alpha"));
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x05, sentData[1]); // AuthenticationFailed
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// Only maxConcurrentAuthentications authenticator callbacks run at once, so an unauthenticated peer
+    /// cannot drive unbounded concurrent authentication work simply by connecting.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_ManyRegistrations_BoundsConcurrentAuthenticatorCalls()
+    {
+        const int ConcurrencyLimit = 2;
+        const int ClientCount = 8;
+
+        int concurrent = 0;
+        int peakConcurrent = 0;
+        var release = new TaskCompletionSource();
+        var allBlocked = new TaskCompletionSource();
+
+        var fixture = new MeshHubFixture(
+            authenticator: async (_, _) =>
+            {
+                int now = Interlocked.Increment(ref concurrent);
+                InterlockedRaiseMax(ref peakConcurrent, now);
+
+                if (now >= ConcurrencyLimit)
+                {
+                    allBlocked.TrySetResult();
+                }
+
+                await release.Task;
+                Interlocked.Decrement(ref concurrent);
+                return true;
+            },
+            maxConcurrentAuthentications: ConcurrencyLimit);
+
+        for (int i = 0; i < ClientCount; i++)
+        {
+            var transport = MeshHubFixture.CreateMockTransport();
+            byte[] registration = MeshHubFixture.CreateRegistrationRequest($"Client{i}");
+            transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(registration);
+            transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+            fixture.EnqueueClient(transport.Object);
+        }
+
+        await fixture.Hub.StartAsync();
+        await allBlocked.Task.WaitAsync(WaitTimeout);
+
+        // Give any unbounded callbacks a chance to pile in before sampling the peak.
+        await Task.Delay(100);
+        release.TrySetResult();
+
+        Assert.True(
+            Volatile.Read(ref peakConcurrent) <= ConcurrencyLimit,
+            $"Expected at most {ConcurrencyLimit} concurrent authenticator calls, saw {Volatile.Read(ref peakConcurrent)}.");
+
+        await fixture.Hub.StopAsync();
+    }
+
+    private static void InterlockedRaiseMax(ref int target, int value)
+    {
+        int observed = Volatile.Read(ref target);
+        while (observed < value)
+        {
+            int previous = Interlocked.CompareExchange(ref target, value, observed);
+            if (previous == observed)
+            {
+                return;
+            }
+
+            observed = previous;
+        }
+    }
+
+    /// <summary>
+    /// A registration frame declaring a zero-length name is malformed and is dropped, so the empty
+    /// string is never reserved in the name registry.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_EmptyClientName_DropsConnectionWithoutRegistering()
+    {
+        var fixture = new MeshHubFixture();
+        var transport = MeshHubFixture.CreateMockTransport();
+        var disposedTcs = new TaskCompletionSource();
+        var blockingReceive = new TaskCompletionSource<byte[]?>();
+
+        // The empty-name frame first, then a receive that parks. Were the guard to regress, the client
+        // would be admitted and its receive loop would park rather than spin on a repeated frame, so
+        // this test fails on its assertion instead of hanging the run.
+        transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest(string.Empty))
+            .Returns(blockingReceive.Task);
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+
+        blockingReceive.TrySetResult(null);
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When the hub has an authenticator that accepts, the client is admitted, and the authenticator
+    /// is given the client's name and the exact credential bytes it supplied.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_AuthenticatorAccepts_AdmitsClientWithNameAndCredential()
+    {
+        string? seenName = null;
+        byte[]? seenCredential = null;
+        var fixture = new MeshHubFixture(authenticator: (context, _) =>
+        {
+            seenName = context.ClientName;
+            seenCredential = context.Credential.ToArray();
+            return ValueTask.FromResult(true);
+        });
+
+        var transport = MeshHubFixture.CreateMockTransport();
+        var registeredTcs = new TaskCompletionSource<byte[]>();
+        var blockingReceive = new TaskCompletionSource<byte[]?>();
+
+        // Registration first, then a receive that blocks until the hub is stopped, so the receive
+        // loop parks instead of spinning on a repeated frame.
+        transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Alpha", [1, 2, 3, 4]))
+            .Returns(blockingReceive.Task);
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => registeredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] response = await registeredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x01, response[0]); // RegistrationComplete
+        Assert.Equal("Alpha", seenName);
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, seenCredential);
+
+        // End the receive loop so the handler completes and StopAsync does not wait on it.
+        blockingReceive.TrySetResult(null);
         await fixture.Hub.StopAsync();
     }
 

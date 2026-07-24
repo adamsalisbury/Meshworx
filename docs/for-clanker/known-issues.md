@@ -9,25 +9,28 @@ the risk to a change, not a claim that the code is defective.
 
 | ID | Title | Where | Severity | Status |
 |---|---|---|---|---|
-| KI-1 | Full outbound queue silently drops the frame | `MeshHub.cs:624`, `:650`, `:782` | high (correctness) | open — by design |
-| KI-2 | No authentication or authorisation | system-wide | high (security) | open — by design |
-| KI-3 | Client-name length checked in chars, not UTF-8 bytes | `MeshHub.cs:276`, `MeshClient.cs:102` | medium (correctness) | open |
-| KI-4 | Unknown recipient drops the message silently | `MeshHub.cs:610-616` | medium (correctness) | open — by design |
+| KI-1 | Full outbound queue silently drops the frame | `MeshHub.cs:790`, `:816`, `:948` | high (correctness) | open — by design |
+| KI-2 | Open admission by default; no authorisation model | system-wide | high (security) | **partly addressed** — authentication seam added (PR #56); open admission remains the default |
+| KI-3 | Client-name length checked in chars, not UTF-8 bytes | `MeshHub.cs:331`, `MeshClient.cs:102` | medium (correctness) | open |
+| KI-4 | Unknown recipient drops the message silently | `MeshHub.cs:776-782` | medium (correctness) | open — by design |
 | KI-5 | Delivery is unordered/unacked across the fan-out; no persistence | system-wide | medium (correctness) | open — by design |
-| KI-6 | `StopAsync` writes `Disconnect` outside the send loop | `MeshHub.cs:118-128` | medium (correctness) | open |
+| KI-6 | `StopAsync` writes `Disconnect` outside the send loop | `MeshHub.cs:156-166` | medium (correctness) | open |
 | KI-7 | `InMemoryTransport` uses unbounded channels (no back-pressure) | `InMemoryTransport.cs:34-39` | medium (perf) | open — by design |
-| KI-8 | Group-name length asymmetry (join unbounded, send ≤ 65 535) | `MeshHub.cs:354`, `MeshClient.cs:342-351` | low (correctness) | open |
-| KI-9 | Malformed/short/unknown frames silently ignored | `MeshHub.cs:340-412`, `MeshClient.cs:513-643` | medium (maintainability) | open — by design |
+| KI-8 | Group-name length asymmetry (join unbounded, send ≤ 65 535) | `MeshHub.cs:440`, `MeshClient.cs:342-351` | low (correctness) | open |
+| KI-9 | Malformed/short/unknown frames silently ignored | `MeshHub.cs:426-498`, `MeshClient.cs:513-643` | medium (maintainability) | open — by design |
 | KI-10 | `JoinedGroups` can drift from the hub; no auto-rejoin on reconnect | `MeshClient.cs:310-330`, `MeshClientReconnector.cs:20-23` | medium (correctness) | open — by design |
-| KI-11 | Heartbeat eviction is off-by-one vs "max missed" | `MeshHub.cs:584` | low (behaviour) | open |
+| KI-11 | Heartbeat eviction is off-by-one vs "max missed" | `MeshHub.cs:750` | low (behaviour) | open |
 | KI-12 | Only one client lookup in flight at a time | `MeshClient.cs:387-434` | low (perf) | open — by design |
 | KI-13 | Event `Data` is a view over the received frame | `MeshClient.cs:551`, `:577` | low (correctness) | open |
+| KI-14 | Protocol v3 is a hard break: v2 peers are refused, and `ConnectAsync` is source-breaking | `Messages/Protocol.cs:5`, `IMeshClient.cs:49` | high (compatibility) | open — by design |
+| KI-15 | `AuthenticationFailed` conflates refusal, throw, timeout and slot starvation | `MeshHub.cs:560-638` | medium (maintainability) | open — by design |
+| KI-16 | A reconnector's credential is fixed at construction and cannot be rotated | `MeshClientReconnector.cs:81`, `:137`, `:216` | medium (correctness) | open |
 
 ---
 
 ### KI-1 — Full outbound queue silently drops the frame
-- **Where:** `RouteMessage` `MeshHub.cs:624`, `BroadcastMessage` `:650`, `SendToGroup` `:782`. Queue is
-  a bounded `Channel<byte[]>` of capacity **1024** per connection (`MeshHub.cs:805`, `:831`).
+- **Where:** `RouteMessage` `MeshHub.cs:790`, `BroadcastMessage` `:816`, `SendToGroup` `:948`. Queue is
+  a bounded `Channel<byte[]>` of capacity **1024** per connection (`MeshHub.cs:971`, `:997`).
 - **Why it bites:** the hub delivers with `TryWrite`. If a recipient's consumer (its transport) is slow
   enough to fill 1024 queued frames, every further frame for it is **dropped and logged at Warning** —
   no exception, no back-pressure to the sender. A `SendAsync` that "succeeds" guarantees only that the
@@ -36,18 +39,38 @@ the risk to a change, not a claim that the code is defective.
   application layer. If you raise the cap or change to blocking writes, understand you are trading drop
   for head-of-line blocking of the router — do it deliberately and test under a stalled consumer.
 
-### KI-2 — No authentication or authorisation
-- **Where:** system-wide; registration (`MeshHub.cs:238-306`) only checks name uniqueness/length/version/
-  capacity.
-- **Why it bites:** any peer that can open the transport can register under any unused name, enumerate
-  peers via `GetClientIdByNameAsync`, broadcast to everyone, and join any group. There is no identity,
-  no secrecy, no access control.
-- **What to do:** treat the transport boundary as the trust boundary (bind to loopback/private networks,
-  or wrap the transport in TLS/an authenticated channel). Do not expose a hub to untrusted networks as-is.
-  If you add auth, it belongs in/around the handshake and/or a custom `ITransport`.
+### KI-2 — Open admission by default; no authorisation model
+- **Where:** system-wide; registration `MeshHub.cs:277-395`, authentication `MeshHub.cs:560-638`.
+- **Status:** the *authentication* half now has a supported seam (PR #56, protocol version 3). The
+  *authorisation* half does not, and the default is still open admission.
+- **What exists:** pass a `ClientAuthenticator` to the `MeshHub` constructor and it is invoked for every
+  registration with the client's name and an opaque credential; returning `false` refuses the client
+  with `RegistrationErrorCode.AuthenticationFailed`. Clients supply the credential via
+  `ConnectAsync(transport, name, credential)` and `MeshClientReconnector`'s `credential` parameter,
+  which re-sends it on every reconnect. See [hub.md](hub.md#authentication).
+- **Why it still bites:**
+  1. **No authenticator is the default.** A `MeshHub` constructed without one admits any peer that
+     completes the handshake — exactly the pre-v3 behaviour. Nothing warns you.
+  2. **Authentication is not authorisation.** Once admitted, *every* client can enumerate peers via
+     `GetClientIdByNameAsync`, broadcast to everyone, join any group and send to any group. The
+     authenticator's only lever is admit/refuse; there are no per-client capabilities and the hub does
+     not pass identity into routing.
+  3. **Names are not bound to identity.** The authenticator sees the requested name, but the hub's only
+     name rule is uniqueness. Unless *your* callback ties credential to name, an authenticated client
+     may register under any unused name, including one it has no right to.
+  4. **No confidentiality or integrity.** The bundled TCP transport is cleartext, and sender ids are
+     asserted by the hub, not authenticated end to end.
+- **What to do:** supply an authenticator for anything beyond a trusted network, and bind the credential
+  to the requested `ClientName` inside it if names are meaningful to your application. Keep treating the
+  transport boundary as the trust boundary — run over TLS/VPN/mesh-mTLS where traffic crosses an
+  untrusted segment. Note the `TcpTransportListener(int port)` convenience constructor now binds
+  loopback only ([transport.md](transport.md)), so remote exposure is a deliberate act.
+- **What not to do:** do not treat a returned `true` as an authorisation decision, and do not put
+  expensive or non-constant-time credential checks in the callback without reading
+  [hub.md](hub.md#authentication) first — it runs on unauthenticated input.
 
 ### KI-3 — Client-name length checked in chars, not UTF-8 bytes
-- **Where:** hub `clientName.Length > Protocol.MaxClientNameLength` (`MeshHub.cs:276`); client
+- **Where:** hub `clientName.Length > Protocol.MaxClientNameLength` (`MeshHub.cs:331`); client
   `clientName.Length > Protocol.MaxClientNameLength` (`MeshClient.cs:102`). `MaxClientNameLength = 256`.
 - **Why it bites:** `.Length` counts UTF-16 code units, not encoded bytes. A 256-"character" name of
   multi-byte code points encodes to well over 256 bytes on the wire, and a name of astral characters
@@ -58,8 +81,8 @@ the risk to a change, not a claim that the code is defective.
   docs together.
 
 ### KI-4 — Unknown recipient drops the message silently
-- **Where:** `RouteMessage` `MeshHub.cs:610-616` (logs `Debug`, returns). Same effect for group sends to
-  a non-existent/empty group (`SendToGroup` early-returns, `MeshHub.cs:737`, `:745`).
+- **Where:** `RouteMessage` `MeshHub.cs:776-782` (logs `Debug`, returns). Same effect for group sends to
+  a non-existent/empty group (`SendToGroup` early-returns, `MeshHub.cs:903`, `:911`).
 - **Why it bites:** sending to a stale/never-registered id, or to a group nobody has joined, is a no-op.
   The sender gets no signal. Combined with KI-1, "message sent" never implies "message delivered".
 - **What to do:** resolve ids via `GetClientIdByNameAsync` immediately before sending if freshness
@@ -72,7 +95,7 @@ the risk to a change, not a claim that the code is defective.
 - **What to do:** layer any ordering/durability guarantees on top; do not assume them.
 
 ### KI-6 — `StopAsync` writes `Disconnect` outside the send loop
-- **Where:** `MeshHub.cs:118-128` — iterates `_clients` and calls `client.Transport.SendAsync` directly,
+- **Where:** `MeshHub.cs:156-166` — iterates `_clients` and calls `client.Transport.SendAsync` directly,
   concurrently with each connection's still-running send loop.
 - **Why it bites:** two writers hit the same transport at once. This is **safe for `TcpTransport`**
   (internal `SemaphoreSlim` write lock, `TcpTransport.cs:20`) and any transport that honours the
@@ -89,7 +112,7 @@ the risk to a change, not a claim that the code is defective.
 - **What to do:** use TCP (or a bounded custom transport) where back-pressure matters.
 
 ### KI-8 — Group-name length asymmetry
-- **Where:** `Join`/`Leave` frames carry the name as the whole frame remainder (`MeshHub.cs:354`, `:359`)
+- **Where:** `Join`/`Leave` frames carry the name as the whole frame remainder (`MeshHub.cs:440`, `:445`)
   — effectively bounded only by the 1 MiB frame cap. `GroupMessage`/`DeliverGroupMessage` encode the
   name length as a `u16`, and the client rejects names over `ushort.MaxValue` (`MeshClient.cs:342-351`).
 - **Why it bites:** a group name between 65 536 bytes and 1 MiB can be joined but never targeted by a
@@ -97,11 +120,15 @@ the risk to a change, not a claim that the code is defective.
 - **What to do:** keep group names short. If you unify the limit, apply it at join time too.
 
 ### KI-9 — Malformed/short/unknown frames silently ignored
-- **Where:** dispatch ladders `MeshHub.cs:340-412` and `MeshClient.cs:513-643` — length-guarded
+- **Where:** dispatch ladders `MeshHub.cs:426-498` and `MeshClient.cs:513-643` — length-guarded
   `else if` chains with no terminal `else`.
 - **Why it bites:** a frame that is too short for its opcode, or has an unknown opcode, is dropped with
   no error and no warning-level log. A framing/offset bug manifests as "nothing happens", which is hard
   to diagnose.
+- **Also applies to registration** (`MeshHub.cs:299-327`): a frame under 2 bytes, under 4 bytes, with a
+  zero name length, or with a name length running past the payload, drops the connection with **no error
+  frame**. The client sees a closed connection rather than a `RegistrationRefusedException`, so a
+  framing bug there looks like "the hub is down".
 - **What to do:** when adding an opcode, add the guard *and* the branch on the correct side at the exact
   offsets in [protocol.md](protocol.md). When debugging missing messages, check framing first.
 
@@ -116,7 +143,7 @@ the risk to a change, not a claim that the code is defective.
   reconnector's `Reconnected` event (see [client.md](client.md)).
 
 ### KI-11 — Heartbeat eviction off-by-one
-- **Where:** `MeshHub.cs:584` — evicts when `missedHeartbeats > _maxMissedHeartbeats`.
+- **Where:** `MeshHub.cs:750` — evicts when `missedHeartbeats > _maxMissedHeartbeats`.
 - **Why it bites:** "max missed heartbeats = N" actually tolerates N idle intervals and evicts on the
   (N+1)th. With the default 2, a silent client is evicted after 3 idle intervals. Sizing a client
   `idleTimeout` or an SLA around the literal parameter value will be one interval short.
@@ -139,12 +166,56 @@ the risk to a change, not a claim that the code is defective.
   works — but a future pooled-buffer transport would invalidate anything you kept.
 - **What to do:** copy (`.ToArray()` / `Span.CopyTo`) if you retain the payload past the handler.
 
+### KI-14 — Protocol v3 is a hard break, on the wire and in source
+- **Where:** `Protocol.Version = 3` (`Messages/Protocol.cs:5`); the reshaped `RegistrationRequest`
+  (`MeshHub.cs:314-329`, `MeshClient.cs:181-189`); the signature change on `IMeshClient.ConnectAsync`
+  (`IMeshClient.cs:49`) and `MeshClient.ConnectAsync` (`MeshClient.cs:147`).
+- **Why it bites — two distinct ways:**
+  1. **On the wire.** A v2 client against a v3 hub is refused with `UnsupportedProtocolVersion`; a v3
+     client against a v2 hub gets its length-prefixed name interpreted as a raw UTF-8 name. There is no
+     negotiation and no compatibility shim. **Hub and clients must be upgraded together** — a rolling
+     upgrade of a live mesh will refuse connections until both sides are on v3.
+  2. **In source.** `credential` was inserted **before** the `CancellationToken`, so any call site
+     written as `ConnectAsync(transport, name, cancellationToken)` no longer compiles. It fails loudly
+     rather than silently binding, but every call site must be revisited.
+- **What to do:** upgrade hub and clients in one step. Fix broken call sites by naming the token
+  (`cancellationToken: ct`) or by passing a credential. If you ever need on-the-wire compatibility, it
+  has to be built as version negotiation in the handshake — nothing in the current design supports it.
+
+### KI-15 — `AuthenticationFailed` conflates every non-success outcome
+- **Where:** `AuthenticateAsync` (`MeshHub.cs:560-638`) returns `false` for a refusal, a throw, a
+  cancellation inside the callback, a callback that exceeds `registrationTimeout`, and a failure to
+  acquire an authentication slot. The caller sends the same
+  `Error(AuthenticationFailed)` in all cases (`MeshHub.cs:357-358`).
+- **Why it bites:** a client that catches `RegistrationRefusedException` with
+  `ErrorCode == AuthenticationFailed` **cannot tell "your credential is wrong" from "the hub's
+  authenticator is broken, slow or saturated"**. A client that treats it as terminal will give up on a
+  transient hub problem; a client that retries hard will hammer a hub that is already overloaded. The
+  distinction exists **only in the hub's logs**, at `Warning`/`Error`, with distinct messages per cause.
+- **What to do:** when diagnosing, read the hub logs — the message text identifies the cause. When
+  writing client retry logic, back off rather than assuming either extreme. This conflation is
+  deliberate (an error code that distinguished them would leak authenticator state to unauthenticated
+  peers); do not "fix" it by adding codes without thinking about what that discloses.
+
+### KI-16 — A reconnector's credential is fixed at construction
+- **Where:** `MeshClientReconnector` captures `credential` into a `readonly` field
+  (`MeshClientReconnector.cs:81`, `:99`) and replays it on every connect and reconnect (`:137`, `:216`).
+- **Why it bites:** there is no setter and no factory callback for the credential, unlike
+  `transportFactory` which *is* re-invoked per attempt. If the credential expires or is rotated
+  mid-session, every subsequent reconnect fails with `AuthenticationFailed` and
+  `ConnectWithRetryAsync` keeps retrying at `retryDelay` **indefinitely** — the reconnector never gives
+  up and never surfaces the cause to the application beyond logs.
+- **What to do:** for expiring credentials, do not rely on the reconnector to carry them. Either use a
+  long-lived credential, or dispose the reconnector and construct a new one with a fresh credential when
+  rotation happens. If you need this properly, the shape to add is a credential factory mirroring
+  `transportFactory` — note that would be a constructor change on a public sealed type.
+
 ---
 
 ## Also worth knowing (not defects)
 
 - **Broadcasts are indistinguishable from direct messages at the recipient** — both arrive as
-  `DeliverMessage` → `MessageReceived` (`MeshHub.cs:637`). If you need to tell them apart, encode it in
+  `DeliverMessage` → `MessageReceived` (`MeshHub.cs:803`). If you need to tell them apart, encode it in
   your payload.
 - **Two `.slnx` files** (root `Meshworx.slnx` vs `src/Meshworx.slnx`). CI and "done" use the root one.
 - **`RegistrationRefusedException`'s extra ctors** (message / message+inner / default) exist only to

@@ -1,19 +1,28 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 32031aa
+reconciled-to-commit: 747c58d
 reconciled-to-date: 2026-07-24
-mode: create
+mode: update
 -->
 
 # Meshworx — coding agent field guide
 
 This is the entry point. Read it in full before touching the code, then jump to the area file for
-whatever you are changing. Every claim here is grounded in the source on `main`; where something is
-inferred rather than read directly, it says so.
+whatever you are changing. Every claim here is grounded in the source; where something is inferred
+rather than read directly, it says so.
 
-> **Documented branch:** `main` (`32031aa`). If you are working on a feature branch, the working tree
-> may differ from what is described here.
+> **Documented tree:** branch `feat/issue-6-registration-authentication` (`747c58d`), which is `main`
+> plus the registration-authentication work (PR #56, protocol version 3). If you are on `main` or
+> another branch, the wire protocol and the `ConnectAsync` / `MeshHub` signatures described here will
+> not match your working tree.
+>
+> **Known documentation gap:** the coordinates (`path:line`) for `MeshClient.cs` and
+> `MeshClientReconnector.cs` outside the registration path were written against an older tree and have
+> since drifted — PRs #52 (reconnector group-membership restore) and #55 (client send timeout and
+> retry) landed on `main` after this documentation set was first written and have not been reconciled.
+> Names and behaviour are accurate; the line numbers in those two files may be tens of lines out. Every
+> `MeshHub.cs` coordinate is current.
 
 ---
 
@@ -30,8 +39,12 @@ everyone, or sent to a named **group**. The hub never interprets payloads; it re
 opcode and forwards the body. Delivery is **best-effort, fire-and-forget** — there are no acks, no
 retries, no ordering guarantees beyond a single connection's stream, and no persistence.
 
-There is **no authentication or authorisation** in the `main` design: any peer that can reach the
-listener may register under any unused name. Treat the transport boundary as the trust boundary.
+Since protocol version 3 the hub has an **authentication seam**: an optional `ClientAuthenticator`
+callback decides whether a registering client may join, given its name and an opaque credential it
+supplied. **It is opt-in — a hub constructed without one admits any peer that can reach the listener**,
+under any unused name. There is no authorisation model at all: once admitted, every client can reach
+every other client and every group. Treat the transport boundary as the trust boundary, and see
+[known-issues.md](for-clanker/known-issues.md) KI-2.
 
 ### Headline facts
 
@@ -41,7 +54,7 @@ listener may register under any unused name. Treat the transport boundary as the
 | Target framework | `net10.0` | `AdamSalisbury.Meshworx.csproj:4` |
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
-| Wire protocol version | `2` | `Messages/Protocol.cs:5` |
+| Wire protocol version | `3` | `Messages/Protocol.cs:5` |
 | Max frame payload (TCP) | 1 MiB (`1024*1024`) | `Transport/Tcp/TcpTransport.cs:18` |
 | Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:6` |
 | Warnings as errors | Yes (`Directory.Build.props`) | `src/Directory.Build.props:3` |
@@ -59,10 +72,19 @@ the assembly, and you should not need to.
 
 ```csharp
 using var loggerFactory = LoggerFactory.Create(b => b.AddConsole());
-var listener = new TcpTransportListener(port: 22001);
+var listener = new TcpTransportListener(port: 22001);   // binds LOOPBACK only — see transport.md
 await using var hub = new MeshHub(loggerFactory.CreateLogger<MeshHub>(), listener);
 await hub.StartAsync();
 // ... hub now accepts clients; StopAsync() / DisposeAsync() to shut down ...
+```
+
+Add authentication by passing a callback — without one the hub admits anyone who can reach it:
+
+```csharp
+ClientAuthenticator authenticator = (context, _) =>
+    ValueTask.FromResult(CredentialStore.IsValid(context.ClientName, context.Credential.Span));
+
+await using var hub = new MeshHub(logger, listener, authenticator: authenticator);
 ```
 
 **Connect a client:**
@@ -71,6 +93,8 @@ await hub.StartAsync();
 await using var client = new MeshClient(loggerFactory.CreateLogger<MeshClient>());
 var transport = await TcpTransport.ConnectAsync("localhost", 22001);
 await client.ConnectAsync(transport, clientName: "Alice");   // client TAKES OWNERSHIP of transport
+// ... or, against a hub with an authenticator:
+// await client.ConnectAsync(transport, "Alice", credential: Encoding.UTF8.GetBytes(apiKey));
 
 client.MessageReceived += (_, e) => Handle(e.SenderId, e.Data.Span);
 
@@ -97,6 +121,7 @@ complete, idiomatic client that uses every capability.
 | Group message | `SendToGroupAsync(name, payload)` | Every other member; sender need not be a member |
 | Graceful disconnect | `DisconnectAsync()` | Does **not** raise `Disconnected` |
 | Auto-reconnect | wrap in `MeshClientReconnector` | Re-establishes on drop; you restore app state |
+| Present a credential | `ConnectAsync(transport, name, credential)` | Opaque bytes; only meaningful if the hub has an `authenticator` |
 
 ---
 
@@ -145,7 +170,7 @@ receive loops never block on a slow recipient's socket; they just enqueue. See
 | Client + reconnection | `MeshClient`, `IMeshClient`, `MeshClientReconnector` | [client.md](for-clanker/client.md) |
 | Transports | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `TcpTransport(Listener)`, `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
 | Wire protocol & framing | `MessageType`, `Protocol`, handshake, opcode payloads | [protocol.md](for-clanker/protocol.md) |
-| Public value types | event args, `DisconnectReason`, `RegistrationErrorCode`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
+| Public value types | event args, `DisconnectReason`, `RegistrationErrorCode`, `ClientAuthenticator`, `RegistrationContext`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
 | Tests, fixtures, build/CI | xUnit + Moq suite, `MeshHubFixture`, `MeshClientFixture` | [testing.md](for-clanker/testing.md) |
 | **Known issues register** | consolidated foot-guns and limitations | [known-issues.md](for-clanker/known-issues.md) |
 
@@ -188,7 +213,7 @@ deadlocks or dropped messages that tests may not catch.
 There is **no config file, no environment variables, no external services**. Everything is configured
 through constructor parameters. The only ambient dependency is an `ILogger<T>` you supply.
 
-**`MeshHub` options** (`MeshHub.cs:53-94`, all optional):
+**`MeshHub` options** (`MeshHub.cs:75-132`, all optional):
 
 | Param | Default | Effect |
 |---|---|---|
@@ -196,6 +221,8 @@ through constructor parameters. The only ambient dependency is an `ILogger<T>` y
 | `maxClients` | unlimited (`int.MaxValue`) | Refuse beyond this with `HubAtCapacity` |
 | `heartbeatInterval` | `null` (disabled) | Ping idle clients; evict after missed intervals |
 | `maxMissedHeartbeats` | 2 | Idle intervals tolerated before eviction (see hub.md for exact off-by-one semantics) |
+| `authenticator` | `null` (**open admission**) | Decides whether each registering client may join; `false` → `AuthenticationFailed` |
+| `maxConcurrentAuthentications` | 64 | Caps concurrent authenticator callbacks; ignored when `authenticator` is `null` |
 
 **`MeshClient` options** (`MeshClient.cs:67`): `idleTimeout` (default `null`), `sendTimeout`
 (default `null`), `maxSendAttempts` (default `1` — the first attempt counts, so `1` disables retrying;
@@ -203,8 +230,9 @@ only transient I/O errors are retried) and `sendRetryDelay` (default `100 ms`, l
 `idleTimeout` **above** the hub's `heartbeatInterval` so the hub's pings reset it; a genuinely silent
 hub then trips it and raises `Disconnected(ConnectionLost)`.
 
-**`MeshClientReconnector` options** (`MeshClientReconnector.cs:53`): `retryDelay` (1 s), `connectTimeout`
-(10 s), optional `ILogger`.
+**`MeshClientReconnector` options** (`MeshClientReconnector.cs:73`): `retryDelay` (1 s), `connectTimeout`
+(10 s), `restoreGroupMembership`, optional `ILogger`, and `credential` (empty; replayed on every
+reconnect — it cannot be changed afterwards, see [known-issues.md](for-clanker/known-issues.md) KI-16).
 
 All constructors validate ranges and throw `ArgumentOutOfRangeException` for non-positive timeouts/counts.
 
@@ -225,8 +253,8 @@ full house style; the points below are the ones the code actually enforces and d
 - **Guard clauses first:** `ArgumentNullException.ThrowIfNull`, `ArgumentException.ThrowIfNullOrEmpty`,
   explicit range checks. Every public entry point does this.
 - **Catch specific exceptions.** Broad `catch (Exception)` appears **only** at loop/callback boundaries
-  and is always logged with a comment explaining why it is intentional (e.g. `MeshHub.cs:205-213`,
-  `:489`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
+  and is always logged with a comment explaining why it is intentional (e.g. `MeshHub.cs:244-252`,
+  `:655`, and the three catches in `AuthenticateAsync` `:600-624`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
 - **No blocking, no `.Result`.** `CA2007` (ConfigureAwait) is a build error in the library.
 - **Binary wire work uses `System.Buffers.Binary.BinaryPrimitives`** (big-endian) and
   `Guid.TryWriteBytes` / `new Guid(span)` for the 16-byte ids. Frame buffers on hot paths are rented
@@ -275,7 +303,14 @@ there is no publish step in CI — CI only builds and tests.
 
 - **Delivery is lossy by design.** Full outbound queue → dropped frame (logged). Unknown recipient →
   dropped silently. No acks. Do not assume a message sent is a message received.
-- **No auth.** Any reachable peer can register any unused name and lookup/broadcast to everyone.
+- **Authentication is opt-in; authorisation does not exist.** Without a `ClientAuthenticator` any
+  reachable peer can register under any unused name and lookup/broadcast to everyone. Even *with* one,
+  an admitted client can reach every other client and group. KI-2.
+- **Protocol v3 broke both wire and source compatibility.** v2 and v3 peers cannot interoperate — there
+  is no negotiation — and `ConnectAsync` gained a `credential` parameter **before** the
+  `CancellationToken`, so positional call sites no longer compile. KI-14.
+- **`new TcpTransportListener(port)` binds loopback**, not every interface. Remote clients cannot reach
+  a hub created that way; pass an explicit `IPEndPoint` to expose it deliberately.
 - **Client-name length is checked in `char`s (UTF-16 units), not UTF-8 bytes**, on both sides — a name
   can encode to more bytes than you expect. Names are also case-sensitive and `Ordinal`-compared.
 - **Group membership is fire-and-forget and optimistic on the client.** The client's `JoinedGroups`

@@ -23,7 +23,7 @@ up peers, manages group membership, and raises events for inbound traffic and di
 | `Name` | `string` — set on connect, cleared on disconnect | `MeshClient.cs:61` |
 | `IsConnected` | `bool` — true only in `Connected` state | `MeshClient.cs:64` |
 | `JoinedGroups` | `IReadOnlyCollection<string>` — **snapshot** of client-side membership | `MeshClient.cs:76` |
-| `ConnectAsync` | `Task ConnectAsync(ITransport, string clientName, CancellationToken=default)` | `MeshClient.cs:97` |
+| `ConnectAsync` | `Task ConnectAsync(ITransport, string clientName, ReadOnlyMemory<byte> credential=default, CancellationToken=default)` | `MeshClient.cs:147` |
 | `DisconnectAsync` | `Task DisconnectAsync(CancellationToken=default)` — graceful; no `Disconnected` event | `MeshClient.cs:202` |
 | `SendAsync` | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, CancellationToken=default)` | `MeshClient.cs:262` |
 | `BroadcastAsync` | `Task BroadcastAsync(ReadOnlyMemory<byte>, CancellationToken=default)` | `MeshClient.cs:288` |
@@ -41,13 +41,15 @@ Internal `enum ConnectionState { Disconnected, Connecting, Connected, Disconnect
 (`MeshClient.cs:714`), guarded by `_stateLock` (`System.Threading.Lock`). Send/lookup/group methods
 throw `InvalidOperationException("Not connected to a hub.")` unless `Connected`.
 
-**`ConnectAsync`** (`MeshClient.cs:97`):
+**`ConnectAsync`** (`MeshClient.cs:147`):
 1. Validates `transport`/`clientName`, rejects names longer than 256 chars, and refuses to connect
    unless currently `Disconnected` (state-specific message otherwise).
-2. Sends `RegistrationRequest` (`[0x04][version][utf8 name]`), then awaits one frame.
+2. Sends `RegistrationRequest` (`[0x04][version][nameLen u16 BE][utf8 name][credential]`,
+   `MeshClient.cs:181-189`), then awaits one frame.
 3. If the reply is `Error`, throws `RegistrationRefusedException` carrying the
-   `RegistrationErrorCode`. If it is not a well-formed `RegistrationComplete` (exactly 17 bytes), throws
-   `InvalidOperationException`.
+   `RegistrationErrorCode` — which now includes `AuthenticationFailed` if the hub's authenticator
+   rejected the credential. If the reply is not a well-formed `RegistrationComplete` (exactly 17 bytes),
+   throws `InvalidOperationException`.
 4. Records `Id`, sets `Connected`, and starts `ReceiveLoopAsync`.
 5. On **any** failure it cleans up (disposes the transport), resets to `Disconnected`, logs, and rethrows.
 
@@ -55,6 +57,31 @@ throw `InvalidOperationException("Not connected to a hub.")` unless `Connected`.
 > it is disposed on disconnect or if the handshake fails. **The caller must not use or dispose the
 > transport after `ConnectAsync`.** Each connection needs a fresh transport — this is why
 > `MeshClientReconnector` takes a `transportFactory`, not a transport.
+
+#### The `credential` parameter
+
+`credential` is an **opaque `ReadOnlyMemory<byte>` inserted before the `CancellationToken`** — a
+**source-breaking** change to `ConnectAsync` on both `IMeshClient` (`IMeshClient.cs:49`) and
+`MeshClient`. Any call site that passed a token positionally
+(`ConnectAsync(transport, name, cancellationToken)`) will now fail to compile; pass the token by name,
+or supply a credential.
+
+- It defaults to empty, so `ConnectAsync(transport, name)` is unchanged.
+- It is copied into the registration frame and sent once, during the handshake. It is **not** retained,
+  and there is no way to present a credential after connecting.
+- The client never inspects it. Whether it is required, and what it must contain, is entirely determined
+  by the `ClientAuthenticator` the hub was constructed with — see [hub.md](hub.md#authentication).
+- A hub with no authenticator ignores whatever you send, so a credential is safe to pass unconditionally.
+
+```csharp
+await client.ConnectAsync(transport, "Alice", credential: Encoding.UTF8.GetBytes(apiKey));
+```
+
+If the hub's authenticator refuses, `ConnectAsync` throws
+`RegistrationRefusedException` with `ErrorCode == RegistrationErrorCode.AuthenticationFailed`. That code
+is **also** what you get if the hub's authenticator threw, hung or was starved of concurrency slots — the
+client cannot tell those apart, so do not treat it as proof the credential itself was wrong. Retrying is
+reasonable; retrying in a tight loop is not.
 
 There is a subtle **synchronous-completion guard** (`MeshClient.cs:159-179`): if the hub has already
 buffered a `Disconnect`, `ReceiveLoopAsync` can run to completion synchronously and a `Disconnected`
@@ -124,7 +151,7 @@ connection lifecycle** — you still use `reconnector.Client` to send/receive.
 
 | Member | Notes | Source |
 |---|---|---|
-| ctor | `(IMeshClient client, string clientName, Func<CancellationToken,Task<ITransport>> transportFactory, TimeSpan? retryDelay=null, TimeSpan? connectTimeout=null, ILogger<MeshClientReconnector>?=null)` | `MeshClientReconnector.cs:53` |
+| ctor | `(IMeshClient client, string clientName, Func<CancellationToken,Task<ITransport>> transportFactory, TimeSpan? retryDelay=null, TimeSpan? connectTimeout=null, bool restoreGroupMembership=true, ILogger<MeshClientReconnector>?=null, ReadOnlyMemory<byte> credential=default)` | `MeshClientReconnector.cs:73` |
 | `Client` | `IMeshClient` — the managed client | `MeshClientReconnector.cs:86` |
 | `StartAsync` | Fail-fast initial connect; then begins monitoring. Throws if already started or if the first connect fails (retryable). | `MeshClientReconnector.cs:99` |
 | `Reconnected` | `event EventHandler` — raised after a re-established connection | `MeshClientReconnector.cs:92` |
@@ -134,6 +161,12 @@ connection lifecycle** — you still use `reconnector.Client` to send/receive.
 
 - **`transportFactory` produces a fresh transport per attempt** — because the client consumes/disposes a
   transport per connection. Defaults: `retryDelay` 1 s, `connectTimeout` 10 s.
+- **The `credential` is stored and re-sent on every connect and reconnect**
+  (`MeshClientReconnector.cs:137`, `:216`), so an authenticated client keeps its credential across drops
+  without any work from you. It is captured once at construction: **there is no way to rotate it** on a
+  live reconnector — a credential that expires mid-session will cause every subsequent reconnect attempt
+  to fail with `AuthenticationFailed`, retried at `retryDelay` forever. If your credentials expire,
+  dispose the reconnector and build a new one with the fresh credential.
 - `StartAsync` (`:99`) does one bounded connect; **throws on failure** and resets the started flag so it
   can be retried (`:114-119`). On success it subscribes to `Client.Disconnected` and starts the loop.
 - `OnDisconnected` (`:126`) just `TryWrite`s to a **capacity-1 `DropWrite` channel** — disconnect
