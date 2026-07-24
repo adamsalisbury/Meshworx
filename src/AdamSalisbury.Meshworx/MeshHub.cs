@@ -235,6 +235,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         var clientId = Guid.NewGuid();
         ClientConnection? connection = null;
         Task? sendLoopTask = null;
+        Task? heartbeatMonitorTask = null;
         CancellationTokenSource? clientCts = null;
 
         try
@@ -313,52 +314,25 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             clientCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             sendLoopTask = SendLoopAsync(connection, clientCts);
 
-            int missedHeartbeats = 0;
+            // A single monitor per connection probes liveness off a PeriodicTimer, so the receive
+            // loop below reads against one long-lived token with no per-frame CancellationTokenSource
+            // or timer-queue churn. The monitor is only started when heartbeats are configured.
+            if (_heartbeatInterval is { } heartbeatInterval)
+            {
+                heartbeatMonitorTask = MonitorHeartbeatAsync(connection, clientCts, heartbeatInterval, clientId);
+            }
 
             while (!clientCts.Token.IsCancellationRequested)
             {
-                byte[]? data;
-
-                if (_heartbeatInterval is null)
-                {
-                    data = await transport.ReceiveAsync(clientCts.Token).ConfigureAwait(false);
-                }
-                else
-                {
-                    using var readCts = CancellationTokenSource.CreateLinkedTokenSource(clientCts.Token);
-                    readCts.CancelAfter(_heartbeatInterval.Value);
-                    try
-                    {
-                        data = await transport.ReceiveAsync(readCts.Token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                        when (readCts.IsCancellationRequested && !clientCts.Token.IsCancellationRequested)
-                    {
-                        missedHeartbeats++;
-                        if (missedHeartbeats > _maxMissedHeartbeats)
-                        {
-                            _logger.LogInformation(
-                                "Client {ClientId} did not respond to {Missed} heartbeats; evicting",
-                                clientId,
-                                _maxMissedHeartbeats);
-                            break;
-                        }
-
-                        // Probe liveness via the outbound queue so the ping serialises with any
-                        // other queued frames. A live client replies with a Pong (or any frame),
-                        // resetting the counter below.
-                        connection.OutboundQueue.Writer.TryWrite([(byte)MessageType.Ping]);
-                        continue;
-                    }
-                }
+                byte[]? data = await transport.ReceiveAsync(clientCts.Token).ConfigureAwait(false);
 
                 if (data is null)
                 {
                     break;
                 }
 
-                // Any received frame proves the client is alive.
-                missedHeartbeats = 0;
+                // Any received frame proves the client is alive; the heartbeat monitor observes this.
+                connection.RecordActivity();
 
                 if (data.Length == 0)
                 {
@@ -426,7 +400,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 }
                 else if ((MessageType)data[0] == MessageType.Pong)
                 {
-                    // Liveness reply to a heartbeat ping; the counter was already reset above.
+                    // Liveness reply to a heartbeat ping; RecordActivity above already noted it.
                 }
                 else if ((MessageType)data[0] == MessageType.Disconnect)
                 {
@@ -461,6 +435,18 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 catch (OperationCanceledException)
                 {
                     // Expected during shutdown.
+                }
+            }
+
+            if (heartbeatMonitorTask is not null)
+            {
+                try
+                {
+                    await heartbeatMonitorTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected once the client's cancellation token is triggered.
                 }
             }
 
@@ -525,6 +511,54 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 "Send loop for client {ClientId} terminated due to transport error",
                 connection.Id);
             await clientCts.CancelAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async Task MonitorHeartbeatAsync(
+        ClientConnection connection,
+        CancellationTokenSource clientCts,
+        TimeSpan interval,
+        Guid clientId)
+    {
+        // One timer per connection, reused for the connection's whole lifetime. Between ticks the
+        // receive loop bumps ActivitySequence for every frame; an unchanged sequence across a tick
+        // means the client sent nothing during that interval, so it is probed and eventually evicted.
+        using var timer = new PeriodicTimer(interval);
+        long lastSeenActivity = connection.ActivitySequence;
+        int missedHeartbeats = 0;
+
+        try
+        {
+            while (await timer.WaitForNextTickAsync(clientCts.Token).ConfigureAwait(false))
+            {
+                long currentActivity = connection.ActivitySequence;
+                if (currentActivity != lastSeenActivity)
+                {
+                    // A frame arrived during the interval; the client is alive.
+                    lastSeenActivity = currentActivity;
+                    missedHeartbeats = 0;
+                    continue;
+                }
+
+                missedHeartbeats++;
+                if (missedHeartbeats > _maxMissedHeartbeats)
+                {
+                    _logger.LogInformation(
+                        "Client {ClientId} did not respond to {Missed} heartbeats; evicting",
+                        clientId,
+                        _maxMissedHeartbeats);
+                    await clientCts.CancelAsync().ConfigureAwait(false);
+                    return;
+                }
+
+                // Probe liveness via the outbound queue so the ping serialises with any other queued
+                // frames. A live client replies with a Pong (or any frame), resetting the counter.
+                connection.OutboundQueue.Writer.TryWrite([(byte)MessageType.Ping]);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The connection's cancellation token was triggered; stop monitoring.
         }
     }
 
@@ -693,10 +727,23 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     {
         private const int OutboundQueueCapacity = 1024;
         private int _disposed;
+        private long _activitySequence;
 
         public Guid Id { get; } = id;
         public string Name { get; } = name;
         public ITransport Transport { get; } = transport;
+
+        /// <summary>
+        /// A monotonically increasing counter bumped once for every frame received from the client.
+        /// The heartbeat monitor compares it between ticks to detect an idle connection without
+        /// arming a timer per received frame.
+        /// </summary>
+        public long ActivitySequence => Volatile.Read(ref _activitySequence);
+
+        public void RecordActivity()
+        {
+            Interlocked.Increment(ref _activitySequence);
+        }
 
         /// <summary>
         /// The set of groups this client has joined. Only accessed under the hub's groups lock.

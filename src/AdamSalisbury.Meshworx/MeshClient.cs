@@ -484,39 +484,55 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         // connection; only an explicit hub disconnect message changes it.
         var reason = DisconnectReason.ConnectionLost;
 
+        // One linked source and one activity counter for the whole loop. The idle monitor compares
+        // the counter between ticks and cancels this source if no frame arrives within the timeout,
+        // so the read below never allocates a CancellationTokenSource or arms a timer per frame.
+        using var idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        long activitySequence = 0;
+        Task? idleMonitorTask = _idleTimeout is { } idleTimeout ? MonitorIdleAsync(idleTimeout) : null;
+
+        async Task MonitorIdleAsync(TimeSpan timeout)
+        {
+            using var timer = new PeriodicTimer(timeout);
+            long lastSeen = Volatile.Read(ref activitySequence);
+            try
+            {
+                while (await timer.WaitForNextTickAsync(idleCts.Token).ConfigureAwait(false))
+                {
+                    long current = Volatile.Read(ref activitySequence);
+                    if (current != lastSeen)
+                    {
+                        // A frame arrived during the interval; the connection is alive.
+                        lastSeen = current;
+                        continue;
+                    }
+
+                    _logger.LogWarning(
+                        "No frame received from the hub within {Timeout}; treating the connection as lost",
+                        timeout);
+                    await idleCts.CancelAsync().ConfigureAwait(false);
+                    return;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // The receive loop is tearing down; stop monitoring.
+            }
+        }
+
         try
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (!idleCts.Token.IsCancellationRequested)
             {
-                byte[]? data;
-
-                if (_idleTimeout is null)
-                {
-                    data = await transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
-                }
-                else
-                {
-                    using var readCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                    readCts.CancelAfter(_idleTimeout.Value);
-                    try
-                    {
-                        data = await transport.ReceiveAsync(readCts.Token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                        when (readCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
-                    {
-                        _logger.LogWarning(
-                            "No frame received from the hub within {Timeout}; treating the connection as lost",
-                            _idleTimeout);
-                        reason = DisconnectReason.ConnectionLost;
-                        break;
-                    }
-                }
+                byte[]? data = await transport.ReceiveAsync(idleCts.Token).ConfigureAwait(false);
 
                 if (data is null)
                 {
                     break;
                 }
+
+                // Any received frame proves the connection is alive; the idle monitor observes this.
+                Interlocked.Increment(ref activitySequence);
 
                 if (data.Length == 0)
                 {
@@ -630,6 +646,20 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
         finally
         {
+            // Stop the idle monitor and let it unwind before tearing the connection down.
+            if (idleMonitorTask is not null)
+            {
+                await idleCts.CancelAsync().ConfigureAwait(false);
+                try
+                {
+                    await idleMonitorTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected once the loop's cancellation token is triggered.
+                }
+            }
+
             // The receive loop is the only thing that completes a pending lookup. If it
             // terminates for any reason before the response arrives, fault the waiter so
             // callers using a default (non-cancellable) token are not left hanging — and
