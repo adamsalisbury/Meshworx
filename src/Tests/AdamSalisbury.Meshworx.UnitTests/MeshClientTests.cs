@@ -101,8 +101,11 @@ public sealed class MeshClientTests
 
         Assert.NotNull(sentData);
         Assert.Equal(0x04, sentData[0]);
-        Assert.Equal(0x02, sentData[1]);
-        Assert.Equal("TestClient", Encoding.UTF8.GetString(sentData.AsSpan(2)));
+        Assert.Equal(0x03, sentData[1]);
+        int nameLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(2, 2));
+        Assert.Equal("TestClient", Encoding.UTF8.GetString(sentData.AsSpan(4, nameLength)));
+        // No credential supplied, so the name is the whole remaining payload.
+        Assert.Equal(4 + nameLength, sentData.Length);
     }
 
     /// <summary>

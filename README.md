@@ -74,11 +74,11 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
 
 ## Core concepts
 
-- **Registration.** `ConnectAsync` performs a handshake: the client sends its name and
-  protocol version; the hub assigns a `Guid` and returns it, or refuses with a
-  `RegistrationRefusedException` carrying a `RegistrationErrorCode` (duplicate name,
-  unsupported version, name too long, or hub at capacity). Client names are unique and limited
-  to 256 characters.
+- **Registration.** `ConnectAsync` performs a handshake: the client sends its name, protocol
+  version and an optional opaque credential; the hub assigns a `Guid` and returns it, or refuses
+  with a `RegistrationRefusedException` carrying a `RegistrationErrorCode` (duplicate name,
+  unsupported version, name too long, hub at capacity, or authentication failed). Client names are
+  unique and limited to 256 characters. See [Security](#security) for the authentication seam.
 - **Lookup.** `GetClientIdByNameAsync` resolves a name to its `Guid`, or `null` if no client is
   registered under that name. Requests are correlated, so a response from a cancelled lookup
   cannot resolve a later one.
@@ -151,16 +151,48 @@ new MeshClient(
 Set `idleTimeout` above the hub's heartbeat interval so the hub's pings keep the connection
 alive; a genuinely silent hub then trips the timeout and raises `Disconnected(ConnectionLost)`.
 
+## Security
+
+Meshworx has no built-in authentication or encryption by default. Treat these as decisions you
+must make deliberately.
+
+- **Authentication.** The hub admits any peer that completes the handshake unless you supply a
+  `ClientAuthenticator`. It is invoked for every registration with the client's name and the opaque
+  credential it sent, and returning `false` refuses the client with
+  `RegistrationErrorCode.AuthenticationFailed`:
+
+  ```csharp
+  ClientAuthenticator authenticator = (context, _) =>
+  {
+      bool ok = CredentialStore.IsValid(context.ClientName, context.Credential.Span);
+      return ValueTask.FromResult(ok);
+  };
+
+  await using var hub = new MeshHub(logger, listener, authenticator: authenticator);
+  ```
+
+  The client supplies its credential through `ConnectAsync(transport, name, credential)` (and
+  `MeshClientReconnector`'s `credential` parameter, which re-sends it on every reconnect).
+
+- **Network exposure.** The `TcpTransportListener(int port)` convenience constructor binds to
+  `IPAddress.Loopback`, so a hub created that way is not reachable from other hosts. To listen on a
+  public interface, pass an explicit `IPEndPoint` — and only do so behind an authenticator, a
+  network boundary, or both.
+
+- **Confidentiality.** The bundled TCP transport is cleartext. Run it inside an already-encrypted
+  channel (VPN, service-mesh mTLS, a TLS-terminating proxy) when traffic crosses an untrusted
+  segment; message sender ids are asserted by the hub and are not authenticated end to end.
+
 ## Wire protocol
 
 The TCP transport frames every message as a **4-byte big-endian length prefix** followed by the
 payload (maximum 1 MiB). The first payload byte is the message type.
 
-Protocol version: **2**.
+Protocol version: **3**.
 
 | Type | Byte | Direction | Payload after the type byte |
 |---|---|---|---|
-| `RegistrationRequest` | `0x04` | client → hub | version (1 byte), UTF-8 name |
+| `RegistrationRequest` | `0x04` | client → hub | version (1 byte), name length (2 bytes, big-endian), UTF-8 name, opaque credential (remaining bytes) |
 | `RegistrationComplete` | `0x01` | hub → client | assigned client id (16 bytes) |
 | `Error` | `0x05` | hub → client | registration error code (1 byte) |
 | `SendMessage` | `0x02` | client → hub | recipient id (16 bytes), message bytes |
@@ -177,7 +209,8 @@ Protocol version: **2**.
 | `Pong` | `0x0A` | client → hub | none |
 
 Registration error codes (`RegistrationErrorCode`): `DuplicateClientName` (`0x01`),
-`UnsupportedProtocolVersion` (`0x02`), `ClientNameTooLong` (`0x03`), `HubAtCapacity` (`0x04`).
+`UnsupportedProtocolVersion` (`0x02`), `ClientNameTooLong` (`0x03`), `HubAtCapacity` (`0x04`),
+`AuthenticationFailed` (`0x05`).
 
 ## Custom transports
 

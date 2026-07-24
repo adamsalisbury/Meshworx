@@ -634,11 +634,7 @@ public sealed class MeshHubTests
         var disposedTcs = new TaskCompletionSource();
 
         string longName = new('A', 257);
-        byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(longName);
-        var payload = new byte[2 + nameBytes.Length];
-        payload[0] = 0x04; // RegistrationRequest
-        payload[1] = 0x02; // Protocol version
-        nameBytes.CopyTo(payload, 2);
+        byte[] payload = MeshHubFixture.CreateRegistrationRequest(longName);
 
         transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(payload);
@@ -657,6 +653,80 @@ public sealed class MeshHubTests
         Assert.Equal(0x05, sentData[0]); // Error
         Assert.Equal(0x03, sentData[1]); // ClientNameTooLong
 
+        await fixture.Hub.StopAsync();
+    }
+
+    // HandleClient — authentication
+
+    /// <summary>
+    /// When the hub has an authenticator that rejects the credential, registration is refused with the
+    /// AuthenticationFailed error code and the client is not registered.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_AuthenticatorRejects_SendsAuthenticationFailedError()
+    {
+        var fixture = new MeshHubFixture(authenticator: (_, _) => ValueTask.FromResult(false));
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Alpha", [0xDE, 0xAD]));
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x05, sentData[1]); // AuthenticationFailed
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When the hub has an authenticator that accepts, the client is admitted, and the authenticator
+    /// is given the client's name and the exact credential bytes it supplied.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_AuthenticatorAccepts_AdmitsClientWithNameAndCredential()
+    {
+        string? seenName = null;
+        byte[]? seenCredential = null;
+        var fixture = new MeshHubFixture(authenticator: (context, _) =>
+        {
+            seenName = context.ClientName;
+            seenCredential = context.Credential.ToArray();
+            return ValueTask.FromResult(true);
+        });
+
+        var transport = MeshHubFixture.CreateMockTransport();
+        var registeredTcs = new TaskCompletionSource<byte[]>();
+        var blockingReceive = new TaskCompletionSource<byte[]?>();
+
+        // Registration first, then a receive that blocks until the hub is stopped, so the receive
+        // loop parks instead of spinning on a repeated frame.
+        transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Alpha", [1, 2, 3, 4]))
+            .Returns(blockingReceive.Task);
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => registeredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] response = await registeredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x01, response[0]); // RegistrationComplete
+        Assert.Equal("Alpha", seenName);
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, seenCredential);
+
+        // End the receive loop so the handler completes and StopAsync does not wait on it.
+        blockingReceive.TrySetResult(null);
         await fixture.Hub.StopAsync();
     }
 

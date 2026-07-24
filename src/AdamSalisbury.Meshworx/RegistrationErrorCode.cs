@@ -24,4 +24,9 @@ public enum RegistrationErrorCode : byte
     /// The hub has reached its maximum number of registered clients and cannot accept more.
     /// </summary>
     HubAtCapacity = 0x04,
+
+    /// <summary>
+    /// The hub's authenticator rejected the client's credential.
+    /// </summary>
+    AuthenticationFailed = 0x05,
 }

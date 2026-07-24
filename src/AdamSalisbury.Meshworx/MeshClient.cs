@@ -94,7 +94,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public event EventHandler<DisconnectedEventArgs>? Disconnected;
 
     /// <inheritdoc/>
-    public async Task ConnectAsync(ITransport transport, string clientName, CancellationToken cancellationToken = default)
+    public async Task ConnectAsync(
+        ITransport transport,
+        string clientName,
+        ReadOnlyMemory<byte> credential = default,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(transport);
         ArgumentException.ThrowIfNullOrEmpty(clientName);
@@ -124,11 +128,14 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         try
         {
+            // Registration frame: [type][version][name length (2, big-endian)][name][credential].
             byte[] nameBytes = Encoding.UTF8.GetBytes(clientName);
-            var requestPayload = new byte[2 + nameBytes.Length];
+            var requestPayload = new byte[2 + 2 + nameBytes.Length + credential.Length];
             requestPayload[0] = (byte)MessageType.RegistrationRequest;
             requestPayload[1] = Protocol.Version;
-            nameBytes.CopyTo(requestPayload, 2);
+            BinaryPrimitives.WriteUInt16BigEndian(requestPayload.AsSpan(2, 2), (ushort)nameBytes.Length);
+            nameBytes.CopyTo(requestPayload, 4);
+            credential.Span.CopyTo(requestPayload.AsSpan(4 + nameBytes.Length));
             await _transport.SendAsync(requestPayload, cancellationToken).ConfigureAwait(false);
 
             byte[]? responseData = await _transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);

@@ -18,6 +18,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly int _maxClients;
     private readonly TimeSpan? _heartbeatInterval;
     private readonly int _maxMissedHeartbeats;
+    private readonly ClientAuthenticator? _authenticator;
     private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
     private readonly ConcurrentDictionary<string, Guid> _clientNames = new();
     private readonly ConcurrentDictionary<Task, byte> _handlerTasks = new();
@@ -50,13 +51,21 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// The number of consecutive idle intervals a client may go without sending any frame before it is
     /// evicted. Only used when <paramref name="heartbeatInterval"/> is set. Defaults to 2.
     /// </param>
+    /// <param name="authenticator">
+    /// An optional callback invoked for each registration to decide whether the client may join, given
+    /// its name and the opaque credential it supplied. Returning <see langword="false"/> refuses the
+    /// client with <see cref="RegistrationErrorCode.AuthenticationFailed"/>. When <see langword="null"/>
+    /// (the default) the hub performs no authentication and admits any peer that completes the
+    /// handshake — in that case the hub must only be exposed to a trusted network.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
         TimeSpan? registrationTimeout = null,
         int? maxClients = null,
         TimeSpan? heartbeatInterval = null,
-        int maxMissedHeartbeats = 2)
+        int maxMissedHeartbeats = 2,
+        ClientAuthenticator? authenticator = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -91,6 +100,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _maxClients = maxClients ?? int.MaxValue;
         _heartbeatInterval = heartbeatInterval;
         _maxMissedHeartbeats = maxMissedHeartbeats;
+        _authenticator = authenticator;
     }
 
     /// <inheritdoc/>
@@ -256,8 +266,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 }
             }
 
+            // Registration frame: [type][version][name length (2, big-endian)][name][credential].
             if (registrationData is null
-                || registrationData.Length < 3
+                || registrationData.Length < 2
                 || (MessageType)registrationData[0] != MessageType.RegistrationRequest)
             {
                 return;
@@ -271,13 +282,36 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 return;
             }
 
-            string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(2));
+            if (registrationData.Length < 4)
+            {
+                // Too short to carry the 2-byte name length; malformed.
+                return;
+            }
+
+            int registrationNameLength = BinaryPrimitives.ReadUInt16BigEndian(registrationData.AsSpan(2, 2));
+            if (registrationData.Length < 4 + registrationNameLength)
+            {
+                // Malformed frame: the declared name runs past the payload.
+                return;
+            }
+
+            string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(4, registrationNameLength));
 
             if (clientName.Length > Protocol.MaxClientNameLength)
             {
                 byte[] nameTooLongError =
                     [(byte)MessageType.Error, (byte)RegistrationErrorCode.ClientNameTooLong];
                 await transport.SendAsync(nameTooLongError, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            if (_authenticator is not null
+                && !await AuthenticateAsync(
+                        clientId, clientName, registrationData, registrationNameLength, cancellationToken)
+                    .ConfigureAwait(false))
+            {
+                byte[] authError = [(byte)MessageType.Error, (byte)RegistrationErrorCode.AuthenticationFailed];
+                await transport.SendAsync(authError, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
@@ -469,6 +503,39 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 await transport.DisposeAsync().ConfigureAwait(false);
             }
         }
+    }
+
+    private async Task<bool> AuthenticateAsync(
+        Guid clientId,
+        string clientName,
+        byte[] registrationData,
+        int nameLength,
+        CancellationToken cancellationToken)
+    {
+        // Copy the credential out of the registration frame so the context does not alias the larger
+        // inbound buffer, which is safer if a caller retains it beyond the call.
+        byte[] credential = registrationData.AsSpan(4 + nameLength).ToArray();
+        var context = new RegistrationContext { ClientName = clientName, Credential = credential };
+
+        bool authenticated;
+        try
+        {
+            authenticated = await _authenticator!(context, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A throwing authenticator must refuse the client, not fault the handler. Callback boundary.
+            _logger.LogError(ex, "Authenticator threw for client {ClientName}; refusing registration", clientName);
+            return false;
+        }
+
+        if (!authenticated)
+        {
+            _logger.LogWarning(
+                "Refusing client {ClientId} ({ClientName}): authentication failed", clientId, clientName);
+        }
+
+        return authenticated;
     }
 
     private void RaiseClientEvent(
