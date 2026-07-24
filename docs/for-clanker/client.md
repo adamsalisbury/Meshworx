@@ -18,7 +18,7 @@ up peers, manages group membership, and raises events for inbound traffic and di
 
 | Member | Signature / notes | Source |
 |---|---|---|
-| ctor | `MeshClient(ILogger<MeshClient>, TimeSpan? idleTimeout=null)` | `MeshClient.cs:43` |
+| ctor | `MeshClient(ILogger<MeshClient>, TimeSpan? idleTimeout=null, TimeSpan? sendTimeout=null, int maxSendAttempts=1, TimeSpan? sendRetryDelay=null)` | `MeshClient.cs:67` |
 | `Id` | `Guid` — assigned by hub; `Guid.Empty` when disconnected | `MeshClient.cs:58` |
 | `Name` | `string` — set on connect, cleared on disconnect | `MeshClient.cs:61` |
 | `IsConnected` | `bool` — true only in `Connected` state | `MeshClient.cs:64` |

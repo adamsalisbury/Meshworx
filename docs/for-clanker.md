@@ -197,9 +197,11 @@ through constructor parameters. The only ambient dependency is an `ILogger<T>` y
 | `heartbeatInterval` | `null` (disabled) | Ping idle clients; evict after missed intervals |
 | `maxMissedHeartbeats` | 2 | Idle intervals tolerated before eviction (see hub.md for exact off-by-one semantics) |
 
-**`MeshClient` options** (`MeshClient.cs:43`): `idleTimeout` (default `null`). Set it **above** the
-hub's `heartbeatInterval` so the hub's pings reset it; a genuinely silent hub then trips it and raises
-`Disconnected(ConnectionLost)`.
+**`MeshClient` options** (`MeshClient.cs:67`): `idleTimeout` (default `null`), `sendTimeout`
+(default `null`), `maxSendAttempts` (default `1` — the first attempt counts, so `1` disables retrying;
+only transient I/O errors are retried) and `sendRetryDelay` (default `100 ms`, linear back-off). Set
+`idleTimeout` **above** the hub's `heartbeatInterval` so the hub's pings reset it; a genuinely silent
+hub then trips it and raises `Disconnected(ConnectionLost)`.
 
 **`MeshClientReconnector` options** (`MeshClientReconnector.cs:53`): `retryDelay` (1 s), `connectTimeout`
 (10 s), optional `ILogger`.
