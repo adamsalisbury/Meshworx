@@ -21,6 +21,10 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport
     private readonly Stream _stream;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
+    // Reused across reads to hold each frame's length prefix. The transport is single-reader (see
+    // ITransport), so ReceiveAsync is never called concurrently and the buffer cannot be aliased.
+    private readonly byte[] _headerBuffer = new byte[HeaderSize];
+
     internal TcpTransport(TcpClient tcpClient)
     {
         _tcpClient = tcpClient;
@@ -182,13 +186,14 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport
     /// <inheritdoc/>
     public async Task<byte[]?> ReceiveAsync(CancellationToken cancellationToken = default)
     {
-        var header = await ReadBytesAsync(HeaderSize, cancellationToken).ConfigureAwait(false);
-        if (header is null)
+        // Read the length prefix into the reused header buffer; only the payload array below is
+        // allocated per frame, because it is handed back to the caller.
+        if (!await ReadExactlyAsync(_headerBuffer, cancellationToken).ConfigureAwait(false))
         {
             return null;
         }
 
-        int payloadLength = BinaryPrimitives.ReadInt32BigEndian(header);
+        int payloadLength = BinaryPrimitives.ReadInt32BigEndian(_headerBuffer);
 
         if (payloadLength is < 0 or > MaxPayloadSize)
         {
@@ -204,7 +209,13 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport
             return [];
         }
 
-        return await ReadBytesAsync(payloadLength, cancellationToken).ConfigureAwait(false);
+        var payload = new byte[payloadLength];
+        if (!await ReadExactlyAsync(payload, cancellationToken).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        return payload;
     }
 
     /// <inheritdoc/>
@@ -215,17 +226,17 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport
         _writeLock.Dispose();
     }
 
-    private async Task<byte[]?> ReadBytesAsync(int count, CancellationToken cancellationToken)
+    private async Task<bool> ReadExactlyAsync(byte[] buffer, CancellationToken cancellationToken)
     {
-        var buffer = new byte[count];
         try
         {
             await _stream.ReadExactlyAsync(buffer, cancellationToken).ConfigureAwait(false);
-            return buffer;
+            return true;
         }
         catch (EndOfStreamException)
         {
-            return null;
+            // The peer closed the connection (cleanly, or mid-frame); signal end of stream.
+            return false;
         }
     }
 }
