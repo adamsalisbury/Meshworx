@@ -234,6 +234,9 @@ must make deliberately.
     anyone and reduces TLS to obfuscation. Validate or pin properly.
   - `TcpTransport.IsEncrypted` reports whether a connection actually negotiated TLS — worth
     asserting in a start-up check.
+  - `MeshClientReconnector` needs no change: its transport factory just calls the TLS overload, so
+    every reconnect renegotiates —
+    `async ct => (ITransport)await TcpTransport.ConnectAsync("hub.example.com", 9000, tlsOptions, ct)`.
   - Handshakes run **off** the accept path, bounded by `tlsHandshakeTimeout` (10 seconds) and
     `maxConcurrentTlsHandshakes` (64), so a peer that connects and then stalls cannot block other
     clients from connecting, and a connection flood cannot demand unbounded handshake CPU. A
