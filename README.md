@@ -227,9 +227,14 @@ must make deliberately.
   Practical notes:
 
   - `TargetHost` defaults to the host passed to `ConnectAsync`, which is what the hub's certificate
-    is validated against. Both option objects are copied on the way in, so mutating your instance
-    afterwards does not change a live listener or connection.
+    is validated against. Both option objects are copied on the way in, so reassigning a property on
+    your instance afterwards does not change a live listener or connection. The copy is shallow, so
+    mutating a shared object you passed in — the `ClientCertificates` collection, the
+    `CertificateChainPolicy` — still will; treat those as immutable once handed over.
   - Leave `EnabledSslProtocols` unset so the platform negotiates its best available version.
+    `AllowRenegotiation` and `CertificateRevocationCheckMode` are likewise passed through untouched,
+    so they keep their platform defaults — notably, revocation is **not** checked unless you ask for
+    it.
   - A `RemoteCertificateValidationCallback` that always returns `true` accepts any certificate from
     anyone and reduces TLS to obfuscation. Validate or pin properly.
   - `TcpTransport.IsEncrypted` reports whether a connection actually negotiated TLS — worth
@@ -237,10 +242,16 @@ must make deliberately.
   - `MeshClientReconnector` needs no change: its transport factory just calls the TLS overload, so
     every reconnect renegotiates —
     `async ct => (ITransport)await TcpTransport.ConnectAsync("hub.example.com", 9000, tlsOptions, ct)`.
-  - Handshakes run **off** the accept path, bounded by `tlsHandshakeTimeout` (10 seconds) and
-    `maxConcurrentTlsHandshakes` (64), so a peer that connects and then stalls cannot block other
-    clients from connecting, and a connection flood cannot demand unbounded handshake CPU. A
-    handshake that fails or times out drops that connection only; the hub never sees it.
+  - Handshakes run **off** the accept path, and accepting is never gated on a handshake bound, so a
+    flood of peers that connect and then stay silent cannot stop the listener admitting anyone. A
+    connection counts against `maxConcurrentTlsHandshakes` (64) only once its peer has actually sent
+    something, which bounds handshake CPU without letting silent peers hold the budget; sixteen times
+    that many may be waiting to negotiate, beyond which new connections are refused rather than
+    queued. Every negotiation is bounded by `tlsHandshakeTimeout` (10 seconds). A handshake that
+    fails or times out drops that connection only; the hub never sees it.
+  - A transient accept failure does not retire the listener — the pump pauses briefly and carries on,
+    so a temporary descriptor shortage cannot leave the hub silently accepting nothing for the rest
+    of its life.
 
 - **Confidentiality.** Without TLS options the bundled TCP transport is cleartext: client names,
   assigned ids, group names and every message payload cross the wire in the clear, and an on-path

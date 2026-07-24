@@ -61,8 +61,8 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport
     public bool IsEncrypted => _stream is SslStream { IsEncrypted: true };
 
     /// <summary>
-    /// Creates a new <see cref="TcpTransport"/> by connecting to the specified remote endpoint,
-    /// **without** TLS.
+    /// Creates a new, unencrypted <see cref="TcpTransport"/> by connecting to the specified remote
+    /// endpoint.
     /// </summary>
     /// <remarks>
     /// The resulting connection is cleartext, so every client name, assigned id, group name and message

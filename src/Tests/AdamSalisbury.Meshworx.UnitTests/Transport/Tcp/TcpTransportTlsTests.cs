@@ -240,6 +240,69 @@ public sealed class TcpTransportTlsTests
     }
 
     /// <summary>
+    /// When far more peers connect and stay silent than there are handshake slots, a genuine client still
+    /// connects promptly. Silent peers must not be able to hold the handshake budget, or a trivial flood
+    /// would stop the listener admitting anyone.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ServerTls_SilentPeersOutnumberHandshakeSlots_GenuineClientStillConnects()
+    {
+        using X509Certificate2 serverCertificate = TestCertificates.CreateSelfSigned();
+
+        const int handshakeSlots = 2;
+        const int silentPeerCount = 12;
+
+        var listener = new TcpTransportListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new SslServerAuthenticationOptions { ServerCertificate = serverCertificate },
+            // Generous relative to the test's own deadline: if a silent peer could hold a handshake slot,
+            // the genuine client below would not get one before the assertion times out.
+            tlsHandshakeTimeout: TimeSpan.FromSeconds(20),
+            maxConcurrentTlsHandshakes: handshakeSlots);
+
+        await listener.StartAsync().ConfigureAwait(false);
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        var silentPeers = new List<System.Net.Sockets.TcpClient>();
+        try
+        {
+            for (int i = 0; i < silentPeerCount; i++)
+            {
+                var silent = new System.Net.Sockets.TcpClient();
+                silentPeers.Add(silent);
+                await silent.ConnectAsync(IPAddress.Loopback, port).ConfigureAwait(false);
+            }
+
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+            await using TcpTransport clientTransport = await TcpTransport.ConnectAsync(
+                "localhost",
+                port,
+                new SslClientAuthenticationOptions
+                {
+                    RemoteCertificateValidationCallback = TestCertificates.PinnedTo(serverCertificate),
+                },
+                deadline.Token).ConfigureAwait(false);
+
+            await using ITransport serverTransport =
+                await listener.AcceptAsync(deadline.Token).ConfigureAwait(false);
+
+            var payload = new byte[] { 9, 9, 9 };
+            await clientTransport.SendAsync(payload, deadline.Token).ConfigureAwait(false);
+            Assert.Equal(payload, await serverTransport.ReceiveAsync(deadline.Token).ConfigureAwait(false));
+        }
+        finally
+        {
+            foreach (System.Net.Sockets.TcpClient silent in silentPeers)
+            {
+                silent.Dispose();
+            }
+
+            await listener.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
     /// When a cleartext client connects to a TLS listener, its frames are not mistaken for a handshake:
     /// the listener refuses it rather than admitting an unencrypted peer.
     /// </summary>

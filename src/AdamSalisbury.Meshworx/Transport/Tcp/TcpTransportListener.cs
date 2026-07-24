@@ -21,10 +21,21 @@ public sealed class TcpTransportListener : ITransportListener
     private static readonly TimeSpan DefaultTlsHandshakeTimeout = TimeSpan.FromSeconds(10);
     private const int DefaultMaxConcurrentTlsHandshakes = 64;
 
+    // How many connections may be waiting to negotiate at once, as a multiple of the handshake
+    // concurrency limit. Negotiating connections are mostly idle — waiting on the peer's next flight — so
+    // this is deliberately far larger than the CPU bound: it exists to cap memory and descriptors, not
+    // work. Sizing it off the handshake limit keeps one knob meaningful instead of two.
+    private const int PendingHandshakeMultiplier = 16;
+
+    // Pause after a failed accept, so a persistent failure such as descriptor exhaustion cannot spin the
+    // pump hot while still recovering promptly once the condition clears.
+    private static readonly TimeSpan AcceptRetryDelay = TimeSpan.FromMilliseconds(50);
+
     private readonly IPEndPoint _endPoint;
     private readonly SslServerAuthenticationOptions? _tlsOptions;
     private readonly TimeSpan _tlsHandshakeTimeout;
     private readonly int _maxConcurrentTlsHandshakes;
+    private readonly int _maxPendingTlsHandshakes;
 
     private TcpListener? _listener;
 
@@ -55,8 +66,11 @@ public sealed class TcpTransportListener : ITransportListener
     /// </param>
     /// <param name="maxConcurrentTlsHandshakes">
     /// The maximum number of TLS handshakes to run at once. The handshake is asymmetric cryptography on
-    /// unauthenticated input, so this bounds the CPU a connection flood can demand; further connections
-    /// wait in the socket backlog. Defaults to 64. Ignored without <paramref name="tlsOptions"/>.
+    /// unauthenticated input, so this bounds the CPU a connection flood can demand. A connection only
+    /// counts against this once its peer has actually sent something, so peers that connect and stay
+    /// silent do not consume the budget. Sixteen times this value may be waiting to negotiate at any
+    /// moment, beyond which new connections are refused rather than queued. Defaults to 64. Ignored
+    /// without <paramref name="tlsOptions"/>.
     /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="endPoint"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException">
@@ -107,6 +121,7 @@ public sealed class TcpTransportListener : ITransportListener
         _tlsOptions = tlsOptions is null ? null : CloneServerOptions(tlsOptions);
         _tlsHandshakeTimeout = tlsHandshakeTimeout ?? DefaultTlsHandshakeTimeout;
         _maxConcurrentTlsHandshakes = maxConcurrentTlsHandshakes ?? DefaultMaxConcurrentTlsHandshakes;
+        _maxPendingTlsHandshakes = _maxConcurrentTlsHandshakes * PendingHandshakeMultiplier;
     }
 
     /// <summary>
@@ -295,7 +310,7 @@ public sealed class TcpTransportListener : ITransportListener
     }
 
     /// <summary>
-    /// Accepts sockets and hands each to a bounded pool of concurrent TLS handshakes, publishing the
+    /// Accepts sockets and negotiates each one's TLS handshake off the accept path, publishing the
     /// successfully authenticated transports for <see cref="AcceptAsync"/> to return.
     /// </summary>
     /// <remarks>
@@ -303,6 +318,13 @@ public sealed class TcpTransportListener : ITransportListener
     /// hostile peer serialising behind itself every other client waiting to connect: the hub's accept loop
     /// consumes one connection at a time, so an inline handshake would be head-of-line blocking on
     /// unauthenticated input.
+    /// <para>
+    /// The accept itself is never gated on a handshake bound. Waiting for a free handshake slot before
+    /// accepting would hand an attacker the whole listener: a few dozen peers that connect and then send
+    /// nothing would hold every slot until their timeout, and the loop would stop accepting entirely.
+    /// Admission is instead capped by a much larger pending bound that is polled, never waited on, so a
+    /// flood is shed as refused connections while the loop keeps draining the backlog.
+    /// </para>
     /// </remarks>
     private async Task HandshakePumpAsync(
         TcpListener listener,
@@ -312,29 +334,40 @@ public sealed class TcpTransportListener : ITransportListener
         // Yield so StartAsync returns before the first accept is issued, keeping it non-blocking.
         await Task.Yield();
 
-        using var slots = new SemaphoreSlim(_maxConcurrentTlsHandshakes, _maxConcurrentTlsHandshakes);
+        using var handshakeSlots = new SemaphoreSlim(_maxConcurrentTlsHandshakes, _maxConcurrentTlsHandshakes);
+        using var pendingSlots = new SemaphoreSlim(_maxPendingTlsHandshakes, _maxPendingTlsHandshakes);
         var inFlight = new ConcurrentDictionary<Task, byte>();
 
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                // Take a slot before accepting, so saturation leaves connections queued in the socket
-                // backlog — where the kernel bounds them — instead of in our own memory.
-                await slots.WaitAsync(cancellationToken).ConfigureAwait(false);
-
                 TcpClient tcpClient;
                 try
                 {
                     tcpClient = await listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
                 }
-                catch
+                catch (SocketException)
                 {
-                    slots.Release();
-                    throw;
+                    // A single accept failing — a peer resetting between the SYN and the accept, an
+                    // interrupted call, or a transient descriptor shortage — must not end the listener for
+                    // good. The cleartext path recovers from this because the hub's own accept loop logs
+                    // and continues; the pump has to recover for itself. Pause briefly so a persistent
+                    // failure such as descriptor exhaustion cannot spin this loop hot.
+                    await Task.Delay(AcceptRetryDelay, cancellationToken).ConfigureAwait(false);
+                    continue;
                 }
 
-                Task handshakeTask = HandshakeAsync(tcpClient, writer, slots, cancellationToken);
+                // Poll, never wait: a full pending set means shedding this connection immediately is far
+                // better than parking the accept loop, which is precisely the failure being avoided.
+                if (!pendingSlots.Wait(0, CancellationToken.None))
+                {
+                    tcpClient.Dispose();
+                    continue;
+                }
+
+                Task handshakeTask = HandshakeAsync(
+                    tcpClient, writer, handshakeSlots, pendingSlots, cancellationToken);
                 inFlight.TryAdd(handshakeTask, 0);
                 _ = handshakeTask.ContinueWith(t => inFlight.TryRemove(t, out _), TaskScheduler.Default);
             }
@@ -360,7 +393,7 @@ public sealed class TcpTransportListener : ITransportListener
         }
         finally
         {
-            // Wait for the outstanding handshakes so the semaphore is not disposed while they still hold
+            // Wait for the outstanding handshakes so the semaphores are not disposed while they still hold
             // slots, and so DisposeAsync does not return with sockets still being negotiated. HandshakeAsync
             // never faults — it swallows and disposes — so this cannot throw. No handshake is added after
             // the loop exits, so the snapshot is complete.
@@ -371,7 +404,8 @@ public sealed class TcpTransportListener : ITransportListener
     private async Task HandshakeAsync(
         TcpClient tcpClient,
         ChannelWriter<TcpTransport> writer,
-        SemaphoreSlim slots,
+        SemaphoreSlim handshakeSlots,
+        SemaphoreSlim pendingSlots,
         CancellationToken cancellationToken)
     {
         TcpTransport? transport = null;
@@ -379,15 +413,32 @@ public sealed class TcpTransportListener : ITransportListener
         {
             tcpClient.NoDelay = true;
 
-            var sslStream = new SslStream(tcpClient.GetStream(), leaveInnerStreamOpen: false);
+            NetworkStream networkStream = tcpClient.GetStream();
+            var sslStream = new SslStream(networkStream, leaveInnerStreamOpen: false);
             transport = new TcpTransport(tcpClient, sslStream);
 
-            // Bound the handshake: an unauthenticated peer must not be able to occupy a slot for as long
-            // as it likes by opening a connection and then going quiet.
+            // Bound the whole negotiation: an unauthenticated peer must not be able to hold a connection
+            // open for as long as it likes by connecting and then going quiet.
             using var handshakeCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             handshakeCts.CancelAfter(_tlsHandshakeTimeout);
 
-            await sslStream.AuthenticateAsServerAsync(_tlsOptions!, handshakeCts.Token).ConfigureAwait(false);
+            // Wait for the peer to actually send something before spending a handshake slot on it. A
+            // zero-byte read consumes nothing and completes only once data has arrived, so a peer that
+            // never sends a ClientHello waits out its timeout without ever occupying one of the slots that
+            // bound handshake CPU — which is what keeps a flood of silent peers from starving genuine
+            // clients of the ability to negotiate.
+            await networkStream.ReadAsync(Memory<byte>.Empty, handshakeCts.Token).ConfigureAwait(false);
+
+            await handshakeSlots.WaitAsync(handshakeCts.Token).ConfigureAwait(false);
+            try
+            {
+                await sslStream.AuthenticateAsServerAsync(_tlsOptions!, handshakeCts.Token)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                handshakeSlots.Release();
+            }
 
             await writer.WriteAsync(transport, cancellationToken).ConfigureAwait(false);
             transport = null;
@@ -409,7 +460,7 @@ public sealed class TcpTransportListener : ITransportListener
         }
         finally
         {
-            slots.Release();
+            pendingSlots.Release();
         }
     }
 }
