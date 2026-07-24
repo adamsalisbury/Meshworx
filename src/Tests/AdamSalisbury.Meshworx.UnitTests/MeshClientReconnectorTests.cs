@@ -1,9 +1,13 @@
 using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.Transport.InMemory;
 using AdamSalisbury.Meshworx.Transport.Tcp;
+using AdamSalisbury.Meshworx.UnitTests.Transport.Tcp;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
@@ -65,6 +69,49 @@ public sealed class MeshClientReconnectorTests
             async ct => (ITransport)await TcpTransport.ConnectAsync("localhost", 22001, ct));
 
         Assert.False(client.IsConnected);
+    }
+
+    /// <summary>
+    /// The TLS transport-factory idiom shown in the README really connects a reconnector to a
+    /// TLS-secured hub, and the client ends up on an encrypted transport.
+    /// </summary>
+    [Fact(Timeout = 20000)]
+    public async Task StartAsync_TlsTransportFactoryFromDocumentation_ConnectsOverEncryptedTransport()
+    {
+        using X509Certificate2 hubCertificate = TestCertificates.CreateSelfSigned("localhost");
+
+        var listener = new TcpTransportListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new SslServerAuthenticationOptions { ServerCertificate = hubCertificate });
+
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        var tlsOptions = new SslClientAuthenticationOptions
+        {
+            RemoteCertificateValidationCallback = TestCertificates.PinnedTo(hubCertificate),
+        };
+
+        TcpTransport? established = null;
+
+        await using var client = CreateClient();
+        await using var reconnector = new MeshClientReconnector(
+            client,
+            "Alice",
+            async ct =>
+            {
+                established = await TcpTransport.ConnectAsync("localhost", port, tlsOptions, ct);
+                return established;
+            });
+
+        await reconnector.StartAsync();
+
+        Assert.True(client.IsConnected);
+        Assert.True(hub.IsClientRegistered(client.Id));
+        Assert.True(established!.IsEncrypted);
+
+        await hub.StopAsync();
     }
 
     // StartAsync

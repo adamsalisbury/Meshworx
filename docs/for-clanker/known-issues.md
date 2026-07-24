@@ -10,7 +10,7 @@ the risk to a change, not a claim that the code is defective.
 | ID | Title | Where | Severity | Status |
 |---|---|---|---|---|
 | KI-1 | Full outbound queue silently drops the frame | `MeshHub.cs:790`, `:816`, `:948` | high (correctness) | open — by design |
-| KI-2 | Open admission by default; no authorisation model | system-wide | high (security) | **partly addressed** — authentication seam added (PR #56); open admission remains the default |
+| KI-2 | Open admission by default; no authorisation model | system-wide | high (security) | **partly addressed** — authentication seam added (PR #56), transport TLS added (PR #59); open admission and cleartext remain the *defaults* |
 | KI-3 | Client-name length checked in chars, not UTF-8 bytes | `MeshHub.cs:331`, `MeshClient.cs:102` | medium (correctness) | open |
 | KI-4 | Unknown recipient drops the message silently | `MeshHub.cs:776-782` | medium (correctness) | open — by design |
 | KI-5 | Delivery is unordered/unacked across the fan-out; no persistence | system-wide | medium (correctness) | open — by design |
@@ -25,6 +25,8 @@ the risk to a change, not a claim that the code is defective.
 | KI-14 | Protocol v3 is a hard break: v2 peers are refused, and `ConnectAsync` is source-breaking | `Messages/Protocol.cs:5`, `IMeshClient.cs:49` | high (compatibility) | open — by design |
 | KI-15 | `AuthenticationFailed` conflates refusal, throw, timeout and slot starvation | `MeshHub.cs:560-638` | medium (maintainability) | open — by design |
 | KI-16 | A reconnector's credential is fixed at construction and cannot be rotated | `MeshClientReconnector.cs:81`, `:137`, `:216` | medium (correctness) | open |
+| KI-17 | Sender identity is hop-by-hop: a compromised hub can forge any sender | system-wide | medium (security) | open — by design |
+| KI-18 | A failed TLS handshake is silent — the hub sees nothing at all | `TcpTransportListener.cs:446-460` | medium (maintainability) | open — by design |
 
 ---
 
@@ -41,13 +43,19 @@ the risk to a change, not a claim that the code is defective.
 
 ### KI-2 — Open admission by default; no authorisation model
 - **Where:** system-wide; registration `MeshHub.cs:277-395`, authentication `MeshHub.cs:560-638`.
-- **Status:** the *authentication* half now has a supported seam (PR #56, protocol version 3). The
-  *authorisation* half does not, and the default is still open admission.
-- **What exists:** pass a `ClientAuthenticator` to the `MeshHub` constructor and it is invoked for every
-  registration with the client's name and an opaque credential; returning `false` refuses the client
-  with `RegistrationErrorCode.AuthenticationFailed`. Clients supply the credential via
-  `ConnectAsync(transport, name, credential)` and `MeshClientReconnector`'s `credential` parameter,
-  which re-sends it on every reconnect. See [hub.md](hub.md#authentication).
+- **Status:** the *authentication* half now has a supported seam (PR #56, protocol version 3) and the
+  *transport* half can now be secured with TLS (PR #59). The *authorisation* half does not exist, and
+  both of the above are **opt-in** — the defaults are still open admission over a cleartext socket.
+- **What exists:**
+  - **Application-level authentication.** Pass a `ClientAuthenticator` to the `MeshHub` constructor and
+    it is invoked for every registration with the client's name and an opaque credential; returning
+    `false` refuses the client with `RegistrationErrorCode.AuthenticationFailed`. Clients supply the
+    credential via `ConnectAsync(transport, name, credential)` and `MeshClientReconnector`'s
+    `credential` parameter, which re-sends it on every reconnect. See [hub.md](hub.md#authentication).
+  - **Transport-level confidentiality, integrity and peer authentication.** Pass
+    `SslServerAuthenticationOptions` to `TcpTransportListener` and `SslClientAuthenticationOptions` to
+    `TcpTransport.ConnectAsync`; add `ClientCertificateRequired` for mutual TLS. Framing is unchanged.
+    See [transport.md](transport.md#turning-tls-on-both-ends).
 - **Why it still bites:**
   1. **No authenticator is the default.** A `MeshHub` constructed without one admits any peer that
      completes the handshake — exactly the pre-v3 behaviour. Nothing warns you.
@@ -58,13 +66,22 @@ the risk to a change, not a claim that the code is defective.
   3. **Names are not bound to identity.** The authenticator sees the requested name, but the hub's only
      name rule is uniqueness. Unless *your* callback ties credential to name, an authenticated client
      may register under any unused name, including one it has no right to.
-  4. **No confidentiality or integrity.** The bundled TCP transport is cleartext, and sender ids are
-     asserted by the hub, not authenticated end to end.
+  4. **Confidentiality and integrity are opt-in, and nothing warns you.** A listener constructed
+     without `tlsOptions`, or a client using the three-argument `TcpTransport.ConnectAsync(host, port,
+     ct)`, is **cleartext**: client names, assigned ids, group names and every message payload cross the
+     wire in the clear and can be modified in flight. There is no log line, no property check and no
+     handshake failure to tell you — only `TcpTransport.IsEncrypted` (`TcpTransport.cs:61`), which you
+     have to assert yourself.
+  5. **Even with TLS, sender identity is not end to end.** TLS secures each client–hub hop separately;
+     a delivered message's sender id is still asserted by the hub rather than signed by the sending
+     client. See KI-17.
 - **What to do:** supply an authenticator for anything beyond a trusted network, and bind the credential
-  to the requested `ClientName` inside it if names are meaningful to your application. Keep treating the
-  transport boundary as the trust boundary — run over TLS/VPN/mesh-mTLS where traffic crosses an
-  untrusted segment. Note the `TcpTransportListener(int port)` convenience constructor now binds
-  loopback only ([transport.md](transport.md)), so remote exposure is a deliberate act.
+  to the requested `ClientName` inside it if names are meaningful to your application. Configure TLS on
+  both ends where traffic crosses an untrusted segment — or run inside an already-encrypted channel
+  (VPN, service-mesh mTLS, a TLS-terminating proxy) if that is how your deployment already works. Assert
+  `IsEncrypted` in a start-up check so a mis-wired deployment fails loudly rather than quietly running
+  in the clear. Note the `TcpTransportListener(int port)` convenience constructor binds loopback only
+  ([transport.md](transport.md)), so remote exposure is a deliberate act.
 - **What not to do:** do not treat a returned `true` as an authorisation decision, and do not put
   expensive or non-constant-time credential checks in the callback without reading
   [hub.md](hub.md#authentication) first — it runs on unauthenticated input.
@@ -98,7 +115,7 @@ the risk to a change, not a claim that the code is defective.
 - **Where:** `MeshHub.cs:156-166` — iterates `_clients` and calls `client.Transport.SendAsync` directly,
   concurrently with each connection's still-running send loop.
 - **Why it bites:** two writers hit the same transport at once. This is **safe for `TcpTransport`**
-  (internal `SemaphoreSlim` write lock, `TcpTransport.cs:20`) and any transport that honours the
+  (internal `SemaphoreSlim` write lock, `TcpTransport.cs:32`) and any transport that honours the
   "`SendAsync` must be concurrency-safe" contract — but a custom transport that serialises incorrectly
   will interleave/corrupt framing during shutdown.
 - **What to do:** if you write a custom transport, make `SendAsync` genuinely concurrency-safe. Don't
@@ -209,6 +226,41 @@ the risk to a change, not a claim that the code is defective.
   long-lived credential, or dispose the reconnector and construct a new one with a fresh credential when
   rotation happens. If you need this properly, the shape to add is a credential factory mirroring
   `transportFactory` — note that would be a constructor change on a public sealed type.
+
+### KI-17 — Sender identity is hop-by-hop, not end to end
+- **Where:** system-wide. The hub stamps the sender id into every delivery frame it builds —
+  `RouteMessage` `MeshHub.cs:787`, `BroadcastMessage` `:805`, `SendToGroup` `:935` — from its own record
+  of the connection, and nothing in `Messages/` carries a signature. TLS, where configured, secures the
+  client↔hub connection only.
+- **Why it bites:** TLS makes it tempting to conclude the mesh is now "secure end to end". It is not.
+  Each client authenticates *the hub* (and, under mTLS, the hub authenticates *that client*), but a
+  recipient's trust in `SenderId` is entirely trust in the hub. **A compromised or malicious hub can
+  forge any sender id**, and mutual TLS does not change that — the hub is a full participant, not a
+  transparent pipe. Nor does TLS help with the authorisation gap in KI-2: any admitted client can still
+  message any other.
+- **What to do:** if recipients must be able to attribute a message to its sender independently of the
+  hub, sign the payload at the application layer and verify it in your `MessageReceived` handler. Do not
+  present transport TLS to stakeholders as end-to-end authenticity. Treat the hub as trusted
+  infrastructure and scope its blast radius accordingly.
+
+### KI-18 — A failed TLS handshake is invisible to everything above the transport
+- **Where:** `TcpTransportListener.HandshakeAsync`'s catch-all (`TcpTransportListener.cs:446-460`) —
+  disposes the connection and swallows the cause. The transport layer has no logger.
+- **Why it bites:** an untrusted or absent client certificate, a protocol/cipher mismatch, a peer that
+  exceeded `tlsHandshakeTimeout`, a cleartext client dialling a TLS listener, and a peer that reset all
+  produce **exactly the same observable outcome: nothing**. The hub never sees a connection, logs no
+  error, and the client gets a generic `AuthenticationException` or a closed socket. "The client cannot
+  connect and neither side says why" is the expected symptom of a TLS misconfiguration here, and it will
+  cost you time if you do not know that going in. The same silence covers the pending-bound shedding
+  path (`:363-367`), where a connection is dropped before a handshake is even attempted.
+- **What to do:** diagnose from the *client* side first — its exception is the only signal in the
+  system. Reproduce against a known-good configuration (`TcpTransportTlsTests` is the reference), and
+  narrow with `SSLKEYLOGFILE`/platform TLS tracing rather than expecting library logs. If you add
+  logging here, note that it would be the first `ILogger` dependency in the transport layer — a design
+  change, not a tweak, and one that logs unauthenticated peer input.
+- **What not to do:** do not narrow that `catch` so a handshake failure escapes. It runs on a background
+  pump; an escaping exception there kills the pump and, via the channel completion, the whole listener —
+  which is precisely the "one bad peer stops the hub" outcome the design avoids.
 
 ---
 

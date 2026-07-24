@@ -198,14 +198,76 @@ must make deliberately.
   public interface, pass an explicit `IPEndPoint` — and only do so behind an authenticator, a
   network boundary, or both.
 
-- **Confidentiality.** The bundled TCP transport is cleartext. Run it inside an already-encrypted
-  channel (VPN, service-mesh mTLS, a TLS-terminating proxy) when traffic crosses an untrusted
-  segment; message sender ids are asserted by the hub and are not authenticated end to end.
+- **Transport encryption (TLS).** The TCP transport runs cleartext by default and secured when you
+  give it TLS options. Pass `SslServerAuthenticationOptions` to the listener and
+  `SslClientAuthenticationOptions` to `TcpTransport.ConnectAsync`; the framing is identical either
+  way, so nothing else changes.
+
+  ```csharp
+  // Hub
+  var listener = new TcpTransportListener(
+      new IPEndPoint(IPAddress.Any, 9000),
+      new SslServerAuthenticationOptions { ServerCertificate = hubCertificate });
+
+  await using var hub = new MeshHub(logger, listener);
+  await hub.StartAsync();
+
+  // Client
+  await using var client = new MeshClient(clientLogger);
+  await client.ConnectAsync(
+      await TcpTransport.ConnectAsync("hub.example.com", 9000, new SslClientAuthenticationOptions()),
+      "Alice");
+  ```
+
+  For **mutual TLS**, set `ClientCertificateRequired = true` and a
+  `RemoteCertificateValidationCallback` on the server options, and supply `ClientCertificates` on
+  the client options. That authenticates the peer at the transport, which composes with — and is
+  independent of — the application-level `ClientAuthenticator` above.
+
+  Practical notes:
+
+  - `TargetHost` defaults to the host passed to `ConnectAsync`, which is what the hub's certificate
+    is validated against. Both option objects are copied on the way in, so reassigning a property on
+    your instance afterwards does not change a live listener or connection. The copy is shallow, so
+    mutating a shared object you passed in — the `ClientCertificates` collection, the
+    `CertificateChainPolicy` — still will; treat those as immutable once handed over.
+  - Leave `EnabledSslProtocols` unset so the platform negotiates its best available version.
+    `AllowRenegotiation` and `CertificateRevocationCheckMode` are likewise passed through untouched,
+    so they keep their platform defaults — notably, revocation is **not** checked unless you ask for
+    it.
+  - A `RemoteCertificateValidationCallback` that always returns `true` accepts any certificate from
+    anyone and reduces TLS to obfuscation. Validate or pin properly.
+  - `TcpTransport.IsEncrypted` reports whether a connection actually negotiated TLS — worth
+    asserting in a start-up check.
+  - `MeshClientReconnector` needs no change: its transport factory just calls the TLS overload, so
+    every reconnect renegotiates —
+    `async ct => (ITransport)await TcpTransport.ConnectAsync("hub.example.com", 9000, tlsOptions, ct)`.
+  - Handshakes run **off** the accept path, and accepting is never gated on a handshake bound, so a
+    flood of peers that connect and then stay silent cannot stop the listener admitting anyone. A
+    connection counts against `maxConcurrentTlsHandshakes` (64) only once its peer has actually sent
+    something, which bounds handshake CPU without letting silent peers hold the budget; sixteen times
+    that many may be waiting to negotiate, beyond which new connections are refused rather than
+    queued. Every negotiation is bounded by `tlsHandshakeTimeout` (10 seconds). A handshake that
+    fails or times out drops that connection only; the hub never sees it.
+  - A transient accept failure does not retire the listener — the pump pauses briefly and carries on,
+    so a temporary descriptor shortage cannot leave the hub silently accepting nothing for the rest
+    of its life.
+
+- **Confidentiality.** Without TLS options the bundled TCP transport is cleartext: client names,
+  assigned ids, group names and every message payload cross the wire in the clear, and an on-path
+  attacker can modify them. Configure TLS as above, or run inside an already-encrypted channel
+  (VPN, service-mesh mTLS, a TLS-terminating proxy), whenever traffic crosses an untrusted segment.
+
+- **Sender identity is hop-by-hop, not end to end.** TLS secures each client–hub connection
+  separately. The sender id in a delivered message is asserted by the hub, not signed by the sending
+  client, so a recipient is trusting the hub. A compromised hub can forge any sender. Sign payloads
+  at the application layer if you need end-to-end authenticity.
 
 ## Wire protocol
 
 The TCP transport frames every message as a **4-byte big-endian length prefix** followed by the
-payload (maximum 1 MiB). The first payload byte is the message type.
+payload (maximum 1 MiB). The first payload byte is the message type. Enabling TLS does not change
+any of this — the same frames simply travel inside the TLS record layer.
 
 Protocol version: **3**.
 

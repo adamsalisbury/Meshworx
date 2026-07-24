@@ -15,18 +15,37 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 | `Fixtures/MeshClientFixture.cs` | 106 | Client test harness (mock transport, scripted receive) |
 | `MeshHubTests.cs` | 1588 | Registration, **authentication**, routing, broadcast, groups, heartbeat, capacity, lifecycle |
 | `MeshClientTests.cs` | 1367 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events |
-| `MeshClientReconnectorTests.cs` | 479 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay |
-| `MeshIntegrationTests.cs` | 327 | Hub + real clients over `InMemoryTransport`, end-to-end |
+| `MeshClientReconnectorTests.cs` | 526 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory** |
+| `MeshIntegrationTests.cs` | 385 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** |
 | `Transport/InMemory/InMemoryTransportTests.cs` | 173 | Pair semantics, copy-on-send, close signalling |
 | `Transport/Tcp/TcpTransportTests.cs` | 342 | Framing, oversize rejection, invalid length, batch send |
 | `Transport/Tcp/TcpTransportLoopbackTests.cs` | 70 | Round-trip over a real stream |
-| `Transport/Tcp/TcpTransportListenerTests.cs` | 47 | Start/accept/dispose |
+| `Transport/Tcp/TcpTransportListenerTests.cs` | 47 | Start/accept/dispose (cleartext) |
+| `Transport/Tcp/TcpTransportTlsTests.cs` | 494 | Server TLS, mutual TLS, rejection paths, handshake timeout, silent-peer flood, constructor guards, `TargetHost` defaulting, `IsEncrypted` |
+| `Transport/Tcp/TlsOptionsCloneTests.cs` | 242 | Reflection-driven proof that both TLS option clones copy **every** settable property |
+| `Transport/Tcp/TestCertificates.cs` | 67 | Helper: self-signed certificate generation and a pinning validation callback |
 
 ## Testing conventions (follow these)
 
-- **Unit tests mock `ITransport` / `ITransportListener` with Moq — no real sockets.** The transport
-  contract is the seam. Integration tests use `InMemoryTransport` for a real end-to-end path without
-  ports.
+- **Hub and client tests mock `ITransport` / `ITransportListener` with Moq — no real sockets.** The
+  transport contract is the seam. Integration tests use `InMemoryTransport` for a real end-to-end path
+  without ports. **The exception is the TCP transport's own tests**, which must exercise real sockets;
+  see the TLS bullet below.
+- **TLS tests bind loopback on port 0 and read the port back.** `new TcpTransportListener(new
+  IPEndPoint(IPAddress.Loopback, 0), tlsOptions)` then `((IPEndPoint)listener.LocalEndPoint!).Port` —
+  that `internal` property exists for exactly this. Certificates come from
+  `TestCertificates.CreateSelfSigned(subjectName)` (`Transport/Tcp/TestCertificates.cs:17`) and trust is
+  established with `TestCertificates.PinnedTo(cert)` (`:59`) on both ends, never by returning `true`
+  from the validation callback. Every TLS test carries an explicit `[Fact(Timeout = …)]` (10–30 s) and
+  disposes the listener in a `finally`, because these tests can genuinely hang rather than fail.
+  Shrink the bounds under test — `tlsHandshakeTimeout: TimeSpan.FromMilliseconds(300)`,
+  `maxConcurrentTlsHandshakes: 2` — rather than waiting out the production defaults.
+- **Assert the negative directly when testing a denial-of-service property.** The silent-peer tests
+  (`TcpTransportTlsTests.cs:207`, `:263`) make the point that a surviving-client assertion alone is not
+  proof: one test asserts the abandoned peer's socket actually reaches end of stream (a zero-byte read),
+  the other floods with more silent peers than there are handshake slots. Copy that pairing if you touch
+  the pump — a test that only checks "a good client still got through" passes even with the protection
+  removed.
 - **Drive the receive loop with a `Channel`, not `SetupSequence` returning `null`.** A completed/`null`
   receive is now interpreted as a lost connection and triggers teardown. `MeshClientFixture`
   (`Fixtures/MeshClientFixture.cs:44-63`) writes the registration response and scripted frames into an
@@ -49,6 +68,15 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   `registrationTimeout`, concurrency bounded by the semaphore, and a successful admit carrying name plus
   credential. `HandleClient_EmptyClientName_DropsConnectionWithoutRegistering` covers the malformed-frame
   path.
+- **`TlsOptionsCloneTests` is an intentional tripwire, not a normal test.** It reflects over every
+  public settable property of `SslClientAuthenticationOptions` / `SslServerAuthenticationOptions`, sets
+  each to a non-default value, clones, and asserts the value survived. **An unrecognised property type
+  fails the test outright** — that is the design: a property added by a future .NET release must force
+  someone to decide how it is carried, rather than being silently dropped from a security setting.
+  `TargetHost` is excluded from the mechanical sweep because it is deliberately defaulted, and is
+  asserted separately (`TlsOptionsCloneTests.cs:35-37`, `:55`). If this test fails after an SDK bump,
+  fix the clone in `TcpTransport.CloneClientOptions` / `TcpTransportListener.CloneServerOptions` — do
+  not add an exclusion.
 - Test names use `Method_State_ExpectedBehaviour` with underscores (hence `CA1707` suppressed).
 
 ### Minimal end-to-end pattern (integration style)
