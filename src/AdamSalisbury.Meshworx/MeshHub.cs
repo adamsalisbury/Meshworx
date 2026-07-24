@@ -366,7 +366,13 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     if (data.Length >= 3 + nameLength)
                     {
                         string groupName = Encoding.UTF8.GetString(data.AsSpan(3, nameLength));
-                        SendToGroup(clientId, groupName, data.AsMemory(3 + nameLength));
+                        // Pass the original name bytes straight through so SendToGroup does not
+                        // re-encode the string it was just decoded from.
+                        SendToGroup(
+                            clientId,
+                            groupName,
+                            data.AsMemory(3, nameLength),
+                            data.AsMemory(3 + nameLength));
                     }
                 }
                 else if (data.Length >= 5
@@ -722,7 +728,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
     }
 
-    private void SendToGroup(Guid senderId, string groupName, ReadOnlyMemory<byte> messageData)
+    private void SendToGroup(
+        Guid senderId,
+        string groupName,
+        ReadOnlyMemory<byte> groupNameBytes,
+        ReadOnlyMemory<byte> messageData)
     {
         if (!_groups.TryGetValue(groupName, out Group? group))
         {
@@ -751,14 +761,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
 
         // One shared, never-mutated delivery frame across every recipient's queue (see
-        // BroadcastMessage). The frame carries the group name so recipients know its origin.
-        byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
-        var deliveryPayload = new byte[1 + 16 + 2 + nameBytes.Length + messageData.Length];
+        // BroadcastMessage). The frame carries the group name so recipients know its origin. The
+        // name bytes are copied straight from the inbound frame rather than re-encoding the string.
+        int nameLength = groupNameBytes.Length;
+        var deliveryPayload = new byte[1 + 16 + 2 + nameLength + messageData.Length];
         deliveryPayload[0] = (byte)MessageType.DeliverGroupMessage;
         senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
-        BinaryPrimitives.WriteUInt16BigEndian(deliveryPayload.AsSpan(17, 2), (ushort)nameBytes.Length);
-        nameBytes.CopyTo(deliveryPayload, 19);
-        messageData.CopyTo(deliveryPayload.AsMemory(19 + nameBytes.Length));
+        BinaryPrimitives.WriteUInt16BigEndian(deliveryPayload.AsSpan(17, 2), (ushort)nameLength);
+        groupNameBytes.Span.CopyTo(deliveryPayload.AsSpan(19));
+        messageData.CopyTo(deliveryPayload.AsMemory(19 + nameLength));
 
         foreach (Guid recipientId in recipients)
         {
