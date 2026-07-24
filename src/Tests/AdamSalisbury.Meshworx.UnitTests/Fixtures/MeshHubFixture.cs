@@ -21,7 +21,8 @@ internal sealed class MeshHubFixture
         int? maxClients = null,
         TimeSpan? heartbeatInterval = null,
         int maxMissedHeartbeats = 2,
-        ClientAuthenticator? authenticator = null)
+        ClientAuthenticator? authenticator = null,
+        int? maxConcurrentAuthentications = null)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -43,7 +44,8 @@ internal sealed class MeshHubFixture
             maxClients,
             heartbeatInterval,
             maxMissedHeartbeats,
-            authenticator);
+            authenticator,
+            maxConcurrentAuthentications);
     }
 
     /// <summary>

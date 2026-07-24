@@ -126,7 +126,9 @@ new MeshHub(
     registrationTimeout: TimeSpan.FromSeconds(10),  // drop connections that never register
     maxClients: 1000,                               // refuse registration beyond this (default: unlimited)
     heartbeatInterval: TimeSpan.FromSeconds(30),    // ping idle clients (default: disabled)
-    maxMissedHeartbeats: 2);                        // evict after this many silent intervals
+    maxMissedHeartbeats: 2,                         // evict after this many silent intervals
+    authenticator: authenticator,                   // decide who may register (default: none — see Security)
+    maxConcurrentAuthentications: 64);              // cap concurrent authenticator calls (default: 64)
 ```
 
 When a heartbeat interval is set, the hub pings idle clients and evicts any that fail to send a
@@ -183,6 +185,14 @@ must make deliberately.
   The client supplies its credential through `ConnectAsync(transport, name, credential)` (and
   `MeshClientReconnector`'s `credential` parameter, which re-sends it on every reconnect).
 
+  The authenticator runs on **unauthenticated input**, once per accepted connection, so any peer that
+  can reach the port can cause it to run. Compare credentials in constant time, and keep the callback
+  cheap or externally rate-limited. The hub caps how many callbacks run at once —
+  `maxConcurrentAuthentications`, 64 by default — so a connection flood cannot turn a deliberately
+  expensive credential check into a denial of service; a connection that cannot get a slot within
+  `registrationTimeout` is refused with `AuthenticationFailed`. An authenticator that throws, hangs
+  past `registrationTimeout`, or cancels is treated as a refusal rather than faulting the hub.
+
 - **Network exposure.** The `TcpTransportListener(int port)` convenience constructor binds to
   `IPAddress.Loopback`, so a hub created that way is not reachable from other hosts. To listen on a
   public interface, pass an explicit `IPEndPoint` — and only do so behind an authenticator, a
@@ -220,6 +230,9 @@ Protocol version: **3**.
 Registration error codes (`RegistrationErrorCode`): `DuplicateClientName` (`0x01`),
 `UnsupportedProtocolVersion` (`0x02`), `ClientNameTooLong` (`0x03`), `HubAtCapacity` (`0x04`),
 `AuthenticationFailed` (`0x05`).
+
+A registration frame whose declared name length is zero, or which runs past the payload, is malformed:
+the hub drops the connection without replying.
 
 ## Custom transports
 
