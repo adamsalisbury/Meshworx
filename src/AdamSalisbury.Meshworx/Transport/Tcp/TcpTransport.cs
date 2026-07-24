@@ -119,49 +119,63 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport
             return;
         }
 
+        // Frame only the valid prefix up to the first oversize payload (if any). Writing that prefix
+        // before throwing preserves the single-send path's deliver-then-fault behaviour: frames
+        // coalesced ahead of an oversize one are still delivered, rather than the whole batch being
+        // discarded because a later frame is invalid.
         long frameSize = 0;
+        int validCount = messages.Count;
         for (int i = 0; i < messages.Count; i++)
         {
-            int length = messages[i].Length;
-            if (length > MaxPayloadSize)
+            if (messages[i].Length > MaxPayloadSize)
             {
-                throw new ArgumentException(
-                    $"Payload size {length} exceeds the maximum frame payload of {MaxPayloadSize} bytes.",
-                    nameof(messages));
+                validCount = i;
+                break;
             }
 
-            frameSize += HeaderSize + length;
+            frameSize += HeaderSize + messages[i].Length;
         }
 
-        // The send loop bounds a batch's total size, so frameSize is well within int range here; the
-        // cast is safe. Renting a single buffer keeps the whole batch to one write and one flush.
-        byte[] frame = ArrayPool<byte>.Shared.Rent((int)frameSize);
-        try
+        if (frameSize > 0)
         {
-            int offset = 0;
-            for (int i = 0; i < messages.Count; i++)
-            {
-                ReadOnlyMemory<byte> message = messages[i];
-                BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(offset), message.Length);
-                offset += HeaderSize;
-                message.Span.CopyTo(frame.AsSpan(offset));
-                offset += message.Length;
-            }
-
-            await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            // The send loop bounds a batch's total size, so frameSize is well within int range here;
+            // the cast is safe. Renting a single buffer keeps the prefix to one write and one flush.
+            byte[] frame = ArrayPool<byte>.Shared.Rent((int)frameSize);
             try
             {
-                await _stream.WriteAsync(frame.AsMemory(0, offset), cancellationToken).ConfigureAwait(false);
-                await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+                int offset = 0;
+                for (int i = 0; i < validCount; i++)
+                {
+                    ReadOnlyMemory<byte> message = messages[i];
+                    BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(offset), message.Length);
+                    offset += HeaderSize;
+                    message.Span.CopyTo(frame.AsSpan(offset));
+                    offset += message.Length;
+                }
+
+                await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await _stream.WriteAsync(frame.AsMemory(0, offset), cancellationToken).ConfigureAwait(false);
+                    await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    _writeLock.Release();
+                }
             }
             finally
             {
-                _writeLock.Release();
+                ArrayPool<byte>.Shared.Return(frame);
             }
         }
-        finally
+
+        if (validCount < messages.Count)
         {
-            ArrayPool<byte>.Shared.Return(frame);
+            int length = messages[validCount].Length;
+            throw new ArgumentException(
+                $"Payload size {length} exceeds the maximum frame payload of {MaxPayloadSize} bytes.",
+                nameof(messages));
         }
     }
 

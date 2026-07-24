@@ -295,6 +295,29 @@ public sealed class TcpTransportTests
         Assert.Equal(1, stream.WriteCount);
     }
 
+    /// <summary>
+    /// When a batch contains a valid frame ahead of an oversize one, the valid frame is written before
+    /// the batched send throws — matching the single-send path's deliver-then-fault behaviour rather
+    /// than discarding the whole batch.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_Batch_OversizeFrameAfterValid_WritesValidPrefixThenThrows()
+    {
+        var stream = new MemoryStream();
+        var transport = new TcpTransport(stream);
+
+        var valid = new byte[] { 1, 2, 3 };
+        var oversize = new byte[(1024 * 1024) + 1];
+        ReadOnlyMemory<byte>[] batch = [valid, oversize];
+
+        await Assert.ThrowsAsync<ArgumentException>(async () => await transport.SendAsync(batch));
+
+        // The valid frame ahead of the oversize one must still have reached the stream.
+        var readBack = new TcpTransport(new MemoryStream(stream.ToArray()));
+        Assert.Equal(valid, await readBack.ReceiveAsync());
+        Assert.Null(await readBack.ReceiveAsync());
+    }
+
     private sealed class CountingStream : MemoryStream
     {
         public int WriteCount { get; private set; }
