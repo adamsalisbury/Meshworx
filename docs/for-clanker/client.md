@@ -192,6 +192,9 @@ await using var reconnector = new MeshClientReconnector(
     "Alice",
     async ct => await TcpTransport.ConnectAsync("localhost", 22001, ct));
 
+// Against a TLS hub the factory simply calls the TLS overload, so every reconnect renegotiates:
+//   async ct => (ITransport)await TcpTransport.ConnectAsync("hub.example.com", 22001, tlsOptions, ct)
+
 reconnector.Reconnected += async (_, _) =>
 {
     foreach (string group in savedGroups) await reconnector.Client.JoinGroupAsync(group);

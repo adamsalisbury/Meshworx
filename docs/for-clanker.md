@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 747c58d
+reconciled-to-commit: 95b408c
 reconciled-to-date: 2026-07-24
 mode: update
 -->
@@ -12,17 +12,19 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `feat/issue-6-registration-authentication` (`747c58d`), which is `main`
-> plus the registration-authentication work (PR #56, protocol version 3). If you are on `main` or
-> another branch, the wire protocol and the `ConnectAsync` / `MeshHub` signatures described here will
-> not match your working tree.
+> **Documented tree:** branch `feat/tls-tcp-transport` (`95b408c`), which is `main` (`cf4b180`,
+> including the registration-authentication work of PR #56 and protocol version 3) plus the TLS
+> transport work (PR #59, closing issue #7). If you are on `main`, `TcpTransport` and
+> `TcpTransportListener` have no TLS surface and the coordinates in
+> [transport.md](for-clanker/transport.md) will not match your working tree; everything else does.
 >
 > **Known documentation gap:** the coordinates (`path:line`) for `MeshClient.cs` and
 > `MeshClientReconnector.cs` outside the registration path were written against an older tree and have
 > since drifted — PRs #52 (reconnector group-membership restore) and #55 (client send timeout and
-> retry) landed on `main` after this documentation set was first written and have not been reconciled.
-> Names and behaviour are accurate; the line numbers in those two files may be tens of lines out. Every
-> `MeshHub.cs` coordinate is current.
+> retry) landed on `main` after this documentation set was first written and have **still** not been
+> reconciled; PR #59 did not touch either file and deliberately left them alone. Names and behaviour are
+> accurate; the line numbers in those two files may be tens of lines out. Every `MeshHub.cs`,
+> `TcpTransport.cs` and `TcpTransportListener.cs` coordinate is current.
 
 ---
 
@@ -55,7 +57,8 @@ every other client and every group. Treat the transport boundary as the trust bo
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
 | Wire protocol version | `3` | `Messages/Protocol.cs:5` |
-| Max frame payload (TCP) | 1 MiB (`1024*1024`) | `Transport/Tcp/TcpTransport.cs:18` |
+| Max frame payload (TCP) | 1 MiB (`1024*1024`) | `Transport/Tcp/TcpTransport.cs:28` |
+| TCP transport encryption | Optional TLS, **off by default** | `Transport/Tcp/TcpTransport.cs:137`, `TcpTransportListener.cs:86` |
 | Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:6` |
 | Warnings as errors | Yes (`Directory.Build.props`) | `src/Directory.Build.props:3` |
 
@@ -87,11 +90,22 @@ ClientAuthenticator authenticator = (context, _) =>
 await using var hub = new MeshHub(logger, listener, authenticator: authenticator);
 ```
 
+Add transport encryption by giving the listener TLS options — separate from, and composable with, the
+authenticator above. Framing is unchanged, so nothing else in the stack cares:
+
+```csharp
+var listener = new TcpTransportListener(
+    new IPEndPoint(IPAddress.Any, 22001),
+    new SslServerAuthenticationOptions { ServerCertificate = hubCertificate });
+```
+
 **Connect a client:**
 
 ```csharp
 await using var client = new MeshClient(loggerFactory.CreateLogger<MeshClient>());
-var transport = await TcpTransport.ConnectAsync("localhost", 22001);
+var transport = await TcpTransport.ConnectAsync("localhost", 22001);   // CLEARTEXT — see transport.md
+// ... or, against a TLS listener:
+// var transport = await TcpTransport.ConnectAsync("hub.example.com", 22001, new SslClientAuthenticationOptions());
 await client.ConnectAsync(transport, clientName: "Alice");   // client TAKES OWNERSHIP of transport
 // ... or, against a hub with an authenticator:
 // await client.ConnectAsync(transport, "Alice", credential: Encoding.UTF8.GetBytes(apiKey));
@@ -168,7 +182,7 @@ receive loops never block on a slow recipient's socket; they just enqueue. See
 |---|---|---|
 | Hub: routing, groups, heartbeat, lifecycle | `MeshHub`, `IMeshHub` | [hub.md](for-clanker/hub.md) |
 | Client + reconnection | `MeshClient`, `IMeshClient`, `MeshClientReconnector` | [client.md](for-clanker/client.md) |
-| Transports | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `TcpTransport(Listener)`, `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
+| Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `TcpTransport(Listener)`, `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
 | Wire protocol & framing | `MessageType`, `Protocol`, handshake, opcode payloads | [protocol.md](for-clanker/protocol.md) |
 | Public value types | event args, `DisconnectReason`, `RegistrationErrorCode`, `ClientAuthenticator`, `RegistrationContext`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
 | Tests, fixtures, build/CI | xUnit + Moq suite, `MeshHubFixture`, `MeshClientFixture` | [testing.md](for-clanker/testing.md) |
@@ -187,7 +201,7 @@ deadlocks or dropped messages that tests may not catch.
   block on async (`.Result` / `.Wait()`).
 - **`ITransport` contract:** `SendAsync` must be safe to call **concurrently**; `ReceiveAsync` is
   **single-reader** (never called concurrently). Both hub and client rely on this. `TcpTransport`
-  enforces send-concurrency with an internal `SemaphoreSlim` write lock (`TcpTransport.cs:20`).
+  enforces send-concurrency with an internal `SemaphoreSlim` write lock (`TcpTransport.cs:32`).
 - **Hub per-connection tasks:** each accepted connection runs a **receive loop** (`HandleClientAsync`),
   a **send loop** (`SendLoopAsync`, drains the bounded outbound `Channel`), and — only when heartbeats
   are configured — a **heartbeat monitor** (`MonitorHeartbeatAsync`, one `PeriodicTimer`). All share one
@@ -234,7 +248,22 @@ hub then trips it and raises `Disconnected(ConnectionLost)`.
 (10 s), `restoreGroupMembership`, optional `ILogger`, and `credential` (empty; replayed on every
 reconnect — it cannot be changed afterwards, see [known-issues.md](for-clanker/known-issues.md) KI-16).
 
+**`TcpTransportListener` options** (`TcpTransportListener.cs:86`, all optional):
+
+| Param | Default | Effect |
+|---|---|---|
+| `tlsOptions` | `null` (**cleartext**) | `SslServerAuthenticationOptions` used to authenticate every accepted connection as the server; set `ClientCertificateRequired` for mutual TLS |
+| `tlsHandshakeTimeout` | 10 s | Bounds a single negotiation; ignored without `tlsOptions` |
+| `maxConcurrentTlsHandshakes` | 64 | Caps concurrent handshakes (CPU bound, **not** an admission limit); 16× that many may be pending. Ignored without `tlsOptions` |
+
+Client-side TLS is configured per connection, not per client: pass `SslClientAuthenticationOptions` to
+`TcpTransport.ConnectAsync`. Both option objects are **copied** on the way in (shallow), so reassigning
+a property afterwards does not affect a live listener or connection — but mutating a shared object you
+handed over still does. Details in [transport.md](for-clanker/transport.md).
+
 All constructors validate ranges and throw `ArgumentOutOfRangeException` for non-positive timeouts/counts.
+`TcpTransportListener` additionally throws `ArgumentException` if `tlsOptions` carries no certificate,
+certificate context, or certificate-selection callback.
 
 ---
 
@@ -311,6 +340,12 @@ there is no publish step in CI — CI only builds and tests.
   `CancellationToken`, so positional call sites no longer compile. KI-14.
 - **`new TcpTransportListener(port)` binds loopback**, not every interface. Remote clients cannot reach
   a hub created that way; pass an explicit `IPEndPoint` to expose it deliberately.
+- **The TCP transport is cleartext unless you pass TLS options** to both the listener and
+  `TcpTransport.ConnectAsync`. Nothing warns you; assert `TcpTransport.IsEncrypted` at start-up if it
+  matters. Even with TLS, security is **hop-by-hop**: a delivered message's sender id is asserted by the
+  hub, not signed by the sender, so a compromised hub can forge one. KI-2, KI-17.
+- **A failed TLS handshake is silent on the listener side** — no log, no exception, the hub simply never
+  sees the connection. Diagnose from the client. KI-18.
 - **Client-name length is checked in `char`s (UTF-16 units), not UTF-8 bytes**, on both sides — a name
   can encode to more bytes than you expect. Names are also case-sensitive and `Ordinal`-compared.
 - **Group membership is fire-and-forget and optimistic on the client.** The client's `JoinedGroups`
