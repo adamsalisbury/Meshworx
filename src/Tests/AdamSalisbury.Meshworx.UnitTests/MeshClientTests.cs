@@ -1039,6 +1039,39 @@ public sealed class MeshClientTests
     }
 
     /// <summary>
+    /// When the connection ends, the Disconnected event carries the groups the client was a member of,
+    /// captured before the client clears its membership as it resets.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_ConnectionClosed_DisconnectedCarriesJoinedGroups()
+    {
+        var fixture = new MeshClientFixture();
+        var channel = Channel.CreateUnbounded<byte[]?>();
+        channel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct));
+
+        var argsTcs = new TaskCompletionSource<DisconnectedEventArgs>();
+        fixture.Client.Disconnected += (_, e) => argsTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+        await fixture.Client.JoinGroupAsync("alpha");
+        await fixture.Client.JoinGroupAsync("beta");
+
+        // Close the connection: the receive loop reads null and tears the connection down.
+        channel.Writer.TryWrite(null);
+
+        DisconnectedEventArgs args = await argsTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(DisconnectReason.ConnectionLost, args.Reason);
+        Assert.Equal(2, args.JoinedGroups.Count);
+        Assert.Contains("alpha", args.JoinedGroups);
+        Assert.Contains("beta", args.JoinedGroups);
+    }
+
+    /// <summary>
     /// When the connection is lost remotely, the client resets to a disconnected state so its
     /// Id is cleared and further sends are rejected.
     /// </summary>
