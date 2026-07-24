@@ -1,9 +1,12 @@
 using System.Buffers.Binary;
 using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport.InMemory;
 using AdamSalisbury.Meshworx.Transport.Tcp;
+using AdamSalisbury.Meshworx.UnitTests.Transport.Tcp;
 using Microsoft.Extensions.Logging;
 using Moq;
 
@@ -323,5 +326,60 @@ public sealed class MeshIntegrationTests
 
         DisconnectReason reason = await reasonTcs.Task.WaitAsync(WaitTimeout);
         Assert.Equal(DisconnectReason.RemoteDisconnect, reason);
+    }
+
+    /// <summary>
+    /// The whole stack — registration with a credential, name lookup, and routed delivery — runs over a
+    /// mutually authenticated TLS connection, with both ends confirming the byte stream is encrypted.
+    /// </summary>
+    [Fact(Timeout = 20000)]
+    public async Task EndToEnd_MessageRoutedBetweenTwoClientsOverMutualTls()
+    {
+        using X509Certificate2 hubCertificate = TestCertificates.CreateSelfSigned("localhost");
+        using X509Certificate2 clientCertificate = TestCertificates.CreateSelfSigned("mesh-client");
+
+        var listener = new TcpTransportListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new SslServerAuthenticationOptions
+            {
+                ServerCertificate = hubCertificate,
+                ClientCertificateRequired = true,
+                RemoteCertificateValidationCallback = TestCertificates.PinnedTo(clientCertificate),
+            });
+
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        var clientTlsOptions = new SslClientAuthenticationOptions
+        {
+            ClientCertificates = [clientCertificate],
+            RemoteCertificateValidationCallback = TestCertificates.PinnedTo(hubCertificate),
+        };
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        TcpTransport bobTransport = await TcpTransport.ConnectAsync("localhost", port, clientTlsOptions);
+        TcpTransport aliceTransport = await TcpTransport.ConnectAsync("localhost", port, clientTlsOptions);
+
+        Assert.True(bobTransport.IsEncrypted);
+        Assert.True(aliceTransport.IsEncrypted);
+
+        await bob.ConnectAsync(bobTransport, "Bob");
+        await alice.ConnectAsync(aliceTransport, "Alice");
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        bob.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        Guid? bobId = await alice.GetClientIdByNameAsync("Bob");
+        Assert.Equal(bob.Id, bobId);
+
+        byte[] payload = Encoding.UTF8.GetBytes("hello over tls");
+        await alice.SendAsync(bobId!.Value, payload);
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(alice.Id, received.SenderId);
+        Assert.Equal(payload, received.Data.ToArray());
     }
 }
