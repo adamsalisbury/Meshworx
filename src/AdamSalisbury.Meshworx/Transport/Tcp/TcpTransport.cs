@@ -173,11 +173,20 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport
         }
     }
 
-    private static SslClientAuthenticationOptions CloneClientOptions(
+    /// <summary>
+    /// Copies every setting from the caller's options, defaulting an unset target host to
+    /// <paramref name="host"/>.
+    /// </summary>
+    /// <remarks>
+    /// Every settable property must be copied. A property left out here silently discards the caller's
+    /// intent, which for a security setting means quietly weakening the connection — so this is covered
+    /// by a reflection test that fails when the framework type gains a property this does not handle.
+    /// </remarks>
+    internal static SslClientAuthenticationOptions CloneClientOptions(
         SslClientAuthenticationOptions source,
         string host)
     {
-        return new SslClientAuthenticationOptions
+        var clone = new SslClientAuthenticationOptions
         {
             // Without a target host the platform cannot match the certificate's subject against anything,
             // so fall back to the host we dialled. That is the name the caller expressed trust in.
@@ -195,6 +204,17 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport
             LocalCertificateSelectionCallback = source.LocalCertificateSelectionCallback,
             RemoteCertificateValidationCallback = source.RemoteCertificateValidationCallback,
         };
+
+        // The RSA padding switches only exist on Linux and Windows; reading them elsewhere throws. They
+        // still have to be carried across where they do exist, since a caller that turned off PKCS#1 v1.5
+        // padding must not have it silently restored by the copy.
+        if (OperatingSystem.IsLinux() || OperatingSystem.IsWindows())
+        {
+            clone.AllowRsaPkcs1Padding = source.AllowRsaPkcs1Padding;
+            clone.AllowRsaPssPadding = source.AllowRsaPssPadding;
+        }
+
+        return clone;
     }
 
     /// <inheritdoc/>
