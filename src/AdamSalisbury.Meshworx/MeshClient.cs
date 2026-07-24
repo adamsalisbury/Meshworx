@@ -47,14 +47,17 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// interval so the hub's pings keep the connection alive. Defaults to <see langword="null"/> (no timeout).
     /// </param>
     /// <param name="sendTimeout">
-    /// The maximum time a single message send may take before it is abandoned with a
-    /// <see cref="TimeoutException"/>. Applies to <see cref="SendAsync"/>, <see cref="BroadcastAsync"/>
-    /// and <see cref="SendToGroupAsync"/>. Defaults to <see langword="null"/> (no timeout).
+    /// The maximum time a single message send may take before it is cancelled and fails with a
+    /// <see cref="TimeoutException"/>. Cancelling releases the transport so a stalled send does not block
+    /// the connection. Applies to <see cref="SendAsync"/>, <see cref="BroadcastAsync"/> and
+    /// <see cref="SendToGroupAsync"/>. A timed-out send is not retried. Defaults to <see langword="null"/>
+    /// (no timeout).
     /// </param>
     /// <param name="maxSendAttempts">
-    /// The maximum number of attempts a send is given when it fails with a transient transport error (a
-    /// timeout or an I/O/socket failure). The first attempt counts, so a value of 1 disables retrying.
-    /// Logic errors, cancellation, and a closed connection are never retried. Defaults to 1.
+    /// The maximum number of attempts a send is given when it fails with a transient transport I/O error
+    /// (an <see cref="IOException"/> or <see cref="SocketException"/>). The first attempt counts, so a
+    /// value of 1 disables retrying. Timeouts, logic errors, cancellation, and a closed connection are
+    /// never retried. Defaults to 1.
     /// </param>
     /// <param name="sendRetryDelay">
     /// The base delay between send retries; each successive retry waits this multiplied by the attempt
@@ -413,28 +416,19 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             try
             {
-                Task sendTask = transport.SendAsync(payload, cancellationToken);
-
-                if (_sendTimeout is { } timeout)
-                {
-                    // WaitAsync bounds the wait regardless of whether the transport honours the token,
-                    // surfacing a TimeoutException when the send does not complete in time.
-                    await sendTask.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
-                }
-                else
-                {
-                    await sendTask.ConfigureAwait(false);
-                }
-
+                await SendOnceAsync(transport, payload, cancellationToken).ConfigureAwait(false);
                 return;
             }
             catch (Exception ex) when (
                 attempt < _maxSendAttempts
                 && !cancellationToken.IsCancellationRequested
-                && ex is TimeoutException or IOException or SocketException)
+                && ex is IOException or SocketException)
             {
-                // Only transient transport failures are retried; logic errors, cancellation and a closed
-                // connection (ObjectDisposedException) fall through and propagate to the caller.
+                // Only a transient transport I/O failure is retried, and only for a transport that does
+                // not partially transmit a message before failing (the ITransport "send a complete
+                // message" contract). A timeout is deliberately not retried: cancelling a stalled write
+                // may leave a stream framing partly written, so it surfaces to the caller instead. Logic
+                // errors, cancellation and a closed connection (ObjectDisposedException) also propagate.
                 _logger.LogDebug(
                     ex,
                     "Transient failure sending to the hub on attempt {Attempt} of {MaxAttempts}; retrying",
@@ -442,6 +436,33 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     _maxSendAttempts);
                 await Task.Delay(_sendRetryDelay * attempt, cancellationToken).ConfigureAwait(false);
             }
+        }
+    }
+
+    private async Task SendOnceAsync(
+        ITransport transport,
+        ReadOnlyMemory<byte> payload,
+        CancellationToken cancellationToken)
+    {
+        if (_sendTimeout is not { } timeout)
+        {
+            await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // Bound the send by cancelling it, not by abandoning the wait: cancelling releases the
+        // transport's write path and any pooled buffer so a stalled send cannot block the connection.
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(timeout);
+
+        try
+        {
+            await transport.SendAsync(payload, timeoutCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+            when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"The send did not complete within {timeout}.");
         }
     }
 

@@ -378,7 +378,7 @@ public sealed class MeshClientTests
     private static async Task ConnectWithScriptedSendAsync(
         MeshClient client,
         Mock<ITransport> transport,
-        Func<int, Task> onSend)
+        Func<int, CancellationToken, Task> onSend)
     {
         var assignedId = Guid.NewGuid();
         var registrationResponse = new byte[17];
@@ -394,7 +394,7 @@ public sealed class MeshClientTests
 
         int sendCount = 0;
         transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
-            .Returns<ReadOnlyMemory<byte>, CancellationToken>((_, _) => onSend(Interlocked.Increment(ref sendCount)));
+            .Returns<ReadOnlyMemory<byte>, CancellationToken>((_, ct) => onSend(Interlocked.Increment(ref sendCount), ct));
 
         await client.ConnectAsync(transport.Object, "TestClient");
     }
@@ -414,7 +414,7 @@ public sealed class MeshClientTests
 
         // Send 1 is registration. Data sends are 2, 3, 4: the first two fail transiently, the third works.
         int dataSendCount = 0;
-        await ConnectWithScriptedSendAsync(client, transport, send =>
+        await ConnectWithScriptedSendAsync(client, transport, (send, _) =>
         {
             if (send == 1)
             {
@@ -442,9 +442,10 @@ public sealed class MeshClientTests
         await using var client = new MeshClient(new Mock<ILogger<MeshClient>>().Object);
 
         int dataSendCount = 0;
-        await ConnectWithScriptedSendAsync(client, transport, send =>
+        await ConnectWithScriptedSendAsync(client, transport, (send, _) =>
         {
-            if (send == 1)
+            // Fail only the caller's data send (send 2), not registration or the teardown disconnect.
+            if (send != 2)
             {
                 return Task.CompletedTask;
             }
@@ -469,13 +470,14 @@ public sealed class MeshClientTests
             new Mock<ILogger<MeshClient>>().Object,
             sendTimeout: TimeSpan.FromMilliseconds(100));
 
-        var neverCompletes = new TaskCompletionSource();
+        // The data send (send 2) stalls but honours cancellation, so the timeout cancels it; other sends
+        // (registration, teardown disconnect) complete normally.
         await ConnectWithScriptedSendAsync(
-            client, transport, send => send == 1 ? Task.CompletedTask : neverCompletes.Task);
+            client,
+            transport,
+            (send, ct) => send == 2 ? Task.Delay(Timeout.Infinite, ct) : Task.CompletedTask);
 
         await Assert.ThrowsAsync<TimeoutException>(() => client.SendAsync(Guid.NewGuid(), new byte[] { 1 }));
-
-        neverCompletes.TrySetResult();
     }
 
     /// <summary>
@@ -492,17 +494,17 @@ public sealed class MeshClientTests
             maxSendAttempts: 3,
             sendRetryDelay: TimeSpan.FromMilliseconds(1));
 
-        var neverCompletes = new TaskCompletionSource();
+        // The data send (send 2) stalls but honours cancellation; other sends complete normally.
         await ConnectWithScriptedSendAsync(
-            client, transport, send => send == 1 ? Task.CompletedTask : neverCompletes.Task);
+            client,
+            transport,
+            (send, ct) => send == 2 ? Task.Delay(Timeout.Infinite, ct) : Task.CompletedTask);
 
         using var cts = new CancellationTokenSource();
         Task sendTask = client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, cts.Token);
         await cts.CancelAsync();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => sendTask);
-
-        neverCompletes.TrySetResult();
     }
 
     // BroadcastAsync
