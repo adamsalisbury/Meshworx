@@ -99,8 +99,9 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
   has reset and may reconnect from the handler.
 - **Auto-reconnect.** `MeshClientReconnector` wraps a client and keeps it connected: it does a
   fail-fast initial connect, then transparently re-establishes the connection (bounded per attempt,
-  retried with a delay) whenever it drops, raising `Reconnected` so the application can restore
-  state such as group membership.
+  retried with a delay) whenever it drops. It automatically re-joins the groups the client belonged
+  to before the drop, then raises `Reconnected` so the application can restore any further state. Pass
+  `restoreGroupMembership: false` to take full manual control of group restoration.
 
 ```csharp
 await using var reconnector = new MeshClientReconnector(
@@ -108,13 +109,10 @@ await using var reconnector = new MeshClientReconnector(
     "Alice",
     async ct => (ITransport)await TcpTransport.ConnectAsync("localhost", 22001, ct));
 
-reconnector.Reconnected += async (_, _) =>
-{
-    foreach (string group in savedGroups) await reconnector.Client.JoinGroupAsync(group);
-};
-
 await reconnector.StartAsync();
+await reconnector.Client.JoinGroupAsync("news");
 await reconnector.Client.SendAsync(recipientId, payload);
+// After an unexpected drop the connection — and membership of "news" — is restored automatically.
 ```
 
 ## Configuration
@@ -145,11 +143,22 @@ Observability:
 ```csharp
 new MeshClient(
     logger,
-    idleTimeout: TimeSpan.FromSeconds(90)); // treat the hub as lost if no frame arrives in time (default: none)
+    idleTimeout: TimeSpan.FromSeconds(90),      // treat the hub as lost if no frame arrives in time (default: none)
+    sendTimeout: TimeSpan.FromSeconds(5),        // cancel a send that stalls, surfacing a TimeoutException (default: none)
+    maxSendAttempts: 3,                          // retry a transient send I/O failure up to this many attempts (default: 1, no retry)
+    sendRetryDelay: TimeSpan.FromMilliseconds(100)); // base delay between retries, scaled linearly per attempt (default: 100 ms)
 ```
 
 Set `idleTimeout` above the hub's heartbeat interval so the hub's pings keep the connection
 alive; a genuinely silent hub then trips the timeout and raises `Disconnected(ConnectionLost)`.
+
+`SendAsync`, `BroadcastAsync` and `SendToGroupAsync` honour the send policy: each send is bounded by
+`sendTimeout` (a stalled send is cancelled — releasing the transport rather than blocking the
+connection — and surfaces as a `TimeoutException`), and a send that fails with a transient transport I/O
+error (an `IOException` or `SocketException`) is retried up to `maxSendAttempts`, waiting `sendRetryDelay`
+multiplied by the attempt number between tries. A timeout is not retried, since a cancelled send may have
+partially written; logic errors, a cancelled `CancellationToken`, and a closed connection are never
+retried either. The defaults — one attempt, no timeout — preserve the original fire-and-forget behaviour.
 
 ## Security
 

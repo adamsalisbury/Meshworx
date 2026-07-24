@@ -16,9 +16,10 @@ namespace AdamSalisbury.Meshworx;
 /// a successful start, an unexpected disconnect triggers reconnection: each attempt is bounded by the
 /// connect timeout and retried after the retry delay until it succeeds or the reconnector is disposed.
 /// <para>
-/// This type does not re-join groups or re-send in-flight messages after a reconnect — application state
-/// is the application's responsibility. Subscribe to <see cref="Reconnected"/> to restore it, for example
-/// by re-joining the groups in <see cref="IMeshClient.JoinedGroups"/> captured before the drop.
+/// By default the reconnector re-joins the groups the client belonged to before the drop, so group
+/// messages resume without any application involvement. Pass <c>restoreGroupMembership: false</c> to the
+/// constructor to take full manual control and restore membership yourself in a <see cref="Reconnected"/>
+/// handler. In-flight messages are never re-sent — that remains the application's responsibility.
 /// </para>
 /// </remarks>
 public sealed class MeshClientReconnector : IAsyncDisposable
@@ -31,12 +32,21 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     private readonly Func<CancellationToken, Task<ITransport>> _transportFactory;
     private readonly TimeSpan _retryDelay;
     private readonly TimeSpan _connectTimeout;
+    private readonly bool _restoreGroupMembership;
     private readonly ILogger _logger;
     private readonly CancellationTokenSource _stopCts = new();
 
     // Coalesces disconnect notifications: at most one pending reconnect request is queued at a time.
     private readonly Channel<byte> _reconnectSignals =
         Channel.CreateBounded<byte>(new BoundedChannelOptions(1) { FullMode = BoundedChannelFullMode.DropWrite });
+
+    // The groups awaiting restoration after a reconnect, guarded by _restoreLock. Disconnects union the
+    // client's last membership into this set; the reconnect loop drains it as each group is successfully
+    // re-joined. Union-then-drain (rather than overwrite) means a restore interrupted by a fresh drop
+    // leaves the not-yet-restored groups pending, so they survive to the next reconnect instead of being
+    // lost from the client's now-depleted live membership.
+    private readonly Lock _restoreLock = new();
+    private readonly HashSet<string> _pendingGroupRestore = new(StringComparer.Ordinal);
 
     private Task? _reconnectLoopTask;
     private int _started;
@@ -50,6 +60,11 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     /// <param name="transportFactory">Creates a fresh transport for each connection attempt.</param>
     /// <param name="retryDelay">How long to wait between failed reconnect attempts. Defaults to 1 second.</param>
     /// <param name="connectTimeout">The maximum time a single connection attempt may take. Defaults to 10 seconds.</param>
+    /// <param name="restoreGroupMembership">
+    /// Whether to automatically re-join the groups the client belonged to before a drop once the connection
+    /// is re-established, before raising <see cref="Reconnected"/>. Defaults to <see langword="true"/>; set
+    /// it to <see langword="false"/> to restore membership manually in a <see cref="Reconnected"/> handler.
+    /// </param>
     /// <param name="logger">An optional logger.</param>
     /// <param name="credential">
     /// An opaque credential presented to the hub's authenticator on every connection attempt, including
@@ -61,6 +76,7 @@ public sealed class MeshClientReconnector : IAsyncDisposable
         Func<CancellationToken, Task<ITransport>> transportFactory,
         TimeSpan? retryDelay = null,
         TimeSpan? connectTimeout = null,
+        bool restoreGroupMembership = true,
         ILogger<MeshClientReconnector>? logger = null,
         ReadOnlyMemory<byte> credential = default)
     {
@@ -84,6 +100,7 @@ public sealed class MeshClientReconnector : IAsyncDisposable
         _transportFactory = transportFactory;
         _retryDelay = retryDelay ?? DefaultRetryDelay;
         _connectTimeout = connectTimeout ?? DefaultConnectTimeout;
+        _restoreGroupMembership = restoreGroupMembership;
         _logger = logger ?? NullLogger<MeshClientReconnector>.Instance;
     }
 
@@ -93,8 +110,9 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     public IMeshClient Client { get; }
 
     /// <summary>
-    /// Raised after the connection has been re-established following an unexpected disconnect. Handlers
-    /// may restore connection-scoped state such as group membership.
+    /// Raised after the connection has been re-established following an unexpected disconnect. When
+    /// <c>restoreGroupMembership</c> is enabled the client's previous groups have already been re-joined
+    /// by the time this fires, so handlers only need to restore any remaining connection-scoped state.
     /// </summary>
     public event EventHandler? Reconnected;
 
@@ -132,6 +150,20 @@ public sealed class MeshClientReconnector : IAsyncDisposable
 
     private void OnDisconnected(object? sender, DisconnectedEventArgs e)
     {
+        if (_restoreGroupMembership && e.JoinedGroups.Count > 0)
+        {
+            // Union rather than overwrite: a restore interrupted by a fresh drop leaves groups still
+            // pending, and this disconnect only reports the client's now-depleted live membership.
+            // Adding to the pending set preserves those not-yet-restored groups instead of losing them.
+            lock (_restoreLock)
+            {
+                foreach (string group in e.JoinedGroups)
+                {
+                    _pendingGroupRestore.Add(group);
+                }
+            }
+        }
+
         // Coalescing channel: signals the reconnect loop without blocking the client's receive loop.
         _reconnectSignals.Writer.TryWrite(0);
     }
@@ -148,6 +180,11 @@ public sealed class MeshClientReconnector : IAsyncDisposable
                 }
 
                 await ConnectWithRetryAsync(cancellationToken).ConfigureAwait(false);
+
+                if (_restoreGroupMembership)
+                {
+                    await RestoreGroupMembershipAsync(cancellationToken).ConfigureAwait(false);
+                }
 
                 try
                 {
@@ -187,6 +224,45 @@ public sealed class MeshClientReconnector : IAsyncDisposable
             {
                 _logger.LogWarning(ex, "Reconnect attempt failed; retrying in {RetryDelay}", _retryDelay);
                 await Task.Delay(_retryDelay, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task RestoreGroupMembershipAsync(CancellationToken cancellationToken)
+    {
+        string[] groups;
+        lock (_restoreLock)
+        {
+            if (_pendingGroupRestore.Count == 0)
+            {
+                return;
+            }
+
+            groups = [.. _pendingGroupRestore];
+        }
+
+        foreach (string group in groups)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                await Client.JoinGroupAsync(group, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // The connection dropped again mid-restore, or the join otherwise failed. The group stays
+                // in the pending set (it is only removed on success below), so the reconnect that the
+                // drop triggers retries it. Stop this pass rather than hammering a likely-dead connection.
+                _logger.LogWarning(
+                    ex, "Failed to restore membership of group {GroupName} after reconnect; it remains pending", group);
+                return;
+            }
+
+            // Re-joined successfully: drop it from the pending set so a later reconnect need not repeat it.
+            lock (_restoreLock)
+            {
+                _pendingGroupRestore.Remove(group);
             }
         }
     }
