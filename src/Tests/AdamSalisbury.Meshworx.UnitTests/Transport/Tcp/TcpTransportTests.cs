@@ -252,6 +252,83 @@ public sealed class TcpTransportTests
         Assert.Throws<ObjectDisposedException>(() => stream.ReadByte());
     }
 
+    // SendAsync — batched (IBatchSendTransport)
+
+    /// <summary>
+    /// When the batched SendAsync is called with several payloads, each is written as its own
+    /// length-prefixed frame, in order, and reads back as separate messages.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_Batch_WritesEachPayloadAsIndividualFrameInOrder()
+    {
+        var stream = new MemoryStream();
+        var transport = new TcpTransport(stream);
+
+        byte[][] payloads = [[1, 2], [3], [4, 5, 6]];
+        ReadOnlyMemory<byte>[] batch = [payloads[0], payloads[1], payloads[2]];
+        await transport.SendAsync(batch);
+
+        // Read the written bytes back through a receiving transport; each frame must round-trip
+        // as a distinct message in the order it was sent.
+        var readBack = new TcpTransport(new MemoryStream(stream.ToArray()));
+        foreach (byte[] expected in payloads)
+        {
+            byte[]? received = await readBack.ReceiveAsync();
+            Assert.Equal(expected, received);
+        }
+
+        Assert.Null(await readBack.ReceiveAsync());
+    }
+
+    /// <summary>
+    /// The batched SendAsync issues a single write to the underlying stream for the whole batch,
+    /// not one write per payload.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_Batch_WritesWholeBatchInOneWrite()
+    {
+        var stream = new CountingStream();
+        var transport = new TcpTransport(stream);
+
+        await transport.SendAsync(new ReadOnlyMemory<byte>[] { new byte[] { 1 }, new byte[] { 2 }, new byte[] { 3 } });
+
+        Assert.Equal(1, stream.WriteCount);
+    }
+
+    /// <summary>
+    /// When a batch contains a valid frame ahead of an oversize one, the valid frame is written before
+    /// the batched send throws — matching the single-send path's deliver-then-fault behaviour rather
+    /// than discarding the whole batch.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_Batch_OversizeFrameAfterValid_WritesValidPrefixThenThrows()
+    {
+        var stream = new MemoryStream();
+        var transport = new TcpTransport(stream);
+
+        var valid = new byte[] { 1, 2, 3 };
+        var oversize = new byte[(1024 * 1024) + 1];
+        ReadOnlyMemory<byte>[] batch = [valid, oversize];
+
+        await Assert.ThrowsAsync<ArgumentException>(async () => await transport.SendAsync(batch));
+
+        // The valid frame ahead of the oversize one must still have reached the stream.
+        var readBack = new TcpTransport(new MemoryStream(stream.ToArray()));
+        Assert.Equal(valid, await readBack.ReceiveAsync());
+        Assert.Null(await readBack.ReceiveAsync());
+    }
+
+    private sealed class CountingStream : MemoryStream
+    {
+        public int WriteCount { get; private set; }
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            WriteCount++;
+            return base.WriteAsync(buffer, cancellationToken);
+        }
+    }
+
     private static void WriteFrame(MemoryStream stream, byte[] payload)
     {
         var header = new byte[4];
