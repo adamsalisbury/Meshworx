@@ -143,11 +143,20 @@ Observability:
 ```csharp
 new MeshClient(
     logger,
-    idleTimeout: TimeSpan.FromSeconds(90)); // treat the hub as lost if no frame arrives in time (default: none)
+    idleTimeout: TimeSpan.FromSeconds(90),      // treat the hub as lost if no frame arrives in time (default: none)
+    sendTimeout: TimeSpan.FromSeconds(5),        // abandon a send that stalls, as a TimeoutException (default: none)
+    maxSendAttempts: 3,                          // retry a transient send failure up to this many attempts (default: 1, no retry)
+    sendRetryDelay: TimeSpan.FromMilliseconds(100)); // base delay between retries, scaled linearly per attempt (default: 100 ms)
 ```
 
 Set `idleTimeout` above the hub's heartbeat interval so the hub's pings keep the connection
 alive; a genuinely silent hub then trips the timeout and raises `Disconnected(ConnectionLost)`.
+
+`SendAsync`, `BroadcastAsync` and `SendToGroupAsync` honour the send policy: each send is bounded by
+`sendTimeout`, and a send that fails with a transient transport error (a timeout or an I/O/socket
+failure) is retried up to `maxSendAttempts`, waiting `sendRetryDelay` multiplied by the attempt number
+between tries. Logic errors, a cancelled `CancellationToken`, and a closed connection are never retried.
+The defaults — one attempt, no timeout — preserve the original fire-and-forget behaviour.
 
 ## Wire protocol
 

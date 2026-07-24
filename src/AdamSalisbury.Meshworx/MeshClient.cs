@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Net.Sockets;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
@@ -32,7 +33,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private readonly Lock _groupMembershipLock = new();
     private readonly HashSet<string> _joinedGroups = new(StringComparer.Ordinal);
 
+    private static readonly TimeSpan DefaultSendRetryDelay = TimeSpan.FromMilliseconds(100);
+
     private readonly TimeSpan? _idleTimeout;
+    private readonly TimeSpan? _sendTimeout;
+    private readonly int _maxSendAttempts;
+    private readonly TimeSpan _sendRetryDelay;
 
     /// <param name="logger">The logger used to record client activity.</param>
     /// <param name="idleTimeout">
@@ -40,7 +46,27 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// the connection as lost and raising <see cref="Disconnected"/>. Set this above the hub's heartbeat
     /// interval so the hub's pings keep the connection alive. Defaults to <see langword="null"/> (no timeout).
     /// </param>
-    public MeshClient(ILogger<MeshClient> logger, TimeSpan? idleTimeout = null)
+    /// <param name="sendTimeout">
+    /// The maximum time a single message send may take before it is abandoned with a
+    /// <see cref="TimeoutException"/>. Applies to <see cref="SendAsync"/>, <see cref="BroadcastAsync"/>
+    /// and <see cref="SendToGroupAsync"/>. Defaults to <see langword="null"/> (no timeout).
+    /// </param>
+    /// <param name="maxSendAttempts">
+    /// The maximum number of attempts a send is given when it fails with a transient transport error (a
+    /// timeout or an I/O/socket failure). The first attempt counts, so a value of 1 disables retrying.
+    /// Logic errors, cancellation, and a closed connection are never retried. Defaults to 1.
+    /// </param>
+    /// <param name="sendRetryDelay">
+    /// The base delay between send retries; each successive retry waits this multiplied by the attempt
+    /// number (linear back-off). Only used when <paramref name="maxSendAttempts"/> is greater than 1.
+    /// Defaults to 100 milliseconds.
+    /// </param>
+    public MeshClient(
+        ILogger<MeshClient> logger,
+        TimeSpan? idleTimeout = null,
+        TimeSpan? sendTimeout = null,
+        int maxSendAttempts = 1,
+        TimeSpan? sendRetryDelay = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
 
@@ -50,8 +76,29 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 nameof(idleTimeout), "The idle timeout must be positive.");
         }
 
+        if (sendTimeout is { } sendTimeoutValue && sendTimeoutValue <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(sendTimeout), "The send timeout must be positive.");
+        }
+
+        if (maxSendAttempts < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxSendAttempts), "The maximum send attempts must be at least one.");
+        }
+
+        if (sendRetryDelay is { } retryDelay && retryDelay <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(sendRetryDelay), "The send retry delay must be positive.");
+        }
+
         _logger = logger;
         _idleTimeout = idleTimeout;
+        _sendTimeout = sendTimeout;
+        _maxSendAttempts = maxSendAttempts;
+        _sendRetryDelay = sendRetryDelay ?? DefaultSendRetryDelay;
     }
 
     /// <inheritdoc/>
@@ -281,7 +328,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         recipientId.TryWriteBytes(payload.AsSpan(1));
         message.CopyTo(payload.AsMemory(17));
 
-        await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+        await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -303,7 +350,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         payload[0] = (byte)MessageType.BroadcastMessage;
         message.CopyTo(payload.AsMemory(1));
 
-        await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+        await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
@@ -350,7 +397,52 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         nameBytes.CopyTo(payload, 3);
         message.CopyTo(payload.AsMemory(3 + nameBytes.Length));
 
-        await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+        await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Sends a payload over the transport, applying the configured send timeout and transient-failure
+    /// retry policy. Defaults leave a single attempt with no timeout, preserving fire-and-forget sends.
+    /// </summary>
+    private async Task SendWithPolicyAsync(
+        ITransport transport,
+        ReadOnlyMemory<byte> payload,
+        CancellationToken cancellationToken)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                Task sendTask = transport.SendAsync(payload, cancellationToken);
+
+                if (_sendTimeout is { } timeout)
+                {
+                    // WaitAsync bounds the wait regardless of whether the transport honours the token,
+                    // surfacing a TimeoutException when the send does not complete in time.
+                    await sendTask.WaitAsync(timeout, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await sendTask.ConfigureAwait(false);
+                }
+
+                return;
+            }
+            catch (Exception ex) when (
+                attempt < _maxSendAttempts
+                && !cancellationToken.IsCancellationRequested
+                && ex is TimeoutException or IOException or SocketException)
+            {
+                // Only transient transport failures are retried; logic errors, cancellation and a closed
+                // connection (ObjectDisposedException) fall through and propagate to the caller.
+                _logger.LogDebug(
+                    ex,
+                    "Transient failure sending to the hub on attempt {Attempt} of {MaxAttempts}; retrying",
+                    attempt,
+                    _maxSendAttempts);
+                await Task.Delay(_sendRetryDelay * attempt, cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 
     private async Task SendGroupMembershipAsync(
