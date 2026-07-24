@@ -368,6 +368,145 @@ public sealed class MeshClientTests
         Assert.Equal(message, sentData[17..]);
     }
 
+    // Send policy (timeout and retry)
+
+    /// <summary>
+    /// Connects a freshly built client whose transport yields a registration response and then routes
+    /// every send through <paramref name="onSend"/>. The first send is the registration request (send
+    /// number 1); subsequent numbers are the sends the test drives.
+    /// </summary>
+    private static async Task ConnectWithScriptedSendAsync(
+        MeshClient client,
+        Mock<ITransport> transport,
+        Func<int, CancellationToken, Task> onSend)
+    {
+        var assignedId = Guid.NewGuid();
+        var registrationResponse = new byte[17];
+        registrationResponse[0] = 0x01; // RegistrationComplete
+        assignedId.TryWriteBytes(registrationResponse.AsSpan(1));
+
+        var channel = Channel.CreateUnbounded<byte[]?>();
+        channel.Writer.TryWrite(registrationResponse);
+
+        transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct));
+
+        int sendCount = 0;
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns<ReadOnlyMemory<byte>, CancellationToken>((_, ct) => onSend(Interlocked.Increment(ref sendCount), ct));
+
+        await client.ConnectAsync(transport.Object, "TestClient");
+    }
+
+    /// <summary>
+    /// When a send fails with a transient transport error and retries are configured, the client retries
+    /// and the send ultimately succeeds.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task SendAsync_TransientFailure_RetriesThenSucceeds()
+    {
+        var transport = new Mock<ITransport>();
+        await using var client = new MeshClient(
+            new Mock<ILogger<MeshClient>>().Object,
+            maxSendAttempts: 3,
+            sendRetryDelay: TimeSpan.FromMilliseconds(1));
+
+        // Send 1 is registration. Data sends are 2, 3, 4: the first two fail transiently, the third works.
+        int dataSendCount = 0;
+        await ConnectWithScriptedSendAsync(client, transport, (send, _) =>
+        {
+            if (send == 1)
+            {
+                return Task.CompletedTask;
+            }
+
+            return Interlocked.Increment(ref dataSendCount) <= 2
+                ? Task.FromException(new IOException("transient transport failure"))
+                : Task.CompletedTask;
+        });
+
+        await client.SendAsync(Guid.NewGuid(), new byte[] { 1 });
+
+        Assert.Equal(3, Volatile.Read(ref dataSendCount));
+    }
+
+    /// <summary>
+    /// With the default policy (a single attempt), a transient transport failure is not retried and
+    /// surfaces to the caller immediately, preserving the original fire-and-forget behaviour.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task SendAsync_TransientFailure_DefaultPolicy_DoesNotRetry()
+    {
+        var transport = new Mock<ITransport>();
+        await using var client = new MeshClient(new Mock<ILogger<MeshClient>>().Object);
+
+        int dataSendCount = 0;
+        await ConnectWithScriptedSendAsync(client, transport, (send, _) =>
+        {
+            // Fail only the caller's data send (send 2), not registration or the teardown disconnect.
+            if (send != 2)
+            {
+                return Task.CompletedTask;
+            }
+
+            Interlocked.Increment(ref dataSendCount);
+            return Task.FromException(new IOException("transient transport failure"));
+        });
+
+        await Assert.ThrowsAsync<IOException>(() => client.SendAsync(Guid.NewGuid(), new byte[] { 1 }));
+        Assert.Equal(1, Volatile.Read(ref dataSendCount));
+    }
+
+    /// <summary>
+    /// When a send does not complete within the configured send timeout, it is abandoned with a
+    /// TimeoutException.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task SendAsync_ExceedsSendTimeout_ThrowsTimeoutException()
+    {
+        var transport = new Mock<ITransport>();
+        await using var client = new MeshClient(
+            new Mock<ILogger<MeshClient>>().Object,
+            sendTimeout: TimeSpan.FromMilliseconds(100));
+
+        // The data send (send 2) stalls but honours cancellation, so the timeout cancels it; other sends
+        // (registration, teardown disconnect) complete normally.
+        await ConnectWithScriptedSendAsync(
+            client,
+            transport,
+            (send, ct) => send == 2 ? Task.Delay(Timeout.Infinite, ct) : Task.CompletedTask);
+
+        await Assert.ThrowsAsync<TimeoutException>(() => client.SendAsync(Guid.NewGuid(), new byte[] { 1 }));
+    }
+
+    /// <summary>
+    /// A cancelled token is honoured while a send is in flight: the send fails with an
+    /// OperationCanceledException rather than being retried or timing out.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task SendAsync_TokenCancelledDuringSend_HonoursCancellation()
+    {
+        var transport = new Mock<ITransport>();
+        await using var client = new MeshClient(
+            new Mock<ILogger<MeshClient>>().Object,
+            sendTimeout: TimeSpan.FromSeconds(30),
+            maxSendAttempts: 3,
+            sendRetryDelay: TimeSpan.FromMilliseconds(1));
+
+        // The data send (send 2) stalls but honours cancellation; other sends complete normally.
+        await ConnectWithScriptedSendAsync(
+            client,
+            transport,
+            (send, ct) => send == 2 ? Task.Delay(Timeout.Infinite, ct) : Task.CompletedTask);
+
+        using var cts = new CancellationTokenSource();
+        Task sendTask = client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, cts.Token);
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => sendTask);
+    }
+
     // BroadcastAsync
 
     /// <summary>
