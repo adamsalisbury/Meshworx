@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
@@ -12,6 +13,8 @@ namespace AdamSalisbury.Meshworx.UnitTests;
 public sealed class MeshClientReconnectorTests
 {
     private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly string[] GroupsAbc = ["A", "B", "C"];
+    private static readonly string[] GroupsAb = ["A", "B"];
 
     private static MeshClient CreateClient()
     {
@@ -248,6 +251,176 @@ public sealed class MeshClientReconnectorTests
         Assert.Equal(payload, received.Data.ToArray());
 
         await secondHub.StopAsync();
+    }
+
+    // Group membership restoration
+
+    /// <summary>
+    /// After an unexpected drop and reconnect, the reconnector re-joins the client's previous groups, so
+    /// group messages resume without the application re-joining in the Reconnected handler.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task RestoresGroupMembership_AfterReconnect()
+    {
+        var firstListener = new InMemoryTransportListener();
+        var firstHub = CreateHub(firstListener);
+        await firstHub.StartAsync();
+        var listenerHolder = new[] { firstListener };
+
+        await using var aliceClient = CreateClient();
+
+        // Subscribe once, before any reconnect.
+        var receivedTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        aliceClient.GroupMessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await using var reconnector = new MeshClientReconnector(
+            aliceClient,
+            "Alice",
+            _ => Task.FromResult<ITransport>(Volatile.Read(ref listenerHolder[0]).Connect()),
+            retryDelay: TimeSpan.FromMilliseconds(50),
+            connectTimeout: TimeSpan.FromSeconds(2));
+
+        var reconnectedTcs = new TaskCompletionSource();
+        reconnector.Reconnected += (_, _) => reconnectedTcs.TrySetResult();
+        await reconnector.StartAsync();
+
+        // Alice joins a group on the first hub, then the connection is moved to a replacement hub.
+        await aliceClient.JoinGroupAsync("news");
+
+        var secondListener = new InMemoryTransportListener();
+        await using var secondHub = CreateHub(secondListener);
+        await secondHub.StartAsync();
+        Volatile.Write(ref listenerHolder[0], secondListener);
+        await firstHub.StopAsync();
+        await firstHub.DisposeAsync();
+        await reconnectedTcs.Task.WaitAsync(WaitTimeout);
+
+        // The reconnector should have re-joined "news" on the replacement hub before raising Reconnected.
+        Assert.Contains("news", aliceClient.JoinedGroups);
+
+        // A sender on the replacement hub addresses the group; Alice receives it as a group member.
+        await using var bob = CreateClient();
+        await bob.ConnectAsync(secondListener.Connect(), "Bob");
+        byte[] payload = Encoding.UTF8.GetBytes("group message after reconnect");
+        await bob.SendToGroupAsync("news", payload);
+
+        GroupMessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal("news", received.GroupName);
+        Assert.Equal(bob.Id, received.SenderId);
+        Assert.Equal(payload, received.Data.ToArray());
+
+        await secondHub.StopAsync();
+    }
+
+    /// <summary>
+    /// When group-membership restoration is disabled, the reconnector does not re-join the client's
+    /// previous groups after a reconnect, leaving restoration to the application.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task DoesNotRestoreGroupMembership_WhenDisabled()
+    {
+        var firstListener = new InMemoryTransportListener();
+        var firstHub = CreateHub(firstListener);
+        await firstHub.StartAsync();
+        var listenerHolder = new[] { firstListener };
+
+        await using var aliceClient = CreateClient();
+        await using var reconnector = new MeshClientReconnector(
+            aliceClient,
+            "Alice",
+            _ => Task.FromResult<ITransport>(Volatile.Read(ref listenerHolder[0]).Connect()),
+            retryDelay: TimeSpan.FromMilliseconds(50),
+            connectTimeout: TimeSpan.FromSeconds(2),
+            restoreGroupMembership: false);
+
+        var reconnectedTcs = new TaskCompletionSource();
+        reconnector.Reconnected += (_, _) => reconnectedTcs.TrySetResult();
+        await reconnector.StartAsync();
+
+        await aliceClient.JoinGroupAsync("news");
+
+        var secondListener = new InMemoryTransportListener();
+        await using var secondHub = CreateHub(secondListener);
+        await secondHub.StartAsync();
+        Volatile.Write(ref listenerHolder[0], secondListener);
+        await firstHub.StopAsync();
+        await firstHub.DisposeAsync();
+        await reconnectedTcs.Task.WaitAsync(WaitTimeout);
+
+        // With restoration disabled the client should not have re-joined any group.
+        Assert.Empty(aliceClient.JoinedGroups);
+
+        await secondHub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a second disconnect interrupts restoration part-way through, the groups not yet re-joined are
+    /// not lost: the follow-up reconnect restores them rather than dropping them from the pending set.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task RestoresGroupMembership_SurvivesInterruptedRestore()
+    {
+        var transport = new Mock<ITransport>();
+        transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
+
+        var client = new Mock<IMeshClient>();
+        client.Setup(c => c.ConnectAsync(It.IsAny<ITransport>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        client.Setup(c => c.DisconnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        client.Setup(c => c.DisposeAsync()).Returns(ValueTask.CompletedTask);
+
+        var joinedGroups = new ConcurrentBag<string>();
+        int cAttempts = 0;
+        var cRestored = new TaskCompletionSource();
+
+        client.Setup(c => c.JoinGroupAsync(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+            .Returns<string, CancellationToken>((group, _) =>
+            {
+                joinedGroups.Add(group);
+
+                if (group == "C")
+                {
+                    if (Interlocked.Increment(ref cAttempts) == 1)
+                    {
+                        // Simulate the connection dropping mid-restore: the client reports the groups
+                        // still live (A and B, already re-joined) and the join for C then fails.
+                        client.Raise(
+                            c2 => c2.Disconnected += null,
+                            new DisconnectedEventArgs
+                            {
+                                Reason = DisconnectReason.ConnectionLost,
+                                JoinedGroups = GroupsAb,
+                            });
+                        throw new IOException("connection dropped during restore");
+                    }
+
+                    cRestored.TrySetResult();
+                }
+
+                return Task.CompletedTask;
+            });
+
+        await using var reconnector = new MeshClientReconnector(
+            client.Object,
+            "Alice",
+            _ => Task.FromResult<ITransport>(transport.Object),
+            retryDelay: TimeSpan.FromMilliseconds(10));
+
+        await reconnector.StartAsync();
+
+        // First drop: the client was in A, B and C. Restoration re-joins A and B, is interrupted on C,
+        // and the follow-up reconnect must restore C rather than losing it.
+        client.Raise(
+            c => c.Disconnected += null,
+            new DisconnectedEventArgs
+            {
+                Reason = DisconnectReason.ConnectionLost,
+                JoinedGroups = GroupsAbc,
+            });
+
+        await cRestored.Task.WaitAsync(WaitTimeout);
+
+        Assert.Contains("C", joinedGroups);
     }
 
     // DisposeAsync

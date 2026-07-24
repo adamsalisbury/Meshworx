@@ -691,6 +691,14 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             _state = ConnectionState.Disconnecting;
         }
 
+        // Capture group membership before CleanUpAsync clears it, so the Disconnected event can
+        // report the groups the client was in and a handler can restore them after reconnecting.
+        string[] joinedGroups;
+        lock (_groupMembershipLock)
+        {
+            joinedGroups = _joinedGroups.ToArray();
+        }
+
         await CleanUpAsync().ConfigureAwait(false);
 
         lock (_stateLock)
@@ -702,7 +710,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         try
         {
-            Disconnected?.Invoke(this, new DisconnectedEventArgs { Reason = reason });
+            Disconnected?.Invoke(this, new DisconnectedEventArgs { Reason = reason, JoinedGroups = joinedGroups });
         }
         catch (Exception ex)
         {
