@@ -13,7 +13,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 |---|---|---|
 | `Fixtures/MeshHubFixture.cs` | 173 | Hub test harness (mock listener/transport, register helpers, authenticator pass-through) |
 | `Fixtures/MeshClientFixture.cs` | 106 | Client test harness (mock transport, scripted receive) |
-| `MeshHubTests.cs` | 1951 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, capacity, lifecycle, **concurrent stop/dispose and start-vs-stop races** |
+| `MeshHubTests.cs` | 2082 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, **capacity claim/release under a concurrent registration**, lifecycle, **concurrent stop/dispose and start-vs-stop races** |
 | `MeshClientTests.cs` | 1499 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race** |
 | `MeshClientReconnectorTests.cs` | 785 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal** |
 | `MeshIntegrationTests.cs` | 385 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** |
@@ -69,7 +69,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   ([known-issues.md](known-issues.md) KI-22). Copy this shape whenever a guard is written against
   undocumented platform behaviour.
 - **When the bug is "one interval late", assert a count, not an outcome.** The heartbeat tests
-  (`MeshHubTests.cs:1695`, `:1743`) do not merely assert that a silent client was evicted — that passes
+  (`MeshHubTests.cs:1826`, `:1874`) do not merely assert that a silent client was evicted — that passes
   whether eviction fires on the Nth or the (N+1)th interval, which was exactly the KI-11 defect. They
   count `Ping` frames in the mock's `SendAsync` callback and **snapshot the count inside the
   `DisposeAsync` setup**, so the teardown itself latches the value and no later write can inflate it,
@@ -77,7 +77,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   `DisposeAsync` callback to wait for eviction rather than sleeping. Copy this shape for any timing
   contract where the wrong answer is still a *plausible* answer. The complementary direction — a client
   that keeps sending is never evicted — is `HandleClient_ClientSendingFramesEveryInterval_IsNotEvicted`
-  (`:1787`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
+  (`:1918`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
   interval so a scheduling stall on a loaded runner cannot masquerade as a genuine eviction.
 - **Drive the receive loop with a `Channel`, not `SetupSequence` returning `null`.** A completed/`null`
   receive is now interpreted as a lost connection and triggers teardown. `MeshClientFixture`
@@ -133,7 +133,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   back. Prefer these over anything timing-based.
 
   1. **To park a caller *inside* a shutdown, hold the mocked `ITransport.SendAsync` open on the
-     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:299-309`) awaits each client's
+     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:310-320`) awaits each client's
      `SendAsync` in turn, and that await sits **after** the caller has claimed the hub's state but
      **before** the shutdown has finished — so returning an incomplete task there pins the hub
      mid-shutdown for as long as the test needs. The helper is already written:
@@ -181,6 +181,34 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   Both carry `[Fact(Timeout = 10000)]`, because the failure mode is a hang rather than an assertion
   failure. See [hub.md](hub.md#lifecycle) for the lifecycle contract these pin, and
   [known-issues.md](known-issues.md) KI-23.
+- **Park a *registration* mid-admission by holding the authenticator open.** Added with the capacity
+  claim in PR #65 (issue #13). A `ClientAuthenticator` that signals a TCS and then awaits a second one
+  parks the registration at exactly the point past the pre-authentication early-out and immediately
+  before the hub takes its capacity decision — the only window in which the racing state can be staged:
+
+  ```csharp
+  // MeshHubTests.cs:822
+  var fixture = new MeshHubFixture(
+      maxClients: 1,
+      authenticator: async (_, ct) =>
+      {
+          authenticatorReached.TrySetResult();
+          await releaseAuthenticator.Task.WaitAsync(ct);
+          return true;
+      });
+  ...
+  await authenticatorReached.Task.WaitAsync(WaitTimeout);
+
+  // Stand in for a registration that holds the only slot but is not yet in _clients.
+  Assert.True(fixture.Hub.TryReserveClientSlot());
+  Assert.Equal(0, fixture.Hub.ConnectedClientCount);   // a count-based check would admit here
+  ```
+
+  The `Assert.Equal(0, ConnectedClientCount)` is the point of the test, not incidental: it demonstrates
+  that the observable count *cannot* see the claim, which is why the old check-then-act was unsound.
+  Staging the second registration directly through `TryReserveClientSlot` rather than racing two real
+  registrations is what makes it deterministic — do not rewrite it as a thread race. See
+  [known-issues.md](known-issues.md) KI-26.
 - **Synchronise on observable state, not sleeps.** `MeshHubFixture.RegisterClientAsync`
   (`Fixtures/MeshHubFixture.cs`) captures the `RegistrationComplete` frame via a `SendAsync` callback,
   extracts the id, then spins on `IsClientRegistered(id)` with `Task.Yield()` until the hub has recorded

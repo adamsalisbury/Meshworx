@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: c681dc4 (branch fix/hub-concurrent-shutdown, PR #64)
+reconciled-to-commit: a54acfb (branch fix/atomic-hub-capacity-admission, PR #65)
 reconciled-to-date: 2026-07-25
 mode: update
 -->
@@ -12,23 +12,29 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `fix/hub-concurrent-shutdown` (PR #64), which is `main` plus the hub
-> lifecycle-concurrency fix (PR #64, closing issue #12). The
-> [Lifecycle & concurrency](for-clanker/hub.md#lifecycle) section of
-> [hub.md](for-clanker/hub.md), its `StartAsync` / `StopAsync` / `DisposeAsync` rows,
-> [known-issues.md](for-clanker/known-issues.md) KI-23/KI-24/KI-25, the hub-lifecycle parking seams in
-> [testing.md](for-clanker/testing.md#parking-a-caller-mid-lifecycle) and the threading model in §4 below
-> describe **that branch**. On `main` `MeshHub` has no `_stateLock`, `StopAsync` is a plain `async`
-> method that null-checks and then re-reads `_cts`, there is no `StopCoreAsync` / `ShutDownAsync` split
-> and no `_stopTask` / `_disposeTask` / `_starting` / `_disposed`, `DisposeAsync` is unguarded — and
-> **every `MeshHub.cs` coordinate past line 37 is 8–180 lines lower**, as is every `MeshHubTests.cs`
-> coordinate past line 117 (by 242).
+> **Documented tree:** branch `fix/atomic-hub-capacity-admission` (PR #65), which is `main` plus the
+> atomic client-capacity admission fix (PR #65, closing issue #13). The
+> [Registration handshake](for-clanker/hub.md#registration-handshake-hub-side) section of
+> [hub.md](for-clanker/hub.md) and its `ConnectedClientCount` row, the hub-side validation order in
+> [protocol.md](for-clanker/protocol.md#registration-handshake), the `ClientAuthenticator` contract in
+> [types.md](for-clanker/types.md#authentication-types),
+> [known-issues.md](for-clanker/known-issues.md) KI-26, the authenticator parking seam in
+> [testing.md](for-clanker/testing.md#parking-a-caller-mid-lifecycle) and the admission bullet in §4
+> below describe **that branch**. On `main` `MeshHub` has no `_reservedClientSlots`, no
+> `TryReserveClientSlot` / `ReleaseClientSlot` / `RefuseAtCapacityAsync`, and enforces `maxClients` with
+> two non-atomic `_clients.Count` checks — one before the authenticator, one after it — so the cap is
+> soft under concurrent registration. Every `MeshHub.cs` coordinate past line 31 is 6–81 lines lower on
+> `main`, as is every `MeshHubTests.cs` coordinate past line 810 (by 131).
 >
-> The listener disposal-contract fix (PR #63, closing issue #11) has since merged as `a8b05d2`, so the
-> `ITransportListener` disposal contract and the `TcpTransportListener` / `InMemoryTransportListener`
-> sections of [transport.md](for-clanker/transport.md), the accept-loop note in
-> [hub.md](for-clanker/hub.md#the-accept-loop), KI-22 and the two listener test rows in
-> [testing.md](for-clanker/testing.md) now describe `main` directly.
+> The hub lifecycle-concurrency fix (PR #64, closing issue #12) has since merged as `c90d515`, so the
+> [Lifecycle & concurrency](for-clanker/hub.md#lifecycle) section of [hub.md](for-clanker/hub.md), its
+> `StartAsync` / `StopAsync` / `DisposeAsync` rows, KI-23/KI-24/KI-25, the hub-lifecycle parking seams in
+> [testing.md](for-clanker/testing.md#parking-a-caller-mid-lifecycle) and the lifecycle bullet in §4 now
+> describe `main` directly. The listener disposal-contract fix (PR #63, closing issue #11) merged as
+> `a8b05d2`, so the `ITransportListener` disposal contract and the `TcpTransportListener` /
+> `InMemoryTransportListener` sections of [transport.md](for-clanker/transport.md), the accept-loop note
+> in [hub.md](for-clanker/hub.md#the-accept-loop), KI-22 and the two listener test rows in
+> [testing.md](for-clanker/testing.md) describe `main` too.
 >
 > Everything else documented here is on `main`. The disconnect-race fix (PR #62, closing issue #10) has
 > since merged as `28672a0`, so the claim protocol in
@@ -46,10 +52,10 @@ rather than read directly, it says so.
 > `MeshClientReconnector.cs` outside the registration path were written against an older tree and have
 > since drifted — PRs #52 (reconnector group-membership restore) and #55 (client send timeout and
 > retry) landed on `main` after this documentation set was first written and have **still** not been
-> reconciled. None of PRs #59, #60, #61, #62, #63 or #64 touched that backlog: each reconciliation is
-> scoped to its own branch, so PR #64 corrected only the coordinates its own diff moved and the sections
-> its own diff invalidated. **[client.md](for-clanker/client.md) was knowingly left alone in the PR #63
-> and PR #64 passes**
+> reconciled. None of PRs #59, #60, #61, #62, #63, #64 or #65 touched that backlog: each reconciliation is
+> scoped to its own branch, so PR #65 corrected only the coordinates its own diff moved and the sections
+> its own diff invalidated. **[client.md](for-clanker/client.md) was knowingly left alone in the PR #63,
+> PR #64 and PR #65 passes**
 > and is stale against `MeshClient.cs` beyond the items listed here; treat it as the next pass's job, not
 > as verified. Concretely, in [client.md](for-clanker/client.md) the `MeshClientReconnector` **Surface**
 > table still carries pre-#52 line numbers (`Client` `:86`, `StartAsync` `:99`, `Reconnected` `:92`,
@@ -61,10 +67,10 @@ rather than read directly, it says so.
 > Names and behaviour outside the reconnector's connect path are accurate; the line numbers in
 > those two files may be tens of lines out. Every `MeshHub.cs`, `MeshHubTests.cs`, `TcpTransport.cs`,
 > `ITransportListener.cs`, `TcpTransportListener.cs` and `InMemoryTransportListener.cs` coordinate is
-> current — the `MeshHub.cs` set was re-pointed in full for PR #64, which shifted everything below the
-> lifecycle fields, the `MeshHubTests.cs` set likewise (PR #64 inserted its tests at line 116 rather than
-> appending them, so pre-existing test coordinates moved too), and the listener sets were re-pointed in
-> full for PR #63, which shifted everything below `TcpTransportListener.cs:39`.
+> current — the `MeshHub.cs` set was re-pointed in full for PR #65, which shifted everything below the
+> new `_reservedClientSlots` field, the `MeshHubTests.cs` set likewise (PR #65 inserted its tests at line
+> 811 rather than appending them, so pre-existing test coordinates moved too), and the listener sets were
+> re-pointed in full for PR #63, which shifted everything below `TcpTransportListener.cs:39`.
 
 ---
 
@@ -252,17 +258,26 @@ deadlocks or dropped messages that tests may not catch.
   `DisposeAsync` must be idempotent, safe to call concurrently, and return only once teardown is
   complete (`Transport/ITransportListener.cs:6-22`). The type matters:
   `MeshHub.AcceptLoopAsync` stops on `ObjectDisposedException` but logs-and-retries **without delay**
-  on anything else (`MeshHub.cs:443-451`), so a finished listener that reports itself any other way
+  on anything else (`MeshHub.cs:454-462`), so a finished listener that reports itself any other way
   spins the hub hot. See [known-issues.md](for-clanker/known-issues.md) KI-22.
 - **Hub lifecycle is serialised behind one lock.** `MeshHub.StartAsync`, `StopAsync` and `DisposeAsync`
   may all be called concurrently. Every lifecycle field (`_cts`, `_acceptLoopTask`, `_stopTask`,
-  `_disposeTask`, `_starting`, `_disposed`) is guarded by `Lock _stateLock` (`MeshHub.cs:44`), and each
+  `_disposeTask`, `_starting`, `_disposed`) is guarded by `Lock _stateLock` (`MeshHub.cs:55`), and each
   entry point **captures what it needs once into locals and never awaits while holding the lock**.
-  `StopAsync` is deliberately **not `async`** (`MeshHub.cs:253`): it decides synchronously under the
+  `StopAsync` is deliberately **not `async`** (`MeshHub.cs:264`): it decides synchronously under the
   lock, so overlapping callers provably share one shutdown — clients are notified once, and every caller
   returns only when the hub has actually stopped. Do not re-read a lifecycle field outside the lock and
   do not make `StopAsync` `async` again. See [hub.md](for-clanker/hub.md#lifecycle) and
   [known-issues.md](for-clanker/known-issues.md) KI-23.
+- **Client admission is an atomic claim, not a count check.** `maxClients` is enforced against
+  `_reservedClientSlots` (`MeshHub.cs:41`), which a registration takes with a single compare-and-swap
+  (`TryReserveClientSlot`, `MeshHub.cs:794`) and gives back in its handler's `finally`
+  (`MeshHub.cs:764-767`). The claim sits **after** the authenticator so an unauthenticated peer cannot
+  hold capacity, with a cheap at-capacity early-out **before** it so a full hub still never runs the
+  callback. Consequence for any code you write here: `ConnectedClientCount` can transiently read *below*
+  the number of claimed slots, so never gate admission on it. See
+  [hub.md](for-clanker/hub.md#registration-handshake-hub-side) and
+  [known-issues.md](for-clanker/known-issues.md) KI-26.
 - **Hub per-connection tasks:** each accepted connection runs a **receive loop** (`HandleClientAsync`),
   a **send loop** (`SendLoopAsync`, drains the bounded outbound `Channel`), and — only when heartbeats
   are configured — a **heartbeat monitor** (`MonitorHeartbeatAsync`, one `PeriodicTimer`). All share one
@@ -290,12 +305,12 @@ deadlocks or dropped messages that tests may not catch.
 There is **no config file, no environment variables, no external services**. Everything is configured
 through constructor parameters. The only ambient dependency is an `ILogger<T>` you supply.
 
-**`MeshHub` options** (`MeshHub.cs:108-178`, all optional):
+**`MeshHub` options** (`MeshHub.cs:119-189`, all optional):
 
 | Param | Default | Effect |
 |---|---|---|
 | `registrationTimeout` | 10 s | Drop a connection that accepts but never registers |
-| `maxClients` | unlimited (`int.MaxValue`) | Refuse beyond this with `HubAtCapacity` |
+| `maxClients` | unlimited (`int.MaxValue`) | Refuse beyond this with `HubAtCapacity`. A **hard** cap — admission is one atomic claim, so concurrent registrations cannot overshoot it |
 | `heartbeatInterval` | `null` (disabled) | Ping idle clients; evict on the `maxMissedHeartbeats`th consecutive silent interval |
 | `maxMissedHeartbeats` | 2 | **Silent intervals until eviction, counted inclusively:** a client that sends nothing is evicted on the Nth silent interval and probed N − 1 times first. At 1 it is never probed at all and the constructor logs a warning. Schedule table in [hub.md](for-clanker/hub.md#heartbeat-schedule) |
 | `authenticator` | `null` (**open admission**) | Decides whether each registering client may join; `false` → `AuthenticationFailed` |
@@ -345,8 +360,8 @@ full house style; the points below are the ones the code actually enforces and d
 - **Guard clauses first:** `ArgumentNullException.ThrowIfNull`, `ArgumentException.ThrowIfNullOrEmpty`,
   explicit range checks. Every public entry point does this.
 - **Catch specific exceptions.** Broad `catch (Exception)` appears **only** at loop/callback boundaries
-  and is always logged with a comment explaining why it is intentional (e.g. `MeshHub.cs:443-451`,
-  `:854`, and the three catches in `AuthenticateAsync` `:799-823`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
+  and is always logged with a comment explaining why it is intentional (e.g. `MeshHub.cs:454-462`,
+  `:935`, and the three catches in `AuthenticateAsync` `:880-904`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
 - **No blocking, no `.Result`.** `CA2007` (ConfigureAwait) is a build error in the library.
 - **Binary wire work uses `System.Buffers.Binary.BinaryPrimitives`** (big-endian) and
   `Guid.TryWriteBytes` / `new Guid(span)` for the 16-byte ids. Frame buffers on hot paths are rented
@@ -422,6 +437,10 @@ there is no publish step in CI — CI only builds and tests.
   client **sequentially with no send timeout**, so one registered peer that has stopped reading can hold
   `StopAsync(default)` — and therefore `await using` — open indefinitely, leaving the peers behind it
   unnotified. Pass a cancellable token if shutdown latency matters. KI-24.
+- **`ConnectedClientCount` is not the capacity gauge.** `maxClients` is enforced against an atomic slot
+  claim, not the client registry, so the count can transiently read *below* the number of claimed slots —
+  during a registration and during shutdown. The invariant is `reserved >= registered`, so it only errs
+  conservative, but never write an admission check against `ConnectedClientCount`. KI-26.
 - **A stopped hub is spent.** `StopAsync` releases the hub's state, but `ITransportListener` has no stop:
   the endpoint stays bound and both shipped listeners refuse a second `StartAsync`. Dispose it and build
   a new one rather than restarting. KI-25.
