@@ -101,7 +101,9 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
   fail-fast initial connect, then transparently re-establishes the connection (bounded per attempt,
   retried with a delay) whenever it drops. It automatically re-joins the groups the client belonged
   to before the drop, then raises `Reconnected` so the application can restore any further state. Pass
-  `restoreGroupMembership: false` to take full manual control of group restoration.
+  `restoreGroupMembership: false` to take full manual control of group restoration. `Reconnected` means
+  the connection is up again rather than that the reconnector re-established it, and it may fire more
+  than once for a single drop, so keep your handlers idempotent.
 
 ```csharp
 await using var reconnector = new MeshClientReconnector(

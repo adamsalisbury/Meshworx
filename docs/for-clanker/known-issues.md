@@ -27,8 +27,8 @@ the risk to a change, not a claim that the code is defective.
 | KI-16 | A reconnector's credential is fixed at construction and cannot be rotated | `MeshClientReconnector.cs:81`, `:137`, `:216` | medium (correctness) | open |
 | KI-17 | Sender identity is hop-by-hop: a compromised hub can forge any sender | system-wide | medium (security) | open — by design |
 | KI-18 | A failed TLS handshake is silent — the hub sees nothing at all | `TcpTransportListener.cs:446-460` | medium (maintainability) | open — by design |
-| KI-19 | A queued reconnect signal means the connection *was* lost, not that it still is | `MeshClientReconnector.cs:233-236`, `:160-163` | high (correctness) | **load-bearing** — guard added by PR #60; do not remove |
-| KI-20 | The caller owns the transport until `ConnectAsync` accepts it | `MeshClient.cs:163-177`, `MeshClientReconnector.cs:249-256`, `:131-145` | medium (resource correctness) | **partly addressed** — retry path fixed by PR #60; `StartAsync` still leaks |
+| KI-19 | A queued reconnect signal means the connection *was* lost, not that it still is | `MeshClientReconnector.cs:241-244`, `:168-171` | high (correctness) | **load-bearing** — guard added by PR #60; do not remove |
+| KI-20 | The caller owns the transport until `ConnectAsync` accepts it | `MeshClient.cs:163-177`, `MeshClientReconnector.cs:257-264`, `:139-153` | medium (resource correctness) | **partly addressed** — retry path fixed by PR #60; `StartAsync` still leaks |
 
 ---
 
@@ -218,7 +218,7 @@ the risk to a change, not a claim that the code is defective.
 
 ### KI-16 — A reconnector's credential is fixed at construction
 - **Where:** `MeshClientReconnector` captures `credential` into a `readonly` field
-  (`MeshClientReconnector.cs:81`, `:99`) and replays it on every connect and reconnect (`:137`, `:247`).
+  (`MeshClientReconnector.cs:81`, `:107`) and replays it on every connect and reconnect (`:145`, `:255`).
 - **Why it bites:** there is no setter and no factory callback for the credential, unlike
   `transportFactory` which *is* re-invoked per attempt. If the credential expires or is rotated
   mid-session, every subsequent reconnect fails with `AuthenticationFailed` and
@@ -266,8 +266,8 @@ the risk to a change, not a claim that the code is defective.
 
 ### KI-19 — A queued reconnect signal means the connection *was* lost, not that it still is
 - **Where:** the revalidation guard at the top of `ConnectWithRetryAsync`
-  (`MeshClientReconnector.cs:233-236`); the signal sources are `OnDisconnected` (`:185`) and the
-  post-subscription state re-check in `StartAsync` (`:160-163`).
+  (`MeshClientReconnector.cs:241-244`); the signal sources are `OnDisconnected` (`:193`) and the
+  post-subscription state re-check in `StartAsync` (`:168-171`).
 - **Why it bites:** the reconnector's trigger is **level-based, not edge-based**. A signal sitting in
   the capacity-1 channel is a record that a drop *happened*, not a guarantee the client is still down by
   the time the loop services it. Three ways a signal goes stale:
@@ -301,13 +301,13 @@ the risk to a change, not a claim that the code is defective.
 - **Where:** `MeshClient.ConnectAsync` adopts the transport at `MeshClient.cs:176`, *after* its argument
   and state validation (`:153-173`). A throw from that validation therefore leaves the transport
   unowned and unclosed; a throw after adoption is cleaned up by `CleanUpAsync` (`:238`, disposal at
-  `:581-584`). The reconnector's retry path handles the gap (`MeshClientReconnector.cs:249-256`).
+  `:581-584`). The reconnector's retry path handles the gap (`MeshClientReconnector.cs:257-264`).
 - **Why it bites:** the reachable case is not a programming error. A reconnect attempt racing a teardown
   hits the `ConnectionState.Disconnecting` guard (`MeshClient.cs:170`) and is rejected with
   `InvalidOperationException` before adoption — so before PR #60 every such attempt **abandoned a live
   transport**, one connected socket leaked per rejected retry, on a path that retries indefinitely.
 - **Two things this leaves you with:**
-  1. **`StartAsync` has no equivalent guard.** Its connect (`MeshClientReconnector.cs:131-145`) resets
+  1. **`StartAsync` has no equivalent guard.** Its connect (`MeshClientReconnector.cs:139-153`) resets
      the started flag and rethrows without disposing the transport. Bounded to one per call, but
      `StartAsync` is documented as retryable, so a caller looping it leaks one transport per attempt.
      *(Inference from reading both paths; no test covers it.)*

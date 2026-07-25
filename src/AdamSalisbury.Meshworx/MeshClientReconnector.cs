@@ -114,6 +114,14 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     /// <c>restoreGroupMembership</c> is enabled the client's previous groups have already been re-joined
     /// by the time this fires, so handlers only need to restore any remaining connection-scoped state.
     /// </summary>
+    /// <remarks>
+    /// The event means the connection is up again, not that this reconnector is what restored it, and it
+    /// may fire more than once for a single disconnect. A drop is detected both by the client's
+    /// <see cref="IMeshClient.Disconnected"/> event and, at startup, by a direct state check, so one drop
+    /// can raise the event twice; an application handler that reconnects the client itself will also
+    /// leave the reconnector raising it. <b>Handlers must therefore be safe to run more than once per
+    /// drop</b> — make the work they do idempotent rather than assuming it happens exactly once.
+    /// </remarks>
     public event EventHandler? Reconnected;
 
     /// <summary>
