@@ -212,6 +212,28 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 + "their first idle interval and are never probed with a ping. Clients that do not send "
                 + "frames of their own will be evicted every interval; use 2 or more to probe liveness.");
         }
+
+        // While the group authoriser runs, the calling client's receive loop is parked and reads nothing,
+        // so that client looks idle to the heartbeat monitor however healthy it is — it cannot answer a
+        // ping the loop is not there to read. If the authoriser is still deciding when the eviction
+        // budget runs out, the monitor cancels the connection and the client is dropped rather than
+        // refused, which is not what the fail-closed contract promises and, behind a reconnector, becomes
+        // a reconnect loop. Warn rather than throw: the combination is legal, the default authorisation
+        // timeout would otherwise refuse construction of a hub with a short heartbeat interval, and a slow
+        // authoriser may simply never take that long in practice.
+        if (groupAuthoriser is not null
+            && heartbeatInterval is { } configuredInterval
+            && _groupAuthorisationTimeout >= configuredInterval * maxMissedHeartbeats)
+        {
+            _logger.LogWarning(
+                "The group authorisation timeout ({Timeout}) is not shorter than the heartbeat eviction "
+                + "budget ({Interval} × {MaxMissed}). A client's receive loop is parked while its join is "
+                + "being authorised, so a decision that takes this long will have the client evicted "
+                + "instead of refused. Set groupAuthorisationTimeout below the budget.",
+                _groupAuthorisationTimeout,
+                configuredInterval,
+                maxMissedHeartbeats);
+        }
     }
 
     /// <inheritdoc/>
@@ -1156,24 +1178,53 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         if (_groupAuthoriser is not null)
         {
-            // Copy the name out of the inbound frame before awaiting the authoriser. The refusal below
-            // echoes these bytes, and it is built after the await — the only place in the hub where a
-            // slice of a received buffer outlives one. ITransport promises nothing about how long the
-            // array it returned stays valid; both shipped transports hand back a freshly allocated one
-            // per frame, so nothing reuses it today, but a pooled-buffer transport would make this alias
-            // a buffer that had already been recycled. One array on a control-plane path settles the
-            // question rather than resting on an implementation detail of the transports in the box.
-            // The registration authenticator copies the credential out of its frame for the same reason.
+            // Copy the name out of the inbound frame before awaiting the authoriser, because the refusal
+            // below echoes these bytes and is built after that await. ITransport promises nothing about
+            // how long the array it returned stays valid; both shipped transports hand back a freshly
+            // allocated one per frame, so nothing reuses it today, but a pooled-buffer transport would
+            // leave the refusal aliasing a buffer that had already been recycled. One array on a
+            // control-plane path settles that rather than resting on an implementation detail of the
+            // transports that happen to be in the box.
+            //
+            // Note this is stricter than AuthenticateAsync, which reads registrationData to copy the
+            // credential only *after* awaiting an authentication slot. That is equally safe today and for
+            // the same reason, but it is not a precedent for copying early — if a pooled-buffer transport
+            // is ever added, that read needs this treatment too.
             byte[] retainedNameBytes = groupNameBytes.ToArray();
 
             if (!await AuthoriseGroupJoinAsync(connection, groupName, cancellationToken).ConfigureAwait(false))
             {
+                // A refusal has to revoke, not merely decline to add. The client may already be a member
+                // from an earlier join that was allowed — the same connection re-joining a group it is in,
+                // which is legal and idempotent — and if the authoriser has since changed its mind, leaving
+                // that membership in place would mean a deliberate "no" left the client still receiving the
+                // group's traffic and still entitled to send to it. Removing here also keeps the two sides
+                // in step: the client drops the group when it sees the refusal.
+                LeaveGroup(connection, groupName);
                 RefuseGroupJoin(connection, groupName, retainedNameBytes);
                 return;
             }
         }
 
         AddToGroup(connection, groupName);
+    }
+
+    // How much of a group name is written to a log line. Group names are client-supplied and carry no
+    // length cap, so a name may be most of a 1 MiB frame. The refusal paths below log at Warning and
+    // Error and are reachable at will by any admitted client, so logging a name whole would let one
+    // client turn a rejected join into an arbitrary volume of log output. Long enough to identify a
+    // real group, short enough that the log line's size is the hub's decision rather than the client's.
+    private const int MaxLoggedGroupNameLength = 64;
+
+    /// <summary>
+    /// Renders a client-supplied group name for a log line, clipping it to a bounded length so that a
+    /// client cannot choose how much the hub writes.
+    /// </summary>
+    private static string ForLog(string groupName)
+    {
+        return groupName.Length <= MaxLoggedGroupNameLength
+            ? groupName
+            : string.Concat(groupName.AsSpan(0, MaxLoggedGroupNameLength), "… (truncated)");
     }
 
     /// <summary>
@@ -1223,7 +1274,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     "Refusing client {ClientId} ({ClientName}) membership of group {GroupName}: not authorised",
                     connection.Id,
                     connection.Name,
-                    groupName);
+                    ForLog(groupName));
             }
 
             return authorised;
@@ -1235,7 +1286,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 + "group {GroupName}; refusing the join",
                 _groupAuthorisationTimeout,
                 connection.Name,
-                groupName);
+                ForLog(groupName));
             return false;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
@@ -1248,7 +1299,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 "The group authoriser was cancelled for client {ClientName} joining group {GroupName}; "
                 + "refusing the join",
                 connection.Name,
-                groupName);
+                ForLog(groupName));
             return false;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -1258,7 +1309,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 ex,
                 "The group authoriser threw for client {ClientName} joining group {GroupName}; refusing the join",
                 connection.Name,
-                groupName);
+                ForLog(groupName));
             return false;
         }
     }
@@ -1286,7 +1337,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             _logger.LogWarning(
                 "Outbound queue for {ClientId} is full, group join refusal for {GroupName} dropped",
                 connection.Id,
-                groupName);
+                ForLog(groupName));
         }
     }
 
@@ -1391,7 +1442,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             _logger.LogDebug(
                 "Group message from {SenderId} to group {GroupName} dropped: the sender is not a member",
                 senderId,
-                groupName);
+                ForLog(groupName));
             return;
         }
 

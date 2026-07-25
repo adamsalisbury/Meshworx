@@ -2284,16 +2284,22 @@ public sealed class MeshHubTests
     [Fact(Timeout = 5000)]
     public async Task JoinGroup_AfterReconnect_IsAuthorisedAgainRatherThanRestored()
     {
-        int joinAttempts = 0;
-        var fixture = new MeshHubFixture(groupAuthoriser: (_, _) =>
+        int memberJoinAttempts = 0;
+        var fixture = new MeshHubFixture(groupAuthoriser: (context, _) =>
         {
-            // Allow the first join and refuse the re-join, so a restore that skipped authorisation
-            // would show up as an admitted second membership.
-            return ValueTask.FromResult(Interlocked.Increment(ref joinAttempts) == 1);
+            // Everyone but the reconnecting client is admitted, so the group still has a member other
+            // than the sender at the end and a delivery genuinely happens. Of the reconnecting client's
+            // joins, the first is allowed and the re-join refused, so a restore that skipped
+            // authorisation would show up as an admitted second membership.
+            return context.ClientName == "Member"
+                ? ValueTask.FromResult(Interlocked.Increment(ref memberJoinAttempts) == 1)
+                : ValueTask.FromResult(true);
         });
         await fixture.Hub.StartAsync();
 
         var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var bystander = await fixture.RegisterMultiMessageClientAsync("Bystander");
+        var bystanderFrames = new FrameRecorder(bystander.Transport);
 
         var first = await fixture.RegisterMultiMessageClientAsync("Member");
         var firstFrames = new FrameRecorder(first.Transport);
@@ -2313,16 +2319,24 @@ public sealed class MeshHubTests
 
         byte[] refusal = await secondFrames.WaitForAsync(f => f[0] == 0x10).WaitAsync(WaitTimeout);
         Assert.Equal("team", Encoding.UTF8.GetString(refusal.AsSpan(1)));
-        Assert.Equal(2, Volatile.Read(ref joinAttempts));
+        Assert.Equal(2, Volatile.Read(ref memberJoinAttempts));
+
+        // The bystander keeps the group alive, so the send below really does fan out to a member. The
+        // refused client must not be among them: its direct message arriving proves no group frame was
+        // queued for it first, and the bystander's arrival proves the send was not a no-op.
+        bystander.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        await ApplyPendingFramesAsync(bystander, bystanderFrames, "Sender");
 
         sender.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
         sender.EnqueueMessage(MeshHubFixture.CreateGroupMessage("team", [1]));
         sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(second.Id, [9]));
 
+        await bystanderFrames.WaitForAsync(f => f[0] == 0x0F).WaitAsync(WaitTimeout);
         await secondFrames.WaitForAsync(f => f[0] == 0x03).WaitAsync(WaitTimeout);
         Assert.DoesNotContain(secondFrames.Frames, f => f[0] == 0x0F);
 
         sender.Disconnect();
+        bystander.Disconnect();
         second.Disconnect();
         await fixture.Hub.StopAsync();
     }
@@ -2333,8 +2347,14 @@ public sealed class MeshHubTests
     /// U+FFFD and encodes back as three, so a name of invalid bytes would triple. Group names are not
     /// length-capped, so a tripled refusal can exceed the transport's maximum payload and throw on send,
     /// faulting the send loop — and a faulted send loop is awaited during the connection's teardown,
-    /// abandoning the rest of it including the release of the client's slot. The name here is sized so
-    /// that tripling it would breach the 1 MiB transport cap.
+    /// abandoning the rest of it including the release of the client's slot.
+    /// <para>
+    /// What is asserted is the invariant that prevents all of that: the refusal is exactly the inbound
+    /// frame's length and carries its bytes verbatim. The cap itself is deliberately not exercised here —
+    /// the fixture drives the hub through a mocked transport that enforces no size limit — so this test
+    /// does not depend on what that limit happens to be. The name is nonetheless sized so that tripling
+    /// it would breach the 1 MiB one, which is what makes the invariant worth pinning.
+    /// </para>
     /// </summary>
     [Fact(Timeout = 5000)]
     public async Task JoinGroup_AuthoriserRefusesAnInvalidUtf8Name_RefusalEchoesTheNameWithoutGrowingIt()
@@ -2359,6 +2379,46 @@ public sealed class MeshHubTests
         Assert.Equal(nameBytes, refusal[1..]);
 
         client.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A refusal revokes an existing membership rather than merely declining to add one. Re-joining a
+    /// group the client is already in is legal and idempotent, so an authoriser that has since changed
+    /// its mind must be able to use it to revoke: leaving the earlier membership in place would mean a
+    /// deliberate refusal left the client still receiving the group's traffic.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task JoinGroup_AuthoriserRefusesAnExistingMember_RevokesTheMembership()
+    {
+        bool allowJoins = true;
+        var fixture = new MeshHubFixture(
+            groupAuthoriser: (_, _) => ValueTask.FromResult(Volatile.Read(ref allowJoins)));
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var member = await fixture.RegisterMultiMessageClientAsync("Member");
+        var memberFrames = new FrameRecorder(member.Transport);
+
+        // The member joins while joins are allowed, and the sender joins so it may send at all.
+        member.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        sender.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        await ApplyPendingFramesAsync(member, memberFrames, "Sender");
+
+        // Policy changes, and the member re-joins the group it is already in. The refusal must take the
+        // membership away, not leave it standing.
+        Volatile.Write(ref allowJoins, false);
+        member.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        await memberFrames.WaitForAsync(f => f[0] == 0x10).WaitAsync(WaitTimeout);
+
+        sender.EnqueueMessage(MeshHubFixture.CreateGroupMessage("team", [1]));
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(member.Id, [9]));
+
+        await memberFrames.WaitForAsync(f => f[0] == 0x03).WaitAsync(WaitTimeout);
+        Assert.DoesNotContain(memberFrames.Frames, f => f[0] == 0x0F);
+
+        sender.Disconnect();
+        member.Disconnect();
         await fixture.Hub.StopAsync();
     }
 

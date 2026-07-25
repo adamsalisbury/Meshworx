@@ -399,9 +399,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         // its refusal can arrive and be handled by the receive loop before this method resumes — an add
         // afterwards would then reinstate the very group the refusal had just removed. Both checks above
         // run before the record is made, so the only thing left to undo is a send that failed.
+        bool recorded;
         lock (_groupMembershipLock)
         {
-            _joinedGroups.Add(groupName);
+            recorded = _joinedGroups.Add(groupName);
         }
 
         try
@@ -411,10 +412,17 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
         catch
         {
-            // The frame never reached the hub, so no membership was created; take the record back.
-            lock (_groupMembershipLock)
+            // The frame never reached the hub, so no membership was created; take the record back — but
+            // only if this call is what recorded it. A join of a group already joined, or one racing a
+            // concurrent join of the same name, must not roll back the record its predecessor owns: the
+            // group would then be missing from JoinedGroups while the client is still in it on the hub,
+            // and the reconnector, which restores from that snapshot, would silently not restore it.
+            if (recorded)
             {
-                _joinedGroups.Remove(groupName);
+                lock (_groupMembershipLock)
+                {
+                    _joinedGroups.Remove(groupName);
+                }
             }
 
             throw;

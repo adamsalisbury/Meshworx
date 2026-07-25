@@ -778,6 +778,39 @@ public sealed class MeshClientTests
         Assert.DoesNotContain("secret", fixture.Client.JoinedGroups);
     }
 
+    /// <summary>
+    /// A failed re-join of a group the client is already in does not roll back the record its earlier,
+    /// successful join owns. Rolling it back would leave JoinedGroups missing a group the hub still has
+    /// the client in — and the reconnector restores from that snapshot, so the group would silently not
+    /// be restored after a drop.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task JoinGroupAsync_FailedRejoinOfAJoinedGroup_KeepsTheExistingMembershipRecord()
+    {
+        var fixture = new MeshClientFixture();
+        var inbound = Channel.CreateUnbounded<byte[]?>();
+        inbound.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        bool failSends = false;
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns<ReadOnlyMemory<byte>, CancellationToken>((_, _) => Volatile.Read(ref failSends)
+                ? Task.FromException(new IOException("transport failed"))
+                : Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await inbound.Reader.ReadAsync(ct));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "Alice");
+
+        await fixture.Client.JoinGroupAsync("team");
+        Assert.Contains("team", fixture.Client.JoinedGroups);
+
+        Volatile.Write(ref failSends, true);
+        await Assert.ThrowsAsync<IOException>(() => fixture.Client.JoinGroupAsync("team"));
+
+        Assert.Contains("team", fixture.Client.JoinedGroups);
+    }
+
     // GetClientIdByNameAsync
 
     /// <summary>

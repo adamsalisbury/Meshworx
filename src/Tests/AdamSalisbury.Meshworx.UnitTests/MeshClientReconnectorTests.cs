@@ -659,6 +659,12 @@ public sealed class MeshClientReconnectorTests
         await reconnector.StartAsync();
         await aliceClient.JoinGroupAsync("news");
 
+        // JoinGroupAsync returns once the frame is sent, not once the hub has applied it, and this test
+        // counts authoriser invocations — so without a barrier the first hub might never consume the
+        // join, making the re-join attempt 1 and therefore allowed. A lookup round trip on the same
+        // connection forces it: the hub processes one client's frames in order.
+        await aliceClient.GetClientIdByNameAsync("Alice");
+
         // Move the connection to a replacement hub that shares the authoriser, so the re-join is the
         // second attempt it sees.
         var secondListener = new InMemoryTransportListener();
