@@ -1444,6 +1444,117 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    /// <summary>
+    /// A silent client is evicted on the maxMissedHeartbeats'th consecutive idle interval, not the one
+    /// after it. The hub therefore probes it exactly maxMissedHeartbeats minus one times before
+    /// evicting, which pins the eviction interval: an extra ping means eviction ran an interval late.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_SilentClient_IsEvictedOnConfiguredIntervalNotTheOneAfter()
+    {
+        const int MaxMissedHeartbeats = 3;
+
+        var fixture = new MeshHubFixture(
+            heartbeatInterval: TimeSpan.FromMilliseconds(50), maxMissedHeartbeats: MaxMissedHeartbeats);
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterMultiMessageClientAsync("Silent");
+
+        int pingCount = 0;
+        int pingsAtEviction = -1;
+        var disposedTcs = new TaskCompletionSource();
+
+        client.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                if (data.Length >= 1 && data.Span[0] == 0x09) // Ping
+                {
+                    Interlocked.Increment(ref pingCount);
+                }
+            })
+            .Returns(Task.CompletedTask); // swallow pings, never reply
+        client.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() =>
+            {
+                // Snapshot inside the eviction teardown so no later send can inflate the count.
+                Volatile.Write(ref pingsAtEviction, Volatile.Read(ref pingCount));
+                disposedTcs.TrySetResult();
+            })
+            .Returns(ValueTask.CompletedTask);
+
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.False(fixture.Hub.IsClientRegistered(client.Id));
+        Assert.Equal(MaxMissedHeartbeats - 1, Volatile.Read(ref pingsAtEviction));
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// With maxMissedHeartbeats set to 1 the client is evicted on the very first idle interval, so the
+    /// hub never gets to probe it. This is the documented boundary of the silent-interval count.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_SilentClientWithSingleMissedHeartbeat_IsEvictedWithoutPinging()
+    {
+        var fixture = new MeshHubFixture(
+            heartbeatInterval: TimeSpan.FromMilliseconds(50), maxMissedHeartbeats: 1);
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterMultiMessageClientAsync("Silent");
+
+        int pingCount = 0;
+        int pingsAtEviction = -1;
+        var disposedTcs = new TaskCompletionSource();
+
+        client.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                if (data.Length >= 1 && data.Span[0] == 0x09) // Ping
+                {
+                    Interlocked.Increment(ref pingCount);
+                }
+            })
+            .Returns(Task.CompletedTask);
+        client.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() =>
+            {
+                Volatile.Write(ref pingsAtEviction, Volatile.Read(ref pingCount));
+                disposedTcs.TrySetResult();
+            })
+            .Returns(ValueTask.CompletedTask);
+
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.False(fixture.Hub.IsClientRegistered(client.Id));
+        Assert.Equal(0, Volatile.Read(ref pingsAtEviction));
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A client that keeps sending frames is never evicted, however many heartbeat intervals pass. The
+    /// tightened eviction threshold must not clip clients that are demonstrably alive.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_ClientSendingFramesEveryInterval_IsNotEvicted()
+    {
+        var fixture = new MeshHubFixture(
+            heartbeatInterval: TimeSpan.FromMilliseconds(50), maxMissedHeartbeats: 2);
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterMultiMessageClientAsync("Chatty");
+
+        // Send a frame well inside every interval for comfortably longer than the eviction window.
+        for (int i = 0; i < 20; i++)
+        {
+            client.EnqueueMessage([0x0A]); // Pong
+            await Task.Delay(TimeSpan.FromMilliseconds(20));
+        }
+
+        Assert.True(fixture.Hub.IsClientRegistered(client.Id));
+
+        client.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // AcceptLoop — resilience
 
     /// <summary>

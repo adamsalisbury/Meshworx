@@ -54,8 +54,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// evicted, detecting half-open connections. Defaults to <see langword="null"/> (disabled).
     /// </param>
     /// <param name="maxMissedHeartbeats">
-    /// The number of consecutive idle intervals a client may go without sending any frame before it is
-    /// evicted. Only used when <paramref name="heartbeatInterval"/> is set. Defaults to 2.
+    /// The number of consecutive idle intervals that causes a client to be evicted. A client that sends
+    /// no frame across this many consecutive intervals is dropped; any frame it sends resets the count.
+    /// The hub pings the client on each idle interval before the last, so it is probed
+    /// <paramref name="maxMissedHeartbeats"/> minus one times before eviction — a value of 1 evicts on
+    /// the first idle interval without probing at all. Only used when
+    /// <paramref name="heartbeatInterval"/> is set. Defaults to 2.
     /// </param>
     /// <param name="authenticator">
     /// An optional callback invoked for each registration to decide whether the client may join, given
@@ -746,13 +750,16 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     continue;
                 }
 
+                // The client sent nothing across this interval. Evicting on the _maxMissedHeartbeats'th
+                // consecutive silent interval — not the one after it — is what the documented contract
+                // promises, so the comparison must be inclusive.
                 missedHeartbeats++;
-                if (missedHeartbeats > _maxMissedHeartbeats)
+                if (missedHeartbeats >= _maxMissedHeartbeats)
                 {
                     _logger.LogInformation(
-                        "Client {ClientId} did not respond to {Missed} heartbeats; evicting",
+                        "Client {ClientId} was idle across {Missed} consecutive heartbeat intervals; evicting",
                         clientId,
-                        _maxMissedHeartbeats);
+                        missedHeartbeats);
                     await clientCts.CancelAsync().ConfigureAwait(false);
                     return;
                 }
