@@ -136,6 +136,14 @@ new MeshHub(
 When a heartbeat interval is set, the hub pings idle clients and evicts any that fail to send a
 frame across the configured number of consecutive intervals, detecting half-open connections.
 
+The count is of silent intervals, not of unanswered pings: with the default `maxMissedHeartbeats: 2`
+and a 30-second interval, a client that goes completely silent is pinged at 30 seconds and evicted at
+60 seconds. Any frame from the client — a pong, or ordinary traffic — resets the count. Setting
+`maxMissedHeartbeats: 1` evicts on the first silent interval without probing first — there is no
+interval left in which a ping could be answered — so a client that only receives is evicted every
+interval. Use 2 or more unless clients are expected to send continuously; the hub logs a warning at
+construction if you set 1 alongside a heartbeat interval.
+
 Observability:
 
 - `ConnectedClientCount` — current number of registered clients.

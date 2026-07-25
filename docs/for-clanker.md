@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: PR #60 (squash-merged to main)
+reconciled-to-commit: 4b352ef (branch fix/heartbeat-eviction-off-by-one, PR #61)
 reconciled-to-date: 2026-07-25
 mode: update
 -->
@@ -12,13 +12,16 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `fix/reconnector-missed-first-disconnect` (PR #60), which is `main`
-> plus the reconnector race fix (PR #60, closing issue #8). The `MeshClientReconnector` sections of
-> [client.md](for-clanker/client.md), [known-issues.md](for-clanker/known-issues.md) KI-19/KI-20 and
-> the reconnector row in [testing.md](for-clanker/testing.md) describe **that branch**; on `main`
-> `ConnectWithRetryAsync` has neither the already-connected guard nor the transport disposal, and every
-> `MeshClientReconnector.cs` coordinate past line 147 is 25–49 lines lower.
+> **Documented tree:** branch `fix/heartbeat-eviction-off-by-one` (PR #61), which is `main` plus the
+> heartbeat eviction fix (PR #61, closing issue #9). The heartbeat schedule in
+> [hub.md](for-clanker/hub.md#heartbeat-schedule), the `maxMissedHeartbeats` row in §5 below,
+> [known-issues.md](for-clanker/known-issues.md) KI-11 and the `MeshHubTests.cs` row in
+> [testing.md](for-clanker/testing.md) describe **that branch**; on `main` eviction fires one interval
+> later (`missedHeartbeats > _maxMissedHeartbeats`), there is no constructor warning for
+> `maxMissedHeartbeats: 1`, and every `MeshHub.cs` coordinate past line 61 is 6–22 lines lower.
 >
+> The reconnector race fix (PR #60, closing issue #8) is on `main` and is documented in the
+> `MeshClientReconnector` sections of [client.md](for-clanker/client.md) and KI-19/KI-20.
 > The TLS transport work (PR #59, closing issue #7) is documented in
 > [transport.md](for-clanker/transport.md); the registration-authentication work of PR #56 and protocol
 > version 3 are on `main`.
@@ -27,17 +30,19 @@ rather than read directly, it says so.
 > `MeshClientReconnector.cs` outside the registration path were written against an older tree and have
 > since drifted — PRs #52 (reconnector group-membership restore) and #55 (client send timeout and
 > retry) landed on `main` after this documentation set was first written and have **still** not been
-> reconciled. Neither PR #59 nor PR #60 touched that backlog: each reconciliation is scoped to its own
-> branch, so PR #60 corrected only the coordinates its own diff moved and the sections its own diff
+> reconciled. None of PRs #59, #60 or #61 touched that backlog: each reconciliation is scoped to its own
+> branch, so PR #61 corrected only the coordinates its own diff moved and the sections its own diff
 > invalidated. Concretely, in [client.md](for-clanker/client.md) the `MeshClientReconnector` **Surface**
 > table still carries pre-#52 line numbers (`Client` `:86`, `StartAsync` `:99`, `Reconnected` `:92`,
 > `DisposeAsync` `:190`; the true values are `:110`, `:132`, `:125`, `:322`), the two **How it works**
 > bullets PR #60 did not rewrite are likewise stale (`OnDisconnected` `:126` and `ReconnectLoopAsync`
 > `:132`; the true values are `:176` and `:196`), the class-declaration coordinate `:24` is one line
 > out, and the test-file line count in the closing sentence predates two PRs. Those are the complete
-> set of stale reconnector coordinates as at PR #60 — a follow-up pass can clear them mechanically. Names and behaviour outside the reconnector's connect path are accurate; the line numbers in
+> set of stale reconnector coordinates as at PR #61 — a follow-up pass can clear them mechanically.
+> Names and behaviour outside the reconnector's connect path are accurate; the line numbers in
 > those two files may be tens of lines out. Every `MeshHub.cs`, `TcpTransport.cs` and
-> `TcpTransportListener.cs` coordinate is current.
+> `TcpTransportListener.cs` coordinate is current — the `MeshHub.cs` set was re-pointed in full for
+> PR #61, which shifted everything below the constructor.
 
 ---
 
@@ -218,7 +223,9 @@ deadlocks or dropped messages that tests may not catch.
 - **Hub per-connection tasks:** each accepted connection runs a **receive loop** (`HandleClientAsync`),
   a **send loop** (`SendLoopAsync`, drains the bounded outbound `Channel`), and — only when heartbeats
   are configured — a **heartbeat monitor** (`MonitorHeartbeatAsync`, one `PeriodicTimer`). All share one
-  linked `CancellationTokenSource` per client.
+  linked `CancellationTokenSource` per client. The monitor **checks the miss counter before it probes**,
+  so a silent client is evicted on the `maxMissedHeartbeats`th consecutive silent interval and receives
+  one fewer ping than that; see [hub.md](for-clanker/hub.md#heartbeat-schedule).
 - **Client single receive loop** (`ReceiveLoopAsync`) plus an optional **idle monitor** on a
   `PeriodicTimer`. The client uses an `AsyncLocal<bool> _inReceiveLoop` flag so that calling
   `DisconnectAsync` **from inside a `MessageReceived`/`Disconnected` handler does not deadlock** by
@@ -240,14 +247,14 @@ deadlocks or dropped messages that tests may not catch.
 There is **no config file, no environment variables, no external services**. Everything is configured
 through constructor parameters. The only ambient dependency is an `ILogger<T>` you supply.
 
-**`MeshHub` options** (`MeshHub.cs:75-132`, all optional):
+**`MeshHub` options** (`MeshHub.cs:81-151`, all optional):
 
 | Param | Default | Effect |
 |---|---|---|
 | `registrationTimeout` | 10 s | Drop a connection that accepts but never registers |
 | `maxClients` | unlimited (`int.MaxValue`) | Refuse beyond this with `HubAtCapacity` |
-| `heartbeatInterval` | `null` (disabled) | Ping idle clients; evict after missed intervals |
-| `maxMissedHeartbeats` | 2 | Idle intervals tolerated before eviction (see hub.md for exact off-by-one semantics) |
+| `heartbeatInterval` | `null` (disabled) | Ping idle clients; evict on the `maxMissedHeartbeats`th consecutive silent interval |
+| `maxMissedHeartbeats` | 2 | **Silent intervals until eviction, counted inclusively:** a client that sends nothing is evicted on the Nth silent interval and probed N − 1 times first. At 1 it is never probed at all and the constructor logs a warning. Schedule table in [hub.md](for-clanker/hub.md#heartbeat-schedule) |
 | `authenticator` | `null` (**open admission**) | Decides whether each registering client may join; `false` → `AuthenticationFailed` |
 | `maxConcurrentAuthentications` | 64 | Caps concurrent authenticator callbacks; ignored when `authenticator` is `null` |
 
@@ -295,8 +302,8 @@ full house style; the points below are the ones the code actually enforces and d
 - **Guard clauses first:** `ArgumentNullException.ThrowIfNull`, `ArgumentException.ThrowIfNullOrEmpty`,
   explicit range checks. Every public entry point does this.
 - **Catch specific exceptions.** Broad `catch (Exception)` appears **only** at loop/callback boundaries
-  and is always logged with a comment explaining why it is intentional (e.g. `MeshHub.cs:244-252`,
-  `:655`, and the three catches in `AuthenticateAsync` `:600-624`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
+  and is always logged with a comment explaining why it is intentional (e.g. `MeshHub.cs:263-271`,
+  `:674`, and the three catches in `AuthenticateAsync` `:619-643`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
 - **No blocking, no `.Result`.** `CA2007` (ConfigureAwait) is a build error in the library.
 - **Binary wire work uses `System.Buffers.Binary.BinaryPrimitives`** (big-endian) and
   `Guid.TryWriteBytes` / `new Guid(span)` for the 16-byte ids. Frame buffers on hot paths are rented

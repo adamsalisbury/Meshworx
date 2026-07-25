@@ -13,7 +13,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 |---|---|---|
 | `Fixtures/MeshHubFixture.cs` | 173 | Hub test harness (mock listener/transport, register helpers, authenticator pass-through) |
 | `Fixtures/MeshClientFixture.cs` | 106 | Client test harness (mock transport, scripted receive) |
-| `MeshHubTests.cs` | 1588 | Registration, **authentication**, routing, broadcast, groups, heartbeat, capacity, lifecycle |
+| `MeshHubTests.cs` | 1709 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, capacity, lifecycle |
 | `MeshClientTests.cs` | 1367 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events |
 | `MeshClientReconnectorTests.cs` | 785 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal** |
 | `MeshIntegrationTests.cs` | 385 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** |
@@ -46,6 +46,17 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   the other floods with more silent peers than there are handshake slots. Copy that pairing if you touch
   the pump — a test that only checks "a good client still got through" passes even with the protection
   removed.
+- **When the bug is "one interval late", assert a count, not an outcome.** The heartbeat tests
+  (`MeshHubTests.cs:1453`, `:1501`) do not merely assert that a silent client was evicted — that passes
+  whether eviction fires on the Nth or the (N+1)th interval, which was exactly the KI-11 defect. They
+  count `Ping` frames in the mock's `SendAsync` callback and **snapshot the count inside the
+  `DisposeAsync` setup**, so the teardown itself latches the value and no later write can inflate it,
+  then assert it equals `maxMissedHeartbeats - 1`. Use a `TaskCompletionSource` completed from that same
+  `DisposeAsync` callback to wait for eviction rather than sleeping. Copy this shape for any timing
+  contract where the wrong answer is still a *plausible* answer. The complementary direction — a client
+  that keeps sending is never evicted — is `HandleClient_ClientSendingFramesEveryInterval_IsNotEvicted`
+  (`:1545`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
+  interval so a scheduling stall on a loaded runner cannot masquerade as a genuine eviction.
 - **Drive the receive loop with a `Channel`, not `SetupSequence` returning `null`.** A completed/`null`
   receive is now interpreted as a lost connection and triggers teardown. `MeshClientFixture`
   (`Fixtures/MeshClientFixture.cs:44-63`) writes the registration response and scripted frames into an

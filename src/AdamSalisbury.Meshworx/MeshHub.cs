@@ -49,13 +49,19 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// refused with <see cref="RegistrationErrorCode.HubAtCapacity"/>. Defaults to unlimited.
     /// </param>
     /// <param name="heartbeatInterval">
-    /// How long a registered client may be idle before the hub probes it with a ping. A client that
-    /// fails to send any frame across <paramref name="maxMissedHeartbeats"/> consecutive intervals is
-    /// evicted, detecting half-open connections. Defaults to <see langword="null"/> (disabled).
+    /// How long a registered client may be idle before the hub probes it with a ping — unless
+    /// <paramref name="maxMissedHeartbeats"/> is 1, in which case the first idle interval evicts the
+    /// client rather than probing it. A client that fails to send any frame across
+    /// <paramref name="maxMissedHeartbeats"/> consecutive intervals is evicted, detecting half-open
+    /// connections. Defaults to <see langword="null"/> (disabled).
     /// </param>
     /// <param name="maxMissedHeartbeats">
-    /// The number of consecutive idle intervals a client may go without sending any frame before it is
-    /// evicted. Only used when <paramref name="heartbeatInterval"/> is set. Defaults to 2.
+    /// The number of consecutive idle intervals that causes a client to be evicted. A client that sends
+    /// no frame across this many consecutive intervals is dropped; any frame it sends resets the count.
+    /// The hub pings the client on each idle interval before the last, so it is probed
+    /// <paramref name="maxMissedHeartbeats"/> minus one times before eviction — a value of 1 evicts on
+    /// the first idle interval without probing at all. Only used when
+    /// <paramref name="heartbeatInterval"/> is set. Defaults to 2.
     /// </param>
     /// <param name="authenticator">
     /// An optional callback invoked for each registration to decide whether the client may join, given
@@ -128,6 +134,19 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             int slots = maxConcurrentAuthentications ?? DefaultMaxConcurrentAuthentications;
             _authenticationSlots = new SemaphoreSlim(slots, slots);
+        }
+
+        // At a maximum of one missed heartbeat there is no interval left in which a ping could be
+        // answered, so the hub evicts on the first idle interval without probing. A client that only
+        // receives — and so sends nothing of its own — is then dropped every interval. That is a
+        // legitimate choice if clients are expected to send continuously, but it is far more often a
+        // misconfiguration, and a silent one, so say so once at construction.
+        if (heartbeatInterval is not null && maxMissedHeartbeats == 1)
+        {
+            _logger.LogWarning(
+                "Heartbeats are enabled with maxMissedHeartbeats set to 1, so clients are evicted on "
+                + "their first idle interval and are never probed with a ping. Clients that do not send "
+                + "frames of their own will be evicted every interval; use 2 or more to probe liveness.");
         }
     }
 
@@ -746,13 +765,16 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     continue;
                 }
 
+                // The client sent nothing across this interval. Evicting on the _maxMissedHeartbeats'th
+                // consecutive silent interval — not the one after it — is what the documented contract
+                // promises, so the comparison must be inclusive.
                 missedHeartbeats++;
-                if (missedHeartbeats > _maxMissedHeartbeats)
+                if (missedHeartbeats >= _maxMissedHeartbeats)
                 {
                     _logger.LogInformation(
-                        "Client {ClientId} did not respond to {Missed} heartbeats; evicting",
+                        "Client {ClientId} was idle across {Missed} consecutive heartbeat intervals; evicting",
                         clientId,
-                        _maxMissedHeartbeats);
+                        missedHeartbeats);
                     await clientCts.CancelAsync().ConfigureAwait(false);
                     return;
                 }

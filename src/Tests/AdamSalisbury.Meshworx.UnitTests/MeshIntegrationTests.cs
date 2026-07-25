@@ -217,7 +217,7 @@ public sealed class MeshIntegrationTests
         await using var client = CreateClient();
         await client.ConnectAsync(listener.Connect(), "Responsive");
 
-        // Wait well past the eviction window (4 missed intervals ≈ 200 ms). A real client replies to
+        // Wait well past the eviction window (3 silent intervals ≈ 150 ms). A real client replies to
         // each ping with a pong, so it must remain connected and registered.
         await Task.Delay(TimeSpan.FromMilliseconds(400));
 
