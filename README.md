@@ -181,25 +181,42 @@ new MeshHub(
     logger,
     listener,
     registrationTimeout: TimeSpan.FromSeconds(10),  // drop connections that never register
-    maxClients: 1000,                               // refuse registration beyond this (default: unlimited)
-    heartbeatInterval: TimeSpan.FromSeconds(30),    // ping idle clients (default: disabled)
+    maxClients: 1000,                               // refuse registration beyond this (default: 1000)
+    heartbeatInterval: TimeSpan.FromSeconds(30),    // ping idle clients (default: 30 seconds)
     maxMissedHeartbeats: 2,                         // evict after this many silent intervals
     authenticator: authenticator,                   // decide who may register (default: none — see Security)
     maxConcurrentAuthentications: 64,               // cap concurrent authenticator calls (default: 64)
     groupAuthoriser: groupAuthoriser,               // decide who may join a group (default: none — see Security)
-    groupAuthorisationTimeout: TimeSpan.FromSeconds(10)); // refuse a join whose authoriser hangs (default: 10s)
+    groupAuthorisationTimeout: TimeSpan.FromSeconds(10), // refuse a join whose authoriser hangs (default: 10s)
+    maxConnectionsPerRemoteEndpoint: 100);          // cap connections from one address (default: 100)
 ```
 
-When a heartbeat interval is set, the hub pings idle clients and evicts any that fail to send a
-frame across the configured number of consecutive intervals, detecting half-open connections.
+Every one of these has a finite default, so a hub constructed with no arguments at all is still
+bounded: at most 1000 registered clients, at most 100 concurrent connections from any single remote
+address, and idle clients evicted rather than held open forever. `maxClients` and
+`maxConnectionsPerRemoteEndpoint` both accept `int.MaxValue` to opt back into no limit, and
+`heartbeatInterval` accepts `Timeout.InfiniteTimeSpan` to disable idle eviction entirely — only do
+this if something else bounds how long a connection may sit unused.
+
+The hub pings idle clients and evicts any that fail to send a frame across the configured number of
+consecutive intervals, detecting half-open connections.
 
 The count is of silent intervals, not of unanswered pings: with the default `maxMissedHeartbeats: 2`
-and a 30-second interval, a client that goes completely silent is pinged at 30 seconds and evicted at
-60 seconds. Any frame from the client — a pong, or ordinary traffic — resets the count. Setting
-`maxMissedHeartbeats: 1` evicts on the first silent interval without probing first — there is no
-interval left in which a ping could be answered — so a client that only receives is evicted every
+and the default 30-second interval, a client that goes completely silent is pinged at 30 seconds and
+evicted at 60 seconds. Any frame from the client — a pong, or ordinary traffic — resets the count.
+Setting `maxMissedHeartbeats: 1` evicts on the first silent interval without probing first — there is
+no interval left in which a ping could be answered — so a client that only receives is evicted every
 interval. Use 2 or more unless clients are expected to send continuously; the hub logs a warning at
-construction if you set 1 alongside a heartbeat interval.
+construction if you set 1 without also disabling idle eviction.
+
+`maxConnectionsPerRemoteEndpoint` bounds connections rather than registered clients, and is checked in
+the accept loop before any handshake — a flood of connections from one address that never complete
+registration is refused there rather than sailing past `maxClients`, which only counts clients that
+have actually registered. It is only enforced for a transport that reports where it connected from
+(the bundled `TcpTransport` does); a transport with no meaningful remote address, such as the
+in-process one, is never capped by it. An IPv6 address is grouped with every other address in its /64
+network prefix before the cap applies — a single host is routinely handed an entire /64, so without
+this a single source could defeat the cap by connecting from a different address within it each time.
 
 Observability:
 

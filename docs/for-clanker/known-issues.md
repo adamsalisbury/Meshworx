@@ -9,21 +9,21 @@ the risk to a change, not a claim that the code is defective.
 
 | ID | Title | Where | Severity | Status |
 |---|---|---|---|---|
-| KI-1 | Full outbound queue silently drops the frame | `MeshHub.cs:1124`, `:1150`, `:1474` | high (correctness) | open — by design |
+| KI-1 | Full outbound queue silently drops the frame | `MeshHub.cs:1360`, `:1386`, `:1710` | high (correctness) | open — by design |
 | KI-2 | Open admission by default; authorisation covers groups only | system-wide | high (security) | **partly addressed** — authentication seam (PR #56), transport TLS (PR #59), group authorisation seam + unconditional group-send membership (PR #66); open admission and cleartext remain the *defaults* |
-| KI-3 | Client-name length checked in chars, not UTF-8 bytes | `MeshHub.cs:590`, `MeshClient.cs:102` | medium (correctness) | open |
-| KI-4 | Unknown recipient drops the message silently | `MeshHub.cs:1110-1116` | medium (correctness) | open — by design |
+| KI-3 | Client-name length checked in chars, not UTF-8 bytes | `MeshHub.cs:818`, `MeshClient.cs:102` | medium (correctness) | open |
+| KI-4 | Unknown recipient drops the message silently | `MeshHub.cs:1346-1352` | medium (correctness) | open — by design |
 | KI-5 | Delivery is unordered/unacked across the fan-out; no persistence | system-wide | medium (correctness) | open — by design |
-| KI-6 | `StopAsync` writes `Disconnect` outside the send loop | `MeshHub.cs:358-368` | medium (correctness) | open |
+| KI-6 | `StopAsync` writes `Disconnect` outside the send loop | `MeshHub.cs:427-437` | medium (correctness) | open |
 | KI-7 | `InMemoryTransport` uses unbounded channels (no back-pressure) | `InMemoryTransport.cs:34-39` | medium (perf) | open — by design |
-| KI-8 | Group-name length asymmetry (join unbounded, send ≤ 65 535) | `MeshHub.cs:695`, `MeshClient.cs:345-354` | low (correctness) | open — now also reaches the group authoriser and the refusal frame |
-| KI-9 | Malformed/short/unknown frames silently ignored | `MeshHub.cs:681-756`, `MeshClient.cs:714-835` | medium (maintainability) | open — by design, and now load-bearing for additive opcodes |
+| KI-8 | Group-name length asymmetry (join unbounded, send ≤ 65 535) | `MeshHub.cs:923`, `MeshClient.cs:345-354` | low (correctness) | open — now also reaches the group authoriser and the refusal frame |
+| KI-9 | Malformed/short/unknown frames silently ignored | `MeshHub.cs:909-985`, `MeshClient.cs:714-835` | medium (maintainability) | open — by design, and now load-bearing for additive opcodes |
 | KI-10 | `JoinedGroups` can drift from the hub | `MeshClient.cs:392-430`, `MeshClientReconnector.cs:286-310` | low (correctness) | **largely addressed** — auto-rejoin landed in PR #52; PR #66 made a refusal correct the client's view. Residual drift only, see KI-27 |
-| KI-11 | Heartbeat eviction was off-by-one vs "max missed" | `MeshHub.cs:1084` | low (behaviour) | **fixed** — corrected by PR #61 (issue #9); inclusive comparison, do not loosen |
+| KI-11 | Heartbeat eviction was off-by-one vs "max missed" | `MeshHub.cs:1320` | low (behaviour) | **fixed** — corrected by PR #61 (issue #9); inclusive comparison, do not loosen |
 | KI-12 | Only one client lookup in flight at a time | `MeshClient.cs:390-472` | low (perf) | open — by design |
 | KI-13 | Event `Data` is a view over the received frame | `MeshClient.cs:586`, `:612` | low (correctness) | open |
 | KI-14 | Protocol v3 is a hard break: v2 peers are refused, and `ConnectAsync` is source-breaking | `Messages/Protocol.cs:5`, `IMeshClient.cs:49` | high (compatibility) | open — by design |
-| KI-15 | `AuthenticationFailed` conflates refusal, throw, timeout and slot starvation | `MeshHub.cs:891-969` | medium (maintainability) | open — by design |
+| KI-15 | `AuthenticationFailed` conflates refusal, throw, timeout and slot starvation | `MeshHub.cs:1127-1205` | medium (maintainability) | open — by design |
 | KI-16 | A reconnector's credential is fixed at construction and cannot be rotated | `MeshClientReconnector.cs:87`, `:143`, `:222` | medium (correctness) | open |
 | KI-17 | Sender identity is hop-by-hop: a compromised hub can forge any sender | system-wide | medium (security) | open — by design |
 | KI-18 | A failed TLS handshake is silent — the hub sees nothing at all | `TcpTransportListener.cs:583-597` | medium (maintainability) | open — by design |
@@ -31,18 +31,19 @@ the risk to a change, not a claim that the code is defective.
 | KI-20 | The caller owns the transport until `ConnectAsync` accepts it | `MeshClient.cs:166-180`, `MeshClientReconnector.cs:263-270`, `:145-159` | medium (resource correctness) | **partly addressed** — retry path fixed by PR #60; `StartAsync` still leaks |
 | KI-21 | A `DisconnectAsync` arriving after the teardown publishes its state still raises `Disconnected` | `MeshClient.cs:913-934`, `:289-292` | low (correctness) | open — **accepted residual** of PR #62 (issue #10); the claim protocol around it is **load-bearing**, do not remove |
 | KI-22 | A listener disposed under a pending accept must end it with `ObjectDisposedException` | `Transport/ITransportListener.cs:6-22`, `TcpTransportListener.cs:242-297`, `:307-380`, `InMemoryTransportListener.cs:57`, `:75-90` | high (correctness) | **fixed** — PR #63 (issue #11); the contract and both translations are **load-bearing**, do not remove |
-| KI-23 | `MeshHub.StopAsync` was not safe under concurrent invocation | `MeshHub.cs:58`, `:312-341`, `:347-378`, `:384-432` | high (correctness) | **fixed** — PR #64 (issue #12); the lock discipline and the shared `_stopTask` are **load-bearing**, do not remove |
-| KI-24 | The shutdown's disconnect notification is sequential and has no send timeout | `MeshHub.cs:358-368` | medium (perf / availability) | open — pre-existing, unchanged by PR #64 |
-| KI-25 | A stopped hub is not restartable in general | `MeshHub.cs:312`, `Transport/ITransportListener.cs` | medium (maintainability) | open — by design, documented on `IMeshHub.StopAsync` |
-| KI-26 | `maxClients` was a soft cap — non-atomic check-then-act let a burst overshoot it | `MeshHub.cs:44`, `:605-609`, `:626-632`, `:815-818`, `:845`, `:874` | high (correctness) | **fixed** — PR #65 (issue #13); the atomic claim, its position *after* authentication, and the claim/release pairing are **load-bearing**, do not remove |
-| KI-27 | `GroupJoinRefused` carries no correlation identifier | `MeshHub.cs:1331-1333`, `MeshClient.cs:768-780` | low (correctness) | open — **accepted**, fail-safe by construction |
-| KI-28 | The group authoriser has no concurrency cap, and the timeout does not stop the callback | `MeshHub.cs:1246-1276` | medium (perf / availability) | open — **deliberate**; bounding it is the integrator's job |
+| KI-23 | `MeshHub.StopAsync` was not safe under concurrent invocation | `MeshHub.cs:89`, `:382-411`, `:417-448`, `:454-502` | high (correctness) | **fixed** — PR #64 (issue #12); the lock discipline and the shared `_stopTask` are **load-bearing**, do not remove |
+| KI-24 | The shutdown's disconnect notification is sequential and has no send timeout | `MeshHub.cs:427-437` | medium (perf / availability) | open — pre-existing, unchanged by PR #64 |
+| KI-25 | A stopped hub is not restartable in general | `MeshHub.cs:382`, `Transport/ITransportListener.cs` | medium (maintainability) | open — by design, documented on `IMeshHub.StopAsync` |
+| KI-26 | `maxClients` was a soft cap — non-atomic check-then-act let a burst overshoot it | `MeshHub.cs:75`, `:833-837`, `:854-860`, `:1043-1046`, `:1081`, `:1110` | high (correctness) | **fixed** — PR #65 (issue #13); the atomic claim, its position *after* authentication, and the claim/release pairing are **load-bearing**, do not remove |
+| KI-27 | `GroupJoinRefused` carries no correlation identifier | `MeshHub.cs:1567-1569`, `MeshClient.cs:768-780` | low (correctness) | open — **accepted**, fail-safe by construction |
+| KI-28 | The group authoriser has no concurrency cap, and the timeout does not stop the callback | `MeshHub.cs:1482-1512` | medium (perf / availability) | open — **deliberate**; bounding it is the integrator's job |
+| KI-29 | `MeshHub` had unbounded resource-consumption defaults | `MeshHub.cs:24-38`, `:181-262`, `:602-753` | high (availability / security) | **fixed** — PR #68 (issue #16, draft); the new defaults are a **breaking behavioural change** for any hub relying on the old unlimited/disabled ones |
 
 ---
 
 ### KI-1 — Full outbound queue silently drops the frame
-- **Where:** `RouteMessage` `MeshHub.cs:1124`, `BroadcastMessage` `:1150`, `SendToGroup` `:1474`. Queue is
-  a bounded `Channel<byte[]>` of capacity **1024** per connection (`MeshHub.cs:1497`, `:1523`).
+- **Where:** `RouteMessage` `MeshHub.cs:1360`, `BroadcastMessage` `:1386`, `SendToGroup` `:1710`. Queue is
+  a bounded `Channel<byte[]>` of capacity **1024** per connection (`MeshHub.cs:1733`, `:1759`).
 - **Why it bites:** the hub delivers with `TryWrite`. If a recipient's consumer (its transport) is slow
   enough to fill 1024 queued frames, every further frame for it is **dropped and logged at Warning** —
   no exception, no back-pressure to the sender. A `SendAsync` that "succeeds" guarantees only that the
@@ -52,8 +53,8 @@ the risk to a change, not a claim that the code is defective.
   for head-of-line blocking of the router — do it deliberately and test under a stalled consumer.
 
 ### KI-2 — Open admission by default; authorisation covers groups only
-- **Where:** system-wide; registration `MeshHub.cs:536-650`, authentication `MeshHub.cs:891-969`,
-  group authorisation `MeshHub.cs:1168-1315`, group-send membership `MeshHub.cs:1427-1446`.
+- **Where:** system-wide; registration `MeshHub.cs:764-878`, authentication `MeshHub.cs:1127-1205`,
+  group authorisation `MeshHub.cs:1404-1551`, group-send membership `MeshHub.cs:1663-1682`.
 - **Status:** the *authentication* half has a supported seam (PR #56, protocol version 3), the
   *transport* half can be secured with TLS (PR #59), and since PR #66 (issue #14) there is an
   *authorisation* half — but it covers **groups only**. All three seams are **opt-in** except the
@@ -70,7 +71,7 @@ the risk to a change, not a claim that the code is defective.
     See [transport.md](transport.md#turning-tls-on-both-ends).
   - **Group authorisation (PR #66).** Two rules:
     - **A group send always requires membership of the target group**, with or without a callback. The
-      hub drops a `GroupMessage` from a non-member (`MeshHub.cs:1430`, `:1440-1446`), so a client cannot
+      hub drops a `GroupMessage` from a non-member (`MeshHub.cs:1666`, `:1676-1682`), so a client cannot
       inject a frame into a group it never joined. Membership is the **single** capability — there is no
       send-only permission, so a client that previously published to a group without joining it must now
       join, and will then also receive that group's traffic.
@@ -120,7 +121,7 @@ the risk to a change, not a claim that the code is defective.
   to direct sends, broadcast or lookup — it does not.
 
 ### KI-3 — Client-name length checked in chars, not UTF-8 bytes
-- **Where:** hub `clientName.Length > Protocol.MaxClientNameLength` (`MeshHub.cs:590`); client
+- **Where:** hub `clientName.Length > Protocol.MaxClientNameLength` (`MeshHub.cs:818`); client
   `clientName.Length > Protocol.MaxClientNameLength` (`MeshClient.cs:102`). `MaxClientNameLength = 256`.
 - **Why it bites:** `.Length` counts UTF-16 code units, not encoded bytes. A 256-"character" name of
   multi-byte code points encodes to well over 256 bytes on the wire, and a name of astral characters
@@ -131,10 +132,10 @@ the risk to a change, not a claim that the code is defective.
   docs together.
 
 ### KI-4 — Unknown recipient drops the message silently
-- **Where:** `RouteMessage` `MeshHub.cs:1110-1116` (logs `Debug`, returns). `SendToGroup` drops silently
-  on three paths: the group does not exist (`MeshHub.cs:1416`, plain `return`, **no log**), **the sender
-  is not a member** (`:1440-1446`, logs `Debug`), and the sender is the group's only member
-  (`:1449-1453`, no log).
+- **Where:** `RouteMessage` `MeshHub.cs:1346-1352` (logs `Debug`, returns). `SendToGroup` drops silently
+  on three paths: the group does not exist (`MeshHub.cs:1652`, plain `return`, **no log**), **the sender
+  is not a member** (`:1676-1682`, logs `Debug`), and the sender is the group's only member
+  (`:1685-1689`, no log).
 - **Why it bites:** sending to a stale/never-registered id, or to a group nobody has joined, is a no-op.
   The sender gets no signal. Combined with KI-1, "message sent" never implies "message delivered".
   Since PR #66 the **commonest** cause of a silently-dropped group send is the sender not being a member
@@ -152,7 +153,7 @@ the risk to a change, not a claim that the code is defective.
 - **What to do:** layer any ordering/durability guarantees on top; do not assume them.
 
 ### KI-6 — `StopAsync` writes `Disconnect` outside the send loop
-- **Where:** `MeshHub.cs:358-368` (in `StopCoreAsync` since PR #64) — iterates `_clients` and calls
+- **Where:** `MeshHub.cs:427-437` (in `StopCoreAsync` since PR #64) — iterates `_clients` and calls
   `client.Transport.SendAsync` directly, concurrently with each connection's still-running send loop.
 - **Why it bites:** two writers hit the same transport at once. This is **safe for `TcpTransport`**
   (internal `SemaphoreSlim` write lock, `TcpTransport.cs:32`) and any transport that honours the
@@ -171,7 +172,7 @@ the risk to a change, not a claim that the code is defective.
 - **What to do:** use TCP (or a bounded custom transport) where back-pressure matters.
 
 ### KI-8 — Group-name length asymmetry
-- **Where:** `Join`/`Leave` frames carry the name as the whole frame remainder (`MeshHub.cs:695`, `:703`)
+- **Where:** `Join`/`Leave` frames carry the name as the whole frame remainder (`MeshHub.cs:923`, `:931`)
   — effectively bounded only by the 1 MiB frame cap. `GroupMessage`/`DeliverGroupMessage` encode the
   name length as a `u16`, and the client rejects names over `ushort.MaxValue` (`MeshClient.cs:345-354`).
 - **Why it bites:** a group name between 65 536 bytes and 1 MiB can be joined but never targeted by a
@@ -182,18 +183,18 @@ the risk to a change, not a claim that the code is defective.
     as a dictionary key, a log field or a filesystem path without bounding it yourself.
   - **The unbounded name reaches the hub's log lines.** The refusal paths log at `Warning`/`Error` and
     are reachable at will by any admitted client, so an unclipped name would let one client choose how
-    much the hub writes. `ForLog` clips to 64 characters (`MeshHub.cs:1217`, `:1223-1228`); run any new
+    much the hub writes. `ForLog` clips to 64 characters (`MeshHub.cs:1453`, `:1459-1464`); run any new
     log line on this path through it. Note `MeshClient` does **not** clip (`MeshClient.cs:782`) — the
     name there came from your own hub.
 - **What to do:** keep group names short. If you unify the limit, apply it at join time too.
 
 ### KI-9 — Malformed/short/unknown frames silently ignored
-- **Where:** dispatch ladders `MeshHub.cs:681-756` and `MeshClient.cs:714-835` — length-guarded
+- **Where:** dispatch ladders `MeshHub.cs:909-985` and `MeshClient.cs:714-835` — length-guarded
   `else if` chains with no terminal `else`.
 - **Why it bites:** a frame that is too short for its opcode, or has an unknown opcode, is dropped with
   no error and no warning-level log. A framing/offset bug manifests as "nothing happens", which is hard
   to diagnose.
-- **Also applies to registration** (`MeshHub.cs:558-586`): a frame under 2 bytes, under 4 bytes, with a
+- **Also applies to registration** (`MeshHub.cs:786-814`): a frame under 2 bytes, under 4 bytes, with a
   zero name length, or with a name length running past the payload, drops the connection with **no error
   frame**. The client sees a closed connection rather than a `RegistrationRefusedException`, so a
   framing bug there looks like "the hub is down".
@@ -231,7 +232,7 @@ the risk to a change, not a claim that the code is defective.
   restoration succeeded (see [client.md](client.md#group-membership)).
 
 ### KI-11 — Heartbeat eviction off-by-one — **FIXED (PR #61, issue #9)**
-- **Where:** `MonitorHeartbeatAsync`, `MeshHub.cs:1084`.
+- **Where:** `MonitorHeartbeatAsync`, `MeshHub.cs:1320`.
 - **Status:** resolved by PR #61. The comparison is now `missedHeartbeats >= _maxMissedHeartbeats`
   (it was `>`), so eviction fires on the **Nth** consecutive silent interval, which is what the
   parameter name and the XML docs always claimed. Retained here because the behaviour of any hub built
@@ -240,15 +241,19 @@ the risk to a change, not a claim that the code is defective.
   With the default 2, a silent client was pinged twice and evicted after 3 idle intervals, so sizing a
   client `idleTimeout` or an SLA around the literal parameter value came out one interval short.
 - **What it is now:** a silent client is evicted on the Nth silent interval and probed **N − 1** times
-  on the way there, because the threshold check precedes the `Ping` enqueue (`MeshHub.cs:1084-1096`). The
+  on the way there, because the threshold check precedes the `Ping` enqueue (`MeshHub.cs:1320-1332`). The
   ping cadence for a live client is unchanged — only the eviction point moved. **N = 1 therefore never
-  probes at all**; the constructor logs a `Warning` for that combination (`MeshHub.cs:177-188`). Full
+  probes at all**; the constructor logs a `Warning` for that combination (`MeshHub.cs:270-283`). Full
   schedule table in [hub.md](hub.md#heartbeat-schedule).
 - **What to do:** if you had compensated for the old +1 in a deployment's `idleTimeout`, hub-side
   eviction now happens one interval sooner than it used to — re-check that the client's `idleTimeout`
   is still comfortably above `heartbeatInterval`. Do not loosen the comparison back to `>`; three tests
-  pin the schedule (`MeshHubTests.cs:1827`, `:1875`, `:1919`), and they assert the **ping count** at
+  pin the schedule (`MeshHubTests.cs:2057`, `:2105`, `:2149`), and they assert the **ping count** at
   eviction precisely because an "was it evicted?" assertion cannot distinguish N from N+1.
+- **Note:** since PR #68 (issue #16) `heartbeatInterval` defaults to 30 seconds rather than `null`, so
+  idle eviction — and this schedule — now applies to every hub that does not explicitly pass
+  `Timeout.InfiniteTimeSpan`. See [hub.md](hub.md#using-it-efficiently) and the constructor row in
+  [for-clanker.md](../for-clanker.md#5-configuration--environment).
 
 ### KI-12 — One client lookup in flight at a time
 - **Where:** `GetClientIdByNameAsync` serialised by `_lookupLock` (`SemaphoreSlim(1,1)`) with a
@@ -269,7 +274,7 @@ the risk to a change, not a claim that the code is defective.
 
 ### KI-14 — Protocol v3 is a hard break, on the wire and in source
 - **Where:** `Protocol.Version = 3` (`Messages/Protocol.cs:5`); the reshaped `RegistrationRequest`
-  (`MeshHub.cs:573-588`, `MeshClient.cs:184-192`); the signature change on `IMeshClient.ConnectAsync`
+  (`MeshHub.cs:801-816`, `MeshClient.cs:184-192`); the signature change on `IMeshClient.ConnectAsync`
   (`IMeshClient.cs:49`) and `MeshClient.ConnectAsync` (`MeshClient.cs:147`).
 - **Why it bites — two distinct ways:**
   1. **On the wire.** A v2 client against a v3 hub is refused with `UnsupportedProtocolVersion`; a v3
@@ -284,10 +289,10 @@ the risk to a change, not a claim that the code is defective.
   has to be built as version negotiation in the handshake — nothing in the current design supports it.
 
 ### KI-15 — `AuthenticationFailed` conflates every non-success outcome
-- **Where:** `AuthenticateAsync` (`MeshHub.cs:891-969`) returns `false` for a refusal, a throw, a
+- **Where:** `AuthenticateAsync` (`MeshHub.cs:1127-1205`) returns `false` for a refusal, a throw, a
   cancellation inside the callback, a callback that exceeds `registrationTimeout`, and a failure to
   acquire an authentication slot. The caller sends the same
-  `Error(AuthenticationFailed)` in all cases (`MeshHub.cs:615-616`).
+  `Error(AuthenticationFailed)` in all cases (`MeshHub.cs:843-844`).
 - **Why it bites:** a client that catches `RegistrationRefusedException` with
   `ErrorCode == AuthenticationFailed` **cannot tell "your credential is wrong" from "the hub's
   authenticator is broken, slow or saturated"**. A client that treats it as terminal will give up on a
@@ -313,7 +318,7 @@ the risk to a change, not a claim that the code is defective.
 
 ### KI-17 — Sender identity is hop-by-hop, not end to end
 - **Where:** system-wide. The hub stamps the sender id into every delivery frame it builds —
-  `RouteMessage` `MeshHub.cs:1121`, `BroadcastMessage` `:1139`, `SendToGroup` `:1461` — from its own record
+  `RouteMessage` `MeshHub.cs:1357`, `BroadcastMessage` `:1375`, `SendToGroup` `:1697` — from its own record
   of the connection, and nothing in `Messages/` carries a signature. TLS, where configured, secures the
   client↔hub connection only.
 - **Why it bites:** TLS makes it tempting to conclude the mesh is now "secure end to end". It is not.
@@ -453,13 +458,13 @@ the risk to a change, not a claim that the code is defective.
 - **Where:** the contract on `ITransportListener`'s `<remarks>` (`Transport/ITransportListener.cs:6-22`);
   the `TcpTransportListener` implementation (`:242-297` for accept, `:307-380` for disposal); the
   `InMemoryTransportListener` implementation (`InMemoryTransportListener.cs:57`, `:75-90`); the consumer
-  that depends on it, `MeshHub.AcceptLoopAsync` (`MeshHub.cs:485-510`).
+  that depends on it, `MeshHub.AcceptLoopAsync` (`MeshHub.cs:570-595`).
 - **Status:** resolved by PR #63. Retained because the resulting behaviour is **load-bearing** in three
   separate places, each easy to regress, and because a custom `ITransportListener` has to satisfy the
   same contract.
 - **Why the exception type is the whole issue:** `MeshHub.AcceptLoopAsync` breaks on
   `OperationCanceledException`/`ObjectDisposedException` and treats **everything else** as one bad
-  connection — logged at Warning and retried, with `continue` and **no delay** (`MeshHub.cs:502-510`).
+  connection — logged at Warning and retried, with `continue` and **no delay** (`MeshHub.cs:587-595`).
   Against a listener that is never coming back, "anything else" is therefore an unbounded hot spin that
   floods the log and pins a core. A listener that fails to report its own disposal correctly does not
   merely confuse a caller; it takes the hub with it.
@@ -510,8 +515,8 @@ the risk to a change, not a claim that the code is defective.
 ---
 
 ### KI-23 — `MeshHub.StopAsync` was not safe under concurrent invocation — **FIXED (PR #64, issue #12)**
-- **Where:** `MeshHub.cs:58` (`Lock _stateLock`), `:312-341` (`StopAsync`), `:347-378`
-  (`StopCoreAsync`), `:384-432` (`ShutDownAsync`), `:241-302` (`StartAsync`), `:455-483`
+- **Where:** `MeshHub.cs:89` (`Lock _stateLock`), `:382-411` (`StopAsync`), `:417-448`
+  (`StopCoreAsync`), `:454-502` (`ShutDownAsync`), `:311-372` (`StartAsync`), `:540-568`
   (`DisposeAsync` / `DisposeCoreAsync`).
 - **Severity:** high (correctness). Every failure below is reachable from ordinary shutdown code — two
   threads calling `StopAsync`, or a `StopAsync` racing an `await using`.
@@ -530,16 +535,16 @@ the risk to a change, not a claim that the code is defective.
      covers only `IOException`/`ObjectDisposedException`/`OperationCanceledException`; anything else
      escaped and skipped the teardown, leaving the accept loop running and the token source undisposed
      on a hub that reported itself stopped. `ShutDownAsync` now runs from `StopCoreAsync`'s `finally`
-     (`:370-377`), so the shutdown proper always runs.
+     (`:440-447`), so the shutdown proper always runs.
   5. **A start racing a stop could abandon a just-bound listener.** `StartAsync` now claims the running
-     slot with a `_starting` flag (`:259`) *before* the listener starts, and publishes `_cts` and
-     `_acceptLoopTask` together (`:299-300`). A stop can no longer take a token source whose accept loop
+     slot with a `_starting` flag (`:329`) *before* the listener starts, and publishes `_cts` and
+     `_acceptLoopTask` together (`:369-370`). A stop can no longer take a token source whose accept loop
      does not exist yet — which would have left the endpoint bound with nothing serving it.
-  6. **Disposal ran its teardown once per caller.** `DisposeAsync` memoises in `_disposeTask` (`:464`)
-     and sets `_disposed` first (`:463`); the listener is disposed exactly once and a start on a
+  6. **Disposal ran its teardown once per caller.** `DisposeAsync` memoises in `_disposeTask` (`:549`)
+     and sets `_disposed` first (`:548`); the listener is disposed exactly once and a start on a
      disposed hub throws `ObjectDisposedException`.
 - **What to do:** keep the discipline — take state under the lock, work from locals, never await while
-  holding it. Eight tests pin this (`MeshHubTests.cs:117-356`); two of them park a caller mid-lifecycle
+  holding it. Eight tests pin this (`MeshHubTests.cs:118-357`); two of them park a caller mid-lifecycle
   deterministically rather than relying on thread timing, see [testing.md](testing.md#parking-a-caller-mid-lifecycle).
 - **What not to do:** do not make `StopAsync` `async` again — its decision is taken synchronously under
   the lock, and that is what makes the "join the existing shutdown" handover race-free. Do not move
@@ -547,7 +552,7 @@ the risk to a change, not a claim that the code is defective.
   the lock, and do not clear `_disposed` — disposal is terminal.
 
 ### KI-24 — The shutdown's disconnect notification is sequential and has no send timeout
-- **Where:** `MeshHub.cs:358-368` — the `foreach` over `_clients.Values` inside `StopCoreAsync`.
+- **Where:** `MeshHub.cs:427-437` — the `foreach` over `_clients.Values` inside `StopCoreAsync`.
 - **Severity:** medium (performance / availability). **Pre-existing and unchanged by PR #64** — the loop
   moved from `StopAsync` into `StopCoreAsync` but its behaviour is identical. Do not read it as a
   regression introduced by that change.
@@ -563,7 +568,7 @@ the risk to a change, not a claim that the code is defective.
 - **What not to do:** do not assume `await using var hub = ...` bounds shutdown — it passes no token.
 
 ### KI-25 — A stopped hub is not restartable in general
-- **Where:** `MeshHub.cs:312` (`StopAsync`), `Transport/ITransportListener.cs` (no stop operation).
+- **Where:** `MeshHub.cs:382` (`StopAsync`), `Transport/ITransportListener.cs` (no stop operation).
 - **Severity:** medium (maintainability). Pre-existing; made **explicit** by PR #64 rather than
   introduced by it — `IMeshHub.StopAsync`'s XML docs now state it outright.
 - **Why it bites:** `StopAsync` releases the hub's own state and clears `_stopTask`, so the *hub* is
@@ -573,13 +578,13 @@ the risk to a change, not a claim that the code is defective.
 - **What to do:** treat a stopped hub as spent and dispose it. Construct a new hub over a new listener
   if you need to serve again.
 - **What not to do:** do not infer restartability from `StopAsync_AfterCompleting_ReleasesTheHubsRunningClaim`
-  (`MeshHubTests.cs:281`). Its own `<remarks>` is explicit that it covers the hub's half only, and that
+  (`MeshHubTests.cs:282`). Its own `<remarks>` is explicit that it covers the hub's half only, and that
   the second start succeeds solely because the fixture's listener is a mock that permits it.
 
 ### KI-26 — `maxClients` was a soft cap; the claim that replaced it is load-bearing — **FIXED (PR #65, issue #13)**
-- **Where:** `MeshHub.cs:44` (`private int _reservedClientSlots`), `:605-609` (the pre-authentication
-  early-out), `:626-632` (the claim), `:815-818` (the release, in `HandleClientAsync`'s `finally`),
-  `:845` (`TryReserveClientSlot`), `:874` (`ReleaseClientSlot`), `:882` (`RefuseAtCapacityAsync`).
+- **Where:** `MeshHub.cs:75` (`private int _reservedClientSlots`), `:833-837` (the pre-authentication
+  early-out), `:854-860` (the claim), `:1043-1046` (the release, in `HandleClientAsync`'s `finally`),
+  `:1081` (`TryReserveClientSlot`), `:1110` (`ReleaseClientSlot`), `:1118` (`RefuseAtCapacityAsync`).
 - **Severity:** high (correctness). Reachable from ordinary load — no adversary required, only
   simultaneous registrations.
 - **What was wrong:** admission tested `_clients.Count >= _maxClients` and added to `_clients` some way
@@ -591,25 +596,25 @@ the risk to a change, not a claim that the code is defective.
 - **What the fix guarantees.** Both count-based checks are gone. Admission now turns on one
   compare-and-swap against `_reservedClientSlots`, so exactly one of any number of concurrent
   registrations takes the last slot and the rest are refused. Three parts of the shape carry weight:
-  1. **The claim is a CAS loop, not increment-then-test-and-undo** (`:845`). An increment that overshoots
+  1. **The claim is a CAS loop, not increment-then-test-and-undo** (`:1081`). An increment that overshoots
      is visible to every other registration until it is backed out, so a burst that all overshot and all
      retreated would refuse clients for slots nobody held. The loop only ever claims from a value that
      was still under the cap at the instant of the claim.
-  2. **The claim sits *after* authentication** (`:626`, the authenticator at `:611-618`). Taking it
+  2. **The claim sits *after* authentication** (`:854`, the authenticator at `:839-846`). Taking it
      earlier would let a peer that never authenticates — or authenticates slowly — hold capacity away
      from one that would.
-  3. **The pre-authentication early-out is retained** (`:605-609`) and now reads `_reservedClientSlots`
+  3. **The pre-authentication early-out is retained** (`:833-837`) and now reads `_reservedClientSlots`
      rather than `_clients.Count`. It decides nothing; it exists solely to preserve the property that a
      **full** hub never runs the integrator's authenticator, so a connection flood cannot drive
      credential work or pin handler tasks on a slow callback.
 - **The pairing is the fragile part.** Every successful claim is owned by exactly one client handler and
   must be given back exactly once, by that handler's `finally`, guarded by the `slotReserved` flag
-  (`:534`, `:632`, `:815`). This covers the duplicate-name refusal as well as ordinary disconnection.
+  (`:762`, `:860`, `:1043`). This covers the duplicate-name refusal as well as ordinary disconnection.
   The release deliberately runs **before** the transport is disposed, so a transport that blocks on close
   cannot hold capacity for as long as it hangs. A claim that escapes its release leaks capacity for the
   lifetime of the hub, and nothing will report it.
 - **`ConnectedClientCount` can read *below* the number of claimed slots, and that is intended.** It is
-  still `_clients.Count` (`:441`). A registration between its claim and its `_clients` insert, and a
+  still `_clients.Count` (`:511`). A registration between its claim and its `_clients` insert, and a
   shutdown that has cleared the registries while a handler is still unwinding, both show fewer connected
   clients than there are outstanding claims — shutdown deliberately does **not** reset the counter,
   because the running handlers own those claims and return them themselves. The invariant is
@@ -623,11 +628,11 @@ the risk to a change, not a claim that the code is defective.
   *correctness*, and load-bearing for the flood property). Do not reset `_reservedClientSlots` on
   shutdown. Do not make `TryReserveClientSlot`/`ReleaseClientSlot` private — they are `internal` so
   `HandleClient_LastSlotClaimedButNotYetRegistered_RefusesRatherThanExceedingMaxClients`
-  (`MeshHubTests.cs:823`) can create the claimed-but-unregistered window that a count-based check cannot
-  see. Three tests pin this (`MeshHubTests.cs:823`, `:879`, `:922`).
+  (`MeshHubTests.cs:824`) can create the claimed-but-unregistered window that a count-based check cannot
+  see. Three tests pin this (`MeshHubTests.cs:824`, `:880`, `:923`).
 
 ### KI-27 — `GroupJoinRefused` carries no correlation identifier
-- **Where:** hub builds `[0x10][name bytes]` with nothing else (`RefuseGroupJoin`, `MeshHub.cs:1331-1333`);
+- **Where:** hub builds `[0x10][name bytes]` with nothing else (`RefuseGroupJoin`, `MeshHub.cs:1567-1569`);
   client keys the removal on the decoded name alone (`MeshClient.cs:768-780`).
 - **Severity:** low (correctness). **Accepted and deliberate** — this is a reporting inaccuracy, not an
   access-control hole. Do not "fix" it without a reason beyond tidiness; a correlation id is a wire
@@ -642,7 +647,7 @@ the risk to a change, not a claim that the code is defective.
   is `JoinedGroups` and, through it, what `MeshClientReconnector` would restore after a drop. Nothing is
   granted that should not be; something is merely forgotten. The reverse — a refusal failing to remove a
   membership the hub denied — cannot happen, because the hub removes its own side before replying
-  (`MeshHub.cs:1203`).
+  (`MeshHub.cs:1439`).
 - **What to do:** if exact membership matters, treat `GroupJoinRefused` as "re-check", not as
   "definitely out of this group", and re-join if you still expect to be a member. Do not build a
   join/refuse retry loop on top of it without your own correlation.
@@ -651,8 +656,8 @@ the risk to a change, not a claim that the code is defective.
   ([protocol.md](protocol.md#additive-opcodes-within-a-version)).
 
 ### KI-28 — The group authoriser has no concurrency cap, and the timeout does not stop the callback
-- **Where:** the deliberate absence is commented at `MeshHub.cs:1246-1257`; the bounded wait is
-  `:1264-1269`.
+- **Where:** the deliberate absence is commented at `MeshHub.cs:1482-1493`; the bounded wait is
+  `:1500-1505`.
 - **Severity:** medium (perf / availability). **Deliberate** — the hub bounds its own waiting and leaves
   the callback's resource use to the integrator, and says so on the delegate and in the README.
 - **Why it bites, in two parts:**
@@ -668,7 +673,7 @@ the risk to a change, not a claim that the code is defective.
 - **The related trap:** while the callback runs the client's receive loop reads nothing, so the client
   looks idle to the heartbeat monitor and can be **evicted rather than refused** if the decision outlasts
   `heartbeatInterval × maxMissedHeartbeats`. Behind a `MeshClientReconnector` that becomes a reconnect
-  loop. The constructor warns on this combination (`MeshHub.cs:216-236`) but does not prevent it.
+  loop. The constructor warns on this combination (`MeshHub.cs:285-306`) but does not prevent it.
 - **What to do:** an authoriser that holds a resource per invocation — a database connection, an
   outbound HTTP call — must **bound its own concurrency**, with its own semaphore or a shared pooled
   client. Prefer a synchronous decision against an in-memory policy table where you can; it takes the
@@ -678,12 +683,74 @@ the risk to a change, not a claim that the code is defective.
   not. Do not add a semaphore to the hub expecting it to help: it would queue joins behind each other
   and make the eviction trap worse, which is why there isn't one.
 
+### KI-29 — `MeshHub` had unbounded resource-consumption defaults — **FIXED (PR #68, issue #16, draft)**
+- **Where:** the new constants `MeshHub.cs:24-38` (`DefaultMaxClients`, `DefaultHeartbeatInterval`,
+  `DefaultMaxConnectionsPerRemoteEndpoint`); the constructor's default resolution `:181-262`; the whole
+  per-remote-endpoint cap machinery in `AcceptLoopAsync` and five new private helpers `:602-753`
+  (`ExtractRemoteAddress`, `NormaliseForEndpointCap`, `DisposeRefusedTransportAsync`,
+  `TryReserveEndpointSlot`, `ReleaseEndpointSlot`); the new `IRemoteEndPointTransport` interface
+  (`Transport/IRemoteEndPointTransport.cs`) and its `TcpTransport` implementation (`TcpTransport.cs:70`).
+- **Severity:** high (availability / security). Reachable from ordinary load, not just an adversary: any
+  hub constructed with the defaults — which is to say, most integration code before this PR — had no
+  ceiling on registered clients and never evicted an idle one.
+- **What was wrong:** three independent gaps, all in the same direction:
+  1. **`maxClients` defaulted to `int.MaxValue`.** A hub built with no arguments admitted an unlimited
+     number of registered clients. An unauthenticated peer (KI-2) could open connections until the
+     process ran out of sockets, threads or memory, and nothing in the constructor warned about it.
+  2. **`heartbeatInterval` defaulted to `null` (disabled).** A registered connection that sent one frame
+     and then went silent forever held its handler task, socket and outbound queue for the life of the
+     hub. There was no idle eviction unless an integrator explicitly opted in.
+  3. **Nothing capped connections per remote address.** Even with `maxClients` set, a flood of
+     connections from one source that never completed the registration handshake sailed straight past
+     it — `maxClients` only ever counted *registered* clients, never the pre-registration window.
+- **What the fix guarantees, and why each default was chosen:**
+  1. **`maxClients` now defaults to 1000.** The figure was already the README's worked example for what a
+     "sensible" cap looks like, so an integrator who never touched the parameter now gets the behaviour
+     the documentation always described as sensible, not silence. `int.MaxValue` still opts back into
+     unlimited.
+  2. **`heartbeatInterval` now defaults to 30 seconds**, and `null` now means "not configured" rather
+     than "disabled" — a hub that never touches the parameter gets idle eviction at the default interval,
+     exactly like an unconfigured `maxClients` still gets a cap. `Timeout.InfiniteTimeSpan` is the new,
+     explicit sentinel that disables idle eviction — passing it is a deliberate act, distinct from simply
+     omitting the parameter. The constructor's two existing warnings (`maxMissedHeartbeats == 1` with
+     heartbeats; `groupAuthorisationTimeout` too close to the eviction budget, `:270-283`, `:285-306`) were
+     updated to check the **resolved** `_heartbeatInterval` field rather than the raw parameter, since
+     idle eviction now runs by default even when the parameter was never set — checking the raw
+     parameter would have missed every hub relying on the new default.
+  3. **`maxConnectionsPerRemoteEndpoint` (new, default 100)** caps connections accepted from one remote
+     address at once, enforced in `AcceptLoopAsync` **before** any handler task is created or any
+     registration frame is read — covering exactly the pre-registration window `maxClients` cannot see.
+     It is keyed on the transport's reported remote address via the new, public
+     `IRemoteEndPointTransport` capability — following the existing `IBatchSendTransport` pattern, but
+     public rather than internal, since an external transport needs to be able to implement it too. A
+     transport that does not implement it (`InMemoryTransport`, or a custom one) is simply never capped.
+     **IPv6 addresses are masked to their `/64` network prefix before being used as the cap's key**
+     (`NormaliseForEndpointCap`, `MeshHub.cs:663-678`) — without this, a single host with a routine `/64`
+     allocation could defeat the cap by connecting from a different address within it each time, since a
+     full-address key would see each one as a brand-new source.
+- **This is a breaking behavioural change, not just a value change.** Any hub already running with the
+  old defaults — unlimited clients, no idle eviction — will now refuse registrations beyond 1000
+  concurrent clients and evict clients that go silent for 60 s (30 s × `maxMissedHeartbeats: 2`) by
+  default. Tests or integrations that relied on either old behaviour, including ones that open many
+  connections from `localhost` without configuring `maxConnectionsPerRemoteEndpoint`, need `int.MaxValue`
+  / `Timeout.InfiniteTimeSpan` passed explicitly.
+- **What to do:** accept the new defaults for any hub facing untrusted or unauthenticated input — that is
+  the case they exist for. If a hub genuinely needs unlimited clients or no idle eviction (e.g. a fully
+  trusted, closed deployment), pass `int.MaxValue` / `Timeout.InfiniteTimeSpan` explicitly and say why in
+  a comment, since the new defaults are now the documented, expected posture.
+- **What not to do:** do not "fix" a test that starts failing under the new caps by raising the cap
+  globally — configure the specific test's `MeshHubFixture`/`MeshHub` instead
+  (`maxConnectionsPerRemoteEndpoint: int.MaxValue`, etc.), the same way `MeshHubFixture` already does for
+  the four per-remote-endpoint tests. Do not remove the IPv6 `/64` masking on the reasoning that "IPv6
+  isn't used in tests" — it is the load-bearing part of the cap for any deployment that is reachable over
+  IPv6 at all.
+
 ---
 
 ## Also worth knowing (not defects)
 
 - **Broadcasts are indistinguishable from direct messages at the recipient** — both arrive as
-  `DeliverMessage` → `MessageReceived` (`MeshHub.cs:1137`). If you need to tell them apart, encode it in
+  `DeliverMessage` → `MessageReceived` (`MeshHub.cs:1373`). If you need to tell them apart, encode it in
   your payload.
 - **Two `.slnx` files** (root `Meshworx.slnx` vs `src/Meshworx.slnx`). CI and "done" use the root one.
 - **`RegistrationRefusedException`'s extra ctors** (message / message+inner / default) exist only to

@@ -51,7 +51,7 @@ implementation:**
 
 The exception *type* is load-bearing. `MeshHub.AcceptLoopAsync` uses it to tell **"this listener is
 finished"** (break the loop) from **"that one connection failed"** (log and `continue`), and the retry
-has no delay (`MeshHub.cs:502-510`) — so a listener that is never coming back but reports anything else
+has no delay (`MeshHub.cs:587-595`) — so a listener that is never coming back but reports anything else
 spins the hub's accept loop hot. Both shipped listeners translate accordingly; see
 [known-issues.md](known-issues.md) KI-22.
 
@@ -62,62 +62,90 @@ Task SendAsync(IReadOnlyList<ReadOnlyMemory<byte>> messages, CancellationToken =
 ```
 
 An **optional capability**. The hub's send loop coalesces a burst of queued frames into one underlying
-write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:1024-1026`);
+write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:1260-1262`);
 transports that don't implement it just receive frames one at a time. It is deliberately **`internal`**:
 only the bundled `TcpTransport` benefits and only the in-assembly hub consumes it, so it stays off the
 public `ITransport` surface. Each element is delivered as its own message. **External transports cannot
 and need not implement it.**
 
+### `IRemoteEndPointTransport` (public) — `Transport/IRemoteEndPointTransport.cs:16`
+
+```csharp
+EndPoint? RemoteEndPoint { get; }
+```
+
+Added by PR #68 (issue #16). Another **optional capability**, following the same pattern as
+`IBatchSendTransport` above but **public** rather than internal, since a custom network transport
+outside this assembly needs to be able to implement it too. `MeshHub.AcceptLoopAsync` uses it,
+immediately after `AcceptAsync` and before any handshake, to cap how many connections it admits from a
+single remote address at once (`ExtractRemoteAddress`, `MeshHub.cs:639-644`) — see
+[hub.md](hub.md#per-remote-endpoint-connection-cap) and [known-issues.md](known-issues.md) KI-29.
+- Return `null` if the transport has no meaningful network address (e.g. it isn't network-backed at
+  all, or the address isn't known yet). A transport that doesn't implement this interface, or that
+  returns `null`, or that returns something other than an `IPEndPoint`, is simply **never capped** by
+  the hub's per-remote-endpoint limit — `InMemoryTransport` falls into this bucket and always has.
+- The hub only recognises an `IPEndPoint`; it discards any other `EndPoint` subtype the same way as
+  `null`.
+- **Only `TcpTransport` implements it** in this codebase (below). If you write a custom TCP-like
+  transport and want it subject to `maxConnectionsPerRemoteEndpoint`, implement this interface and
+  report the genuine peer address — do not fabricate one, since the hub uses it as the cap's dictionary
+  key.
+
 ---
 
-## `TcpTransport` — `Transport/Tcp/TcpTransport.cs:25`
+## `TcpTransport` — `Transport/Tcp/TcpTransport.cs:26`
 
-`public sealed class TcpTransport : ITransport, IBatchSendTransport`. Length-prefixed framing over a
+`public sealed class TcpTransport : ITransport, IBatchSendTransport, IRemoteEndPointTransport`.
+Length-prefixed framing over a
 `Stream` — a `NetworkStream` from a `TcpClient`, an `SslStream` wrapping one when TLS is in use, or an
 arbitrary `Stream` via an internal ctor used by loopback tests.
 
 ### Framing
 
-Every message: **4-byte big-endian length prefix** (`HeaderSize=4`, `TcpTransport.cs:27`) followed by
-the payload. `MaxPayloadSize = 1 MiB` (`:28`). See [protocol.md](protocol.md) for the byte layout.
+Every message: **4-byte big-endian length prefix** (`HeaderSize=4`, `TcpTransport.cs:28`) followed by
+the payload. `MaxPayloadSize = 1 MiB` (`:29`). See [protocol.md](protocol.md) for the byte layout.
 **TLS does not change the framing** — the identical frames simply travel inside the TLS record layer,
 so every send/receive path below behaves the same either way.
 
 ### Behaviour
 
-- **`ConnectAsync(host, port, ct)`** (`:77`) — static factory; sets `NoDelay = true`, connects, returns
+- **`RemoteEndPoint`** (`:70`) — `public EndPoint?`; the `IRemoteEndPointTransport` implementation.
+  `null` only for the internal `Stream`-only constructor tests use; every socket-backed instance reports
+  `TcpClient.Client.RemoteEndPoint`. See [IRemoteEndPointTransport](#iremoteendpointtransport-public--transportiremoteendpointtransportcs16)
+  above.
+- **`ConnectAsync(host, port, ct)`** (`:86`) — static factory; sets `NoDelay = true`, connects, returns
   a ready **cleartext** transport. Disposes the socket if connect throws.
-- **`ConnectAsync(host, port, SslClientAuthenticationOptions, ct)`** (`:137`) — the TLS factory.
+- **`ConnectAsync(host, port, SslClientAuthenticationOptions, ct)`** (`:146`) — the TLS factory.
   Connects, wraps the `NetworkStream` in an `SslStream` (`leaveInnerStreamOpen: false`), runs
   `AuthenticateAsClientAsync`, and returns a transport over the authenticated stream. `tlsOptions` is
   **required** and non-null (`ArgumentNullException` otherwise) — use the cleartext overload if you do
   not want TLS. A failed handshake surfaces as `AuthenticationException`; on any throw the `SslStream`
-  is disposed **before** the `TcpClient` (`:162-173`) so the partially negotiated session unwinds before
+  is disposed **before** the `TcpClient` (`:171-182`) so the partially negotiated session unwinds before
   the socket goes away.
   - **The handshake is bounded only by your `cancellationToken`.** There is no built-in client-side
     handshake timeout (unlike the listener's). Pass a token that expires if a hostile or dead peer must
     not be able to stall the caller indefinitely.
-- **`IsEncrypted`** (`:61`) — `public bool`; true only when the underlying stream is an `SslStream` with
+- **`IsEncrypted`** (`:62`) — `public bool`; true only when the underlying stream is an `SslStream` with
   `IsEncrypted` set. Cheap; intended for a start-up/health assertion that a deployment really is
   encrypted.
-- **`SendAsync(single)`** (`:221`) — rejects payloads over 1 MiB with `ArgumentException` **before**
+- **`SendAsync(single)`** (`:230`) — rejects payloads over 1 MiB with `ArgumentException` **before**
   writing (also guards the size addition against overflow). Rents the frame buffer from
   `ArrayPool<byte>.Shared`, writes header+payload, then **writes and flushes under an internal
   `SemaphoreSlim` write lock** — this is what makes concurrent `SendAsync` safe.
-- **`SendAsync(batch)`** (`:264`) — frames the whole batch into one rented buffer, one `WriteAsync` +
+- **`SendAsync(batch)`** (`:273`) — frames the whole batch into one rented buffer, one `WriteAsync` +
   one `FlushAsync` under the write lock. Subtlety: if a payload in the batch is oversize, it frames and
   writes the **valid prefix up to** the first oversize frame, **then throws** — preserving the
   single-send "deliver-then-fault" behaviour so coalesced frames ahead of the bad one still go out
-  (`:281-338`). Empty batch is a no-op; single-element batch delegates to the scalar path.
-- **`ReceiveAsync`** (`:342`) — reads the 4-byte prefix into a **reused** `_headerBuffer` (safe because
+  (`:290-347`). Empty batch is a no-op; single-element batch delegates to the scalar path.
+- **`ReceiveAsync`** (`:351`) — reads the 4-byte prefix into a **reused** `_headerBuffer` (safe because
   single-reader), then allocates a fresh `byte[payloadLength]` for the body and returns it. A length
   `< 0` or `> 1 MiB` throws `IOException` ("Invalid payload length") — framing is no longer trustworthy,
   so receive loops treat it as a transport failure and close cleanly. Length `0` returns `[]`. A clean
-  or mid-frame EOF (`EndOfStreamException` in `ReadExactlyAsync`, `:391`) returns `null`.
-- **`DisposeAsync`** (`:377`) — disposes the stream (the `SslStream` when TLS is in use, which closes
+  or mid-frame EOF (`EndOfStreamException` in `ReadExactlyAsync`, `:400`) returns `null`.
+- **`DisposeAsync`** (`:386`) — disposes the stream (the `SslStream` when TLS is in use, which closes
   the `NetworkStream` it owns), the `TcpClient` (if owned), and the write lock.
 
-### `CloneClientOptions` (internal) — `:185`
+### `CloneClientOptions` (internal) — `:194`
 
 `ConnectAsync` never uses the caller's `SslClientAuthenticationOptions` instance directly; it copies it
 first. Two reasons, both load-bearing:
@@ -126,10 +154,10 @@ first. Two reasons, both load-bearing:
    authenticated.
 2. Defaulting `TargetHost` is not a visible side effect on an object the caller may reuse.
 
-`TargetHost` falls back to the dialled `host` when unset (`:193`) — that is the name the server
+`TargetHost` falls back to the dialled `host` when unset (`:202`) — that is the name the server
 certificate is then validated against. The RSA padding switches (`AllowRsaPkcs1Padding`,
 `AllowRsaPssPadding`) exist **only on Linux and Windows**; they are copied inside an
-`OperatingSystem.IsLinux() || IsWindows()` guard (`:211-215`) because reading them elsewhere throws.
+`OperatingSystem.IsLinux() || IsWindows()` guard (`:220-224`) because reading them elsewhere throws.
 
 > **If you add a property to this clone, or the framework type gains one, the copy must handle it.** A
 > missed property silently discards the caller's intent, which for a security setting means quietly
@@ -157,10 +185,11 @@ The copy is **shallow**. Mutating an object you passed in — the `ClientCertifi
 - **Leave `EnabledSslProtocols` at its default** (`SslProtocols.None`) so the platform negotiates its
   best available version rather than a pinned, ageing one. `CertificateRevocationCheckMode` is passed
   through untouched, so revocation is **not** checked unless you ask for it.
-- Internal ctors (`TcpTransport(TcpClient)` `:38`, `TcpTransport(Stream)` `:43`,
-  `TcpTransport(TcpClient, Stream)` `:48` — the last used by both TLS paths to pair the socket with its
+- Internal ctors (`TcpTransport(TcpClient)` `:39`, `TcpTransport(Stream)` `:44`,
+  `TcpTransport(TcpClient, Stream)` `:49` — the last used by both TLS paths to pair the socket with its
   `SslStream`) are `internal` and reached by the listener and by `InternalsVisibleTo` tests; not part of
-  the public API.
+  the public API. The `Stream`-only constructor is also the one case where `RemoteEndPoint` returns
+  `null` — see [Behaviour](#behaviour) above.
 
 ---
 

@@ -69,7 +69,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   ([known-issues.md](known-issues.md) KI-22). Copy this shape whenever a guard is written against
   undocumented platform behaviour.
 - **When the bug is "one interval late", assert a count, not an outcome.** The heartbeat tests
-  (`MeshHubTests.cs:1827`, `:1875`) do not merely assert that a silent client was evicted — that passes
+  (`MeshHubTests.cs:2057`, `:2105`) do not merely assert that a silent client was evicted — that passes
   whether eviction fires on the Nth or the (N+1)th interval, which was exactly the KI-11 defect. They
   count `Ping` frames in the mock's `SendAsync` callback and **snapshot the count inside the
   `DisposeAsync` setup**, so the teardown itself latches the value and no later write can inflate it,
@@ -77,7 +77,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   `DisposeAsync` callback to wait for eviction rather than sleeping. Copy this shape for any timing
   contract where the wrong answer is still a *plausible* answer. The complementary direction — a client
   that keeps sending is never evicted — is `HandleClient_ClientSendingFramesEveryInterval_IsNotEvicted`
-  (`:1919`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
+  (`:2149`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
   interval so a scheduling stall on a loaded runner cannot masquerade as a genuine eviction.
 - **Drive the receive loop with a `Channel`, not `SetupSequence` returning `null`.** A completed/`null`
   receive is now interpreted as a lost connection and triggers teardown. `MeshClientFixture`
@@ -133,13 +133,13 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   back. Prefer these over anything timing-based.
 
   1. **To park a caller *inside* a shutdown, hold the mocked `ITransport.SendAsync` open on the
-     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:358-368`) awaits each client's
+     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:427-437`) awaits each client's
      `SendAsync` in turn, and that await sits **after** the caller has claimed the hub's state but
      **before** the shutdown has finished — so returning an incomplete task there pins the hub
      mid-shutdown for as long as the test needs. The helper is already written:
 
      ```csharp
-     // MeshHubTests.cs:338 — fires onFrame, signals, then blocks until released
+     // MeshHubTests.cs:339 — fires onFrame, signals, then blocks until released
      ParkOnDisconnectFrame(client.Transport, notificationReached, releaseNotification,
          () => Interlocked.Increment(ref disconnectFrames));
 
@@ -152,9 +152,9 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
      Assert.Equal(1, Volatile.Read(ref disconnectFrames));   // no settle needed
      ```
 
-     `StopAsync_CalledWhileAShutdownIsInFlight_NotifiesEachClientOnce` (`MeshHubTests.cs:132`) counts
+     `StopAsync_CalledWhileAShutdownIsInFlight_NotifiesEachClientOnce` (`MeshHubTests.cs:133`) counts
      `Disconnect` frames to distinguish "joined the existing shutdown" from "started a second one";
-     `..._ReturnsOnlyOnceTheShutdownCompletes` (`:164`) asserts on the joining caller's task instead.
+     `..._ReturnsOnlyOnceTheShutdownCompletes` (`:165`) asserts on the joining caller's task instead.
      Note the first uses `RegisterMultiMessageClientAsync`, since the parked transport must survive more
      than one scripted frame.
 
@@ -172,7 +172,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
          });
      ```
 
-     `StopAsync_WhileAStartIsInProgress_LeavesTheStartedHubIntact` (`MeshHubTests.cs:305`) lands a full
+     `StopAsync_WhileAStartIsInProgress_LeavesTheStartedHubIntact` (`MeshHubTests.cs:306`) lands a full
      `StopAsync` in that window, releases the start, and then proves the hub is *genuinely* running by
      registering a client over it — not merely that no exception was thrown. Copy that "prove it still
      works" ending; asserting the absence of a throw would pass against a hub that had been left
@@ -181,13 +181,51 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   Both carry `[Fact(Timeout = 10000)]`, because the failure mode is a hang rather than an assertion
   failure. See [hub.md](hub.md#lifecycle) for the lifecycle contract these pin, and
   [known-issues.md](known-issues.md) KI-23.
+- **Assert a resolved default through an `internal` accessor rather than waiting out a real interval.**
+  Added with the finite-defaults work in PR #68 (issue #16), and following the same shape as
+  `TryReserveClientSlot`/`ReleaseClientSlot` below: `GetHeartbeatIntervalForTesting()`
+  (`MeshHub.cs:529-532`) is `internal` rather than `private` purely so a test can assert what
+  `heartbeatInterval` resolved to — including the 30 s default and the
+  `Timeout.InfiniteTimeSpan` opt-out — without a real `PeriodicTimer` interval ever having to elapse.
+  `Constructor_HeartbeatIntervalNotSpecified_DefaultsToThirtySeconds` (`MeshHubTests.cs:989`) and
+  `Constructor_HeartbeatIntervalSetToInfinite_DisablesIdleEviction` (`:1002`) are the
+  reference pair. Copy this shape — an `internal` read-only accessor plus `InternalsVisibleTo` — for any
+  future constructor-resolved default that would otherwise need a real timer/interval to observe.
+  `Constructor_MaxClientsNotSpecified_DefaultsToOneThousand` (`:970`) pins the `maxClients` default the
+  same way, but through `TryReserveClientSlot` directly (claiming it 1000 times) rather than a dedicated
+  accessor, since `maxClients` has no equivalent private field worth exposing.
+<a id="per-remote-endpoint-connection-cap"></a>
+- **Give a mock transport a remote address to test the per-remote-endpoint cap.** Also added by PR #68.
+  `MeshHubFixture.CreateMockTransport(IPEndPoint? remoteEndPoint = null)` and `RegisterClientAsync(string
+  name, IPEndPoint? remoteEndPoint = null)` (`Fixtures/MeshHubFixture.cs:137`, `:157-158`) both grew an
+  optional `remoteEndPoint` parameter — when given, the mock also implements
+  `IRemoteEndPointTransport` and reports it, so it participates in the cap exactly as `TcpTransport`
+  does. The four tests under the `// AcceptLoop — per-remote-endpoint connection cap` banner
+  (`MeshHubTests.cs:1040`) are the reference set:
+  - `AcceptLoop_TooManyConnectionsFromSameAddress_RefusesFurtherConnectionWithoutHandshake` proves the
+    refusal happens **before any handshake** — it asserts `ReceiveAsync` was `Times.Never` called on the
+    refused mock, not merely that registration failed.
+  - `AcceptLoop_ConnectionFromCappedAddressDisconnects_FreesSlotForAnotherFromSameAddress` waits on
+    `ClientDisconnected`, not a sleep, before attempting the replacement — the event only fires after
+    both the client slot and the endpoint slot have been released, so waiting on it pins the replacement
+    to a point where the address is provably free again.
+  - `AcceptLoop_TransportWithoutRemoteEndPoint_IsNeverCappedByAddress` uses the fixture's default
+    `RegisterClientAsync` (no `remoteEndPoint`), proving a transport that never reports an address is
+    never subject to the cap at all.
+  - `AcceptLoop_TwoIPv6AddressesInSamePrefix_ShareTheConnectionCap` and
+    `AcceptLoop_TwoIPv6AddressesInDifferentPrefixes_HaveIndependentConnectionCaps` pin the `/64`
+    normalisation both ways — same prefix shares the cap, different prefixes don't — using addresses
+    (`2001:db8:1:1::1` / `::2` vs `2001:db8:2:2::1`) chosen so the difference falls inside vs outside the
+    masked range. Copy this pairing if you extend `NormaliseForEndpointCap`: a single "it capped
+    something" test cannot tell a correct `/64` mask from one that is off by a bit.
+  See [hub.md](hub.md#per-remote-endpoint-connection-cap) and [known-issues.md](known-issues.md) KI-29.
 - **Park a *registration* mid-admission by holding the authenticator open.** Added with the capacity
   claim in PR #65 (issue #13). A `ClientAuthenticator` that signals a TCS and then awaits a second one
   parks the registration at exactly the point past the pre-authentication early-out and immediately
   before the hub takes its capacity decision — the only window in which the racing state can be staged:
 
   ```csharp
-  // MeshHubTests.cs:823
+  // MeshHubTests.cs:824
   var fixture = new MeshHubFixture(
       maxClients: 1,
       authenticator: async (_, ct) =>
@@ -221,19 +259,19 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   bare "still connected" check, which would pass with the guard removed. Every such test carries an
   explicit `[Fact(Timeout = …)]`, because the failure mode under test is a hang.
 - **The better way to prove "the hub did not send X": order, not time.** PR #66 added `FrameRecorder`
-  (`Fixtures/MeshHubFixture.cs:207`), which records every frame written to one client's transport and
+  (`Fixtures/MeshHubFixture.cs:222`), which records every frame written to one client's transport and
   lets a test await the first frame matching a predicate. The group-authorisation tests use it to assert
   an *absence* deterministically: after the frame that must not appear, they have the hub send one that
   certainly will — a direct message to the same client — and because a client's outbound queue is drained
   **in order**, the later frame's arrival proves the earlier one was never queued. Prefer this to a
   settle-and-count wherever the thing you are excluding shares a queue with something you can trigger.
-  See `SendToGroup_SenderIsNotAMember_MessageIsNotDelivered` (`MeshHubTests.cs:2072`).
+  See `SendToGroup_SenderIsNotAMember_MessageIsNotDelivered` (`MeshHubTests.cs:2302`).
 - **Fixture helpers build wire frames by hand** (`CreateRegistrationRequest`, `CreateDeliverMessagePayload`,
   `CreateLookupFound/NotFoundResponse`) with the raw opcodes — a useful cross-check of
   [protocol.md](protocol.md). If you change a frame layout, these helpers must change too.
   `CreateRegistrationRequest(name, credential)` builds a **version 3** frame
   (`[0x04][0x03][nameLen u16 BE][name][credential]`) and hard-codes the version byte, so a
-  `Protocol.Version` bump requires editing it (`Fixtures/MeshHubFixture.cs:115-127`).
+  `Protocol.Version` bump requires editing it (`Fixtures/MeshHubFixture.cs:118-130`).
 - **Test the authenticator through the hub, not in isolation.** `MeshHubFixture` takes `authenticator`
   and `maxConcurrentAuthentications` pass-throughs, so the seam is exercised over the real registration
   path. The `HandleClient_Authenticator*` tests in `MeshHubTests.cs` cover the outcomes worth copying:
@@ -242,11 +280,11 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   credential. `HandleClient_EmptyClientName_DropsConnectionWithoutRegistering` covers the malformed-frame
   path.
 - **Test the group authoriser the same way, through the hub.** `MeshHubFixture` takes `groupAuthoriser`
-  and `groupAuthorisationTimeout` (`Fixtures/MeshHubFixture.cs:26-27`). The twelve
+  and `groupAuthorisationTimeout` (`Fixtures/MeshHubFixture.cs:27-28`). The twelve
   `SendToGroup_*` / `JoinGroup_*` tests under the `// Groups as an authorisation boundary` banner
-  (`MeshHubTests.cs:2052`) are the reference set — they are enumerated in
+  (`MeshHubTests.cs:2282`) are the reference set — they are enumerated in
   [hub.md](hub.md#idiomatic-usage-from-tests). Note the hanging-authoriser test releases its callback at
-  the end (`MeshHubTests.cs:2272`) so an abandoned task does not outlive the test; do the same, because
+  the end (`MeshHubTests.cs:2502`) so an abandoned task does not outlive the test; do the same, because
   the hub's timeout does not stop the callback (KI-28 in [known-issues.md](known-issues.md)).
 - **End-to-end coverage lives in `MeshIntegrationTests.cs`**: `EndToEnd_NonMemberCannotSendToGroup`
   (`:152`) and `EndToEnd_UnauthorisedClientIsRefusedGroupMembership` (`:191`) run the rules over real

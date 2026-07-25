@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 9562c8f (branch docs/reconnected-handler-async-void, PR #67)
+reconciled-to-commit: 4c7a2ce (branch fix/unbounded-resource-consumption-defaults, PR #68, draft) + uncommitted working-tree changes on that branch (IPv6 /64 normalisation for the connection cap)
 reconciled-to-date: 2026-07-25
 mode: update
 -->
@@ -12,11 +12,40 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `docs/reconnected-handler-async-void` (PR #67, closing issue #15), which is
-> `main` plus a README **Event handlers** subsection and one guard test in
-> `MeshClientReconnectorTests.cs`. **No library code changed on this branch** — no behaviour, no
-> signature and no configuration differs from `main`, so every contract documented here describes `main`
-> exactly as it describes this branch.
+> **Documented tree:** branch `fix/unbounded-resource-consumption-defaults` (**draft PR #68**, closing
+> issue #16), currently checked out — plus uncommitted working-tree changes on top of that branch's pushed
+> commit `4c7a2ce` (an IPv6 `/64` normalisation step for the new connection cap, with its own test
+> coverage). **Unlike PR #67 below, this branch changes library code substantially**: `MeshHub`'s
+> constructor defaults, the accept loop, and a new public transport capability. It has **not merged to
+> `main`** — `main` is still `908a000`. Every `MeshHub.cs` coordinate in this file and in
+> [hub.md](for-clanker/hub.md), [known-issues.md](for-clanker/known-issues.md) and
+> [transport.md](for-clanker/transport.md) has been re-pointed against **this branch's tree**, not
+> against `main` — treat that as the current source of truth for `MeshHub.cs` line numbers until #68
+> merges. Concretely:
+> - `maxClients` now defaults to **1000** (was `int.MaxValue`/unlimited); `heartbeatInterval` now
+>   defaults to **30 s** (was `null`/disabled), with `Timeout.InfiniteTimeSpan` as the new explicit
+>   opt-out sentinel — distinct from omitting the parameter, which now takes the default rather than
+>   disabling eviction. See [§5](#5-configuration--environment).
+> - A new `maxConnectionsPerRemoteEndpoint` constructor parameter (default **100**) caps connections from
+>   a single remote address, enforced in `AcceptLoopAsync` before any registration handshake, backed by a
+>   new public `IRemoteEndPointTransport` capability that `TcpTransport` implements. See
+>   [hub.md](for-clanker/hub.md#per-remote-endpoint-connection-cap) and
+>   [transport.md](for-clanker/transport.md#iremoteendpointtransport-public--transportiremoteendpointtransportcs16).
+> - A new internal `GetHeartbeatIntervalForTesting()` accessor lets tests assert the resolved interval
+>   directly, mirroring the existing `TryReserveClientSlot`/`ReleaseClientSlot` internal-for-testing
+>   pattern. See [testing.md](for-clanker/testing.md).
+> - The two existing constructor warnings (`maxMissedHeartbeats == 1` with heartbeats;
+>   `groupAuthorisationTimeout` too close to the eviction budget) now check the **resolved**
+>   `_heartbeatInterval` field rather than the raw constructor parameter, since idle eviction now runs by
+>   default even when the parameter is left unset.
+> - See [known-issues.md](for-clanker/known-issues.md) KI-29 for the full write-up, including why this is
+>   a breaking behavioural change for any existing hub that relied on the old defaults.
+>
+> **Documented tree (PR #67):** branch `docs/reconnected-handler-async-void` (PR #67, closing issue #15),
+> which is `main` plus a README **Event handlers** subsection and one guard test in
+> `MeshClientReconnectorTests.cs`. **No library code changed on that branch** — no behaviour, no
+> signature and no configuration differs from `main` there, so every contract documented below (outside
+> the `MeshHub.cs` coordinates re-pointed above) describes `main` exactly as it describes PR #67.
 >
 > The group-authorisation work (PR #66, closing issue #14) has since merged as `975c10e`, so the
 > [Group authorisation](for-clanker/hub.md#group-authorisation) and
@@ -87,11 +116,23 @@ rather than read directly, it says so.
 > resolve to unrelated lines. Names and behaviour are accurate throughout; jump by symbol, not by line.
 >
 > Every `MeshHub.cs`, `MeshHubTests.cs`, `TcpTransport.cs`, `ITransportListener.cs`,
-> `TcpTransportListener.cs` and `InMemoryTransportListener.cs` coordinate is current — the `MeshHub.cs`
-> set was re-pointed in full for PR #66, which moved everything below its new `_groupAuthoriser` field
-> and rewrote the group helpers wholesale, the `MeshHubTests.cs` set likewise (PR #66 appended its tests
-> but also added a `using`, shifting every pre-existing coordinate by one), and the listener sets were
-> re-pointed in full for PR #63.
+> `TcpTransportListener.cs` and `InMemoryTransportListener.cs` coordinate is current. The `MeshHub.cs`
+> and `MeshHubTests.cs` sets were most recently re-pointed in full for **PR #68** (draft, issue #16,
+> the branch this file documents — see above): `MeshHub.cs` gained ~270 lines across new constructor
+> defaults, validation, an `internal` testing accessor and the whole per-remote-endpoint cap (new
+> constants, a new field, `AcceptLoopAsync`'s cap check, and five new private helpers inserted before
+> `HandleClientAsync`), which shifted every coordinate below the new `DefaultMaxClients` constant by
+> different amounts depending on position (from +2 near the top of the file to +236 from
+> `TryReserveClientSlot` onward) — each was individually verified against the source rather than
+> computed from a single offset. `MeshHubTests.cs` gained ~230 lines of new tests inserted mid-file
+> (before the "unsupported protocol version" region), shifting everything after that insertion point by
+> the same amount. `TcpTransport.cs` was re-pointed for the same PR, which added the
+> `IRemoteEndPointTransport` implementation (+1 line from a new `using`, +9 more from the `RemoteEndPoint`
+> property and its XML doc, from `IsEncrypted` onward). Before PR #68, the `MeshHub.cs` set was re-pointed
+> in full for PR #66, which moved everything below its new `_groupAuthoriser` field and rewrote the group
+> helpers wholesale, the `MeshHubTests.cs` set likewise (PR #66 appended its tests but also added a
+> `using`, shifting every pre-existing coordinate by one), and the listener sets were re-pointed in full
+> for PR #63 and remain untouched by PR #68.
 
 ---
 
@@ -128,8 +169,8 @@ direct-send to any id it holds. Treat the transport boundary as the trust bounda
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
 | Wire protocol version | `3` | `Messages/Protocol.cs:5` |
-| Max frame payload (TCP) | 1 MiB (`1024*1024`) | `Transport/Tcp/TcpTransport.cs:28` |
-| TCP transport encryption | Optional TLS, **off by default** | `Transport/Tcp/TcpTransport.cs:137`, `TcpTransportListener.cs:110` |
+| Max frame payload (TCP) | 1 MiB (`1024*1024`) | `Transport/Tcp/TcpTransport.cs:29` |
+| TCP transport encryption | Optional TLS, **off by default** | `Transport/Tcp/TcpTransport.cs:146`, `TcpTransportListener.cs:110` |
 | Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:6` |
 | Warnings as errors | Yes (`Directory.Build.props`) | `src/Directory.Build.props:3` |
 
@@ -274,7 +315,7 @@ receive loops never block on a slow recipient's socket; they just enqueue. See
 |---|---|---|
 | Hub: routing, groups, heartbeat, lifecycle | `MeshHub`, `IMeshHub` | [hub.md](for-clanker/hub.md) |
 | Client + reconnection | `MeshClient`, `IMeshClient`, `MeshClientReconnector` | [client.md](for-clanker/client.md) |
-| Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `TcpTransport(Listener)`, `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
+| Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `IRemoteEndPointTransport`, `TcpTransport(Listener)`, `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
 | Wire protocol & framing | `MessageType`, `Protocol`, handshake, opcode payloads | [protocol.md](for-clanker/protocol.md) |
 | Public value types | event args, `DisconnectReason`, `RegistrationErrorCode`, `ClientAuthenticator`, `RegistrationContext`, `GroupAuthoriser`, `GroupJoinContext`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
 | Tests, fixtures, build/CI | xUnit + Moq suite, `MeshHubFixture`, `MeshClientFixture` | [testing.md](for-clanker/testing.md) |
@@ -293,37 +334,46 @@ deadlocks or dropped messages that tests may not catch.
   block on async (`.Result` / `.Wait()`).
 - **`ITransport` contract:** `SendAsync` must be safe to call **concurrently**; `ReceiveAsync` is
   **single-reader** (never called concurrently). Both hub and client rely on this. `TcpTransport`
-  enforces send-concurrency with an internal `SemaphoreSlim` write lock (`TcpTransport.cs:32`).
+  enforces send-concurrency with an internal `SemaphoreSlim` write lock (`TcpTransport.cs:33`).
 - **`ITransportListener` contract:** a listener disposed with an accept still pending must end that
   accept with **`ObjectDisposedException`**, must throw the same for every later accept, and its
   `DisposeAsync` must be idempotent, safe to call concurrently, and return only once teardown is
   complete (`Transport/ITransportListener.cs:6-22`). The type matters:
   `MeshHub.AcceptLoopAsync` stops on `ObjectDisposedException` but logs-and-retries **without delay**
-  on anything else (`MeshHub.cs:502-510`), so a finished listener that reports itself any other way
+  on anything else (`MeshHub.cs:587-595`), so a finished listener that reports itself any other way
   spins the hub hot. See [known-issues.md](for-clanker/known-issues.md) KI-22.
 - **Hub lifecycle is serialised behind one lock.** `MeshHub.StartAsync`, `StopAsync` and `DisposeAsync`
   may all be called concurrently. Every lifecycle field (`_cts`, `_acceptLoopTask`, `_stopTask`,
-  `_disposeTask`, `_starting`, `_disposed`) is guarded by `Lock _stateLock` (`MeshHub.cs:58`), and each
+  `_disposeTask`, `_starting`, `_disposed`) is guarded by `Lock _stateLock` (`MeshHub.cs:89`), and each
   entry point **captures what it needs once into locals and never awaits while holding the lock**.
-  `StopAsync` is deliberately **not `async`** (`MeshHub.cs:312`): it decides synchronously under the
+  `StopAsync` is deliberately **not `async`** (`MeshHub.cs:382`): it decides synchronously under the
   lock, so overlapping callers provably share one shutdown — clients are notified once, and every caller
   returns only when the hub has actually stopped. Do not re-read a lifecycle field outside the lock and
   do not make `StopAsync` `async` again. See [hub.md](for-clanker/hub.md#lifecycle) and
   [known-issues.md](for-clanker/known-issues.md) KI-23.
 - **Client admission is an atomic claim, not a count check.** `maxClients` is enforced against
-  `_reservedClientSlots` (`MeshHub.cs:44`), which a registration takes with a single compare-and-swap
-  (`TryReserveClientSlot`, `MeshHub.cs:845`) and gives back in its handler's `finally`
-  (`MeshHub.cs:815-818`). The claim sits **after** the authenticator so an unauthenticated peer cannot
+  `_reservedClientSlots` (`MeshHub.cs:75`), which a registration takes with a single compare-and-swap
+  (`TryReserveClientSlot`, `MeshHub.cs:1081`) and gives back in its handler's `finally`
+  (`MeshHub.cs:1043-1046`). The claim sits **after** the authenticator so an unauthenticated peer cannot
   hold capacity, with a cheap at-capacity early-out **before** it so a full hub still never runs the
   callback. Consequence for any code you write here: `ConnectedClientCount` can transiently read *below*
   the number of claimed slots, so never gate admission on it. See
   [hub.md](for-clanker/hub.md#registration-handshake-hub-side) and
   [known-issues.md](for-clanker/known-issues.md) KI-26.
+- **A second, independent cap bounds connections per remote address, checked in the accept loop before
+  any handler exists.** `maxConnectionsPerRemoteEndpoint` guards the pre-registration window
+  `maxClients` cannot see — a connection flood that never completes a handshake — via a CAS claim
+  (`TryReserveEndpointSlot`, `MeshHub.cs:705`) against a `ConcurrentDictionary<IPAddress, int>`
+  (`MeshHub.cs:56`) keyed on the transport's `IRemoteEndPointTransport.RemoteEndPoint` (only checked when
+  the transport reports one). Refused connections are disposed immediately, before any registration
+  frame is read (`AcceptLoopAsync`, `MeshHub.cs:602-612`). Added by PR #68 (issue #16). See
+  [hub.md](for-clanker/hub.md#per-remote-endpoint-connection-cap) and
+  [known-issues.md](for-clanker/known-issues.md) KI-29.
 - **Group membership is the hub's only enforceable boundary, and the join gate is an awaited callback.**
   A group send is dropped unless the sender is in the group — tested **inside** the group's lock
-  (`MeshHub.cs:1430`) so a sender removed concurrently cannot slip through. A join, when a
+  (`MeshHub.cs:1666`) so a sender removed concurrently cannot slip through. A join, when a
   `GroupAuthoriser` is configured, awaits that callback **from the calling client's own receive loop**
-  (`MeshHub.cs:698-699`), which therefore reads nothing else from that client until it returns. Two
+  (`MeshHub.cs:926-927`), which therefore reads nothing else from that client until it returns. Two
   consequences: a slow authoriser stalls only its own client, and a client parked on a decision looks
   idle to the heartbeat monitor and can be evicted mid-decision. Keep integrator awaits out of
   `Group.Lock`. See [hub.md](for-clanker/hub.md#group-authorisation) and
@@ -363,18 +413,26 @@ deadlocks or dropped messages that tests may not catch.
 There is **no config file, no environment variables, no external services**. Everything is configured
 through constructor parameters. The only ambient dependency is an `ILogger<T>` you supply.
 
-**`MeshHub` options** (`MeshHub.cs:119-189`, all optional):
+**`MeshHub` options** (`MeshHub.cs:154-249`, all optional):
 
 | Param | Default | Effect |
 |---|---|---|
 | `registrationTimeout` | 10 s | Drop a connection that accepts but never registers |
-| `maxClients` | unlimited (`int.MaxValue`) | Refuse beyond this with `HubAtCapacity`. A **hard** cap — admission is one atomic claim, so concurrent registrations cannot overshoot it |
-| `heartbeatInterval` | `null` (disabled) | Ping idle clients; evict on the `maxMissedHeartbeats`th consecutive silent interval |
+| `maxClients` | **1000** (was unlimited before PR #68) | Refuse beyond this with `HubAtCapacity`. A **hard** cap — admission is one atomic claim, so concurrent registrations cannot overshoot it. Pass `int.MaxValue` for the old unlimited behaviour |
+| `heartbeatInterval` | **30 s** (was `null`/disabled before PR #68) | Ping idle clients; evict on the `maxMissedHeartbeats`th consecutive silent interval. Idle eviction now runs unless you opt out: pass `Timeout.InfiniteTimeSpan` explicitly to disable it — simply omitting the parameter no longer disables it, it takes the 30 s default |
 | `maxMissedHeartbeats` | 2 | **Silent intervals until eviction, counted inclusively:** a client that sends nothing is evicted on the Nth silent interval and probed N − 1 times first. At 1 it is never probed at all and the constructor logs a warning. Schedule table in [hub.md](for-clanker/hub.md#heartbeat-schedule) |
 | `authenticator` | `null` (**open admission**) | Decides whether each registering client may join; `false` → `AuthenticationFailed` |
 | `maxConcurrentAuthentications` | 64 | Caps concurrent authenticator callbacks; ignored when `authenticator` is `null` |
 | `groupAuthoriser` | `null` (**any client may join any group**) | Decides whether each registered client may join a group; `false` → `GroupJoinRefused` to that client. Fails closed on throw, self-cancellation or timeout. Group **sends** require membership with or without this |
-| `groupAuthorisationTimeout` | 10 s | How long the hub waits for a decision before refusing. Bounds the **wait**, not the callback — see [known-issues.md](for-clanker/known-issues.md) KI-28. Ignored when `groupAuthoriser` is `null`; keep it below `heartbeatInterval × maxMissedHeartbeats` |
+| `groupAuthorisationTimeout` | 10 s | How long the hub waits for a decision before refusing. Bounds the **wait**, not the callback — see [known-issues.md](for-clanker/known-issues.md) KI-28. Ignored when `groupAuthoriser` is `null`; keep it below `heartbeatInterval × maxMissedHeartbeats` — now always relevant, since `heartbeatInterval` defaults to a real value |
+| `maxConnectionsPerRemoteEndpoint` | **100** (new in PR #68) | Caps connections accepted from one remote address at once, checked in the accept loop before any handshake — covers the pre-registration window `maxClients` does not. Only enforced for a transport reporting `IRemoteEndPointTransport.RemoteEndPoint`; an IPv6 address is masked to its `/64` first. Pass `int.MaxValue` to opt out. See [hub.md](for-clanker/hub.md#per-remote-endpoint-connection-cap) |
+
+> **Every `MeshHub` default is now finite (PR #68, issue #16).** A hub constructed with no arguments at
+> all — `new MeshHub(logger, listener)` — used to admit an unlimited number of clients and never evict an
+> idle one; it now caps at 1000 clients, 100 concurrent connections per remote address, and evicts idle
+> clients after 60 s (30 s interval × 2 missed). This is a **behavioural change for any hub already
+> relying on the old unlimited/disabled defaults** — pass `int.MaxValue` / `Timeout.InfiniteTimeSpan`
+> explicitly to keep the old behaviour. See [known-issues.md](for-clanker/known-issues.md) KI-29.
 
 **`MeshClient` options** (`MeshClient.cs:67`): `idleTimeout` (default `null`), `sendTimeout`
 (default `null`), `maxSendAttempts` (default `1` — the first attempt counts, so `1` disables retrying;
@@ -420,8 +478,8 @@ full house style; the points below are the ones the code actually enforces and d
 - **Guard clauses first:** `ArgumentNullException.ThrowIfNull`, `ArgumentException.ThrowIfNullOrEmpty`,
   explicit range checks. Every public entry point does this.
 - **Catch specific exceptions.** Broad `catch (Exception)` appears **only** at loop/callback boundaries
-  and is always logged with a comment explaining why it is intentional (e.g. `MeshHub.cs:502-510`,
-  `:986`, and the three catches in `AuthenticateAsync` `:931-955`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
+  and is always logged with a comment explaining why it is intentional (e.g. `MeshHub.cs:587-595`,
+  `:1222`, and the three catches in `AuthenticateAsync` `:1167-1191`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
 - **No blocking, no `.Result`.** `CA2007` (ConfigureAwait) is a build error in the library.
 - **Binary wire work uses `System.Buffers.Binary.BinaryPrimitives`** (big-endian) and
   `Guid.TryWriteBytes` / `new Guid(span)` for the 16-byte ids. Frame buffers on hot paths are rented
@@ -522,5 +580,11 @@ there is no publish step in CI — CI only builds and tests.
   handler. A custom pooling transport could invalidate that assumption.
 - **Malformed/short frames are silently ignored** by both dispatch loops (length-guarded branches with
   no `else`). A bug in your framing will manifest as "nothing happens", not an exception.
+- **Every `MeshHub` default is now finite (PR #68), which is a behavioural change, not just a value
+  change.** A hub built with no arguments used to admit unlimited clients and never evict an idle one;
+  it now caps at 1000 clients and 100 connections per remote address, and evicts a silent client after
+  60 s by default. Code that relied on the old unlimited/disabled defaults — including tests that open
+  many connections from one address, e.g. from `localhost`, without configuring the caps — needs
+  `int.MaxValue` / `Timeout.InfiniteTimeSpan` passed explicitly. KI-29.
 
 Full register with severities, locations and workarounds: **[known-issues.md](for-clanker/known-issues.md)**.
