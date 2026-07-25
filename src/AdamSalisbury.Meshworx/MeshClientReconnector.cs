@@ -114,6 +114,14 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     /// <c>restoreGroupMembership</c> is enabled the client's previous groups have already been re-joined
     /// by the time this fires, so handlers only need to restore any remaining connection-scoped state.
     /// </summary>
+    /// <remarks>
+    /// The event means the connection is up again, not that this reconnector is what restored it, and it
+    /// may fire more than once for a single disconnect. A drop is detected both by the client's
+    /// <see cref="IMeshClient.Disconnected"/> event and, at startup, by a direct state check, so one drop
+    /// can raise the event twice; an application handler that reconnects the client itself will also
+    /// leave the reconnector raising it. <b>Handlers must therefore be safe to run more than once per
+    /// drop</b> — make the work they do idempotent rather than assuming it happens exactly once.
+    /// </remarks>
     public event EventHandler? Reconnected;
 
     /// <summary>
@@ -145,6 +153,23 @@ public sealed class MeshClientReconnector : IAsyncDisposable
         }
 
         Client.Disconnected += OnDisconnected;
+
+        // ConnectAsync returns with the client's receive loop already running on a background task, so the
+        // connection can be lost before the line above attaches the handler. That disconnect would be
+        // raised with no subscriber, leaving nothing to signal the reconnect loop and no other trigger to
+        // fall back on. Re-read the state now the handler is attached, and queue the signal the lost event
+        // would have queued. The client reports itself disconnected from the moment teardown begins, well
+        // before it raises Disconnected, so a drop in the window is always visible here.
+        //
+        // The cost of that early visibility is that a teardown straddling the subscription is seen twice:
+        // once here, and again when the event reaches the handler. The two do not coalesce — the channel
+        // only merges writes that overlap in the queue, and the loop drains before it reconnects — so the
+        // duplicate is dealt with where it is serviced, by the revalidation guard in ConnectWithRetryAsync.
+        if (!Client.IsConnected)
+        {
+            _reconnectSignals.Writer.TryWrite(0);
+        }
+
         _reconnectLoopTask = ReconnectLoopAsync(_stopCts.Token);
     }
 
@@ -207,13 +232,37 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     {
         while (!cancellationToken.IsCancellationRequested)
         {
+            // A queued signal records that the connection was lost, not that it is still lost: it may
+            // already have been recovered, either by an earlier pass servicing the same drop or by an
+            // application Disconnected handler reconnecting from within itself, which the client
+            // explicitly supports. Reconnecting a live client is not merely wasteful but impossible —
+            // the client refuses a connect unless it is fully disconnected — so retrying towards a state
+            // that has already been reached would loop for ever. Treat it as the goal met instead.
+            if (Client.IsConnected)
+            {
+                return;
+            }
+
             try
             {
                 using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 attemptCts.CancelAfter(_connectTimeout);
 
                 ITransport transport = await _transportFactory(attemptCts.Token).ConfigureAwait(false);
-                await Client.ConnectAsync(transport, _clientName, _credential, attemptCts.Token).ConfigureAwait(false);
+
+                try
+                {
+                    await Client.ConnectAsync(transport, _clientName, _credential, attemptCts.Token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // The client only takes ownership of the transport once it accepts it, so a connect
+                    // rejected before that point leaves nothing else to close this one. Disposal is
+                    // idempotent, so this is safe on the paths where the client did clean up itself.
+                    await transport.DisposeAsync().ConfigureAwait(false);
+                    throw;
+                }
+
                 return;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

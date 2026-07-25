@@ -162,20 +162,36 @@ connection lifecycle** — you still use `reconnector.Client` to send/receive.
 - **`transportFactory` produces a fresh transport per attempt** — because the client consumes/disposes a
   transport per connection. Defaults: `retryDelay` 1 s, `connectTimeout` 10 s.
 - **The `credential` is stored and re-sent on every connect and reconnect**
-  (`MeshClientReconnector.cs:137`, `:216`), so an authenticated client keeps its credential across drops
+  (`MeshClientReconnector.cs:145`, `:255`), so an authenticated client keeps its credential across drops
   without any work from you. It is captured once at construction: **there is no way to rotate it** on a
   live reconnector — a credential that expires mid-session will cause every subsequent reconnect attempt
   to fail with `AuthenticationFailed`, retried at `retryDelay` forever. If your credentials expire,
   dispose the reconnector and build a new one with the fresh credential.
-- `StartAsync` (`:99`) does one bounded connect; **throws on failure** and resets the started flag so it
-  can be retried (`:114-119`). On success it subscribes to `Client.Disconnected` and starts the loop.
+- `StartAsync` (`MeshClientReconnector.cs:124`) does one bounded connect; **throws on failure** and
+  resets the started flag so it can be retried (`:139-145`). On success it subscribes `OnDisconnected`
+  to `Client.Disconnected` (`:147`), then **re-reads `Client.IsConnected` and queues a reconnect signal
+  itself if the connection has already gone** (`:168-171`), and only then starts the loop.
+  That re-read is not belt-and-braces — it closes a race. `Client.ConnectAsync` returns with the
+  client's receive loop already running on a background task, so a drop landing between it returning and
+  the subscription line is raised with **no subscriber**: the event is genuinely lost. Without the
+  re-read nothing signals the loop and it parks on `WaitToReadAsync` for ever, leaving a permanently
+  disconnected client that never recovers (issue #8, fixed in PR #60). The client resets itself to a
+  disconnected state *before* raising `Disconnected`, which is what makes the state re-read a reliable
+  detector of a drop in that window.
 - `OnDisconnected` (`:126`) just `TryWrite`s to a **capacity-1 `DropWrite` channel** — disconnect
   notifications are coalesced (many drops → at most one queued reconnect) and the client's receive loop
   is never blocked.
 - `ReconnectLoopAsync` (`:132`) drains the signal, calls `ConnectWithRetryAsync`, then raises
   `Reconnected` (throwing handler logged, loop survives).
-- `ConnectWithRetryAsync` (`:162`) retries each bounded attempt after `retryDelay` until it succeeds or
-  the reconnector is disposed.
+- `ConnectWithRetryAsync` (`MeshClientReconnector.cs:219`) retries each bounded attempt after
+  `retryDelay` until it succeeds or the reconnector is disposed. Two guards inside it are load-bearing,
+  not incidental — both were added by PR #60 and removing either reintroduces a hang or a leak:
+  - **It returns immediately if `Client.IsConnected` is already true** (`:241-244`). The trigger is
+    **level-based, not edge-based**: a queued signal records that the connection *was* lost, not that it
+    still is. Read [known-issues.md](known-issues.md) KI-19 before touching this.
+  - **It disposes the transport the factory produced if `Client.ConnectAsync` rejects it** (`:257-264`),
+    because the client only takes ownership once it accepts the transport. See KI-20 — note the same
+    guard is **not** present on `StartAsync`'s connect (`:131-145`).
 
 ### Contract & gotcha
 
@@ -185,6 +201,12 @@ connection lifecycle** — you still use `reconnector.Client` to send/receive.
   `<remarks>` (`MeshClientReconnector.cs:20-23`).
 - `Reconnected` fires after every successful re-establish but **not** after the initial `StartAsync`
   connect.
+- **`Reconnected` can fire without this reconnector having reconnected anything.** Since the loop treats
+  an already-connected client as the goal met (`MeshClientReconnector.cs:241-244`), a signal that has
+  gone stale — a duplicate for a drop already serviced, or a drop an application `Disconnected` handler
+  recovered from itself — still runs the loop through to raising `Reconnected`. Treat the event as
+  "the connection is up again", not as "I re-established it", and make your handlers safe to run more
+  than once for a single drop. See [known-issues.md](known-issues.md) KI-19.
 
 ```csharp
 await using var reconnector = new MeshClientReconnector(
