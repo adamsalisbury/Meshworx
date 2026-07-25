@@ -27,6 +27,8 @@ the risk to a change, not a claim that the code is defective.
 | KI-16 | A reconnector's credential is fixed at construction and cannot be rotated | `MeshClientReconnector.cs:81`, `:137`, `:216` | medium (correctness) | open |
 | KI-17 | Sender identity is hop-by-hop: a compromised hub can forge any sender | system-wide | medium (security) | open — by design |
 | KI-18 | A failed TLS handshake is silent — the hub sees nothing at all | `TcpTransportListener.cs:446-460` | medium (maintainability) | open — by design |
+| KI-19 | A queued reconnect signal means the connection *was* lost, not that it still is | `MeshClientReconnector.cs:233-236`, `:160-163` | high (correctness) | **load-bearing** — guard added by PR #60; do not remove |
+| KI-20 | The caller owns the transport until `ConnectAsync` accepts it | `MeshClient.cs:163-177`, `MeshClientReconnector.cs:249-256`, `:131-145` | medium (resource correctness) | **partly addressed** — retry path fixed by PR #60; `StartAsync` still leaks |
 
 ---
 
@@ -216,7 +218,7 @@ the risk to a change, not a claim that the code is defective.
 
 ### KI-16 — A reconnector's credential is fixed at construction
 - **Where:** `MeshClientReconnector` captures `credential` into a `readonly` field
-  (`MeshClientReconnector.cs:81`, `:99`) and replays it on every connect and reconnect (`:137`, `:216`).
+  (`MeshClientReconnector.cs:81`, `:99`) and replays it on every connect and reconnect (`:137`, `:247`).
 - **Why it bites:** there is no setter and no factory callback for the credential, unlike
   `transportFactory` which *is* re-invoked per attempt. If the credential expires or is rotated
   mid-session, every subsequent reconnect fails with `AuthenticationFailed` and
@@ -261,6 +263,65 @@ the risk to a change, not a claim that the code is defective.
 - **What not to do:** do not narrow that `catch` so a handshake failure escapes. It runs on a background
   pump; an escaping exception there kills the pump and, via the channel completion, the whole listener —
   which is precisely the "one bad peer stops the hub" outcome the design avoids.
+
+### KI-19 — A queued reconnect signal means the connection *was* lost, not that it still is
+- **Where:** the revalidation guard at the top of `ConnectWithRetryAsync`
+  (`MeshClientReconnector.cs:233-236`); the signal sources are `OnDisconnected` (`:185`) and the
+  post-subscription state re-check in `StartAsync` (`:160-163`).
+- **Why it bites:** the reconnector's trigger is **level-based, not edge-based**. A signal sitting in
+  the capacity-1 channel is a record that a drop *happened*, not a guarantee the client is still down by
+  the time the loop services it. Three ways a signal goes stale:
+  1. **One drop, two signals.** `Client.IsConnected` is false during `Disconnecting` as well as
+     `Disconnected`, so a teardown that straddles the subscription line is seen *both* by `StartAsync`'s
+     state re-check and, moments later, by `OnDisconnected` when the event finally fires. The channel is
+     `DropWrite` capacity 1, so it coalesces only signals that overlap *in the queue* — these two do
+     not, and the second survives as a duplicate for a drop already serviced.
+  2. **An application handler reconnected from inside `Disconnected`.** `MeshClient` explicitly supports
+     this (`MeshClient.cs:224-234`), so the connection can be live again before the loop wakes.
+  3. **An earlier pass already recovered it.**
+- **What it costs if the guard goes:** `MeshClient.ConnectAsync` **refuses** a connect unless the client
+  is fully `Disconnected` (`MeshClient.cs:163-173`), so servicing a stale signal does not merely waste a
+  round trip — it throws `InvalidOperationException` every time, which
+  `ConnectWithRetryAsync`'s catch-all treats as a retryable failure. The loop then retries an
+  already-connected client **for ever** at `retryDelay`, building and discarding a transport each pass.
+  This is the regression PR #60's second commit exists to prevent;
+  `StartAsync_DropSignalledTwice_SettlesWithoutRetryingConnectedClient`
+  (`MeshClientReconnectorTests.cs:318`) is the test that pins it.
+- **What to do:** treat "revalidate the goal before acting on the signal" as the invariant. Any new
+  reconnect trigger you add (a heartbeat watchdog, a manual `Reconnect()` method) must go through the
+  same channel and inherit the same guard. If you ever need to distinguish "reconnect happened" from
+  "signal was stale", note that the current code returns from `ConnectWithRetryAsync` identically in both
+  cases, so `Reconnected` fires for a stale signal too — see the gotchas under
+  [`MeshClientReconnector`](client.md#meshclientreconnector).
+- **What not to do:** do not "simplify" the guard away on the reasoning that the coalescing channel
+  already deduplicates. It deduplicates concurrent writes, not a signal that arrives after the previous
+  one was drained.
+
+### KI-20 — The caller owns the transport until `ConnectAsync` accepts it
+- **Where:** `MeshClient.ConnectAsync` adopts the transport at `MeshClient.cs:176`, *after* its argument
+  and state validation (`:153-173`). A throw from that validation therefore leaves the transport
+  unowned and unclosed; a throw after adoption is cleaned up by `CleanUpAsync` (`:238`, disposal at
+  `:581-584`). The reconnector's retry path handles the gap (`MeshClientReconnector.cs:249-256`).
+- **Why it bites:** the reachable case is not a programming error. A reconnect attempt racing a teardown
+  hits the `ConnectionState.Disconnecting` guard (`MeshClient.cs:170`) and is rejected with
+  `InvalidOperationException` before adoption — so before PR #60 every such attempt **abandoned a live
+  transport**, one connected socket leaked per rejected retry, on a path that retries indefinitely.
+- **Two things this leaves you with:**
+  1. **`StartAsync` has no equivalent guard.** Its connect (`MeshClientReconnector.cs:131-145`) resets
+     the started flag and rethrows without disposing the transport. Bounded to one per call, but
+     `StartAsync` is documented as retryable, so a caller looping it leaks one transport per attempt.
+     *(Inference from reading both paths; no test covers it.)*
+  2. **`ITransport.DisposeAsync` must now be idempotent.** The reconnector disposes on *any*
+     `ConnectAsync` throw, including the post-adoption ones the client already cleaned up — the code
+     relies on the second disposal being harmless. `ITransport`'s `<remarks>` documents a concurrency
+     contract but says **nothing** about idempotent disposal (`Transport/ITransport.cs:3-15`). Both
+     in-tree implementations happen to satisfy it — `InMemoryTransport` guards explicitly
+     (`InMemoryTransport.cs:68-77`), `TcpTransport` inherits it from `Stream`/`TcpClient`/`SemaphoreSlim`
+     (`TcpTransport.cs:377-382`) — but a custom transport that throws on second disposal will fail here.
+- **What to do:** in any new code that hands a transport to `ConnectAsync`, dispose it yourself if the
+  call throws. If you write a custom `ITransport`, make `DisposeAsync` idempotent, as both shipped
+  implementations are. If you fix the `StartAsync` path, mirror the retry path's shape exactly rather
+  than inventing a second convention.
 
 ---
 

@@ -150,9 +150,13 @@ public sealed class MeshClientReconnector : IAsyncDisposable
         // connection can be lost before the line above attaches the handler. That disconnect would be
         // raised with no subscriber, leaving nothing to signal the reconnect loop and no other trigger to
         // fall back on. Re-read the state now the handler is attached, and queue the signal the lost event
-        // would have queued. The client resets to a disconnected state before it raises Disconnected, so a
-        // drop in the window is always visible here; one that lands after the subscription is caught by the
-        // handler instead, and the coalescing channel makes the overlap between the two harmless.
+        // would have queued. The client reports itself disconnected from the moment teardown begins, well
+        // before it raises Disconnected, so a drop in the window is always visible here.
+        //
+        // The cost of that early visibility is that a teardown straddling the subscription is seen twice:
+        // once here, and again when the event reaches the handler. The two do not coalesce — the channel
+        // only merges writes that overlap in the queue, and the loop drains before it reconnects — so the
+        // duplicate is dealt with where it is serviced, by the revalidation guard in ConnectWithRetryAsync.
         if (!Client.IsConnected)
         {
             _reconnectSignals.Writer.TryWrite(0);

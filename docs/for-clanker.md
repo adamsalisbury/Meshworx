@@ -1,8 +1,8 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 95b408c
-reconciled-to-date: 2026-07-24
+reconciled-to-commit: PR #60 (squash-merged to main)
+reconciled-to-date: 2026-07-25
 mode: update
 -->
 
@@ -12,19 +12,32 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `feat/tls-tcp-transport` (`95b408c`), which is `main` (`cf4b180`,
-> including the registration-authentication work of PR #56 and protocol version 3) plus the TLS
-> transport work (PR #59, closing issue #7). If you are on `main`, `TcpTransport` and
-> `TcpTransportListener` have no TLS surface and the coordinates in
-> [transport.md](for-clanker/transport.md) will not match your working tree; everything else does.
+> **Documented tree:** branch `fix/reconnector-missed-first-disconnect` (PR #60), which is `main`
+> plus the reconnector race fix (PR #60, closing issue #8). The `MeshClientReconnector` sections of
+> [client.md](for-clanker/client.md), [known-issues.md](for-clanker/known-issues.md) KI-19/KI-20 and
+> the reconnector row in [testing.md](for-clanker/testing.md) describe **that branch**; on `main`
+> `ConnectWithRetryAsync` has neither the already-connected guard nor the transport disposal, and every
+> `MeshClientReconnector.cs` coordinate past line 147 is 17–41 lines lower.
+>
+> The TLS transport work (PR #59, closing issue #7) is documented in
+> [transport.md](for-clanker/transport.md); the registration-authentication work of PR #56 and protocol
+> version 3 are on `main`.
 >
 > **Known documentation gap:** the coordinates (`path:line`) for `MeshClient.cs` and
 > `MeshClientReconnector.cs` outside the registration path were written against an older tree and have
 > since drifted — PRs #52 (reconnector group-membership restore) and #55 (client send timeout and
 > retry) landed on `main` after this documentation set was first written and have **still** not been
-> reconciled; PR #59 did not touch either file and deliberately left them alone. Names and behaviour are
-> accurate; the line numbers in those two files may be tens of lines out. Every `MeshHub.cs`,
-> `TcpTransport.cs` and `TcpTransportListener.cs` coordinate is current.
+> reconciled. Neither PR #59 nor PR #60 touched that backlog: each reconciliation is scoped to its own
+> branch, so PR #60 corrected only the coordinates its own diff moved and the sections its own diff
+> invalidated. Concretely, in [client.md](for-clanker/client.md) the `MeshClientReconnector` **Surface**
+> table still carries pre-#52 line numbers (`Client` `:86`, `StartAsync` `:99`, `Reconnected` `:92`,
+> `DisposeAsync` `:190`; the true values are `:110`, `:124`, `:117`, `:314`), the two **How it works**
+> bullets PR #60 did not rewrite are likewise stale (`OnDisconnected` `:126` and `ReconnectLoopAsync`
+> `:132`; the true values are `:168` and `:188`), the class-declaration coordinate `:24` is one line
+> out, and the test-file line count in the closing sentence predates two PRs. Those are the complete
+> set of stale reconnector coordinates as at PR #60 — a follow-up pass can clear them mechanically. Names and behaviour outside the reconnector's connect path are accurate; the line numbers in
+> those two files may be tens of lines out. Every `MeshHub.cs`, `TcpTransport.cs` and
+> `TcpTransportListener.cs` coordinate is current.
 
 ---
 

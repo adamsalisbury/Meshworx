@@ -15,7 +15,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 | `Fixtures/MeshClientFixture.cs` | 106 | Client test harness (mock transport, scripted receive) |
 | `MeshHubTests.cs` | 1588 | Registration, **authentication**, routing, broadcast, groups, heartbeat, capacity, lifecycle |
 | `MeshClientTests.cs` | 1367 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events |
-| `MeshClientReconnectorTests.cs` | 526 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory** |
+| `MeshClientReconnectorTests.cs` | 785 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal** |
 | `MeshIntegrationTests.cs` | 385 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** |
 | `Transport/InMemory/InMemoryTransportTests.cs` | 173 | Pair semantics, copy-on-send, close signalling |
 | `Transport/Tcp/TcpTransportTests.cs` | 342 | Framing, oversize rejection, invalid length, batch send |
@@ -55,6 +55,13 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   (`Fixtures/MeshHubFixture.cs`) captures the `RegistrationComplete` frame via a `SendAsync` callback,
   extracts the id, then spins on `IsClientRegistered(id)` with `Task.Yield()` until the hub has recorded
   the client. Copy this rather than `Task.Delay`.
+- **The one sanctioned exception to that: proving something *did not* happen.** There is no observable
+  state to wait on for "no spurious reconnect was queued" or "the loop is not stuck retrying", so the
+  reconnector's negative tests shrink `retryDelay` to 10 ms, then settle for 400 ms and assert an
+  attempt *count* — a stuck loop shows up as a count well past the expected one
+  (`MeshClientReconnectorTests.cs:305-308`, `:385-388`). Pair the delay with a count assertion, never a
+  bare "still connected" check, which would pass with the guard removed. Every such test carries an
+  explicit `[Fact(Timeout = …)]`, because the failure mode under test is a hang.
 - **Fixture helpers build wire frames by hand** (`CreateRegistrationRequest`, `CreateDeliverMessagePayload`,
   `CreateLookupFound/NotFoundResponse`) with the raw opcodes — a useful cross-check of
   [protocol.md](protocol.md). If you change a frame layout, these helpers must change too.
