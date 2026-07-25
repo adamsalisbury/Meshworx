@@ -188,15 +188,19 @@ new MeshHub(
     maxConcurrentAuthentications: 64,               // cap concurrent authenticator calls (default: 64)
     groupAuthoriser: groupAuthoriser,               // decide who may join a group (default: none — see Security)
     groupAuthorisationTimeout: TimeSpan.FromSeconds(10), // refuse a join whose authoriser hangs (default: 10s)
-    maxConnectionsPerRemoteEndpoint: 100);          // cap connections from one address (default: 100)
+    maxConnectionsPerRemoteEndpoint: 100,            // cap connections from one address (default: 100)
+    maxInboundMessagesPerSecond: 200,                // per-client frame-rate budget (default: 200)
+    maxInboundBytesPerSecond: 4 * 1024 * 1024,        // per-client byte-volume budget (default: 4 MiB)
+    maxFanOutMessagesPerSecond: 20);                 // stricter budget for broadcast/group sends (default: 20)
 ```
 
 Every one of these has a finite default, so a hub constructed with no arguments at all is still
 bounded: at most 1000 registered clients, at most 100 concurrent connections from any single remote
-address, and idle clients evicted rather than held open forever. `maxClients` and
-`maxConnectionsPerRemoteEndpoint` both accept `int.MaxValue` to opt back into no limit, and
-`heartbeatInterval` accepts `Timeout.InfiniteTimeSpan` to disable idle eviction entirely — only do
-this if something else bounds how long a connection may sit unused.
+address, idle clients evicted rather than held open forever, and a registered client's inbound
+traffic itself rate-limited. `maxClients` and `maxConnectionsPerRemoteEndpoint` both accept
+`int.MaxValue` to opt back into no limit, and `heartbeatInterval` accepts `Timeout.InfiniteTimeSpan`
+to disable idle eviction entirely — only do this if something else bounds how long a connection may
+sit unused.
 
 The hub pings idle clients and evicts any that fail to send a frame across the configured number of
 consecutive intervals, detecting half-open connections.
@@ -217,6 +221,16 @@ have actually registered. It is only enforced for a transport that reports where
 in-process one, is never capped by it. An IPv6 address is grouped with every other address in its /64
 network prefix before the cap applies — a single host is routinely handed an entire /64, so without
 this a single source could defeat the cap by connecting from a different address within it each time.
+
+`maxInboundMessagesPerSecond` and `maxInboundBytesPerSecond` bound a single registered client's
+inbound traffic — every frame type, charged independently by count and by volume, each with a burst
+allowance equal to one second's own budget. `maxFanOutMessagesPerSecond` applies on top of both,
+specifically to `BroadcastMessage` and `GroupMessage` frames: a single one of these fans out to every
+recipient (every other client for a broadcast, every other member for a group), so its cost to the hub
+is not the sender's alone to spend, and the stricter budget keeps a flood of either from being funded
+by one connection. A frame that exceeds any of these budgets is dropped without being processed or
+queued, and without telling the sender — the same silent-drop behaviour the hub already uses when a
+recipient's outbound queue is full. All three accept `int.MaxValue` to opt out.
 
 Observability:
 
@@ -324,6 +338,16 @@ must make deliberately.
 
   **Without a `GroupAuthoriser` the hub authorises no joins and any client may join any group**, so
   groups are then a routing convenience and must not be relied on for isolation.
+
+- **Inbound flood and amplification.** Authentication answers who a peer is; it does not limit what a
+  registered client can then do. Without a rate limit, one client streaming `BroadcastMessage` or
+  `GroupMessage` frames turns each inbound frame into a send to every recipient, so a single connection
+  could compel the hub to emit a multiple of its own input volume and churn every recipient's outbound
+  queue. `maxInboundMessagesPerSecond` and `maxInboundBytesPerSecond` bound a client's general inbound
+  rate and volume, and `maxFanOutMessagesPerSecond` applies a stricter budget on top of both,
+  specifically to the two message types whose delivery cost scales with the client population rather
+  than staying fixed. All three have finite defaults and are enforced before a frame is otherwise
+  looked at; see Configuration above for the figures and `int.MaxValue` opt-outs.
 
 - **Network exposure.** The `TcpTransportListener(int port)` convenience constructor binds to
   `IPAddress.Loopback`, so a hub created that way is not reachable from other hosts. To listen on a

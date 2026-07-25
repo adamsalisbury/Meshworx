@@ -26,7 +26,10 @@ internal sealed class MeshHubFixture
         int? maxConcurrentAuthentications = null,
         GroupAuthoriser? groupAuthoriser = null,
         TimeSpan? groupAuthorisationTimeout = null,
-        int? maxConnectionsPerRemoteEndpoint = null)
+        int? maxConnectionsPerRemoteEndpoint = null,
+        int? maxInboundMessagesPerSecond = null,
+        int? maxInboundBytesPerSecond = null,
+        int? maxFanOutMessagesPerSecond = null)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -52,7 +55,10 @@ internal sealed class MeshHubFixture
             maxConcurrentAuthentications,
             groupAuthoriser,
             groupAuthorisationTimeout,
-            maxConnectionsPerRemoteEndpoint);
+            maxConnectionsPerRemoteEndpoint,
+            maxInboundMessagesPerSecond,
+            maxInboundBytesPerSecond,
+            maxFanOutMessagesPerSecond);
     }
 
     /// <summary>
@@ -77,6 +83,17 @@ internal sealed class MeshHubFixture
         payload[0] = 0x02; // SendMessage
         recipientId.TryWriteBytes(payload.AsSpan(1));
         message.CopyTo(payload, 17);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a BroadcastMessage frame: [type][message].
+    /// </summary>
+    public static byte[] CreateBroadcastMessage(byte[] message)
+    {
+        var payload = new byte[1 + message.Length];
+        payload[0] = 0x0B; // BroadcastMessage
+        message.CopyTo(payload, 1);
         return payload;
     }
 
