@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: c7fbb62 (branch fix/disconnect-async-suppresses-racing-disconnected-event, PR #62)
+reconciled-to-commit: 283beac (branch fix/tcp-listener-dispose-race, PR #63)
 reconciled-to-date: 2026-07-25
 mode: update
 -->
@@ -12,21 +12,25 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `fix/disconnect-async-suppresses-racing-disconnected-event` (PR #62),
-> which is `main` plus the disconnect-race fix (PR #62, closing issue #10). The claim protocol in
-> [client.md](for-clanker/client.md#the-claim-protocol-load-bearing), the `DisconnectAsync` row in §2
-> below, [known-issues.md](for-clanker/known-issues.md) KI-21 and the `MeshClientTests.cs` row in
-> [testing.md](for-clanker/testing.md) describe **that branch**. On `main` a `DisconnectAsync` that
-> loses the race out of the connected state is a silent no-op and the receive loop still raises
-> `Disconnected(ConnectionLost)` for a disconnect the application requested; there is no
-> `_localDisconnectRequested` flag, and every `MeshClient.cs` coordinate past line 21 is 8–40 lines
-> lower.
+> **Documented tree:** branch `fix/tcp-listener-dispose-race` (PR #63), which is `main` plus the
+> listener disposal-contract fix (PR #63, closing issue #11). The `ITransportListener` disposal contract
+> and the `TcpTransportListener` / `InMemoryTransportListener` sections of
+> [transport.md](for-clanker/transport.md), the accept-loop note in
+> [hub.md](for-clanker/hub.md#the-accept-loop), [known-issues.md](for-clanker/known-issues.md) KI-22 and
+> the two listener test rows in [testing.md](for-clanker/testing.md) describe **that branch**. On `main`
+> `TcpTransportListener` has no `_stateLock`, `AcceptAsync` re-reads its fields, the
+> `ObjectDisposedException` translation exists on the TLS branch only, `DisposeAsync` is a plain `async`
+> method with no idempotency, `InMemoryTransportListener` can serve a queued connection after disposal —
+> and every `TcpTransportListener.cs` coordinate past line 39 is 6–137 lines lower.
 >
-> Everything else documented here is on `main`. The heartbeat eviction fix (PR #61, closing issue #9)
-> has since merged as `a005af2`, so the heartbeat schedule in
-> [hub.md](for-clanker/hub.md#heartbeat-schedule), the `maxMissedHeartbeats` row in §5 below, KI-11 and
-> every `MeshHub.cs` coordinate now describe `main` directly. The reconnector race fix (PR #60, closing
-> issue #8) is documented in the `MeshClientReconnector` sections of
+> Everything else documented here is on `main`. The disconnect-race fix (PR #62, closing issue #10) has
+> since merged as `28672a0`, so the claim protocol in
+> [client.md](for-clanker/client.md#the-claim-protocol-load-bearing), the `DisconnectAsync` row in §2
+> below, KI-21 and the `MeshClientTests.cs` row in [testing.md](for-clanker/testing.md) now describe
+> `main` directly. The heartbeat eviction fix (PR #61, closing issue #9) merged as `a005af2`, so the
+> heartbeat schedule in [hub.md](for-clanker/hub.md#heartbeat-schedule), the `maxMissedHeartbeats` row in
+> §5 below, KI-11 and every `MeshHub.cs` coordinate describe `main` too. The reconnector race fix
+> (PR #60, closing issue #8) is documented in the `MeshClientReconnector` sections of
 > [client.md](for-clanker/client.md) and KI-19/KI-20. The TLS transport work (PR #59, closing issue #7)
 > is documented in [transport.md](for-clanker/transport.md); the registration-authentication work of
 > PR #56 and protocol version 3 are on `main`.
@@ -35,9 +39,11 @@ rather than read directly, it says so.
 > `MeshClientReconnector.cs` outside the registration path were written against an older tree and have
 > since drifted — PRs #52 (reconnector group-membership restore) and #55 (client send timeout and
 > retry) landed on `main` after this documentation set was first written and have **still** not been
-> reconciled. None of PRs #59, #60 or #61 touched that backlog: each reconciliation is scoped to its own
-> branch, so PR #61 corrected only the coordinates its own diff moved and the sections its own diff
-> invalidated. Concretely, in [client.md](for-clanker/client.md) the `MeshClientReconnector` **Surface**
+> reconciled. None of PRs #59, #60, #61, #62 or #63 touched that backlog: each reconciliation is scoped
+> to its own branch, so PR #63 corrected only the coordinates its own diff moved and the sections its own
+> diff invalidated. **[client.md](for-clanker/client.md) was knowingly left alone in the PR #63 pass**
+> and is stale against `MeshClient.cs` beyond the items listed here; treat it as the next pass's job, not
+> as verified. Concretely, in [client.md](for-clanker/client.md) the `MeshClientReconnector` **Surface**
 > table still carries pre-#52 line numbers (`Client` `:86`, `StartAsync` `:99`, `Reconnected` `:92`,
 > `DisposeAsync` `:190`; the true values are `:110`, `:132`, `:125`, `:322`), the two **How it works**
 > bullets PR #60 did not rewrite are likewise stale (`OnDisconnected` `:126` and `ReconnectLoopAsync`
@@ -45,9 +51,11 @@ rather than read directly, it says so.
 > out, and the test-file line count in the closing sentence predates two PRs. Those are the complete
 > set of stale reconnector coordinates as at PR #61 — a follow-up pass can clear them mechanically.
 > Names and behaviour outside the reconnector's connect path are accurate; the line numbers in
-> those two files may be tens of lines out. Every `MeshHub.cs`, `TcpTransport.cs` and
-> `TcpTransportListener.cs` coordinate is current — the `MeshHub.cs` set was re-pointed in full for
-> PR #61, which shifted everything below the constructor.
+> those two files may be tens of lines out. Every `MeshHub.cs`, `TcpTransport.cs`,
+> `ITransportListener.cs`, `TcpTransportListener.cs` and `InMemoryTransportListener.cs` coordinate is
+> current — the `MeshHub.cs` set was re-pointed in full for PR #61, which shifted everything below the
+> constructor, and the listener sets were re-pointed in full for PR #63, which shifted everything below
+> `TcpTransportListener.cs:39`.
 
 ---
 
@@ -81,7 +89,7 @@ every other client and every group. Treat the transport boundary as the trust bo
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
 | Wire protocol version | `3` | `Messages/Protocol.cs:5` |
 | Max frame payload (TCP) | 1 MiB (`1024*1024`) | `Transport/Tcp/TcpTransport.cs:28` |
-| TCP transport encryption | Optional TLS, **off by default** | `Transport/Tcp/TcpTransport.cs:137`, `TcpTransportListener.cs:86` |
+| TCP transport encryption | Optional TLS, **off by default** | `Transport/Tcp/TcpTransport.cs:137`, `TcpTransportListener.cs:110` |
 | Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:6` |
 | Warnings as errors | Yes (`Directory.Build.props`) | `src/Directory.Build.props:3` |
 
@@ -225,6 +233,13 @@ deadlocks or dropped messages that tests may not catch.
 - **`ITransport` contract:** `SendAsync` must be safe to call **concurrently**; `ReceiveAsync` is
   **single-reader** (never called concurrently). Both hub and client rely on this. `TcpTransport`
   enforces send-concurrency with an internal `SemaphoreSlim` write lock (`TcpTransport.cs:32`).
+- **`ITransportListener` contract:** a listener disposed with an accept still pending must end that
+  accept with **`ObjectDisposedException`**, must throw the same for every later accept, and its
+  `DisposeAsync` must be idempotent, safe to call concurrently, and return only once teardown is
+  complete (`Transport/ITransportListener.cs:6-22`). The type matters:
+  `MeshHub.AcceptLoopAsync` stops on `ObjectDisposedException` but logs-and-retries **without delay**
+  on anything else (`MeshHub.cs:263-271`), so a finished listener that reports itself any other way
+  spins the hub hot. See [known-issues.md](for-clanker/known-issues.md) KI-22.
 - **Hub per-connection tasks:** each accepted connection runs a **receive loop** (`HandleClientAsync`),
   a **send loop** (`SendLoopAsync`, drains the bounded outbound `Channel`), and — only when heartbeats
   are configured — a **heartbeat monitor** (`MonitorHeartbeatAsync`, one `PeriodicTimer`). All share one
@@ -273,7 +288,7 @@ hub then trips it and raises `Disconnected(ConnectionLost)`.
 (10 s), `restoreGroupMembership`, optional `ILogger`, and `credential` (empty; replayed on every
 reconnect — it cannot be changed afterwards, see [known-issues.md](for-clanker/known-issues.md) KI-16).
 
-**`TcpTransportListener` options** (`TcpTransportListener.cs:86`, all optional):
+**`TcpTransportListener` options** (`TcpTransportListener.cs:110`, all optional):
 
 | Param | Default | Effect |
 |---|---|---|

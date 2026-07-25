@@ -18,9 +18,10 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 | `MeshClientReconnectorTests.cs` | 785 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal** |
 | `MeshIntegrationTests.cs` | 385 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** |
 | `Transport/InMemory/InMemoryTransportTests.cs` | 173 | Pair semantics, copy-on-send, close signalling |
+| `Transport/InMemory/InMemoryTransportListenerTests.cs` | 90 | **Listener disposal contract in memory (4 tests):** accept after dispose, dispose-without-ever-starting, a queued connection closed rather than served, repeated/concurrent dispose |
 | `Transport/Tcp/TcpTransportTests.cs` | 342 | Framing, oversize rejection, invalid length, batch send |
 | `Transport/Tcp/TcpTransportLoopbackTests.cs` | 70 | Round-trip over a real stream |
-| `Transport/Tcp/TcpTransportListenerTests.cs` | 47 | Start/accept/dispose (cleartext) |
+| `Transport/Tcp/TcpTransportListenerTests.cs` | 282 | Start/accept/dispose (cleartext), **plus the disposal contract (11 tests): start-after-dispose, pending accept ended by dispose, accept raced against dispose, concurrent dispose (cleartext and TLS), `IsStoppedListenerFailure` vs the framework** |
 | `Transport/Tcp/TcpTransportTlsTests.cs` | 494 | Server TLS, mutual TLS, rejection paths, handshake timeout, silent-peer flood, constructor guards, `TargetHost` defaulting, `IsEncrypted` |
 | `Transport/Tcp/TlsOptionsCloneTests.cs` | 242 | Reflection-driven proof that both TLS option clones copy **every** settable property |
 | `Transport/Tcp/TestCertificates.cs` | 67 | Helper: self-signed certificate generation and a pinning validation callback |
@@ -46,6 +47,27 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   the other floods with more silent peers than there are handshake slots. Copy that pairing if you touch
   the pump — a test that only checks "a good client still got through" passes even with the protection
   removed.
+- **To race two operations, dispatch both and release them together — never call them in sequence.**
+  `AcceptAsync_RacedAgainstDispose_OnlyEverReportsDisposal` (`TcpTransportListenerTests.cs:136`) parks an
+  accept and a dispose on separate `Task.Run`s, each awaiting a shared `SemaphoreSlim` that is then
+  released twice, and repeats the whole thing 50 times. Sequencing them on one thread would not race at
+  all: an accept issued first has always registered itself before it yields, so it would only ever
+  exercise the pending-accept path. Assert the **one** acceptable outcome
+  (`Assert.IsType<ObjectDisposedException>`), not "did not throw" — a `NullReferenceException`, a
+  "never started" claim and a raw socket error are each a distinct symptom the test exists to exclude.
+  The same release-together shape drives the concurrent-dispose tests (`:181` cleartext, `:215` TLS,
+  eight disposers each), which lock in a guarantee rather than reproduce a failure: the window they close
+  was a few instructions wide and never reliably reproducible, so they assert the property the elected
+  single teardown makes structural.
+- **Where the behaviour you depend on is the platform's, assert against the platform, not through your
+  wrapper.** `IsStoppedListenerFailure_WhatAStoppedTcpListenerActuallyThrows_IsRecognised` (`:99`) stops
+  a real `System.Net.Sockets.TcpListener` twice — once under a pending accept, once before a fresh accept
+  — and asserts `TcpTransportListener.IsStoppedListenerFailure` recognises whatever came back, naming the
+  actual type in the failure message. That is the entire reason the predicate is `internal` rather than
+  `private`: one of the three cases it covers is not reliably reachable through the listener, so a
+  framework change would otherwise surface not as a red test but as a hot accept loop in production
+  ([known-issues.md](known-issues.md) KI-22). Copy this shape whenever a guard is written against
+  undocumented platform behaviour.
 - **When the bug is "one interval late", assert a count, not an outcome.** The heartbeat tests
   (`MeshHubTests.cs:1453`, `:1501`) do not merely assert that a silent client was evicted — that passes
   whether eviction fires on the Nth or the (N+1)th interval, which was exactly the KI-11 defect. They

@@ -26,10 +26,11 @@ the risk to a change, not a claim that the code is defective.
 | KI-15 | `AuthenticationFailed` conflates refusal, throw, timeout and slot starvation | `MeshHub.cs:579-657` | medium (maintainability) | open — by design |
 | KI-16 | A reconnector's credential is fixed at construction and cannot be rotated | `MeshClientReconnector.cs:81`, `:137`, `:216` | medium (correctness) | open |
 | KI-17 | Sender identity is hop-by-hop: a compromised hub can forge any sender | system-wide | medium (security) | open — by design |
-| KI-18 | A failed TLS handshake is silent — the hub sees nothing at all | `TcpTransportListener.cs:446-460` | medium (maintainability) | open — by design |
+| KI-18 | A failed TLS handshake is silent — the hub sees nothing at all | `TcpTransportListener.cs:583-597` | medium (maintainability) | open — by design |
 | KI-19 | A queued reconnect signal means the connection *was* lost, not that it still is | `MeshClientReconnector.cs:241-244`, `:168-171` | high (correctness) | **load-bearing** — guard added by PR #60; do not remove |
 | KI-20 | The caller owns the transport until `ConnectAsync` accepts it | `MeshClient.cs:163-177`, `MeshClientReconnector.cs:257-264`, `:139-153` | medium (resource correctness) | **partly addressed** — retry path fixed by PR #60; `StartAsync` still leaks |
 | KI-21 | A `DisconnectAsync` arriving after the teardown publishes its state still raises `Disconnected` | `MeshClient.cs:852-873`, `:286-289` | low (correctness) | open — **accepted residual** of PR #62 (issue #10); the claim protocol around it is **load-bearing**, do not remove |
+| KI-22 | A listener disposed under a pending accept must end it with `ObjectDisposedException` | `Transport/ITransportListener.cs:6-22`, `TcpTransportListener.cs:242-297`, `:307-380`, `InMemoryTransportListener.cs:57`, `:75-90` | high (correctness) | **fixed** — PR #63 (issue #11); the contract and both translations are **load-bearing**, do not remove |
 
 ---
 
@@ -126,7 +127,9 @@ the risk to a change, not a claim that the code is defective.
 
 ### KI-7 — `InMemoryTransport` unbounded channels
 - **Where:** `InMemoryTransport.CreatePair` uses `Channel.CreateUnbounded` (`InMemoryTransport.cs:34-35`);
-  `InMemoryTransportListener` pending-connections channel is also unbounded.
+  `InMemoryTransportListener` pending-connections channel is also unbounded
+  (`InMemoryTransportListener.cs:12`) — disposal now drains and closes whatever accumulated there
+  (KI-22), but nothing bounds it while the listener is alive.
 - **Why it bites:** no back-pressure — a fast producer against a stalled consumer grows memory without
   bound. Fine for tests and cooperative in-process use; not for adversarial/production load.
 - **What to do:** use TCP (or a bounded custom transport) where back-pressure matters.
@@ -260,7 +263,7 @@ the risk to a change, not a claim that the code is defective.
   infrastructure and scope its blast radius accordingly.
 
 ### KI-18 — A failed TLS handshake is invisible to everything above the transport
-- **Where:** `TcpTransportListener.HandshakeAsync`'s catch-all (`TcpTransportListener.cs:446-460`) —
+- **Where:** `TcpTransportListener.HandshakeAsync`'s catch-all (`TcpTransportListener.cs:583-597`) —
   disposes the connection and swallows the cause. The transport layer has no logger.
 - **Why it bites:** an untrusted or absent client certificate, a protocol/cipher mismatch, a peer that
   exceeded `tlsHandshakeTimeout`, a cleartext client dialling a TLS listener, and a peer that reset all
@@ -268,7 +271,7 @@ the risk to a change, not a claim that the code is defective.
   error, and the client gets a generic `AuthenticationException` or a closed socket. "The client cannot
   connect and neither side says why" is the expected symptom of a TLS misconfiguration here, and it will
   cost you time if you do not know that going in. The same silence covers the pending-bound shedding
-  path (`:363-367`), where a connection is dropped before a handshake is even attempted.
+  path (`:500-504`), where a connection is dropped before a handshake is even attempted.
 - **What to do:** diagnose from the *client* side first — its exception is the only signal in the
   system. Reproduce against a known-good configuration (`TcpTransportTlsTests` is the reference), and
   narrow with `SSLKEYLOGFILE`/platform TLS tracing rather than expecting library logs. If you add
@@ -332,6 +335,11 @@ the risk to a change, not a claim that the code is defective.
      in-tree implementations happen to satisfy it — `InMemoryTransport` guards explicitly
      (`InMemoryTransport.cs:68-77`), `TcpTransport` inherits it from `Stream`/`TcpClient`/`SemaphoreSlim`
      (`TcpTransport.cs:377-382`) — but a custom transport that throws on second disposal will fail here.
+     **This gap is still open.** PR #63 closed only the *listener* half: `ITransportListener` now states
+     the idempotent-and-concurrency-safe disposal contract explicitly (KI-22). `ITransport` was not
+     touched, so the requirement the reconnector depends on remains undocumented on the interface that
+     needs it. If you write the missing `<remarks>`, mirror the wording already on
+     `ITransportListener.cs:18-21`.
 - **What to do:** in any new code that hands a transport to `ConnectAsync`, dispose it yourself if the
   call throws. If you write a custom `ITransport`, make `DisposeAsync` idempotent, as both shipped
   implementations are. If you fix the `StartAsync` path, mirror the retry path's shape exactly rather
@@ -375,6 +383,64 @@ the risk to a change, not a claim that the code is defective.
   - If you do attempt to close the residual window, the constraint to design against is the synchronous
     reconnect-from-handler pattern, not the lock itself. Anything that ends with the event being raised
     under `_stateLock` is wrong. Prove any change with a test that reconnects from inside `Disconnected`.
+
+### KI-22 — A listener disposed under a pending accept must end it with `ObjectDisposedException` — **FIXED (PR #63, issue #11)**
+- **Where:** the contract on `ITransportListener`'s `<remarks>` (`Transport/ITransportListener.cs:6-22`);
+  the `TcpTransportListener` implementation (`:242-297` for accept, `:307-380` for disposal); the
+  `InMemoryTransportListener` implementation (`InMemoryTransportListener.cs:57`, `:75-90`); the consumer
+  that depends on it, `MeshHub.AcceptLoopAsync` (`MeshHub.cs:246-271`).
+- **Status:** resolved by PR #63. Retained because the resulting behaviour is **load-bearing** in three
+  separate places, each easy to regress, and because a custom `ITransportListener` has to satisfy the
+  same contract.
+- **Why the exception type is the whole issue:** `MeshHub.AcceptLoopAsync` breaks on
+  `OperationCanceledException`/`ObjectDisposedException` and treats **everything else** as one bad
+  connection — logged at Warning and retried, with `continue` and **no delay** (`MeshHub.cs:263-271`).
+  Against a listener that is never coming back, "anything else" is therefore an unbounded hot spin that
+  floods the log and pins a core. A listener that fails to report its own disposal correctly does not
+  merely confuse a caller; it takes the hub with it.
+- **What was wrong, and what each part now guarantees:**
+  1. **The data race the issue was raised for.** `TcpTransportListener.AcceptAsync` null-checked
+     `_listener` and then dereferenced it, while `DisposeAsync` set it to `null`. A dispose landing
+     between the two produced a `NullReferenceException` — which the accept loop then logged and
+     retried. All mutable state is now guarded by a `Lock _stateLock` (`:44`) and every entry point
+     captures what it needs **once** into locals (`:242-248`). *The hub itself never triggered this — it
+     cancels the accept token and awaits the loop before disposing — so the reachable case was
+     standalone use that ignored the interface's "cancel first" remark. The interface now says
+     implementations may not rely on callers doing so.*
+  2. **The cleartext path did not translate.** `ObjectDisposedException` translation existed only on the
+     TLS branch (via `ChannelClosedException`). A **cleartext** listener disposed under a pending accept
+     surfaced the raw `SocketException`/`InvalidOperationException` that a stopped `TcpListener` throws —
+     straight into the retry-without-delay branch. The new `internal static
+     IsStoppedListenerFailure(Exception)` (`:403`) plus a `when (_disposed && …)` filter (`:275-283`)
+     makes both branches end the same way, so the spin is gone from the cleartext path too. **The
+     `_disposed` conjunct is as load-bearing as the filter:** without it an ordinary transient socket
+     error on a healthy listener would be reported as disposal and would stop the accept loop for good.
+  3. **The in-memory listener could serve a connection after disposal, and leaked the rest.**
+     Completing a channel does not discard what is already buffered, so a disposed
+     `InMemoryTransportListener` would still hand out a queued live connection; and its `DisposeAsync`
+     was a synchronous no-op beyond `TryComplete`, so every established-but-never-accepted pair leaked
+     with its client half parked on a server end nobody would read. It now checks `_disposed` **ahead of
+     the started guard and ahead of the read** (`InMemoryTransportListener.cs:57`), is idempotent via
+     `Interlocked.Exchange`, and drains the channel disposing each queued transport (`:82-89`).
+  4. **`StartAsync` on a disposed listener bound a fresh socket.** It now throws
+     `ObjectDisposedException` (`:194`), and publishes `_listener` only after a successful bind
+     (`:201-206`) so a failed bind leaves the listener startable rather than permanently "already
+     running".
+  5. **Concurrent disposal ran the teardown twice over half-cleared state.** `DisposeAsync` is no longer
+     `async`: the first caller elects a single teardown under the lock, hands it the state, clears the
+     fields and stores the `Task`; everyone else awaits that same task (`:307-339`). Every caller returns
+     only once teardown is complete.
+- **What to do:** if you write an `ITransportListener`, satisfy all of it — pending accept ends in
+  `ObjectDisposedException`, later accepts throw the same, disposal is idempotent, concurrency-safe and
+  complete on return. Use the two shipped listeners as worked examples.
+- **What not to do:** do not "simplify" `AcceptAsync` back to reading the fields directly; do not remove
+  the `_disposed` conjunct from the cleartext filter; do not widen `IsStoppedListenerFailure`; do not
+  make it `private` — it is `internal` so a test can assert against the framework directly that what a
+  stopped `TcpListener` actually throws is still recognised, and the narrow third case
+  (`InvalidOperationException`, "Not listening") is not reliably reachable through the listener, so
+  nothing else would notice a framework change. Fifteen tests pin all of this
+  (`TcpTransportListenerTests.cs`, `Transport/InMemory/InMemoryTransportListenerTests.cs` — see
+  [testing.md](testing.md)).
 
 ---
 
