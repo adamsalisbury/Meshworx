@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
@@ -22,7 +23,7 @@ namespace AdamSalisbury.Meshworx.Transport.Tcp;
 /// not already trust. Framing is identical either way; only the byte stream changes.
 /// </para>
 /// </remarks>
-public sealed class TcpTransport : ITransport, IBatchSendTransport
+public sealed class TcpTransport : ITransport, IBatchSendTransport, IRemoteEndPointTransport
 {
     private const int HeaderSize = 4;
     private const int MaxPayloadSize = 1024 * 1024;
@@ -59,6 +60,14 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport
     /// the path. Useful for asserting in a health check that a deployment really is encrypted.
     /// </remarks>
     public bool IsEncrypted => _stream is SslStream { IsEncrypted: true };
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// <see langword="null"/> when this instance was constructed directly from a <see cref="Stream"/>
+    /// rather than a connected <see cref="TcpClient"/> — the internal constructor used by tests that
+    /// exercise framing against an arbitrary stream, which has no socket to report an address for.
+    /// </remarks>
+    public EndPoint? RemoteEndPoint => _tcpClient?.Client.RemoteEndPoint;
 
     /// <summary>
     /// Creates a new, unencrypted <see cref="TcpTransport"/> by connecting to the specified remote

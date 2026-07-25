@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Net;
 using System.Text;
 using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Messages;
@@ -14,6 +15,27 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private static readonly TimeSpan DefaultGroupAuthorisationTimeout = TimeSpan.FromSeconds(10);
     private const int DefaultMaxConcurrentAuthentications = 64;
 
+    // A hub with no configured ceiling used to admit clients without limit. That is never a safe
+    // default: an unauthenticated peer could open connections until the process ran out of sockets,
+    // threads or memory. 1000 is the figure the README has always used as its worked example, so it
+    // is what integrators already expect a "sensible" cap to look like. Pass int.MaxValue explicitly
+    // to opt back into the old unlimited behaviour.
+    private const int DefaultMaxClients = 1000;
+
+    // Idle eviction used to be off unless an integrator opted in, so a registered connection that
+    // never sent another frame held its handler task, socket and outbound queue forever. 30 seconds
+    // matches the README's own worked example for heartbeatInterval, so a hub that never touches this
+    // parameter now gets exactly the behaviour the documentation already described as the sensible
+    // choice. Pass Timeout.InfiniteTimeSpan explicitly to disable idle eviction entirely.
+    private static readonly TimeSpan DefaultHeartbeatInterval = TimeSpan.FromSeconds(30);
+
+    // An unauthenticated peer that can open sockets can open many of them from the same source, each
+    // claiming a handler task, a socket and an outbound queue before ever completing registration.
+    // This bounds how many connections the accept loop admits from a single remote address at once,
+    // independently of maxClients — which only limits registered clients, not connections still mid
+    // handshake. Pass int.MaxValue explicitly to opt out.
+    private const int DefaultMaxConnectionsPerRemoteEndpoint = 100;
+
     private readonly ILogger<MeshHub> _logger;
     private readonly ITransportListener _listener;
     private readonly TimeSpan _registrationTimeout;
@@ -23,6 +45,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly ClientAuthenticator? _authenticator;
     private readonly GroupAuthoriser? _groupAuthoriser;
     private readonly TimeSpan _groupAuthorisationTimeout;
+    private readonly int _maxConnectionsPerRemoteEndpoint;
+
+    // How many connections are currently open from each remote address, counting from acceptance
+    // until the handler that owns that connection finishes — including the pre-registration window,
+    // since that is exactly the window an unauthenticated flood exploits. Only addresses the accept
+    // loop can actually observe: a transport that does not report one (see
+    // <see cref="IRemoteEndPointTransport"/>) is never counted here and so is never capped by it.
+    private readonly ConcurrentDictionary<IPAddress, int> _connectionsByRemoteAddress = new();
 
     // Caps how many integrator authenticator callbacks may run concurrently. Null when no authenticator
     // is configured, since there is then no pre-authentication work to bound.
@@ -87,14 +117,18 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// </param>
     /// <param name="maxClients">
     /// The maximum number of clients that may be registered at once. Further registration attempts are
-    /// refused with <see cref="RegistrationErrorCode.HubAtCapacity"/>. Defaults to unlimited.
+    /// refused with <see cref="RegistrationErrorCode.HubAtCapacity"/>. Defaults to 1000. Pass
+    /// <see cref="int.MaxValue"/> to admit an unlimited number of clients.
     /// </param>
     /// <param name="heartbeatInterval">
     /// How long a registered client may be idle before the hub probes it with a ping — unless
     /// <paramref name="maxMissedHeartbeats"/> is 1, in which case the first idle interval evicts the
     /// client rather than probing it. A client that fails to send any frame across
     /// <paramref name="maxMissedHeartbeats"/> consecutive intervals is evicted, detecting half-open
-    /// connections. Defaults to <see langword="null"/> (disabled).
+    /// connections. Defaults to 30 seconds, so idle eviction is on unless a hub opts out. Pass
+    /// <see cref="Timeout.InfiniteTimeSpan"/> to disable idle eviction entirely and let a registered
+    /// client sit silent indefinitely — only do this if something else bounds how long a connection
+    /// may go unused.
     /// </param>
     /// <param name="maxMissedHeartbeats">
     /// The number of consecutive idle intervals that causes a client to be evicted. A client that sends
@@ -132,6 +166,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// receive loop — and hold its client slot — indefinitely. Defaults to 10 seconds. Ignored when
     /// <paramref name="groupAuthoriser"/> is <see langword="null"/>.
     /// </param>
+    /// <param name="maxConnectionsPerRemoteEndpoint">
+    /// The maximum number of connections the accept loop admits from a single remote address at once,
+    /// counted from acceptance until the connection's handler finishes — including the pre-registration
+    /// window, which <paramref name="maxClients"/> does not cover. Refused connections are closed
+    /// immediately, before any handshake. Only enforced for a transport that reports its remote address
+    /// via <see cref="IRemoteEndPointTransport"/>; a transport that does not is never capped by this.
+    /// Defaults to 100. Pass <see cref="int.MaxValue"/> to opt out.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
@@ -142,7 +184,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         ClientAuthenticator? authenticator = null,
         int? maxConcurrentAuthentications = null,
         GroupAuthoriser? groupAuthoriser = null,
-        TimeSpan? groupAuthorisationTimeout = null)
+        TimeSpan? groupAuthorisationTimeout = null,
+        int? maxConnectionsPerRemoteEndpoint = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -159,10 +202,16 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 nameof(maxClients), "The maximum client count must be positive.");
         }
 
-        if (heartbeatInterval is { } interval && interval <= TimeSpan.Zero)
+        // Timeout.InfiniteTimeSpan is the one negative value accepted here — it is the deliberate,
+        // explicit opt-out from idle eviction, not a misconfiguration.
+        if (heartbeatInterval is { } interval
+            && interval <= TimeSpan.Zero
+            && interval != Timeout.InfiniteTimeSpan)
         {
             throw new ArgumentOutOfRangeException(
-                nameof(heartbeatInterval), "The heartbeat interval must be positive.");
+                nameof(heartbeatInterval),
+                "The heartbeat interval must be positive, or Timeout.InfiniteTimeSpan to disable idle "
+                + "eviction.");
         }
 
         if (maxMissedHeartbeats < 1)
@@ -184,15 +233,29 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 nameof(groupAuthorisationTimeout), "The group authorisation timeout must be positive.");
         }
 
+        if (maxConnectionsPerRemoteEndpoint is { } maxPerEndpoint && maxPerEndpoint <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxConnectionsPerRemoteEndpoint),
+                "The maximum connections per remote endpoint must be positive.");
+        }
+
         _logger = logger;
         _listener = listener;
         _registrationTimeout = registrationTimeout ?? DefaultRegistrationTimeout;
-        _maxClients = maxClients ?? int.MaxValue;
-        _heartbeatInterval = heartbeatInterval;
+        _maxClients = maxClients ?? DefaultMaxClients;
+
+        // Null now means "not configured" rather than "disabled": an unconfigured hub still gets idle
+        // eviction, at the default interval, exactly like an unconfigured maxClients still gets a cap.
+        // Only the explicit Timeout.InfiniteTimeSpan sentinel switches it off.
+        _heartbeatInterval = heartbeatInterval == Timeout.InfiniteTimeSpan
+            ? null
+            : heartbeatInterval ?? DefaultHeartbeatInterval;
         _maxMissedHeartbeats = maxMissedHeartbeats;
         _authenticator = authenticator;
         _groupAuthoriser = groupAuthoriser;
         _groupAuthorisationTimeout = groupAuthorisationTimeout ?? DefaultGroupAuthorisationTimeout;
+        _maxConnectionsPerRemoteEndpoint = maxConnectionsPerRemoteEndpoint ?? DefaultMaxConnectionsPerRemoteEndpoint;
 
         if (authenticator is not null)
         {
@@ -204,8 +267,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         // answered, so the hub evicts on the first idle interval without probing. A client that only
         // receives — and so sends nothing of its own — is then dropped every interval. That is a
         // legitimate choice if clients are expected to send continuously, but it is far more often a
-        // misconfiguration, and a silent one, so say so once at construction.
-        if (heartbeatInterval is not null && maxMissedHeartbeats == 1)
+        // misconfiguration, and a silent one, so say so once at construction. Checked against the
+        // resolved interval rather than the raw parameter, since idle eviction now runs by default even
+        // when heartbeatInterval was never set.
+        if (_heartbeatInterval is not null && maxMissedHeartbeats == 1)
         {
             _logger.LogWarning(
                 "Heartbeats are enabled with maxMissedHeartbeats set to 1, so clients are evicted on "
@@ -220,9 +285,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         // refused, which is not what the fail-closed contract promises and, behind a reconnector, becomes
         // a reconnect loop. Warn rather than throw: the combination is legal, the default authorisation
         // timeout would otherwise refuse construction of a hub with a short heartbeat interval, and a slow
-        // authoriser may simply never take that long in practice.
+        // authoriser may simply never take that long in practice. Checked against the resolved interval
+        // for the same reason as above.
         if (groupAuthoriser is not null
-            && heartbeatInterval is { } configuredInterval
+            && _heartbeatInterval is { } configuredInterval
             && _groupAuthorisationTimeout >= configuredInterval * maxMissedHeartbeats)
         {
             _logger.LogWarning(
@@ -446,6 +512,21 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         return _clients.ContainsKey(clientId);
     }
 
+    /// <summary>
+    /// Gets the resolved interval the idle/heartbeat monitor uses, or <see langword="null"/> if idle
+    /// eviction is disabled.
+    /// </summary>
+    /// <remarks>
+    /// Internal rather than private so a test can assert how the constructor resolved
+    /// <c>heartbeatInterval</c> — including the default it falls back to and the
+    /// <see cref="Timeout.InfiniteTimeSpan"/> opt-out — without waiting out a real interval to observe
+    /// the behaviour indirectly.
+    /// </remarks>
+    internal TimeSpan? GetHeartbeatIntervalForTesting()
+    {
+        return _heartbeatInterval;
+    }
+
     /// <inheritdoc/>
     /// <remarks>
     /// Safe to call more than once, and from more than one thread at a time. The first call performs the
@@ -509,7 +590,24 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 continue;
             }
 
-            var handlerTask = HandleClientAsync(transport, cancellationToken);
+            // Cap connections per remote address before spending a handler task on one. This is
+            // enforced here rather than left to maxClients because maxClients only bounds registered
+            // clients: a flood of connections that never complete registration would otherwise sail
+            // straight past it. Only checked for a transport that can report where it came from —
+            // an in-process transport, for instance, has no meaningful remote address to cap.
+            IPAddress? remoteAddress = ExtractRemoteAddress(transport);
+            if (remoteAddress is not null && !TryReserveEndpointSlot(remoteAddress))
+            {
+                _logger.LogWarning(
+                    "Refusing a connection from {RemoteAddress}: already at the limit of {Limit} "
+                    + "concurrent connections from that address",
+                    remoteAddress,
+                    _maxConnectionsPerRemoteEndpoint);
+                await DisposeRefusedTransportAsync(transport).ConfigureAwait(false);
+                continue;
+            }
+
+            var handlerTask = HandleClientAsync(transport, remoteAddress, cancellationToken);
             _handlerTasks.TryAdd(handlerTask, 0);
             _ = handlerTask.ContinueWith(
                 t =>
@@ -524,7 +622,96 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
     }
 
-    private async Task HandleClientAsync(ITransport transport, CancellationToken cancellationToken)
+    /// <summary>
+    /// Reads the remote address a transport reports, if it reports one at all.
+    /// </summary>
+    /// <remarks>
+    /// Only <see cref="IRemoteEndPointTransport"/> implementers are considered, and only when the
+    /// endpoint they report is an <see cref="IPEndPoint"/> — the per-remote-endpoint cap is keyed on
+    /// the address alone, not the port, since every connection from the same peer arrives on a fresh
+    /// ephemeral port and a port-qualified key would never actually catch a repeat source.
+    /// </remarks>
+    private static IPAddress? ExtractRemoteAddress(ITransport transport)
+    {
+        return transport is IRemoteEndPointTransport { RemoteEndPoint: IPEndPoint endpoint }
+            ? endpoint.Address
+            : null;
+    }
+
+    /// <summary>
+    /// Closes a transport that was refused before any handler was created for it.
+    /// </summary>
+    private async Task DisposeRefusedTransportAsync(ITransport transport)
+    {
+        try
+        {
+            await transport.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            // Best-effort close of a connection nothing else owns; the peer may already be gone.
+        }
+    }
+
+    /// <summary>
+    /// Claims one of the connection slots available to a remote address if one is free.
+    /// </summary>
+    /// <remarks>
+    /// Compare-and-swap against the dictionary rather than a plain increment, mirroring
+    /// <see cref="TryReserveClientSlot"/>: a claim is only ever made from a count that was still under
+    /// the cap at the instant of the claim, so a burst of concurrent accepts from the same address
+    /// cannot all read the same count and all be admitted.
+    /// </remarks>
+    private bool TryReserveEndpointSlot(IPAddress address)
+    {
+        while (true)
+        {
+            int current = _connectionsByRemoteAddress.GetOrAdd(address, 0);
+            if (current >= _maxConnectionsPerRemoteEndpoint)
+            {
+                return false;
+            }
+
+            if (_connectionsByRemoteAddress.TryUpdate(address, current + 1, current))
+            {
+                return true;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gives back a connection slot claimed by <see cref="TryReserveEndpointSlot"/>.
+    /// </summary>
+    /// <remarks>
+    /// Removes the address from the dictionary once its count reaches zero rather than leaving a
+    /// zero-valued entry behind, so a hub that has seen many distinct remote addresses over its
+    /// lifetime does not accumulate one dictionary entry per address forever.
+    /// </remarks>
+    private void ReleaseEndpointSlot(IPAddress address)
+    {
+        while (true)
+        {
+            if (!_connectionsByRemoteAddress.TryGetValue(address, out int current))
+            {
+                return;
+            }
+
+            if (current <= 1)
+            {
+                if (_connectionsByRemoteAddress.TryRemove(new KeyValuePair<IPAddress, int>(address, current)))
+                {
+                    return;
+                }
+            }
+            else if (_connectionsByRemoteAddress.TryUpdate(address, current - 1, current))
+            {
+                return;
+            }
+        }
+    }
+
+    private async Task HandleClientAsync(
+        ITransport transport, IPAddress? remoteAddress, CancellationToken cancellationToken)
     {
         var clientId = Guid.NewGuid();
         ClientConnection? connection = null;
@@ -815,6 +1002,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             if (slotReserved)
             {
                 ReleaseClientSlot();
+            }
+
+            // The per-remote-endpoint slot was claimed in the accept loop, before this handler even
+            // started, and covers the connection's whole lifetime including the pre-registration
+            // window — so it is released here regardless of whether registration ever completed.
+            if (remoteAddress is not null)
+            {
+                ReleaseEndpointSlot(remoteAddress);
             }
 
             if (connection is not null)

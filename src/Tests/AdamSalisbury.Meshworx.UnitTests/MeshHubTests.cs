@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
@@ -956,6 +957,177 @@ public sealed class MeshHubTests
 
         Assert.Throws<ArgumentOutOfRangeException>(
             () => new MeshHub(logger.Object, listener.Object, maxClients: 0));
+    }
+
+    /// <summary>
+    /// When the hub is constructed without an explicit maximum client count, the maximum defaults to
+    /// 1000 rather than being unlimited, so a hub that never touches maxClients is not left open to
+    /// unbounded resource consumption from an unauthenticated flood of registrations. Exercised through
+    /// TryReserveClientSlot directly rather than registering 1000 real connections, which would make
+    /// this test needlessly slow for what it is checking.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_MaxClientsNotSpecified_DefaultsToOneThousand()
+    {
+        await Task.CompletedTask;
+        var fixture = new MeshHubFixture();
+
+        for (int i = 0; i < 1000; i++)
+        {
+            Assert.True(fixture.Hub.TryReserveClientSlot());
+        }
+
+        Assert.False(fixture.Hub.TryReserveClientSlot());
+    }
+
+    /// <summary>
+    /// When the hub is constructed without an explicit heartbeat interval, idle eviction defaults to a
+    /// 30-second interval rather than being disabled, so a hub that never touches heartbeatInterval no
+    /// longer lets a registered client sit silent indefinitely.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_HeartbeatIntervalNotSpecified_DefaultsToThirtySeconds()
+    {
+        await Task.CompletedTask;
+        var fixture = new MeshHubFixture();
+
+        Assert.Equal(TimeSpan.FromSeconds(30), fixture.Hub.GetHeartbeatIntervalForTesting());
+    }
+
+    /// <summary>
+    /// Passing Timeout.InfiniteTimeSpan for the heartbeat interval is the explicit opt-out from idle
+    /// eviction, distinct from simply not specifying one, which now takes the 30-second default.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_HeartbeatIntervalSetToInfinite_DisablesIdleEviction()
+    {
+        await Task.CompletedTask;
+        var fixture = new MeshHubFixture(heartbeatInterval: Timeout.InfiniteTimeSpan);
+
+        Assert.Null(fixture.Hub.GetHeartbeatIntervalForTesting());
+    }
+
+    /// <summary>
+    /// When the hub is constructed with a non-positive heartbeat interval other than the
+    /// Timeout.InfiniteTimeSpan opt-out, an ArgumentOutOfRangeException is thrown.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_HeartbeatIntervalZero_ThrowsArgumentOutOfRangeException()
+    {
+        await Task.CompletedTask;
+        var logger = new Mock<ILogger<MeshHub>>();
+        var listener = new Mock<ITransportListener>();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => new MeshHub(
+            logger.Object, listener.Object, heartbeatInterval: TimeSpan.Zero));
+    }
+
+    /// <summary>
+    /// When the hub is constructed with a non-positive maximum connections-per-remote-endpoint count,
+    /// an ArgumentOutOfRangeException is thrown.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_NonPositiveMaxConnectionsPerRemoteEndpoint_ThrowsArgumentOutOfRangeException()
+    {
+        await Task.CompletedTask;
+        var logger = new Mock<ILogger<MeshHub>>();
+        var listener = new Mock<ITransportListener>();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => new MeshHub(
+            logger.Object, listener.Object, maxConnectionsPerRemoteEndpoint: 0));
+    }
+
+    // AcceptLoop — per-remote-endpoint connection cap
+
+    /// <summary>
+    /// When the accept loop has already admitted the configured maximum number of connections from a
+    /// remote address, a further connection from that same address is closed immediately — without
+    /// ever reading a registration frame from it — while a connection from a different address is
+    /// unaffected by that address's limit.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task AcceptLoop_TooManyConnectionsFromSameAddress_RefusesFurtherConnectionWithoutHandshake()
+    {
+        var fixture = new MeshHubFixture(maxConnectionsPerRemoteEndpoint: 1);
+        await fixture.Hub.StartAsync();
+
+        var floodedAddress = new IPEndPoint(IPAddress.Parse("203.0.113.10"), 51000);
+        var otherAddress = new IPEndPoint(IPAddress.Parse("203.0.113.20"), 51000);
+
+        var first = await fixture.RegisterClientAsync("First", floodedAddress);
+
+        var refused = MeshHubFixture.CreateMockTransport(floodedAddress);
+        var refusedDisposedTcs = new TaskCompletionSource();
+        refused.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Refused"));
+        refused.Setup(t => t.DisposeAsync())
+            .Callback(() => refusedDisposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(refused.Object);
+
+        await refusedDisposedTcs.Task.WaitAsync(WaitTimeout);
+        refused.Verify(t => t.ReceiveAsync(It.IsAny<CancellationToken>()), Times.Never);
+
+        // A connection from a different address is not affected by the flooded address's limit.
+        var second = await fixture.RegisterClientAsync("Second", otherAddress);
+        Assert.Equal(2, fixture.Hub.ConnectedClientCount);
+
+        first.Disconnect();
+        second.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a connection from a remote address that was at its connection limit disconnects, the slot
+    /// it held is given back, so a replacement connection from that same address is then admitted.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task AcceptLoop_ConnectionFromCappedAddressDisconnects_FreesSlotForAnotherFromSameAddress()
+    {
+        var fixture = new MeshHubFixture(maxConnectionsPerRemoteEndpoint: 1);
+        await fixture.Hub.StartAsync();
+
+        var address = new IPEndPoint(IPAddress.Parse("203.0.113.30"), 51000);
+
+        var disconnected = new TaskCompletionSource();
+        fixture.Hub.ClientDisconnected += (_, _) => disconnected.TrySetResult();
+
+        var first = await fixture.RegisterClientAsync("First", address);
+        first.Disconnect();
+
+        // The disconnected event is raised after the handler has released both the client slot and the
+        // per-endpoint slot, so waiting on it pins the replacement to a point where the address's
+        // connection is definitely free again.
+        await disconnected.Task.WaitAsync(WaitTimeout);
+
+        var replacement = await fixture.RegisterClientAsync("Second", address);
+
+        Assert.Equal(1, fixture.Hub.ConnectedClientCount);
+        Assert.True(fixture.Hub.IsClientRegistered(replacement.Id));
+
+        replacement.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A transport that does not implement IRemoteEndPointTransport has no address for the hub to cap,
+    /// so any number of such connections are admitted regardless of maxConnectionsPerRemoteEndpoint.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task AcceptLoop_TransportWithoutRemoteEndPoint_IsNeverCappedByAddress()
+    {
+        var fixture = new MeshHubFixture(maxConnectionsPerRemoteEndpoint: 1);
+        await fixture.Hub.StartAsync();
+
+        var first = await fixture.RegisterClientAsync("First");
+        var second = await fixture.RegisterClientAsync("Second");
+
+        Assert.Equal(2, fixture.Hub.ConnectedClientCount);
+
+        first.Disconnect();
+        second.Disconnect();
+        await fixture.Hub.StopAsync();
     }
 
     // HandleClient — unsupported protocol version

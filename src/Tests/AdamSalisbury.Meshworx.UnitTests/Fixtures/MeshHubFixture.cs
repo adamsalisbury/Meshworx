@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Net;
 using System.Text;
 using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Transport;
@@ -24,7 +25,8 @@ internal sealed class MeshHubFixture
         ClientAuthenticator? authenticator = null,
         int? maxConcurrentAuthentications = null,
         GroupAuthoriser? groupAuthoriser = null,
-        TimeSpan? groupAuthorisationTimeout = null)
+        TimeSpan? groupAuthorisationTimeout = null,
+        int? maxConnectionsPerRemoteEndpoint = null)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -49,7 +51,8 @@ internal sealed class MeshHubFixture
             authenticator,
             maxConcurrentAuthentications,
             groupAuthoriser,
-            groupAuthorisationTimeout);
+            groupAuthorisationTimeout,
+            maxConnectionsPerRemoteEndpoint);
     }
 
     /// <summary>
@@ -126,12 +129,23 @@ internal sealed class MeshHubFixture
         return payload;
     }
 
-    public static Mock<ITransport> CreateMockTransport()
+    /// <param name="remoteEndPoint">
+    /// When given, the transport also implements <see cref="IRemoteEndPointTransport"/> and reports
+    /// this as its remote address, so it participates in the hub's per-remote-endpoint connection cap
+    /// exactly as <see cref="AdamSalisbury.Meshworx.Transport.Tcp.TcpTransport"/> does.
+    /// </param>
+    public static Mock<ITransport> CreateMockTransport(IPEndPoint? remoteEndPoint = null)
     {
         var transport = new Mock<ITransport>();
         transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
         transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
+
+        if (remoteEndPoint is not null)
+        {
+            transport.As<IRemoteEndPointTransport>().Setup(t => t.RemoteEndPoint).Returns(remoteEndPoint);
+        }
+
         return transport;
     }
 
@@ -140,9 +154,10 @@ internal sealed class MeshHubFixture
         _pendingAccepts.Writer.TryWrite(transport);
     }
 
-    public async Task<RegisteredClient> RegisterClientAsync(string name = "TestClient")
+    public async Task<RegisteredClient> RegisterClientAsync(
+        string name = "TestClient", IPEndPoint? remoteEndPoint = null)
     {
-        var transport = CreateMockTransport();
+        var transport = CreateMockTransport(remoteEndPoint);
         var registrationCompleteTcs = new TaskCompletionSource<byte[]>();
         var disconnectTcs = new TaskCompletionSource<byte[]?>();
 
