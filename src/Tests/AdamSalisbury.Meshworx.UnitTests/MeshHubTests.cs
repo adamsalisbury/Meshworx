@@ -1130,6 +1130,64 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    /// <summary>
+    /// Two IPv6 addresses that differ only in their interface identifier — the low 64 bits, freely
+    /// chosen by the host they belong to — share the same /64 network prefix and so are treated as one
+    /// source for the connection cap. A single host with a routine /64 allocation cannot defeat the cap
+    /// by connecting from a different address within it each time.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task AcceptLoop_TwoIPv6AddressesInSamePrefix_ShareTheConnectionCap()
+    {
+        var fixture = new MeshHubFixture(maxConnectionsPerRemoteEndpoint: 1);
+        await fixture.Hub.StartAsync();
+
+        var firstAddressInPrefix = new IPEndPoint(IPAddress.Parse("2001:db8:1:1::1"), 51000);
+        var secondAddressInSamePrefix = new IPEndPoint(IPAddress.Parse("2001:db8:1:1::2"), 51000);
+
+        var first = await fixture.RegisterClientAsync("First", firstAddressInPrefix);
+
+        var refused = MeshHubFixture.CreateMockTransport(secondAddressInSamePrefix);
+        var refusedDisposedTcs = new TaskCompletionSource();
+        refused.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Refused"));
+        refused.Setup(t => t.DisposeAsync())
+            .Callback(() => refusedDisposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(refused.Object);
+
+        await refusedDisposedTcs.Task.WaitAsync(WaitTimeout);
+        refused.Verify(t => t.ReceiveAsync(It.IsAny<CancellationToken>()), Times.Never);
+        Assert.Equal(1, fixture.Hub.ConnectedClientCount);
+
+        first.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// Two IPv6 addresses in different /64 network prefixes are distinct sources, each with its own
+    /// share of the connection cap.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task AcceptLoop_TwoIPv6AddressesInDifferentPrefixes_HaveIndependentConnectionCaps()
+    {
+        var fixture = new MeshHubFixture(maxConnectionsPerRemoteEndpoint: 1);
+        await fixture.Hub.StartAsync();
+
+        var firstPrefix = new IPEndPoint(IPAddress.Parse("2001:db8:1:1::1"), 51000);
+        var secondPrefix = new IPEndPoint(IPAddress.Parse("2001:db8:2:2::1"), 51000);
+
+        var first = await fixture.RegisterClientAsync("First", firstPrefix);
+        var second = await fixture.RegisterClientAsync("Second", secondPrefix);
+
+        Assert.Equal(2, fixture.Hub.ConnectedClientCount);
+
+        first.Disconnect();
+        second.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // HandleClient — unsupported protocol version
 
     /// <summary>

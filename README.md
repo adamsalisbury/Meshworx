@@ -214,7 +214,9 @@ the accept loop before any handshake — a flood of connections from one address
 registration is refused there rather than sailing past `maxClients`, which only counts clients that
 have actually registered. It is only enforced for a transport that reports where it connected from
 (the bundled `TcpTransport` does); a transport with no meaningful remote address, such as the
-in-process one, is never capped by it.
+in-process one, is never capped by it. An IPv6 address is grouped with every other address in its /64
+network prefix before the cap applies — a single host is routinely handed an entire /64, so without
+this a single source could defeat the cap by connecting from a different address within it each time.
 
 Observability:
 

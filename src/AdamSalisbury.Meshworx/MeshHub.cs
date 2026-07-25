@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Messages;
@@ -171,8 +172,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// counted from acceptance until the connection's handler finishes — including the pre-registration
     /// window, which <paramref name="maxClients"/> does not cover. Refused connections are closed
     /// immediately, before any handshake. Only enforced for a transport that reports its remote address
-    /// via <see cref="IRemoteEndPointTransport"/>; a transport that does not is never capped by this.
-    /// Defaults to 100. Pass <see cref="int.MaxValue"/> to opt out.
+    /// via <see cref="IRemoteEndPointTransport"/>; a transport that does not is never capped by this. An
+    /// IPv6 address is grouped with every other address in its /64 network prefix before the cap is
+    /// applied, since a single host is routinely assigned an entire /64 and could otherwise defeat the
+    /// cap by using a different address within it for every connection. Defaults to 100. Pass
+    /// <see cref="int.MaxValue"/> to opt out.
     /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
@@ -629,13 +633,48 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// Only <see cref="IRemoteEndPointTransport"/> implementers are considered, and only when the
     /// endpoint they report is an <see cref="IPEndPoint"/> — the per-remote-endpoint cap is keyed on
     /// the address alone, not the port, since every connection from the same peer arrives on a fresh
-    /// ephemeral port and a port-qualified key would never actually catch a repeat source.
+    /// ephemeral port and a port-qualified key would never actually catch a repeat source. The address
+    /// itself is normalised through <see cref="NormaliseForEndpointCap"/> before use.
     /// </remarks>
     private static IPAddress? ExtractRemoteAddress(ITransport transport)
     {
         return transport is IRemoteEndPointTransport { RemoteEndPoint: IPEndPoint endpoint }
-            ? endpoint.Address
+            ? NormaliseForEndpointCap(endpoint.Address)
             : null;
+    }
+
+    // The network-prefix length an IPv6 address is masked to before it keys the per-remote-endpoint
+    // cap. /64 is the smallest block a single host is routinely assigned by an ISP or cloud provider,
+    // so it is the coarsest grouping that still corresponds to "one host" rather than "one address".
+    private const int IPv6CapPrefixLength = 64;
+
+    /// <summary>
+    /// Reduces an address to the key the per-remote-endpoint cap treats it as coming from.
+    /// </summary>
+    /// <remarks>
+    /// An IPv6 host is routinely handed an entire /64 — or larger — allocation, so keying the cap on
+    /// the full address would let a single attacker defeat it by using a different address within that
+    /// allocation for every connection: each one is, as far as a full-address key is concerned, a
+    /// distinct and never-before-seen source. Masking to the /64 network prefix and zeroing the
+    /// interface identifier closes that gap, treating every address in the same /64 as one source for
+    /// capping purposes. IPv4 addresses are not routinely multi-assigned to a single host in the same
+    /// way, so they are returned unchanged.
+    /// </remarks>
+    private static IPAddress NormaliseForEndpointCap(IPAddress address)
+    {
+        if (address.AddressFamily != AddressFamily.InterNetworkV6)
+        {
+            return address;
+        }
+
+        Span<byte> addressBytes = stackalloc byte[16];
+        address.TryWriteBytes(addressBytes, out _);
+
+        // Zero everything past the /64 network prefix (the low 8 bytes, the interface identifier),
+        // so addresses that differ only there key to the same masked address.
+        addressBytes[(IPv6CapPrefixLength / 8)..].Clear();
+
+        return new IPAddress(addressBytes);
     }
 
     /// <summary>
@@ -647,9 +686,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             await transport.DisposeAsync().ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
         {
-            // Best-effort close of a connection nothing else owns; the peer may already be gone.
+            // Best-effort close of a connection nothing else owns; the peer may already be gone, or
+            // shutdown may already be cancelling everything else at the same moment.
         }
     }
 
@@ -680,7 +720,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     }
 
     /// <summary>
-    /// Gives back a connection slot claimed by <see cref="TryReserveEndpointSlot"/>.
+    /// Gives back a connection slot claimed by <see cref="TryReserveEndpointSlot"/>. Must be called
+    /// exactly once per successful claim.
     /// </summary>
     /// <remarks>
     /// Removes the address from the dictionary once its count reaches zero rather than leaving a
