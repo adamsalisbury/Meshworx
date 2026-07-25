@@ -24,7 +24,7 @@ sites in `MeshHub.cs` / `MeshClient.cs`.
    payload bytes]`, `N ≤ 1 MiB`. `InMemoryTransport` uses channel boundaries — no length prefix. The
    hub/client never see the length prefix; they receive one **message payload** per `ReceiveAsync`.
 2. **Message** (owned by hub/client). The **first payload byte is the opcode** (`MessageType`); the rest
-   is opcode-specific. Empty frames (length 0) are ignored, not decoded (`MeshHub.cs:675`,
+   is opcode-specific. Empty frames (length 0) are ignored, not decoded (`MeshHub.cs:903`,
    `MeshClient.cs:546`).
 
 Everything in the tables below is the **message payload** (i.e. after the transport's framing header).
@@ -73,27 +73,27 @@ be empty (the default). The hub does not interpret those bytes; it hands them to
 `ClientAuthenticator` and nothing else reads them. See [hub.md](hub.md#authentication) and
 [types.md](types.md#authentication-types).
 
-Hub-side validation order (`MeshHub.cs:558-650`), each failure sends the error (if applicable) and drops
+Hub-side validation order (`MeshHub.cs:786-878`), each failure sends the error (if applicable) and drops
 the connection:
-1. Frame ≥ **2** bytes and opcode `0x04` — else drop silently (no error frame) (`:558-563`).
-2. `version == 3` — else `Error(UnsupportedProtocolVersion)` (`:565-571`). **This is checked before the
+1. Frame ≥ **2** bytes and opcode `0x04` — else drop silently (no error frame) (`:786-791`).
+2. `version == 3` — else `Error(UnsupportedProtocolVersion)` (`:793-799`). **This is checked before the
    length checks below**, so a 2-byte frame carrying the wrong version still gets an error reply.
-3. Frame ≥ 4 bytes, i.e. long enough to carry the name length — else drop silently (`:573-577`).
-4. `nameLen != 0` **and** frame ≥ `4 + nameLen` — else drop silently (`:579-586`). A declared length of
+3. Frame ≥ 4 bytes, i.e. long enough to carry the name length — else drop silently (`:801-805`).
+4. `nameLen != 0` **and** frame ≥ `4 + nameLen` — else drop silently (`:807-814`). A declared length of
    zero, or one running past the payload, is treated as malformed: **no error frame, connection
    dropped**. The empty name is refused here rather than admitted so it cannot reserve the empty string
    in the name registry.
 5. Decode the name from bytes `[4, 4+nameLen)`; `clientName.Length ≤ 256` **chars** — else
-   `Error(ClientNameTooLong)` (`:590-596`).
-6. **Authentication**, only when an authenticator was configured (`:598-619`). Two parts, in order: an
+   `Error(ClientNameTooLong)` (`:818-824`).
+6. **Authentication**, only when an authenticator was configured (`:826-847`). Two parts, in order: an
    at-capacity **early-out** — already-claimed slots `>= maxClients` → `Error(HubAtCapacity)` without the
-   callback running (`:605-609`) — then the callback itself, given the name and credential
-   (`:611-618`). Refusal, throw, cancellation or timeout → `Error(AuthenticationFailed)`.
-7. **Capacity claim** (`:626-630`): one atomic compare-and-swap takes a client slot if and only if fewer
+   callback running (`:833-837`) — then the callback itself, given the name and credential
+   (`:839-846`). Refusal, throw, cancellation or timeout → `Error(AuthenticationFailed)`.
+7. **Capacity claim** (`:854-858`): one atomic compare-and-swap takes a client slot if and only if fewer
    than `maxClients` are claimed. Failure → `Error(HubAtCapacity)`. This, not the early-out in step 6 and
    not the registered client count, is the decision that admits or refuses on capacity, so concurrent
    registrations cannot all pass and overshoot the cap.
-8. Name not already claimed (`_clientNames.TryAdd`) — else `Error(DuplicateClientName)` (`:634-639`).
+8. Name not already claimed (`_clientNames.TryAdd`) — else `Error(DuplicateClientName)` (`:862-867`).
 
 Note that the **binding** capacity decision happens **after** authentication — an unauthenticated peer
 cannot hold a slot away from one that would authenticate — and **before** the name is reserved, so a
@@ -104,7 +104,7 @@ Client-side (`MeshClient.cs:126-163`): an `Error` reply → `RegistrationRefused
 reply that isn't exactly a 17-byte `RegistrationComplete` → `InvalidOperationException`.
 
 A connection that never sends a valid registration within `registrationTimeout` (default 10 s) is
-dropped without an error frame (`MeshHub.cs:546-554`).
+dropped without an error frame (`MeshHub.cs:774-782`).
 
 ---
 
@@ -116,7 +116,7 @@ SendMessage       : [0x02][recipientId 16][body...]              # client→hub,
 DeliverMessage    : [0x03][senderId 16][body...]                 # hub→client, needs len ≥ 17
 ```
 Broadcast is sent as `BroadcastMessage` but **delivered as `DeliverMessage`** — recipients cannot tell a
-broadcast from a direct message (`MeshHub.BroadcastMessage` builds a `0x03` frame, `MeshHub.cs:1137`):
+broadcast from a direct message (`MeshHub.BroadcastMessage` builds a `0x03` frame, `MeshHub.cs:1373`):
 ```
 BroadcastMessage  : [0x0B][body...]                              # client→hub
 ```
@@ -130,12 +130,12 @@ DeliverGroupMessage: [0x0F][senderId 16][nameLen u16 BE][utf8 groupName][body...
 GroupJoinRefused  : [0x10][utf8 groupName...]                    # hub→client, client needs len > 1
 ```
 The hub passes the original name bytes straight through from the inbound `GroupMessage` into the
-outbound `DeliverGroupMessage` rather than re-encoding the decoded string (`MeshHub.cs:713-719`,
-`:1458-1463`).
+outbound `DeliverGroupMessage` rather than re-encoding the decoded string (`MeshHub.cs:941-947`,
+`:1694-1699`).
 
 **`GroupJoinRefused` echoes the same bytes, and that is load-bearing rather than tidy.** The hub copies
-the inbound `JoinGroup` name bytes and replies with exactly those (`RefuseGroupJoin`, `MeshHub.cs:1321`,
-copy at `:1193`, echo at `:1331-1333`). Re-encoding the *decoded* string is not size-preserving: every
+the inbound `JoinGroup` name bytes and replies with exactly those (`RefuseGroupJoin`, `MeshHub.cs:1557`,
+copy at `:1429`, echo at `:1567-1569`). Re-encoding the *decoded* string is not size-preserving: every
 byte that is not valid UTF-8 decodes to `U+FFFD` and re-encodes as three, so a name of invalid bytes
 would **triple**. Join frames carry no length cap of their own (KI-8), so a re-encoded refusal could
 exceed the transport's 1 MiB payload limit and throw on send — which faults that connection's send loop,
@@ -144,7 +144,7 @@ the client's capacity slot. Echoing keeps the refusal no larger than the frame t
 the transport has already bounded. If you touch this path, keep the echo.
 
 **Group sends require membership.** The hub silently drops a `GroupMessage` from a client that has not
-joined the target group (`MeshHub.cs:1430`, `:1440-1446`). There is no error frame for this — a correct
+joined the target group (`MeshHub.cs:1666`, `:1676-1682`). There is no error frame for this — a correct
 client only sends to groups it has joined, and it learns that a join did *not* take effect from
 `GroupJoinRefused`. See [hub.md](hub.md#group-authorisation) and
 [known-issues.md](known-issues.md) KI-2.
@@ -195,7 +195,7 @@ as proof of life via its activity counter, so a busy client is never pinged.
 ## Length-guard behaviour (why malformed frames "do nothing")
 
 Both dispatch chains are length-guarded `if / else if` ladders with **no terminal `else`**
-(`MeshHub.cs:681-756`, `MeshClient.cs:714-835`). A frame that is too short for its opcode, or carries an
+(`MeshHub.cs:909-985`, `MeshClient.cs:714-835`). A frame that is too short for its opcode, or carries an
 unrecognised opcode, **falls through and is silently ignored** — no exception, no log at warning level.
 When debugging "my message never arrives", suspect a framing/offset error first; it will not surface as
 an error. If you add an opcode, add both the guard and the branch on the correct side, and mirror the
@@ -204,10 +204,10 @@ exact offsets above.
 That fall-through is what makes a hub → client opcode addable without a version bump: the client's
 `GroupJoinRefused` branch (`MeshClient.cs:768-793`) guards on `data.Length > 1`, so a refusal carrying an
 **empty** name — which a hub will never send, since `JoinGroupAsync` returns early on an empty name
-(`MeshHub.cs:1174`) — would itself fall through and be ignored.
+(`MeshHub.cs:1410`) — would itself fall through and be ignored.
 
 The **registration frame follows the same rule**: a truncated frame, a zero name length, or a declared
-name length running past the payload drops the connection with **no error frame** (`MeshHub.cs:573-586`).
+name length running past the payload drops the connection with **no error frame** (`MeshHub.cs:801-814`).
 A client with a bad framing bug therefore sees the connection close rather than a
 `RegistrationRefusedException` — do not read a silent close as "hub unreachable".
 
