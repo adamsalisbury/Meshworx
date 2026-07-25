@@ -41,7 +41,7 @@ public sealed class TcpTransportListener : ITransportListener
     // different threads, so each of them takes the state it needs under this lock and then works from
     // locals: reading a field twice is what let a concurrent dispose null the listener between a check
     // and the dereference that followed it. Nothing that blocks or awaits is done while holding it.
-    private readonly object _stateLock = new();
+    private readonly Lock _stateLock = new();
 
     private TcpListener? _listener;
 
@@ -272,13 +272,12 @@ public sealed class TcpTransportListener : ITransportListener
         {
             tcpClient = await listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (_disposed && ex is SocketException or ObjectDisposedException)
+        catch (Exception ex) when (_disposed && IsStoppedListenerFailure(ex))
         {
-            // Disposal stopped the listener underneath this accept. What that surfaces as depends on the
-            // platform — a cancelled operation, or a socket already gone — so report the disposal itself,
-            // matching what the TLS path above and the in-memory listener both do. It matters: the hub's
-            // accept loop stops on ObjectDisposedException, whereas a raw socket error is logged and
-            // retried, which against a listener that is never coming back is an endless spin.
+            // Disposal stopped the listener underneath this accept, so report the disposal itself, as the
+            // TLS path above and the in-memory listener both do. It matters: the hub's accept loop stops
+            // on ObjectDisposedException, whereas a raw socket error is logged and retried, which against
+            // a listener that is never coming back is an endless spin.
             throw new ObjectDisposedException(
                 $"The {nameof(TcpTransportListener)} is no longer accepting connections.", ex);
         }
@@ -378,6 +377,32 @@ public sealed class TcpTransportListener : ITransportListener
                 await pending.DisposeAsync().ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>
+    /// Reports whether an exception raised by an accept is how a stopped <see cref="TcpListener"/> makes
+    /// itself known, rather than a fault in the connection being accepted.
+    /// </summary>
+    /// <remarks>
+    /// Stopping a listener out from under an accept surfaces in three different ways, and which one you
+    /// get turns on timing rather than on anything the caller controls. An accept already pending when the
+    /// socket closes reports a <see cref="SocketException"/> (a cancelled operation) or an
+    /// <see cref="ObjectDisposedException"/>; an accept issued in the instant *after* the stop instead
+    /// reports a plain <see cref="InvalidOperationException"/> — "Not listening" — because to the
+    /// <see cref="TcpListener"/> it simply was never started. All three mean the same thing to a caller,
+    /// so all three are treated alike. <see cref="ObjectDisposedException"/> derives from
+    /// <see cref="InvalidOperationException"/> and so is covered by the second test.
+    /// <para>
+    /// Internal rather than private so a test can assert that what the platform actually throws is still
+    /// something this recognises — the narrow window that produces the third case is not reliably
+    /// reachable from a test, so nothing else would notice if the framework changed.
+    /// </para>
+    /// </remarks>
+    /// <param name="exception">The exception raised by the accept.</param>
+    /// <returns><see langword="true"/> if it signifies a stopped listener.</returns>
+    internal static bool IsStoppedListenerFailure(Exception exception)
+    {
+        return exception is SocketException or InvalidOperationException;
     }
 
     /// <summary>

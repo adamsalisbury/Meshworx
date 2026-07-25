@@ -85,11 +85,53 @@ public sealed class TcpTransportListenerTests
     }
 
     /// <summary>
+    /// Every way a stopped TcpListener can report itself is one the accept path recognises as disposal.
+    /// </summary>
+    /// <remarks>
+    /// The exception depends on where the stop lands. An accept already pending gets a SocketException or
+    /// an ObjectDisposedException; an accept issued just after the stop gets a plain
+    /// InvalidOperationException — "Not listening" — since to the TcpListener it was never started. That
+    /// third case sits in a window too narrow to reach reliably from a test, so it is asserted here
+    /// against the framework directly rather than through the listener, which is the only way it would be
+    /// noticed if a framework upgrade changed it.
+    /// </remarks>
+    [Fact(Timeout = 5000)]
+    public async Task IsStoppedListenerFailure_WhatAStoppedTcpListenerActuallyThrows_IsRecognised()
+    {
+        var pendingAccept = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        pendingAccept.Start();
+        Task<System.Net.Sockets.TcpClient> pending = pendingAccept.AcceptTcpClientAsync();
+        pendingAccept.Stop();
+
+        Exception? whilePending = await Record.ExceptionAsync(() => pending).ConfigureAwait(false);
+        Assert.NotNull(whilePending);
+        Assert.True(
+            TcpTransportListener.IsStoppedListenerFailure(whilePending),
+            $"An accept pending when the listener stopped threw {whilePending.GetType()}.");
+
+        var stopped = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        stopped.Start();
+        stopped.Stop();
+
+        Exception? afterStop = await Record.ExceptionAsync(() => stopped.AcceptTcpClientAsync())
+            .ConfigureAwait(false);
+        Assert.NotNull(afterStop);
+        Assert.True(
+            TcpTransportListener.IsStoppedListenerFailure(afterStop),
+            $"An accept issued after the listener stopped threw {afterStop.GetType()}.");
+    }
+
+    /// <summary>
     /// Repeatedly racing an accept against a dispose only ever ends in the disposal being reported. Any
     /// other outcome — a NullReferenceException from the listener being cleared mid-accept, a claim that
     /// the listener was never started, or a raw socket error — is a caller-visible symptom of the two
     /// paths reading the same fields without agreement.
     /// </summary>
+    /// <remarks>
+    /// The accept and the dispose are dispatched to separate threads and released together. Calling them
+    /// in sequence on one thread would not race at all: an accept called first has always registered
+    /// itself before it yields, so it would only ever exercise the pending-accept path.
+    /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task AcceptAsync_RacedAgainstDispose_OnlyEverReportsDisposal()
     {
@@ -100,23 +142,43 @@ public sealed class TcpTransportListenerTests
             var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
             await listener.StartAsync().ConfigureAwait(false);
 
-            Task<ITransport> acceptTask = listener.AcceptAsync();
-            Task disposeTask = listener.DisposeAsync().AsTask();
+            using var released = new SemaphoreSlim(0, 2);
+
+            Task<Exception?> acceptTask = Task.Run<Exception?>(async () =>
+            {
+                await released.WaitAsync().ConfigureAwait(false);
+                return await Record.ExceptionAsync(() => listener.AcceptAsync()).ConfigureAwait(false);
+            });
+
+            Task disposeTask = Task.Run(async () =>
+            {
+                await released.WaitAsync().ConfigureAwait(false);
+                await listener.DisposeAsync().ConfigureAwait(false);
+            });
+
+            released.Release(2);
 
             await disposeTask.ConfigureAwait(false);
+            Exception? caught = await acceptTask.ConfigureAwait(false);
 
-            Exception? caught = await Record.ExceptionAsync(() => acceptTask).ConfigureAwait(false);
-
+            // The accept may lose the race outright and never start, in which case it is refused up front;
+            // either way the caller is told the same thing.
             Assert.IsType<ObjectDisposedException>(caught);
         }
     }
 
     /// <summary>
-    /// Disposing the same listener from several threads at once tears it down exactly once: no call throws
-    /// on state another has already cleared, and every call returns only after the teardown has finished.
+    /// Disposing the same listener from several threads at once does not throw: no call trips over state
+    /// another has already cleared, and the listener is disposed once they have all returned.
     /// </summary>
+    /// <remarks>
+    /// This locks in the guarantee rather than reproducing a failure. The shape it replaced was racy but
+    /// not reliably so — the window in which a second disposer could touch an already-disposed
+    /// cancellation source was a few instructions wide — so this asserts the property the elected single
+    /// teardown makes structural.
+    /// </remarks>
     [Fact(Timeout = 5000)]
-    public async Task DisposeAsync_CalledConcurrently_TearsDownOnceWithoutThrowing()
+    public async Task DisposeAsync_CalledConcurrently_DoesNotThrowAndLeavesListenerDisposed()
     {
         const int disposers = 8;
 
@@ -150,7 +212,7 @@ public sealed class TcpTransportListenerTests
     /// dispose any of those a second time.
     /// </summary>
     [Fact(Timeout = 10000)]
-    public async Task DisposeAsync_TlsListenerCalledConcurrently_TearsDownOnceWithoutThrowing()
+    public async Task DisposeAsync_TlsListenerCalledConcurrently_DoesNotThrowAndLeavesListenerDisposed()
     {
         const int disposers = 8;
 
@@ -158,7 +220,11 @@ public sealed class TcpTransportListenerTests
 
         var listener = new TcpTransportListener(
             new IPEndPoint(IPAddress.Loopback, 0),
-            new SslServerAuthenticationOptions { ServerCertificate = serverCertificate });
+            new SslServerAuthenticationOptions { ServerCertificate = serverCertificate },
+            // The disposal is what must unwind the silent peer's handshake. Keeping the handshake's own
+            // deadline well inside this test's means that if it ever stops doing so, the test fails on the
+            // assertion rather than expiring, which says nothing about why.
+            tlsHandshakeTimeout: TimeSpan.FromSeconds(2));
 
         await listener.StartAsync().ConfigureAwait(false);
         int port = ((IPEndPoint)listener.LocalEndPoint!).Port;

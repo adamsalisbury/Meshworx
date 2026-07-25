@@ -11,6 +11,7 @@ public sealed class InMemoryTransportListener : ITransportListener
 {
     private readonly Channel<InMemoryTransport> _pendingConnections = Channel.CreateUnbounded<InMemoryTransport>();
     private int _started;
+    private int _disposed;
 
     /// <inheritdoc/>
     public Task StartAsync(CancellationToken cancellationToken = default)
@@ -50,6 +51,11 @@ public sealed class InMemoryTransportListener : ITransportListener
     /// <inheritdoc/>
     public async Task<ITransport> AcceptAsync(CancellationToken cancellationToken = default)
     {
+        // Checked ahead of the started guard, and ahead of the read: a disposed listener reports itself as
+        // disposed whether or not it ever ran, and must not hand out a connection that was queued before
+        // it was disposed — completing the channel does not discard what is already buffered.
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
         if (Volatile.Read(ref _started) == 0)
         {
             throw new InvalidOperationException("The listener has not been started.");
@@ -66,9 +72,20 @@ public sealed class InMemoryTransportListener : ITransportListener
     }
 
     /// <inheritdoc/>
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+        {
+            return;
+        }
+
         _pendingConnections.Writer.TryComplete();
-        return ValueTask.CompletedTask;
+
+        // Connections that were established but never accepted belong to nobody else once the listener is
+        // gone; close them rather than leaving a client parked on a server end that will never be read.
+        while (_pendingConnections.Reader.TryRead(out InMemoryTransport? pending))
+        {
+            await pending.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }
