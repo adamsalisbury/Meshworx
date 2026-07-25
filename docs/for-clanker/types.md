@@ -73,14 +73,14 @@ public sealed record RegistrationContext
 ```
 
 A `sealed record` with `required` init-only properties — construct with an object initialiser (the hub
-does, at `MeshHub.cs:606`). Trivially constructible in tests.
+does, at `MeshHub.cs:786`). Trivially constructible in tests.
 
 - `ClientName` — the name being registered under. Already validated for length, **not** yet checked for
   uniqueness, so two concurrent registrations for the same name can both reach your authenticator.
 - `Credential` — exactly the bytes the client sent after its name, empty if it sent none. The library
   assigns no meaning to them.
 - **Only guaranteed valid for the duration of the call** — copy it if it must outlive the invocation.
-  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:605`, so
+  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:785`, so
   it does not alias a larger buffer — but the documented contract is the one to code against.)
 
 ## Exception

@@ -13,7 +13,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 |---|---|---|
 | `Fixtures/MeshHubFixture.cs` | 173 | Hub test harness (mock listener/transport, register helpers, authenticator pass-through) |
 | `Fixtures/MeshClientFixture.cs` | 106 | Client test harness (mock transport, scripted receive) |
-| `MeshHubTests.cs` | 1709 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, capacity, lifecycle |
+| `MeshHubTests.cs` | 1951 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, capacity, lifecycle, **concurrent stop/dispose and start-vs-stop races** |
 | `MeshClientTests.cs` | 1499 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race** |
 | `MeshClientReconnectorTests.cs` | 785 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal** |
 | `MeshIntegrationTests.cs` | 385 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** |
@@ -69,7 +69,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   ([known-issues.md](known-issues.md) KI-22). Copy this shape whenever a guard is written against
   undocumented platform behaviour.
 - **When the bug is "one interval late", assert a count, not an outcome.** The heartbeat tests
-  (`MeshHubTests.cs:1453`, `:1501`) do not merely assert that a silent client was evicted — that passes
+  (`MeshHubTests.cs:1695`, `:1743`) do not merely assert that a silent client was evicted — that passes
   whether eviction fires on the Nth or the (N+1)th interval, which was exactly the KI-11 defect. They
   count `Ping` frames in the mock's `SendAsync` callback and **snapshot the count inside the
   `DisposeAsync` setup**, so the teardown itself latches the value and no later write can inflate it,
@@ -77,7 +77,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   `DisposeAsync` callback to wait for eviction rather than sleeping. Copy this shape for any timing
   contract where the wrong answer is still a *plausible* answer. The complementary direction — a client
   that keeps sending is never evicted — is `HandleClient_ClientSendingFramesEveryInterval_IsNotEvicted`
-  (`:1545`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
+  (`:1787`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
   interval so a scheduling stall on a loaded runner cannot masquerade as a genuine eviction.
 - **Drive the receive loop with a `Channel`, not `SetupSequence` returning `null`.** A completed/`null`
   receive is now interpreted as a lost connection and triggers teardown. `MeshClientFixture`
@@ -123,6 +123,64 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   between that lock release and the delegate invocation remain (`MeshClientTests.cs:1307-1321`). Copy
   this two-step — *wait for a marker past the decision, then settle briefly* — for any "did not happen"
   assertion where a stalled system-under-test would look identical to a correct one.
+
+<a id="parking-a-caller-mid-lifecycle"></a>
+
+- **Park a caller mid-*hub*-lifecycle with one of two seams.** The client-side seams above have hub-side
+  equivalents, added with the lifecycle work in PR #64 (issue #12). Both are deterministic and, unlike
+  the client seams, **neither needs a settle delay at all** — `MeshHub.StopAsync` is not `async`, so it
+  takes its decision synchronously under the lock and has provably decided by the time it hands a task
+  back. Prefer these over anything timing-based.
+
+  1. **To park a caller *inside* a shutdown, hold the mocked `ITransport.SendAsync` open on the
+     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:299-309`) awaits each client's
+     `SendAsync` in turn, and that await sits **after** the caller has claimed the hub's state but
+     **before** the shutdown has finished — so returning an incomplete task there pins the hub
+     mid-shutdown for as long as the test needs. The helper is already written:
+
+     ```csharp
+     // MeshHubTests.cs:337 — fires onFrame, signals, then blocks until released
+     ParkOnDisconnectFrame(client.Transport, notificationReached, releaseNotification,
+         () => Interlocked.Increment(ref disconnectFrames));
+
+     // Before the fix the first stop blocked inside the notification instead of
+     // returning a task, so it has to run off-thread or the test parks itself.
+     Task firstStop = Task.Run(() => fixture.Hub.StopAsync());
+     await notificationReached.Task.WaitAsync(WaitTimeout);
+
+     Task secondStop = fixture.Hub.StopAsync();
+     Assert.Equal(1, Volatile.Read(ref disconnectFrames));   // no settle needed
+     ```
+
+     `StopAsync_CalledWhileAShutdownIsInFlight_NotifiesEachClientOnce` (`MeshHubTests.cs:131`) counts
+     `Disconnect` frames to distinguish "joined the existing shutdown" from "started a second one";
+     `..._ReturnsOnlyOnceTheShutdownCompletes` (`:163`) asserts on the joining caller's task instead.
+     Note the first uses `RegisterMultiMessageClientAsync`, since the parked transport must survive more
+     than one scripted frame.
+
+  2. **To park a *start*, gate the mocked `ITransportListener.StartAsync`.** Returning an incomplete task
+     there stops the hub at the exact point where it has claimed the running slot (`_starting = true`)
+     but has not yet published `_cts` and `_acceptLoopTask` — the window that KI-23's fifth defect lived
+     in:
+
+     ```csharp
+     fixture.Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>()))
+         .Returns(async () =>
+         {
+             listenerStarting.TrySetResult();
+             await releaseListenerStart.Task.ConfigureAwait(false);
+         });
+     ```
+
+     `StopAsync_WhileAStartIsInProgress_LeavesTheStartedHubIntact` (`MeshHubTests.cs:304`) lands a full
+     `StopAsync` in that window, releases the start, and then proves the hub is *genuinely* running by
+     registering a client over it — not merely that no exception was thrown. Copy that "prove it still
+     works" ending; asserting the absence of a throw would pass against a hub that had been left
+     inert.
+
+  Both carry `[Fact(Timeout = 10000)]`, because the failure mode is a hang rather than an assertion
+  failure. See [hub.md](hub.md#lifecycle) for the lifecycle contract these pin, and
+  [known-issues.md](known-issues.md) KI-23.
 - **Synchronise on observable state, not sleeps.** `MeshHubFixture.RegisterClientAsync`
   (`Fixtures/MeshHubFixture.cs`) captures the `RegistrationComplete` frame via a `SendAsync` callback,
   extracts the id, then spins on `IsClientRegistered(id)` with `Task.Yield()` until the hub has recorded
