@@ -55,6 +55,18 @@ public interface IMeshClient : IAsyncDisposable
     /// <summary>
     /// Disconnects from the hub and releases all associated resources.
     /// </summary>
+    /// <remarks>
+    /// The disconnect is graceful and does not raise <see cref="Disconnected"/>. That holds even
+    /// when the connection is lost remotely at the same moment: a teardown already in flight when
+    /// this is called is claimed as application-initiated and stays silent, so the outcome does not
+    /// depend on which side wins the race. The one exception is a call made after the client has
+    /// already published its disconnected state, at which point the event is committed and this is
+    /// simply a no-op on an unconnected client.
+    /// <para>
+    /// Calling this when the client is not connected is a no-op, and it is safe to call from inside
+    /// a <see cref="MessageReceived"/> or <see cref="Disconnected"/> handler.
+    /// </para>
+    /// </remarks>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
     Task DisconnectAsync(CancellationToken cancellationToken = default);
 
@@ -149,6 +161,10 @@ public interface IMeshClient : IAsyncDisposable
     /// <remarks>
     /// When this event fires the client has already reset to a disconnected state, so the
     /// handler may immediately attempt to reconnect via <see cref="ConnectAsync"/>.
+    /// <para>
+    /// A remote drop that coincides with a local <see cref="DisconnectAsync"/> does not raise it:
+    /// the disconnect the application asked for wins, however narrowly the two overlap.
+    /// </para>
     /// </remarks>
     event EventHandler<DisconnectedEventArgs> Disconnected;
 }

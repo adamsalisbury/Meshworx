@@ -96,7 +96,9 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
 - **Disconnect.** Calling `DisconnectAsync` is graceful and does not raise `Disconnected`. The
   `Disconnected` event fires only for unexpected endings — the hub closing the connection
   (`RemoteDisconnect`) or the transport failing (`ConnectionLost`). After it fires the client
-  has reset and may reconnect from the handler.
+  has reset and may reconnect from the handler. A remote drop landing at the same moment as the
+  `DisconnectAsync` call does not change that: the disconnect the application asked for wins, so
+  the event stays silent whichever side tears the connection down first.
 - **Auto-reconnect.** `MeshClientReconnector` wraps a client and keeps it connected: it does a
   fail-fast initial connect, then transparently re-establishes the connection (bounded per attempt,
   retried with a delay) whenever it drops. It automatically re-joins the groups the client belonged
