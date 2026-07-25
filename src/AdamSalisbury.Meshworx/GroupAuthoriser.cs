@@ -25,6 +25,12 @@ namespace AdamSalisbury.Meshworx;
 /// callback stalls only the client that asked. A callback that throws, cancels, or does not return within
 /// the hub's <c>groupAuthorisationTimeout</c> refuses the join — the decision fails closed.
 /// </para>
+/// <para>
+/// That timeout bounds how long the hub waits, not how long the callback runs: one that outruns it is
+/// abandoned and carries on executing, and the client is free to ask again. A callback that holds a
+/// resource per invocation — a database connection, an <see cref="System.Net.Http.HttpClient"/> call —
+/// should therefore bound its own concurrency, since the hub does not bound it for you.
+/// </para>
 /// </remarks>
 public delegate ValueTask<bool> GroupAuthoriser(
     GroupJoinContext context,

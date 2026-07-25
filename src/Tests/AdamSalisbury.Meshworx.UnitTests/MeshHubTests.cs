@@ -2328,6 +2328,41 @@ public sealed class MeshHubTests
     }
 
     /// <summary>
+    /// A refusal echoes the group-name bytes the client sent rather than re-encoding the string they
+    /// were decoded from. Re-encoding is not size-preserving: a byte that is not valid UTF-8 decodes to
+    /// U+FFFD and encodes back as three, so a name of invalid bytes would triple. Group names are not
+    /// length-capped, so a tripled refusal can exceed the transport's maximum payload and throw on send,
+    /// faulting the send loop — and a faulted send loop is awaited during the connection's teardown,
+    /// abandoning the rest of it including the release of the client's slot. The name here is sized so
+    /// that tripling it would breach the 1 MiB transport cap.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task JoinGroup_AuthoriserRefusesAnInvalidUtf8Name_RefusalEchoesTheNameWithoutGrowingIt()
+    {
+        var fixture = new MeshHubFixture(groupAuthoriser: (_, _) => ValueTask.FromResult(false));
+        await fixture.Hub.StartAsync();
+
+        var client = await fixture.RegisterMultiMessageClientAsync("Client");
+        var frames = new FrameRecorder(client.Transport);
+
+        byte[] nameBytes = new byte[400_000];
+        Array.Fill(nameBytes, (byte)0xFF);
+        var joinFrame = new byte[1 + nameBytes.Length];
+        joinFrame[0] = 0x0C; // JoinGroup
+        nameBytes.CopyTo(joinFrame, 1);
+
+        client.EnqueueMessage(joinFrame);
+
+        byte[] refusal = await frames.WaitForAsync(f => f[0] == 0x10).WaitAsync(WaitTimeout);
+
+        Assert.Equal(joinFrame.Length, refusal.Length);
+        Assert.Equal(nameBytes, refusal[1..]);
+
+        client.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
     /// With no group authoriser configured, joins are unrestricted — the default behaviour is unchanged.
     /// </summary>
     [Fact(Timeout = 5000)]

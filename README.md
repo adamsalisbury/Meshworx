@@ -219,7 +219,9 @@ must make deliberately.
 
   - **Sending to a group always requires membership of it**, with or without the callback below. The
     hub drops a group message from a non-member rather than fanning it out, so a client cannot inject a
-    frame into a group it never joined.
+    frame into a group it never joined. Membership is the single capability — there is no send-only
+    permission, so a client that previously published to a group without joining must now join it, and
+    will then also receive that group's traffic.
   - **Who may join is yours to decide.** Supply a `GroupAuthoriser` and it is consulted for every join.
     Returning `false` refuses it, and the client is told so through its `GroupJoinRefused` event:
 
@@ -244,9 +246,17 @@ must make deliberately.
 
   The callback runs on input from an already-admitted client, driven from that client's own receive
   loop, which reads nothing further from it until the callback returns — so a slow decision stalls only
-  the client that asked, and concurrent invocations are bounded by the number of connected clients.
-  One that throws, cancels, or outruns `groupAuthorisationTimeout` refuses the join: the decision fails
-  closed.
+  the client that asked. One that throws, cancels, or outruns `groupAuthorisationTimeout` refuses the
+  join: the decision fails closed.
+
+  Two consequences worth designing for. **`groupAuthorisationTimeout` bounds how long the hub waits, not
+  how long your callback runs** — a callback that outruns it is abandoned and carries on, so a client
+  that keeps asking after each refusal can leave invocations piling up. Across clients the ceiling is
+  the number of connected clients, which is `maxClients` only if you set one. An authoriser that holds a
+  resource per call — a database connection, an HTTP client — should therefore bound its own
+  concurrency; a mass reconnect re-joins every group at once. And keep the timeout comfortably below
+  `heartbeatInterval × maxMissedHeartbeats`, or a slow-but-working authoriser will have the hub evict
+  the very client whose join it is still deciding.
 
   **Without a `GroupAuthoriser` the hub authorises no joins and any client may join any group**, so
   groups are then a routing convenience and must not be relied on for isolation.

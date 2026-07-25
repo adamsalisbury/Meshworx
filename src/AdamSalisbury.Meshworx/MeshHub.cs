@@ -671,7 +671,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 else if ((MessageType)data[0] == MessageType.JoinGroup)
                 {
                     string groupName = Encoding.UTF8.GetString(data.AsSpan(1));
-                    await JoinGroupAsync(connection, groupName, clientCts.Token).ConfigureAwait(false);
+                    // Pass the original name bytes through as well, so a refusal can echo them
+                    // rather than re-encode the string they were just decoded from.
+                    await JoinGroupAsync(connection, groupName, data.AsMemory(1), clientCts.Token)
+                        .ConfigureAwait(false);
                 }
                 else if ((MessageType)data[0] == MessageType.LeaveGroup)
                 {
@@ -1141,7 +1144,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// reconnected client is a new client id that must be authorised again on its own merits.
     /// </remarks>
     private async Task JoinGroupAsync(
-        ClientConnection connection, string groupName, CancellationToken cancellationToken)
+        ClientConnection connection,
+        string groupName,
+        ReadOnlyMemory<byte> groupNameBytes,
+        CancellationToken cancellationToken)
     {
         if (string.IsNullOrEmpty(groupName))
         {
@@ -1151,7 +1157,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         if (_groupAuthoriser is not null
             && !await AuthoriseGroupJoinAsync(connection, groupName, cancellationToken).ConfigureAwait(false))
         {
-            RefuseGroupJoin(connection, groupName);
+            RefuseGroupJoin(connection, groupName, groupNameBytes);
             return;
         }
 
@@ -1176,10 +1182,16 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             // Unlike the registration authenticator, this callback runs on input from an already-admitted
             // client and is driven from that client's own receive loop, which reads nothing further from
-            // it until this returns. Concurrent invocations are therefore already bounded by the number of
-            // connected clients — itself bounded by maxClients — so no separate semaphore is needed here.
-            // Only the wait needs bounding, so that a hanging callback cannot wedge one client's receive
-            // loop, and its slot, for ever.
+            // it until this returns. So there is no semaphore here: the registration authenticator has one
+            // because it runs on unauthenticated input, where any peer that reaches the port can drive it,
+            // and that is not the position this callback is in.
+            //
+            // What the wait below bounds is this hub's willingness to wait, not the callback's execution.
+            // A callback that outruns the timeout is abandoned and goes on running, so a client that keeps
+            // asking after each refusal can leave invocations piling up behind it. Across clients the
+            // ceiling is the connected client count, which is maxClients only if one was configured. An
+            // authoriser that holds a resource per call must therefore bound its own concurrency; this is
+            // documented on the delegate and in the README rather than guessed at with a limit here.
             ValueTask<bool> pending = _groupAuthoriser!(context, cancellationToken);
 
             // A decision taken synchronously — a lookup against a policy table is the common case — needs
@@ -1243,15 +1255,19 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// Tells a client its group join was refused, so it does not go on believing it is a member of a
     /// group it will receive nothing from and may not send to.
     /// </summary>
-    private void RefuseGroupJoin(ClientConnection connection, string groupName)
+    private void RefuseGroupJoin(
+        ClientConnection connection, string groupName, ReadOnlyMemory<byte> groupNameBytes)
     {
-        // Queued rather than written straight to the transport, so it serialises with the connection's
-        // other outbound frames instead of racing the send loop. The name is re-encoded because refusal
-        // is a cold path; the delivery paths that are not pass the inbound bytes through untouched.
-        byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
-        var refusal = new byte[1 + nameBytes.Length];
+        // Echo the name bytes the client sent rather than re-encoding the string they were decoded from.
+        // Re-encoding is not size-preserving: every byte that is not valid UTF-8 decodes to U+FFFD and
+        // encodes back as three bytes, so a name of invalid bytes would triple. Group names are not
+        // length-capped, so the refusal could then exceed the transport's maximum payload and throw on
+        // send — which faults the send loop, and a faulted send loop is awaited during this connection's
+        // teardown, abandoning the rest of it including the release of the client's slot. Echoing keeps
+        // the refusal no larger than the frame that provoked it, which the transport already bounded.
+        var refusal = new byte[1 + groupNameBytes.Length];
         refusal[0] = (byte)MessageType.GroupJoinRefused;
-        nameBytes.CopyTo(refusal, 1);
+        groupNameBytes.Span.CopyTo(refusal.AsSpan(1));
 
         if (!connection.OutboundQueue.Writer.TryWrite(refusal))
         {
