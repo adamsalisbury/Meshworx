@@ -45,7 +45,11 @@ optional and applies with or without an authoriser: sending to a group requires 
 - **The hub owns the listener** — `DisposeAsync` disposes it. Do not dispose the listener yourself.
 - `ClientConnected` / `ClientDisconnected` fire **from the per-client handler task**, so they run
   **concurrently for different clients**. Handlers must be thread-safe. A throwing handler is caught and
-  logged (`RaiseClientEvent`, `MeshHub.cs:971-991`) — it will not fault the hub.
+  logged (`RaiseClientEvent`, `MeshHub.cs:971-991`) — it will not fault the hub. That catch covers the
+  handler only up to its **first suspension**: an `async void` handler's later exception escapes to the
+  thread pool unobserved, so keep handlers synchronous or contain the failure inside the task you start
+  (see [for-clanker.md](../for-clanker.md#4-threading--async-model-read-before-changing-any-loop) and the
+  README's **Event handlers** section).
 - `ConnectedClientCount` and `IsClientRegistered` are point-in-time snapshots over a
   `ConcurrentDictionary`; treat them as advisory.
 - Shut down with `StopAsync` or `await using`. `StopAsync` sends a best-effort `Disconnect` frame to

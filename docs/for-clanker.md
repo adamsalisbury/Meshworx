@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 36cfb63 (branch feat/group-authorisation-boundary, PR #66)
+reconciled-to-commit: 9562c8f (branch docs/reconnected-handler-async-void, PR #67)
 reconciled-to-date: 2026-07-25
 mode: update
 -->
@@ -12,8 +12,13 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `feat/group-authorisation-boundary` (PR #66), which is `main` plus the
-> group-authorisation work (PR #66, closing issue #14). The
+> **Documented tree:** branch `docs/reconnected-handler-async-void` (PR #67, closing issue #15), which is
+> `main` plus a README **Event handlers** subsection and one guard test in
+> `MeshClientReconnectorTests.cs`. **No library code changed on this branch** — no behaviour, no
+> signature and no configuration differs from `main`, so every contract documented here describes `main`
+> exactly as it describes this branch.
+>
+> The group-authorisation work (PR #66, closing issue #14) has since merged as `975c10e`, so the
 > [Group authorisation](for-clanker/hub.md#group-authorisation) and
 > [Routing helpers](for-clanker/hub.md#routing-helpers) sections of [hub.md](for-clanker/hub.md) plus its
 > constructor rows, the `0x10 GroupJoinRefused` opcode and the
@@ -22,15 +27,10 @@ rather than read directly, it says so.
 > [Authorisation types](for-clanker/types.md#authorisation-types) section of
 > [types.md](for-clanker/types.md), the
 > [Group membership](for-clanker/client.md#group-membership) section of
-> [client.md](for-clanker/client.md), KI-2/KI-4/KI-8/KI-9/KI-10 and the new KI-27/KI-28 in
+> [client.md](for-clanker/client.md), KI-2/KI-4/KI-8/KI-9/KI-10 and KI-27/KI-28 in
 > [known-issues.md](for-clanker/known-issues.md), the group-authorisation test rows in
-> [testing.md](for-clanker/testing.md), and the group bullets in §4 and §8 below describe **that branch**.
-> On `main` there is no `GroupAuthoriser`, `GroupJoinContext`, `GroupJoinRefusedEventArgs` or
-> `MessageType.GroupJoinRefused`; `MeshHub` has a synchronous `JoinGroup` and a `SendToGroup` that fans
-> out to every member **without checking that the sender is one**; and `MeshClient.JoinGroupAsync`
-> records membership *after* sending. Every `MeshHub.cs` coordinate past line 10 is 1–243 lines lower on
-> `main`, every `MeshClient.cs` coordinate past line 147 is 3–61 lower, and every `MeshHubTests.cs`
-> coordinate is 1 lower (416 tests' worth were appended at line 2049).
+> [testing.md](for-clanker/testing.md), and the group bullets in §4 and §8 below now describe `main`
+> directly.
 >
 > The atomic capacity-admission fix (PR #65, closing issue #13) has since merged as `40e7731`, so the
 > [Registration handshake](for-clanker/hub.md#registration-handshake-hub-side) section of
@@ -79,7 +79,7 @@ rather than read directly, it says so.
 > `DisposeAsync` `:196`; the true values are `:116`, `:138`, `:131`, `:328` — the ctor row `:79` **is**
 > correct), the two **How it works** bullets PR #60 did not rewrite are likewise stale (`OnDisconnected`
 > `:132` and `ReconnectLoopAsync` `:138`; the true values are `:182` and `:202`), and the
-> `MeshClientReconnectorTests.cs` line count in the closing sentence reads 302 against an actual 853.
+> `MeshClientReconnectorTests.cs` line count in the closing sentence reads 302 against an actual 944.
 > Several `MeshClient.cs` coordinates cited from
 > [known-issues.md](for-clanker/known-issues.md) (e.g. `:102`, `:345`, `:551`) and the receive-loop
 > coordinates in [client.md](for-clanker/client.md) and
@@ -347,6 +347,14 @@ deadlocks or dropped messages that tests may not catch.
 - **Event handlers are invoked on the loop's thread inside `try/catch`.** A throwing subscriber is
   logged and swallowed at every callback boundary so it cannot fault a loop. Handlers must be
   thread-safe (hub events fire concurrently for different clients — `IMeshHub.cs:44-46`).
+  **That containment reaches only as far as the handler's first suspension.** Every event is a plain
+  `EventHandler`/`EventHandler<T>` with no completion for the raiser to await, so an `async void`
+  handler returns to the raiser when it first suspends and everything after runs outside the `try` —
+  a later throw is rethrown on the thread pool, where nothing observes it. Keep handlers synchronous, or
+  start the work from the handler and catch inside the task you start; the README's **Event handlers**
+  section carries the idiom, and
+  `Reconnected_HandlerIdiomFromDocumentation_ContainsPostSuspensionFailure`
+  (`MeshClientReconnectorTests.cs:124`) is the guard on it.
 
 ---
 

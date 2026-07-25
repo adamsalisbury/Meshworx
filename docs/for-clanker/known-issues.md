@@ -368,7 +368,7 @@ the risk to a change, not a claim that the code is defective.
   already-connected client **for ever** at `retryDelay`, building and discarding a transport each pass.
   This is the regression PR #60's second commit exists to prevent;
   `StartAsync_DropSignalledTwice_SettlesWithoutRetryingConnectedClient`
-  (`MeshClientReconnectorTests.cs:318`) is the test that pins it.
+  (`MeshClientReconnectorTests.cs:409`) is the test that pins it.
 - **What to do:** treat "revalidate the goal before acting on the signal" as the invariant. Any new
   reconnect trigger you add (a heartbeat watchdog, a manual `Reconnect()` method) must go through the
   same channel and inherit the same guard. If you ever need to distinguish "reconnect happened" from

@@ -15,7 +15,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 | `Fixtures/MeshClientFixture.cs` | 118 | Client test harness (mock transport, scripted receive, **`CreateGroupJoinRefusal`**) |
 | `MeshHubTests.cs` | 2498 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, **capacity claim/release under a concurrent registration**, **groups as an authorisation boundary**, lifecycle, **concurrent stop/dispose and start-vs-stop races** |
 | `MeshClientTests.cs` | 1602 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race**, **group-join refusal handling** |
-| `MeshClientReconnectorTests.cs` | 853 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal**, **restored membership re-authorised by the hub** |
+| `MeshClientReconnectorTests.cs` | 944 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal**, **restored membership re-authorised by the hub**, **the documented `Reconnected` handler idiom containing a post-suspension failure** |
 | `MeshIntegrationTests.cs` | 481 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** and **non-member/unauthorised group paths** |
 | `Transport/InMemory/InMemoryTransportTests.cs` | 173 | Pair semantics, copy-on-send, close signalling |
 | `Transport/InMemory/InMemoryTransportListenerTests.cs` | 90 | **Listener disposal contract in memory (4 tests):** accept after dispose, dispose-without-ever-starting, a queued connection closed rather than served, repeated/concurrent dispose |
@@ -217,7 +217,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   state to wait on for "no spurious reconnect was queued" or "the loop is not stuck retrying", so the
   reconnector's negative tests shrink `retryDelay` to 10 ms, then settle for 400 ms and assert an
   attempt *count* — a stuck loop shows up as a count well past the expected one
-  (`MeshClientReconnectorTests.cs:305-308`, `:385-388`). Pair the delay with a count assertion, never a
+  (`MeshClientReconnectorTests.cs:396-399`, `:476-479`). Pair the delay with a count assertion, never a
   bare "still connected" check, which would pass with the guard removed. Every such test carries an
   explicit `[Fact(Timeout = …)]`, because the failure mode under test is a hang.
 - **The better way to prove "the hub did not send X": order, not time.** PR #66 added `FrameRecorder`
@@ -251,7 +251,21 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 - **End-to-end coverage lives in `MeshIntegrationTests.cs`**: `EndToEnd_NonMemberCannotSendToGroup`
   (`:152`) and `EndToEnd_UnauthorisedClientIsRefusedGroupMembership` (`:191`) run the rules over real
   `MeshClient`s and `InMemoryTransport`, and `RestoredGroupMembership_IsAuthorisedAgainByTheHub`
-  (`MeshClientReconnectorTests.cs:631`) pins that a reconnect's restore goes through authorisation.
+  (`MeshClientReconnectorTests.cs:722`) pins that a reconnect's restore goes through authorisation.
+- **Code the README hands out carries a compiled guard.** Three tests in
+  `MeshClientReconnectorTests.cs` exist only to keep a documented snippet honest, and are named
+  `*FromDocumentation*` so they are findable: `Constructor_AcceptsTcpTransportFactoryFromDocumentation`
+  (`:62`), `StartAsync_TlsTransportFactoryFromDocumentation_ConnectsOverEncryptedTransport` (`:79`) and
+  `Reconnected_HandlerIdiomFromDocumentation_ContainsPostSuspensionFailure` (`:124`, added with the
+  README's **Event handlers** subsection in PR #67, issue #15). The last transcribes the documented
+  handler idiom verbatim but for a catch block that records what it caught, then makes the mocked
+  `SendAsync` throw **after a `Task.Yield()`** — past the point at which an `async void` handler would
+  have returned to the reconnect loop — and asserts the handler's own `catch` observed the `IOException`;
+  a second drop afterwards proves the loop was unharmed. Copy that shape when you change a README
+  snippet: fail *after* the suspension, because a failure before it is contained by the loop's own
+  callback boundary and would pass against the very idiom the test exists to exclude. See the callback
+  boundary in
+  [for-clanker.md](../for-clanker.md#4-threading--async-model-read-before-changing-any-loop).
 - **`TlsOptionsCloneTests` is an intentional tripwire, not a normal test.** It reflects over every
   public settable property of `SslClientAuthenticationOptions` / `SslServerAuthenticationOptions`, sets
   each to a non-default value, clones, and asserts the value survived. **An unrecognised property type
