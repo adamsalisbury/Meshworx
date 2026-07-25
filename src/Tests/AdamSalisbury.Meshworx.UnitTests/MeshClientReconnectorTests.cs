@@ -191,8 +191,9 @@ public sealed class MeshClientReconnectorTests
         Exception contained = await containedTcs.Task.WaitAsync(WaitTimeout);
         Assert.IsType<IOException>(contained);
 
-        // The loop neither waited for that work nor was harmed by its failure: a further drop still
-        // reconnects and still raises the event.
+        // The loop is unharmed by the handler's work having faulted: a further drop still reconnects and
+        // still raises the event. That the loop never waited for that work is structural rather than
+        // asserted here — EventHandler returns void, so there is no completion it could have awaited.
         var reconnectedAgainTcs = new TaskCompletionSource();
         reconnector.Reconnected += (_, _) => reconnectedAgainTcs.TrySetResult();
 

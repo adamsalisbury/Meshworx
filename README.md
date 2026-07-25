@@ -127,17 +127,18 @@ await reconnector.Client.SendAsync(recipientId, payload);
 
 ### Event handlers
 
-`Reconnected`, and the client's `MessageReceived`, `GroupMessageReceived`, `GroupJoinRefused` and
-`Disconnected`, are plain `EventHandler` events. Each is raised synchronously from the loop that owns
-the connection — the reconnect loop, or the client's receive loop — which catches and logs whatever a
-handler throws and then carries on.
+Every event Meshworx raises — the reconnector's `Reconnected`, the client's `MessageReceived`,
+`GroupMessageReceived`, `GroupJoinRefused` and `Disconnected`, and the hub's `ClientConnected` and
+`ClientDisconnected` — is an ordinary `EventHandler` or `EventHandler<T>`. Each is raised
+synchronously from the loop that owns the connection, and that loop catches and logs whatever a
+handler throws rather than letting it propagate.
 
-That containment reaches only as far as the handler's first `await`. An `async void` handler returns
-to the loop at that point, so everything it does afterwards runs outside the loop's `try`/`catch`: an
-exception thrown after the first `await` is rethrown on the thread pool, or on whatever
-synchronisation context the handler captured, where nothing observes it and it can bring the process
-down. The loop carries on without waiting either, so an `async void` handler's work may still be in
-flight when the next event is raised.
+That containment reaches only as far as the handler's first suspension. An `async void` handler
+returns to the loop at that point, so everything it does afterwards runs outside the loop's
+`try`/`catch`: an exception thrown once the handler has suspended is rethrown on the thread pool, or
+on whatever synchronisation context the handler captured, where nothing observes it and it can bring
+the process down. The loop carries on without waiting either, so an `async void` handler's work may
+still be in flight when the next event is raised.
 
 Keep handlers synchronous. Where one must do asynchronous work, start that work from the handler and
 contain its failures inside the task you start:
@@ -161,7 +162,10 @@ async Task RestoreStateAsync()
 
 The event signature carries no completion for the loop to await, so the handler is the only place
 that failure can be caught. `Reconnected` may fire more than once for a single drop, so the work it
-starts must be idempotent and safe to overlap with a run already under way.
+starts must be idempotent and safe to overlap with a run already under way — and note that `retryDelay`
+does not pace it, since that delay applies only between *failed* connect attempts. A hub that accepts a
+connection and then immediately drops it re-raises `Reconnected` as fast as a connection round trip, so
+bound the work yourself if it is expensive.
 
 ## Configuration
 
