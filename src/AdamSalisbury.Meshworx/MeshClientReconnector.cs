@@ -145,6 +145,19 @@ public sealed class MeshClientReconnector : IAsyncDisposable
         }
 
         Client.Disconnected += OnDisconnected;
+
+        // ConnectAsync returns with the client's receive loop already running on a background task, so the
+        // connection can be lost before the line above attaches the handler. That disconnect would be
+        // raised with no subscriber, leaving nothing to signal the reconnect loop and no other trigger to
+        // fall back on. Re-read the state now the handler is attached, and queue the signal the lost event
+        // would have queued. The client resets to a disconnected state before it raises Disconnected, so a
+        // drop in the window is always visible here; one that lands after the subscription is caught by the
+        // handler instead, and the coalescing channel makes the overlap between the two harmless.
+        if (!Client.IsConnected)
+        {
+            _reconnectSignals.Writer.TryWrite(0);
+        }
+
         _reconnectLoopTask = ReconnectLoopAsync(_stopCts.Token);
     }
 

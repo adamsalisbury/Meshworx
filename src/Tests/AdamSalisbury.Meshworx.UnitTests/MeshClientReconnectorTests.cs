@@ -198,6 +198,116 @@ public sealed class MeshClientReconnectorTests
         await hub.StopAsync();
     }
 
+    /// <summary>
+    /// When the connection is lost in the window between the initial connect completing and StartAsync
+    /// subscribing to Disconnected, the reconnector still reconnects. The drop is raised while nothing is
+    /// subscribed, so the event is genuinely lost and the reconnect can only come from re-reading the
+    /// connection state once the handler is attached.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task StartAsync_ConnectionLostBeforeSubscription_StillReconnects()
+    {
+        var transport = new Mock<ITransport>();
+        transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
+
+        var client = new Mock<IMeshClient>();
+        client.Setup(c => c.DisconnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        client.Setup(c => c.DisposeAsync()).Returns(ValueTask.CompletedTask);
+
+        // A single-element holder lets the connect callback publish the state the reconnector reads back.
+        bool[] connectedHolder = [false];
+        client.SetupGet(c => c.IsConnected).Returns(() => Volatile.Read(ref connectedHolder[0]));
+
+        int connectAttempts = 0;
+
+        client.Setup(c => c.ConnectAsync(
+                It.IsAny<ITransport>(),
+                It.IsAny<string>(),
+                It.IsAny<ReadOnlyMemory<byte>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                Volatile.Write(ref connectedHolder[0], true);
+
+                if (Interlocked.Increment(ref connectAttempts) == 1)
+                {
+                    // The hub drops the connection the instant registration completes — the real client's
+                    // receive loop is already running by the time ConnectAsync returns, so it can observe
+                    // the drop before StartAsync gets as far as subscribing. Raising it here reproduces
+                    // that ordering exactly: there is no subscriber, and the event is lost.
+                    Volatile.Write(ref connectedHolder[0], false);
+                    client.Raise(
+                        c2 => c2.Disconnected += null,
+                        new DisconnectedEventArgs { Reason = DisconnectReason.ConnectionLost });
+                }
+
+                return Task.CompletedTask;
+            });
+
+        await using var reconnector = new MeshClientReconnector(
+            client.Object,
+            "Alice",
+            _ => Task.FromResult<ITransport>(transport.Object),
+            retryDelay: TimeSpan.FromMilliseconds(10));
+
+        var reconnectedTcs = new TaskCompletionSource();
+        reconnector.Reconnected += (_, _) => reconnectedTcs.TrySetResult();
+
+        await reconnector.StartAsync();
+
+        await reconnectedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.True(client.Object.IsConnected);
+        Assert.Equal(2, Volatile.Read(ref connectAttempts));
+    }
+
+    /// <summary>
+    /// When the initial connection stays up, the post-connect state re-check does not queue a reconnect
+    /// that is not needed: the client is connected exactly once and Reconnected never fires.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task StartAsync_ConnectionStaysUp_DoesNotReconnectSpuriously()
+    {
+        var transport = new Mock<ITransport>();
+        transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
+
+        var client = new Mock<IMeshClient>();
+        client.Setup(c => c.DisconnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        client.Setup(c => c.DisposeAsync()).Returns(ValueTask.CompletedTask);
+        client.SetupGet(c => c.IsConnected).Returns(true);
+
+        int connectAttempts = 0;
+
+        client.Setup(c => c.ConnectAsync(
+                It.IsAny<ITransport>(),
+                It.IsAny<string>(),
+                It.IsAny<ReadOnlyMemory<byte>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                Interlocked.Increment(ref connectAttempts);
+                return Task.CompletedTask;
+            });
+
+        await using var reconnector = new MeshClientReconnector(
+            client.Object,
+            "Alice",
+            _ => Task.FromResult<ITransport>(transport.Object),
+            retryDelay: TimeSpan.FromMilliseconds(10));
+
+        int reconnectedCount = 0;
+        reconnector.Reconnected += (_, _) => Interlocked.Increment(ref reconnectedCount);
+
+        await reconnector.StartAsync();
+
+        // A negative assertion needs settling time: a spurious signal queued by StartAsync would be
+        // picked up by the reconnect loop well within this window, given the 10 ms retry delay.
+        await Task.Delay(TimeSpan.FromMilliseconds(400));
+
+        Assert.Equal(1, Volatile.Read(ref connectAttempts));
+        Assert.Equal(0, Volatile.Read(ref reconnectedCount));
+    }
+
     // Reconnection
 
     /// <summary>
