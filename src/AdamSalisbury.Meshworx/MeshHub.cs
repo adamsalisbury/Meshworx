@@ -56,6 +56,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // that same task. Read and written only under the lock.
     private Task? _disposeTask;
 
+    // Set while a start is between claiming the hub and publishing its accept loop. It holds the running
+    // slot across the listener start without exposing a token source that a concurrent stop could take
+    // ownership of before there is anything to stop.
+    private bool _starting;
+
     // Set the instant disposal begins, before any teardown starts, so a start racing a disposal cannot
     // bring the hub back up on a listener that is being torn down.
     private bool _disposed;
@@ -176,8 +181,6 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// <exception cref="ObjectDisposedException">The hub has been disposed.</exception>
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        var cts = new CancellationTokenSource();
-
         lock (_stateLock)
         {
             // A disposed hub must stay disposed. Without this a start racing a disposal would begin
@@ -185,17 +188,19 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             // running accept loop behind that nothing owns.
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            if (_cts is not null || _stopTask is not null)
+            if (_cts is not null || _stopTask is not null || _starting)
             {
-                cts.Dispose();
                 throw new InvalidOperationException("The hub is already running.");
             }
 
-            // Claim the running slot before the listener is started rather than after, so a second
-            // concurrent start is refused here instead of starting the listener a second time and
-            // leaving an orphaned token source and accept loop behind it.
-            _cts = cts;
+            // Claim the running slot with a flag rather than by publishing the token source early. A
+            // second concurrent start is refused here, but a concurrent stop cannot take a token source
+            // whose accept loop does not exist yet — which would abandon a listener that had just been
+            // bound, on a hub that then reported itself stopped.
+            _starting = true;
         }
+
+        var cts = new CancellationTokenSource();
 
         try
         {
@@ -204,13 +209,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         catch
         {
             // Release the claim, so a hub whose listener failed to start is startable again rather than
-            // permanently reporting itself as already running.
+            // permanently reporting itself as already running. Nothing else has seen this token source,
+            // so disposing it here cannot race a stop.
             lock (_stateLock)
             {
-                if (ReferenceEquals(_cts, cts))
-                {
-                    _cts = null;
-                }
+                _starting = false;
             }
 
             cts.Dispose();
@@ -219,14 +222,22 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         lock (_stateLock)
         {
-            // A stop may have taken ownership of this start's token source while the listener was
-            // starting, in which case it is already cancelled and there is nothing left to run an accept
-            // loop against. Returning normally would report a hub that is not running as started.
-            if (!ReferenceEquals(_cts, cts))
+            _starting = false;
+
+            // A disposal may have run to completion while the listener was starting. Its teardown has
+            // already disposed the listener, so publishing an accept loop here would run it against a
+            // closed listener for as long as it took to notice.
+            if (_disposed)
             {
-                throw new InvalidOperationException("The hub was stopped while it was starting.");
+                cts.Dispose();
+                throw new ObjectDisposedException(GetType().FullName);
             }
 
+            // Publish the token source and the accept loop together, so no stop can ever see one without
+            // the other. Creating the loop holds the lock across the synchronous head of
+            // ITransportListener.AcceptAsync; both listeners in this library reach their first await in a
+            // lock acquisition and a field read, and only another lifecycle call could contend.
+            _cts = cts;
             _acceptLoopTask = AcceptLoopAsync(cts.Token);
         }
     }

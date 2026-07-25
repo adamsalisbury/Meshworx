@@ -266,11 +266,18 @@ public sealed class MeshHubTests
     }
 
     /// <summary>
-    /// When a hub that has been stopped is started again, it starts, so the shutdown does not leave the hub
-    /// permanently reporting itself as already running.
+    /// When a shutdown completes, the hub releases its own running claim rather than staying wedged as
+    /// permanently stopping.
     /// </summary>
+    /// <remarks>
+    /// This covers the hub's half only, which is all the hub controls. It is deliberately not a claim that
+    /// a stopped hub can be restarted in general: <see cref="ITransportListener"/> has no stop, so the hub's
+    /// shutdown leaves the endpoint bound, and both listeners in this library throw on a second
+    /// <see cref="ITransportListener.StartAsync"/>. The second start below succeeds only because the
+    /// fixture's listener is a mock that permits it.
+    /// </remarks>
     [Fact(Timeout = 10000)]
-    public async Task StartAsync_AfterAPreviousRunHasStopped_StartsTheListenerAgain()
+    public async Task StopAsync_AfterCompleting_ReleasesTheHubsRunningClaim()
     {
         var fixture = new MeshHubFixture();
         await fixture.Hub.StartAsync();
@@ -280,6 +287,46 @@ public sealed class MeshHubTests
 
         fixture.Listener.Verify(l => l.StartAsync(It.IsAny<CancellationToken>()), Times.Exactly(2));
 
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When StopAsync runs while a start is still in progress, that start completes and the hub is left
+    /// running over a listener it still owns, rather than abandoning a listener it has just bound.
+    /// </summary>
+    /// <remarks>
+    /// The interleaving is pinned by gating the listener's own StartAsync, which parks the hub's start at
+    /// the exact point where it has claimed the hub but not yet published an accept loop. A stop taking
+    /// ownership there would leave the endpoint bound with nothing serving it and no way to recover, since
+    /// the listener cannot be started a second time.
+    /// </remarks>
+    [Fact(Timeout = 10000)]
+    public async Task StopAsync_WhileAStartIsInProgress_LeavesTheStartedHubIntact()
+    {
+        var fixture = new MeshHubFixture();
+        var listenerStarting = new TaskCompletionSource();
+        var releaseListenerStart = new TaskCompletionSource();
+
+        fixture.Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                listenerStarting.TrySetResult();
+                await releaseListenerStart.Task.ConfigureAwait(false);
+            });
+
+        Task start = fixture.Hub.StartAsync();
+        await listenerStarting.Task.WaitAsync(WaitTimeout);
+
+        await fixture.Hub.StopAsync();
+
+        releaseListenerStart.SetResult();
+        await start.WaitAsync(WaitTimeout);
+
+        // The hub is genuinely running, so the client the listener goes on to accept is served.
+        var client = await fixture.RegisterClientAsync();
+        Assert.True(fixture.Hub.IsClientRegistered(client.Id));
+
+        client.Disconnect();
         await fixture.Hub.StopAsync();
     }
 
