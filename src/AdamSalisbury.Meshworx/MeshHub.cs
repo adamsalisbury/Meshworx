@@ -35,8 +35,30 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // on disconnect; that set is only ever touched by the connection's own receive loop (and its
     // teardown, which runs after the loop ends), so it needs no additional lock.
     private readonly ConcurrentDictionary<string, Group> _groups = new(StringComparer.Ordinal);
+
+    // Guards every lifecycle field below. Starting, stopping and disposing can each be called from a
+    // different thread, so each of them takes the state it needs in one critical section and then works
+    // only from locals: reading a field twice is what let a concurrent stop null the token source
+    // between a check and the dereference that followed it. Nothing that blocks or awaits is done while
+    // holding it.
+    private readonly Lock _stateLock = new();
+
     private CancellationTokenSource? _cts;
     private Task? _acceptLoopTask;
+
+    // The call to StopAsync that finds the hub running takes ownership of the shutdown and stores it
+    // here; every concurrent call awaits that same task rather than running a second shutdown over state
+    // the first has already taken. Cleared once the shutdown finishes, so the hub can be started again.
+    // Read and written only under the lock.
+    private Task? _stopTask;
+
+    // The first call to DisposeAsync stores its teardown here; every later or concurrent call awaits
+    // that same task. Read and written only under the lock.
+    private Task? _disposeTask;
+
+    // Set the instant disposal begins, before any teardown starts, so a start racing a disposal cannot
+    // bring the hub back up on a listener that is being torn down.
+    private bool _disposed;
 
     /// <param name="logger">The logger used to record hub activity.</param>
     /// <param name="listener">The transport listener that accepts incoming client connections.</param>
@@ -151,73 +173,192 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    /// <exception cref="ObjectDisposedException">The hub has been disposed.</exception>
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        if (_cts is not null)
+        var cts = new CancellationTokenSource();
+
+        lock (_stateLock)
         {
-            throw new InvalidOperationException("The hub is already running.");
+            // A disposed hub must stay disposed. Without this a start racing a disposal would begin
+            // listening on a transport that is being torn down, and the teardown would then leave a
+            // running accept loop behind that nothing owns.
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (_cts is not null || _stopTask is not null)
+            {
+                cts.Dispose();
+                throw new InvalidOperationException("The hub is already running.");
+            }
+
+            // Claim the running slot before the listener is started rather than after, so a second
+            // concurrent start is refused here instead of starting the listener a second time and
+            // leaving an orphaned token source and accept loop behind it.
+            _cts = cts;
         }
 
-        await _listener.StartAsync(cancellationToken).ConfigureAwait(false);
-        _cts = new CancellationTokenSource();
-        _acceptLoopTask = AcceptLoopAsync(_cts.Token);
+        try
+        {
+            await _listener.StartAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Release the claim, so a hub whose listener failed to start is startable again rather than
+            // permanently reporting itself as already running.
+            lock (_stateLock)
+            {
+                if (ReferenceEquals(_cts, cts))
+                {
+                    _cts = null;
+                }
+            }
+
+            cts.Dispose();
+            throw;
+        }
+
+        lock (_stateLock)
+        {
+            // A stop may have taken ownership of this start's token source while the listener was
+            // starting, in which case it is already cancelled and there is nothing left to run an accept
+            // loop against. Returning normally would report a hub that is not running as started.
+            if (!ReferenceEquals(_cts, cts))
+            {
+                throw new InvalidOperationException("The hub was stopped while it was starting.");
+            }
+
+            _acceptLoopTask = AcceptLoopAsync(cts.Token);
+        }
     }
 
     /// <inheritdoc/>
-    public async Task StopAsync(CancellationToken cancellationToken = default)
+    /// <remarks>
+    /// Safe to call more than once, and from more than one thread at a time. The call that finds the hub
+    /// running takes ownership of its state and performs the shutdown; every concurrent call awaits that
+    /// same shutdown, so each of them returns only once the hub has actually stopped, and none of them
+    /// notifies the clients a second time or disposes the token source twice. A call made when the hub is
+    /// not running returns immediately.
+    /// </remarks>
+    public Task StopAsync(CancellationToken cancellationToken = default)
     {
-        if (_cts is null)
+        Task shutdown;
+
+        lock (_stateLock)
         {
-            return;
+            if (_stopTask is null)
+            {
+                CancellationTokenSource? cts = _cts;
+                if (cts is null)
+                {
+                    return Task.CompletedTask;
+                }
+
+                // Hand the state to the shutdown and clear the fields in the same critical section, so no
+                // other caller can see a half-stopped hub or tear the same state down twice.
+                Task? acceptLoopTask = _acceptLoopTask;
+                _cts = null;
+                _acceptLoopTask = null;
+
+                _stopTask = StopCoreAsync(cts, acceptLoopTask, cancellationToken);
+            }
+
+            shutdown = _stopTask;
         }
 
-        byte[] disconnectPayload = [(byte)MessageType.Disconnect];
-        foreach (ClientConnection client in _clients.Values)
-        {
-            try
-            {
-                await client.Transport.SendAsync(disconnectPayload, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
-            {
-                // Best-effort disconnect notification; the client may already be gone.
-            }
-        }
+        // A caller that joined someone else's shutdown still honours its own cancellation token. Giving
+        // up on the wait does not cancel the shutdown itself, which belongs to the caller that started it.
+        return cancellationToken.CanBeCanceled ? shutdown.WaitAsync(cancellationToken) : shutdown;
+    }
 
-        await _cts.CancelAsync().ConfigureAwait(false);
+    /// <summary>
+    /// Performs the one and only shutdown of a running hub, working from the state handed to it so that it
+    /// cannot race another caller over the fields.
+    /// </summary>
+    private async Task StopCoreAsync(
+        CancellationTokenSource cts, Task? acceptLoopTask, CancellationToken cancellationToken)
+    {
+        // Nothing of the shutdown may run on the caller's stack while it still holds the state lock, and
+        // the first thing below is transport I/O. The TCP listener can reason its teardown's synchronous
+        // head safe instead; here there is an arbitrary ITransport in the way, so yield.
+        await Task.Yield();
 
-        if (_acceptLoopTask is not null)
-        {
-            try
-            {
-                await _acceptLoopTask.WaitAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                // Expected when the cancellation token is triggered during shutdown.
-            }
-        }
-
-        // Wait for all handler tasks to complete — each handler disposes its own client
-        // connection in its finally block, so no separate disposal loop is needed.
         try
         {
-            await Task.WhenAll(_handlerTasks.Keys).WaitAsync(cancellationToken).ConfigureAwait(false);
+            byte[] disconnectPayload = [(byte)MessageType.Disconnect];
+            foreach (ClientConnection client in _clients.Values)
+            {
+                try
+                {
+                    await client.Transport.SendAsync(disconnectPayload, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
+                {
+                    // Best-effort disconnect notification; the client may already be gone.
+                }
+            }
         }
-        catch (Exception)
+        finally
         {
-            // Handler task exceptions are already logged individually via ContinueWith.
-            // This catch prevents WhenAll from propagating during shutdown.
+            // The notification above is best-effort, but the shutdown proper is not: run it even if a
+            // transport failed in a way the filter above does not cover. Skipping it would leave the
+            // accept loop running and the token source undisposed on a hub that now reports itself
+            // stopped, which no later call could put right.
+            await ShutDownAsync(cts, acceptLoopTask, cancellationToken).ConfigureAwait(false);
         }
+    }
 
-        _handlerTasks.Clear();
-        _clientNames.Clear();
-        _clients.Clear();
-        _groups.Clear();
+    /// <summary>
+    /// Cancels the hub's work, waits for the accept loop and every client handler to finish, and clears the
+    /// registries.
+    /// </summary>
+    private async Task ShutDownAsync(
+        CancellationTokenSource cts, Task? acceptLoopTask, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await cts.CancelAsync().ConfigureAwait(false);
 
-        _cts.Dispose();
-        _cts = null;
-        _acceptLoopTask = null;
+            if (acceptLoopTask is not null)
+            {
+                try
+                {
+                    await acceptLoopTask.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected when the cancellation token is triggered during shutdown.
+                }
+            }
+
+            // Wait for all handler tasks to complete — each handler disposes its own client
+            // connection in its finally block, so no separate disposal loop is needed.
+            try
+            {
+                await Task.WhenAll(_handlerTasks.Keys).WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // Handler task exceptions are already logged individually via ContinueWith.
+                // This catch prevents WhenAll from propagating during shutdown.
+            }
+
+            _handlerTasks.Clear();
+            _clientNames.Clear();
+            _clients.Clear();
+            _groups.Clear();
+
+            cts.Dispose();
+        }
+        finally
+        {
+            // Release the shutdown claim whatever happened, so a hub can be started again once it has
+            // stopped — and so a shutdown that failed part way leaves the hub stopped rather than wedged
+            // as permanently stopping.
+            lock (_stateLock)
+            {
+                _stopTask = null;
+            }
+        }
     }
 
     /// <inheritdoc/>
@@ -236,8 +377,36 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     }
 
     /// <inheritdoc/>
-    public async ValueTask DisposeAsync()
+    /// <remarks>
+    /// Safe to call more than once, and from more than one thread at a time. The first call performs the
+    /// teardown; every other call awaits that same teardown, so each of them returns only once the hub has
+    /// stopped and the listener is closed. A disposed hub cannot be started again.
+    /// </remarks>
+    public ValueTask DisposeAsync()
     {
+        Task disposal;
+
+        lock (_stateLock)
+        {
+            // Mark the hub disposed before any teardown begins, so a start racing this call is refused
+            // rather than racing the listener's disposal.
+            _disposed = true;
+            _disposeTask ??= DisposeCoreAsync();
+            disposal = _disposeTask;
+        }
+
+        return new ValueTask(disposal);
+    }
+
+    /// <summary>
+    /// Performs the one and only teardown of the hub.
+    /// </summary>
+    private async Task DisposeCoreAsync()
+    {
+        // Started from inside the state lock, and the shutdown it awaits takes that same lock. Yield first
+        // so none of it runs on the disposing thread while the lock is still held.
+        await Task.Yield();
+
         await StopAsync().ConfigureAwait(false);
         await _listener.DisposeAsync().ConfigureAwait(false);
         _authenticationSlots?.Dispose();
