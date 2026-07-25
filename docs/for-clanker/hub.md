@@ -126,6 +126,13 @@ one bad connection cannot kill the hub (`MeshHub.cs:263-271`) — this is the in
 background-service boundary. Each accepted transport is handed to `HandleClientAsync`; the handler task
 is tracked in `_handlerTasks` and a `ContinueWith` removes it and logs faults.
 
+> **That two-way split is what makes `ITransportListener`'s disposal contract load-bearing.** The retry
+> branch is `continue` with **no delay**, so a listener that is finished but reports itself with anything
+> other than `ObjectDisposedException` puts this loop into an unbounded hot spin rather than stopping it.
+> Both shipped listeners translate accordingly; a custom one must too. See
+> [transport.md](transport.md#itransportlistener--transportitransportlistenercs23) and
+> [known-issues.md](known-issues.md) KI-22.
+
 ### Registration handshake (hub side)
 
 Inside `HandleClientAsync` (`MeshHub.cs:296-414`), in order. The frame layout is
