@@ -220,13 +220,37 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     {
         while (!cancellationToken.IsCancellationRequested)
         {
+            // A queued signal records that the connection was lost, not that it is still lost: it may
+            // already have been recovered, either by an earlier pass servicing the same drop or by an
+            // application Disconnected handler reconnecting from within itself, which the client
+            // explicitly supports. Reconnecting a live client is not merely wasteful but impossible —
+            // the client refuses a connect unless it is fully disconnected — so retrying towards a state
+            // that has already been reached would loop for ever. Treat it as the goal met instead.
+            if (Client.IsConnected)
+            {
+                return;
+            }
+
             try
             {
                 using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 attemptCts.CancelAfter(_connectTimeout);
 
                 ITransport transport = await _transportFactory(attemptCts.Token).ConfigureAwait(false);
-                await Client.ConnectAsync(transport, _clientName, _credential, attemptCts.Token).ConfigureAwait(false);
+
+                try
+                {
+                    await Client.ConnectAsync(transport, _clientName, _credential, attemptCts.Token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // The client only takes ownership of the transport once it accepts it, so a connect
+                    // rejected before that point leaves nothing else to close this one. Disposal is
+                    // idempotent, so this is safe on the paths where the client did clean up itself.
+                    await transport.DisposeAsync().ConfigureAwait(false);
+                    throw;
+                }
+
                 return;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
