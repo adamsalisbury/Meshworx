@@ -53,8 +53,11 @@ work without a type. Return `true` to admit the client, `false` to refuse it wit
 
 Contract, from the delegate's own XML docs and the hub's call site:
 
-- Invoked **once per registration**, after the name and credential are parsed, after the capacity check,
-  and **before** the name is reserved or the client admitted.
+- Invoked **once per registration**, after the name and credential are parsed and **before** the client
+  claims a capacity slot, reserves its name, or is admitted. A cheap at-capacity early-out runs just
+  ahead of it, so an already-full hub never reaches the callback — but the binding capacity decision is
+  taken *after* it returns, so a peer that never authenticates cannot hold a slot. See
+  [hub.md](hub.md#registration-handshake-hub-side).
 - `cancellationToken` is cancelled when the **hub** is shutting down. It is not the client's token.
 - `ValueTask<bool>` — return `ValueTask.FromResult(...)` for a synchronous decision and it allocates
   nothing.
@@ -73,14 +76,14 @@ public sealed record RegistrationContext
 ```
 
 A `sealed record` with `required` init-only properties — construct with an object initialiser (the hub
-does, at `MeshHub.cs:786`). Trivially constructible in tests.
+does, at `MeshHub.cs:867`). Trivially constructible in tests.
 
 - `ClientName` — the name being registered under. Already validated for length, **not** yet checked for
   uniqueness, so two concurrent registrations for the same name can both reach your authenticator.
 - `Credential` — exactly the bytes the client sent after its name, empty if it sent none. The library
   assigns no meaning to them.
 - **Only guaranteed valid for the duration of the call** — copy it if it must outlive the invocation.
-  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:785`, so
+  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:866`, so
   it does not alias a larger buffer — but the documented contract is the one to code against.)
 
 ## Exception

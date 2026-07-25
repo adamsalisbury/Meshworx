@@ -51,7 +51,7 @@ implementation:**
 
 The exception *type* is load-bearing. `MeshHub.AcceptLoopAsync` uses it to tell **"this listener is
 finished"** (break the loop) from **"that one connection failed"** (log and `continue`), and the retry
-has no delay (`MeshHub.cs:443-451`) — so a listener that is never coming back but reports anything else
+has no delay (`MeshHub.cs:454-462`) — so a listener that is never coming back but reports anything else
 spins the hub's accept loop hot. Both shipped listeners translate accordingly; see
 [known-issues.md](known-issues.md) KI-22.
 
@@ -62,7 +62,7 @@ Task SendAsync(IReadOnlyList<ReadOnlyMemory<byte>> messages, CancellationToken =
 ```
 
 An **optional capability**. The hub's send loop coalesces a burst of queued frames into one underlying
-write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:892-894`);
+write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:973-975`);
 transports that don't implement it just receive frames one at a time. It is deliberately **`internal`**:
 only the bundled `TcpTransport` benefits and only the in-assembly hub consumes it, so it stays off the
 public `ITransport` surface. Each element is delivered as its own message. **External transports cannot

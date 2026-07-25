@@ -812,6 +812,137 @@ public sealed class MeshHubTests
     }
 
     /// <summary>
+    /// When a concurrent registration has claimed the hub's last client slot but has not yet added
+    /// itself to the client registry, a registration reaching the capacity decision at that moment is
+    /// refused with HubAtCapacity rather than admitted. The claim, not the observable client count, is
+    /// what maxClients is enforced against, so registrations that all read the same count cannot all be
+    /// admitted and overshoot the cap.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_LastSlotClaimedButNotYetRegistered_RefusesRatherThanExceedingMaxClients()
+    {
+        var authenticatorReached = new TaskCompletionSource();
+        var releaseAuthenticator = new TaskCompletionSource();
+        var fixture = new MeshHubFixture(
+            maxClients: 1,
+            authenticator: async (_, ct) =>
+            {
+                authenticatorReached.TrySetResult();
+                await releaseAuthenticator.Task.WaitAsync(ct);
+                return true;
+            });
+        await fixture.Hub.StartAsync();
+
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+        var neverReceives = new TaskCompletionSource<byte[]?>();
+
+        transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Racer"))
+            .Returns(neverReceives.Task);
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+
+        // Park the registration inside the authenticator, past the pre-authentication capacity check and
+        // immediately before the hub decides whether to admit it.
+        await authenticatorReached.Task.WaitAsync(WaitTimeout);
+
+        // Stand in for a registration that has taken the hub's only slot but has not yet put itself in
+        // the client registry. ConnectedClientCount is still zero, so a capacity check reading the count
+        // would wave the parked registration through and admit a second client to a one-client hub.
+        Assert.True(fixture.Hub.TryReserveClientSlot());
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+
+        releaseAuthenticator.SetResult();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x04, sentData[1]); // HubAtCapacity
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+
+        fixture.Hub.ReleaseClientSlot();
+        neverReceives.TrySetResult(null);
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a registration claims a client slot and is then refused because its name is already taken,
+    /// the slot is given back rather than leaked, so the capacity it briefly held is still available to
+    /// the next client.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_RefusedForDuplicateNameAfterClaimingSlot_GivesTheSlotBack()
+    {
+        var fixture = new MeshHubFixture(maxClients: 2);
+        await fixture.Hub.StartAsync();
+        var first = await fixture.RegisterClientAsync("First");
+
+        var duplicate = MeshHubFixture.CreateMockTransport();
+        var duplicateSentTcs = new TaskCompletionSource<byte[]>();
+        var duplicateDisposedTcs = new TaskCompletionSource();
+
+        duplicate.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("First"));
+        duplicate.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>(
+                (data, _) => duplicateSentTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+        duplicate.Setup(t => t.DisposeAsync())
+            .Callback(() => duplicateDisposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(duplicate.Object);
+
+        byte[] duplicateResponse = await duplicateSentTcs.Task.WaitAsync(WaitTimeout);
+        await duplicateDisposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, duplicateResponse[0]); // Error
+        Assert.Equal(0x01, duplicateResponse[1]); // DuplicateClientName
+
+        // The second of the hub's two slots was claimed by the refused registration; it must be free
+        // again, otherwise the hub is permanently one client short for every name collision it sees.
+        var second = await fixture.RegisterClientAsync("Second");
+        Assert.Equal(2, fixture.Hub.ConnectedClientCount);
+
+        first.Disconnect();
+        second.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a client disconnects, the slot it held is given back, so a hub that was at its maximum
+    /// client count can admit a replacement.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_ClientDisconnects_GivesItsSlotBackForAReplacement()
+    {
+        var fixture = new MeshHubFixture(maxClients: 1);
+        await fixture.Hub.StartAsync();
+
+        var disconnected = new TaskCompletionSource();
+        fixture.Hub.ClientDisconnected += (_, _) => disconnected.TrySetResult();
+
+        var first = await fixture.RegisterClientAsync("First");
+        first.Disconnect();
+
+        // The disconnected event is raised after the handler has released the slot, so waiting on it
+        // pins the replacement to a point where the slot has definitely been given back.
+        await disconnected.Task.WaitAsync(WaitTimeout);
+
+        var replacement = await fixture.RegisterClientAsync("Second");
+
+        Assert.Equal(1, fixture.Hub.ConnectedClientCount);
+        Assert.True(fixture.Hub.IsClientRegistered(replacement.Id));
+
+        replacement.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
     /// When the hub is constructed with a non-positive maximum client count, an
     /// ArgumentOutOfRangeException is thrown.
     /// </summary>
