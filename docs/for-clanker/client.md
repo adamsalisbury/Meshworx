@@ -148,7 +148,7 @@ deliberately left open — see [known-issues.md](known-issues.md) KI-21.
 - **Does not fire for a local `DisconnectAsync`** — including one that races a remote drop. Whichever
   side tears the connection down, an application-requested disconnect stays silent: `DisconnectAsync`
   either performs the teardown itself or claims the one already in flight (see the claim protocol
-  above). The interface XML docs state this contract (`IMeshClient.cs:58-70`, `:161-171`).
+  above). The interface XML docs state this contract (`IMeshClient.cs:58-71`, `:161-171`).
   - **The one exception** is a narrow residual window: a `DisconnectAsync` arriving *after* the teardown
     has published the disconnected state has nothing left to claim, and the event fires. Read
     [known-issues.md](known-issues.md) KI-21 before you rely on the suppression being absolute.
@@ -172,9 +172,12 @@ the hub reports "not found". Cancelling via the token abandons the wait; the `fi
 
 ### Threading & idempotency
 
-- `_stateLock` guards state + transport/cts references. `_groupMembershipLock` guards `_joinedGroups`.
-  `_lookupLock` serialises lookups.
-- `DisconnectAsync` and `DisposeAsync` are safe to call when not connected (no-op / early return).
+- `_stateLock` guards state, the transport/cts references and the `_localDisconnectRequested` claim flag.
+  `_groupMembershipLock` guards `_joinedGroups`. `_lookupLock` serialises lookups.
+- `DisconnectAsync` and `DisposeAsync` are safe to call when not connected (early return). Note that
+  `DisconnectAsync`'s early return is not *quite* inert: in the `Disconnecting` state it claims the
+  in-flight teardown (`MeshClient.cs:286-289`). It is still idempotent and side-effect-free from the
+  caller's point of view.
 - Send methods snapshot the transport under `_stateLock`, then release it before the `await SendAsync`
   — so a slow send does not hold the state lock.
 
