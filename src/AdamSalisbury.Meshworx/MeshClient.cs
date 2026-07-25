@@ -149,6 +149,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public event EventHandler<GroupMessageReceivedEventArgs>? GroupMessageReceived;
 
     /// <inheritdoc/>
+    public event EventHandler<GroupJoinRefusedEventArgs>? GroupJoinRefused;
+
+    /// <inheritdoc/>
     public event EventHandler<DisconnectedEventArgs>? Disconnected;
 
     /// <inheritdoc/>
@@ -388,18 +391,53 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// <inheritdoc/>
     public async Task JoinGroupAsync(string groupName, CancellationToken cancellationToken = default)
     {
-        await SendGroupMembershipAsync(MessageType.JoinGroup, groupName, cancellationToken).ConfigureAwait(false);
+        ArgumentException.ThrowIfNullOrEmpty(groupName);
 
+        ITransport transport = GetConnectedTransport();
+
+        // Record the membership before the frame goes out, not after. The hub may refuse the join, and
+        // its refusal can arrive and be handled by the receive loop before this method resumes — an add
+        // afterwards would then reinstate the very group the refusal had just removed. Both checks above
+        // run before the record is made, so the only thing left to undo is a send that failed.
+        bool recorded;
         lock (_groupMembershipLock)
         {
-            _joinedGroups.Add(groupName);
+            recorded = _joinedGroups.Add(groupName);
+        }
+
+        try
+        {
+            await SendGroupMembershipAsync(transport, MessageType.JoinGroup, groupName, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // The frame never reached the hub, so no membership was created; take the record back — but
+            // only if this call is what recorded it. A join of a group already joined, or one racing a
+            // concurrent join of the same name, must not roll back the record its predecessor owns: the
+            // group would then be missing from JoinedGroups while the client is still in it on the hub,
+            // and the reconnector, which restores from that snapshot, would silently not restore it.
+            if (recorded)
+            {
+                lock (_groupMembershipLock)
+                {
+                    _joinedGroups.Remove(groupName);
+                }
+            }
+
+            throw;
         }
     }
 
     /// <inheritdoc/>
     public async Task LeaveGroupAsync(string groupName, CancellationToken cancellationToken = default)
     {
-        await SendGroupMembershipAsync(MessageType.LeaveGroup, groupName, cancellationToken).ConfigureAwait(false);
+        ArgumentException.ThrowIfNullOrEmpty(groupName);
+
+        ITransport transport = GetConnectedTransport();
+
+        await SendGroupMembershipAsync(transport, MessageType.LeaveGroup, groupName, cancellationToken)
+            .ConfigureAwait(false);
 
         lock (_groupMembershipLock)
         {
@@ -495,15 +533,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
     }
 
-    private async Task SendGroupMembershipAsync(
+    private static async Task SendGroupMembershipAsync(
+        ITransport transport,
         MessageType type,
         string groupName,
         CancellationToken cancellationToken)
     {
-        ArgumentException.ThrowIfNullOrEmpty(groupName);
-
-        ITransport transport = GetConnectedTransport();
-
         byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
         var payload = new byte[1 + nameBytes.Length];
         payload[0] = (byte)type;
@@ -728,6 +763,32 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                             // Callback boundary — a throwing subscriber must not halt the loop.
                             _logger.LogError(ex, "A GroupMessageReceived handler threw an exception");
                         }
+                    }
+                }
+                else if (data.Length > 1
+                    && (MessageType)data[0] == MessageType.GroupJoinRefused)
+                {
+                    // The hub declined the join, so this client is not a member however the join was
+                    // issued — an application call or the reconnector restoring membership. Drop the
+                    // optimistic record first, so JoinedGroups stops claiming a membership that does not
+                    // exist and a later disconnect does not hand the group to the reconnector to restore.
+                    string groupName = Encoding.UTF8.GetString(data.AsSpan(1));
+
+                    lock (_groupMembershipLock)
+                    {
+                        _joinedGroups.Remove(groupName);
+                    }
+
+                    _logger.LogWarning("The hub refused membership of group {GroupName}", groupName);
+
+                    try
+                    {
+                        GroupJoinRefused?.Invoke(this, new GroupJoinRefusedEventArgs { GroupName = groupName });
+                    }
+                    catch (Exception ex)
+                    {
+                        // Callback boundary — a throwing subscriber must not halt the loop.
+                        _logger.LogError(ex, "A GroupJoinRefused handler threw an exception");
                     }
                 }
                 else if (data.Length >= 6

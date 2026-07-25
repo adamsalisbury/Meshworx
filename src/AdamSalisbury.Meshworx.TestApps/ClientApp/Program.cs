@@ -57,6 +57,13 @@ client.GroupMessageReceived += (_, args) =>
     Console.Write("> ");
 };
 
+client.GroupJoinRefused += (_, args) =>
+{
+    Console.WriteLine();
+    Console.WriteLine($"[The hub refused membership of group \"{args.GroupName}\"]");
+    Console.Write("> ");
+};
+
 client.Disconnected += (_, args) =>
 {
     Console.WriteLine();
@@ -142,6 +149,14 @@ while (true)
         if (message.Length == 0)
         {
             Console.WriteLine("Message cannot be empty.");
+            continue;
+        }
+
+        if (!client.JoinedGroups.Contains(group))
+        {
+            // The hub drops a group message from a non-member, so say so rather than letting the
+            // message vanish silently.
+            Console.WriteLine($"You are not a member of \"{group}\". Join it first with /join {group}.");
             continue;
         }
 

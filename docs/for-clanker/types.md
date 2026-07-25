@@ -1,10 +1,10 @@
-# Public value types — event args, enums, authentication types, exception
+# Public value types — event args, enums, authentication & authorisation types, exception
 
 [← back to index](../for-clanker.md) · related: [client.md](client.md) · [hub.md](hub.md) · [protocol.md](protocol.md)
 
-The small public types that flow through events, errors and the authentication seam. All are trivial and
-self-evident — this file is a complete inventory so you don't have to hunt for them. `namespace AdamSalisbury.Meshworx.Messages`
-unless noted otherwise.
+The small public types that flow through events, errors and the two integrator seams (authentication and
+authorisation). All are trivial and self-evident — this file is a complete inventory so you don't have to
+hunt for them. `namespace AdamSalisbury.Meshworx.Messages` unless noted otherwise.
 
 ## Event args
 
@@ -12,6 +12,7 @@ unless noted otherwise.
 |---|---|---|---|
 | `MessageReceivedEventArgs` | `required Guid SenderId`, `required ReadOnlyMemory<byte> Data` | `IMeshClient.MessageReceived` (direct **and** broadcast) | `Messages/MessageReceivedEventArgs.cs` |
 | `GroupMessageReceivedEventArgs` | `required Guid SenderId`, `required string GroupName`, `required ReadOnlyMemory<byte> Data` | `IMeshClient.GroupMessageReceived` | `Messages/GroupMessageReceivedEventArgs.cs` |
+| `GroupJoinRefusedEventArgs` | `required string GroupName` | `IMeshClient.GroupJoinRefused` | `Messages/GroupJoinRefusedEventArgs.cs:6` |
 | `DisconnectedEventArgs` | `required DisconnectReason Reason` | `IMeshClient.Disconnected` | `Messages/DisconnectedEventArgs.cs` |
 | `ClientConnectionEventArgs` | `required Guid ClientId`, `required string ClientName` | `IMeshHub.ClientConnected` / `ClientDisconnected` (namespace `AdamSalisbury.Meshworx`) | `ClientConnectionEventArgs.cs` |
 
@@ -76,15 +77,81 @@ public sealed record RegistrationContext
 ```
 
 A `sealed record` with `required` init-only properties — construct with an object initialiser (the hub
-does, at `MeshHub.cs:867`). Trivially constructible in tests.
+does, at `MeshHub.cs:918`). Trivially constructible in tests.
 
 - `ClientName` — the name being registered under. Already validated for length, **not** yet checked for
   uniqueness, so two concurrent registrations for the same name can both reach your authenticator.
 - `Credential` — exactly the bytes the client sent after its name, empty if it sent none. The library
   assigns no meaning to them.
 - **Only guaranteed valid for the duration of the call** — copy it if it must outlive the invocation.
-  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:866`, so
+  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:917`, so
   it does not alias a larger buffer — but the documented contract is the one to code against.)
+
+<a id="authorisation-types"></a>
+
+## Authorisation types
+
+Added **within** protocol version 3 (no version bump — see
+[protocol.md](protocol.md#additive-opcodes-within-a-version)). Both live in namespace
+`AdamSalisbury.Meshworx` (the root, not `.Messages`) and are the entire public surface of the hub's
+**group** authorisation seam. Neither is used unless you pass a `GroupAuthoriser` to the `MeshHub`
+constructor.
+
+These are the counterpart to the [authentication types](#authentication-types) above, and the split is
+the point: the authenticator establishes **who a peer is**, the authoriser decides **what that peer may
+do**. They compose — a `GroupJoinContext.ClientName` is only as trustworthy as the `ClientAuthenticator`
+that admitted it.
+
+### `GroupAuthoriser` — `GroupAuthoriser.cs:35`
+
+```csharp
+public delegate ValueTask<bool> GroupAuthoriser(
+    GroupJoinContext context,
+    CancellationToken cancellationToken);
+```
+
+A **delegate, not an interface**, matching `ClientAuthenticator`. Return `true` to admit the client to
+the group; `false` refuses the join and the hub sends the client a `GroupJoinRefused` frame.
+
+Contract, from the delegate's own XML docs and the hub's call site (`AuthoriseGroupJoinAsync`,
+`MeshHub.cs:1234`):
+
+- Invoked **once per join request**, including every re-join a client issues after reconnecting, so a
+  decision is never carried across a connection and a reconnector's membership restore cannot bypass it.
+  See [hub.md](hub.md#group-authorisation).
+- `cancellationToken` is the **calling client's** token — cancelled when that client disconnects or the
+  hub shuts down. (Note this differs from `ClientAuthenticator`, whose token is the hub's.)
+- **Fails closed.** Returning `false`, throwing, cancelling from inside the callback, or exceeding
+  `groupAuthorisationTimeout` all refuse the join.
+- `ValueTask<bool>` — a synchronous decision (`ValueTask.FromResult(...)`) takes an explicitly
+  allocation-free fast path in the hub (`MeshHub.cs:1264-1269`) and is the common case; anything else,
+  including an already-faulted result, goes through the bounded `WaitAsync`.
+- **It runs on input from an already-admitted client**, driven from that client's own receive loop, which
+  reads nothing else from that client until it returns. So a slow callback stalls only the client that
+  asked — and there is deliberately **no** concurrency semaphore, unlike `ClientAuthenticator`. The
+  consequence you must design for is in [known-issues.md](known-issues.md) KI-28.
+
+### `GroupJoinContext` — `GroupJoinContext.cs:7`
+
+```csharp
+public sealed record GroupJoinContext
+{
+    public required Guid ClientId { get; init; }      // GroupJoinContext.cs:12
+    public required string ClientName { get; init; }  // GroupJoinContext.cs:22
+    public required string GroupName { get; init; }   // GroupJoinContext.cs:28
+}
+```
+
+A `sealed record` with `required` init-only properties — construct with an object initialiser (the hub
+does, at `MeshHub.cs:1237`). Trivially constructible in tests.
+
+- `ClientId` — the hub-assigned id. Fresh per connection, so it is **not** stable across a reconnect;
+  authorise on the name plus your own state if you need continuity.
+- `ClientName` — the name that passed the hub's `ClientAuthenticator`. **With no authenticator configured
+  the name is self-asserted and is not an identity** — the hub's only name rule is uniqueness.
+- `GroupName` — client-supplied and **untrusted**. Match it against known groups rather than parsing
+  meaning out of it. It is also unbounded in length (KI-8), so do not use it as a key in anything you
+  cannot afford a client to grow.
 
 ## Exception
 

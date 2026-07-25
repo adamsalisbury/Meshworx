@@ -11,6 +11,7 @@ namespace AdamSalisbury.Meshworx;
 public sealed class MeshHub : IMeshHub, IAsyncDisposable
 {
     private static readonly TimeSpan DefaultRegistrationTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan DefaultGroupAuthorisationTimeout = TimeSpan.FromSeconds(10);
     private const int DefaultMaxConcurrentAuthentications = 64;
 
     private readonly ILogger<MeshHub> _logger;
@@ -20,6 +21,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly TimeSpan? _heartbeatInterval;
     private readonly int _maxMissedHeartbeats;
     private readonly ClientAuthenticator? _authenticator;
+    private readonly GroupAuthoriser? _groupAuthoriser;
+    private readonly TimeSpan _groupAuthorisationTimeout;
 
     // Caps how many integrator authenticator callbacks may run concurrently. Null when no authenticator
     // is configured, since there is then no pre-authentication work to bound.
@@ -116,6 +119,19 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// <see cref="RegistrationErrorCode.AuthenticationFailed"/>. Defaults to 64. Ignored when
     /// <paramref name="authenticator"/> is <see langword="null"/>.
     /// </param>
+    /// <param name="groupAuthoriser">
+    /// An optional callback invoked for each group join to decide whether the client may become a member,
+    /// given its registered identity and the group name. Returning <see langword="false"/> refuses the
+    /// join and tells the client so. When <see langword="null"/> (the default) the hub authorises no
+    /// joins and any client may join any group — groups are then a routing convenience, not an isolation
+    /// boundary. Sending to a group always requires membership of it, with or without this callback.
+    /// </param>
+    /// <param name="groupAuthorisationTimeout">
+    /// The maximum time a <paramref name="groupAuthoriser"/> callback is given to decide before the join
+    /// is refused. Bounds a hanging integrator callback, which would otherwise stall the calling client's
+    /// receive loop — and hold its client slot — indefinitely. Defaults to 10 seconds. Ignored when
+    /// <paramref name="groupAuthoriser"/> is <see langword="null"/>.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
@@ -124,7 +140,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         TimeSpan? heartbeatInterval = null,
         int maxMissedHeartbeats = 2,
         ClientAuthenticator? authenticator = null,
-        int? maxConcurrentAuthentications = null)
+        int? maxConcurrentAuthentications = null,
+        GroupAuthoriser? groupAuthoriser = null,
+        TimeSpan? groupAuthorisationTimeout = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -160,6 +178,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 "The maximum concurrent authentication count must be positive.");
         }
 
+        if (groupAuthorisationTimeout is { } authorisationTimeout && authorisationTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(groupAuthorisationTimeout), "The group authorisation timeout must be positive.");
+        }
+
         _logger = logger;
         _listener = listener;
         _registrationTimeout = registrationTimeout ?? DefaultRegistrationTimeout;
@@ -167,6 +191,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _heartbeatInterval = heartbeatInterval;
         _maxMissedHeartbeats = maxMissedHeartbeats;
         _authenticator = authenticator;
+        _groupAuthoriser = groupAuthoriser;
+        _groupAuthorisationTimeout = groupAuthorisationTimeout ?? DefaultGroupAuthorisationTimeout;
 
         if (authenticator is not null)
         {
@@ -185,6 +211,28 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 "Heartbeats are enabled with maxMissedHeartbeats set to 1, so clients are evicted on "
                 + "their first idle interval and are never probed with a ping. Clients that do not send "
                 + "frames of their own will be evicted every interval; use 2 or more to probe liveness.");
+        }
+
+        // While the group authoriser runs, the calling client's receive loop is parked and reads nothing,
+        // so that client looks idle to the heartbeat monitor however healthy it is — it cannot answer a
+        // ping the loop is not there to read. If the authoriser is still deciding when the eviction
+        // budget runs out, the monitor cancels the connection and the client is dropped rather than
+        // refused, which is not what the fail-closed contract promises and, behind a reconnector, becomes
+        // a reconnect loop. Warn rather than throw: the combination is legal, the default authorisation
+        // timeout would otherwise refuse construction of a hub with a short heartbeat interval, and a slow
+        // authoriser may simply never take that long in practice.
+        if (groupAuthoriser is not null
+            && heartbeatInterval is { } configuredInterval
+            && _groupAuthorisationTimeout >= configuredInterval * maxMissedHeartbeats)
+        {
+            _logger.LogWarning(
+                "The group authorisation timeout ({Timeout}) is not shorter than the heartbeat eviction "
+                + "budget ({Interval} × {MaxMissed}). A client's receive loop is parked while its join is "
+                + "being authorised, so a decision that takes this long will have the client evicted "
+                + "instead of refused. Set groupAuthorisationTimeout below the budget.",
+                _groupAuthorisationTimeout,
+                configuredInterval,
+                maxMissedHeartbeats);
         }
     }
 
@@ -645,7 +693,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 else if ((MessageType)data[0] == MessageType.JoinGroup)
                 {
                     string groupName = Encoding.UTF8.GetString(data.AsSpan(1));
-                    JoinGroup(connection, groupName);
+                    // Pass the original name bytes through as well, so a refusal can echo them
+                    // rather than re-encode the string they were just decoded from.
+                    await JoinGroupAsync(connection, groupName, data.AsMemory(1), clientCts.Token)
+                        .ConfigureAwait(false);
                 }
                 else if ((MessageType)data[0] == MessageType.LeaveGroup)
                 {
@@ -1106,13 +1157,192 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
     }
 
-    private void JoinGroup(ClientConnection connection, string groupName)
+    /// <summary>
+    /// Admits a client to a group once the configured <see cref="GroupAuthoriser"/> has allowed it.
+    /// </summary>
+    /// <remarks>
+    /// Every join goes through here, including the re-joins a client sends after reconnecting, so an
+    /// authorisation decision cannot be carried across a connection or bypassed by a restore: a
+    /// reconnected client is a new client id that must be authorised again on its own merits.
+    /// </remarks>
+    private async Task JoinGroupAsync(
+        ClientConnection connection,
+        string groupName,
+        ReadOnlyMemory<byte> groupNameBytes,
+        CancellationToken cancellationToken)
     {
         if (string.IsNullOrEmpty(groupName))
         {
             return;
         }
 
+        if (_groupAuthoriser is not null)
+        {
+            // Copy the name out of the inbound frame before awaiting the authoriser, because the refusal
+            // below echoes these bytes and is built after that await. ITransport promises nothing about
+            // how long the array it returned stays valid; both shipped transports hand back a freshly
+            // allocated one per frame, so nothing reuses it today, but a pooled-buffer transport would
+            // leave the refusal aliasing a buffer that had already been recycled. One array on a
+            // control-plane path settles that rather than resting on an implementation detail of the
+            // transports that happen to be in the box.
+            //
+            // Note this is stricter than AuthenticateAsync, which reads registrationData to copy the
+            // credential only *after* awaiting an authentication slot. That is equally safe today and for
+            // the same reason, but it is not a precedent for copying early — if a pooled-buffer transport
+            // is ever added, that read needs this treatment too.
+            byte[] retainedNameBytes = groupNameBytes.ToArray();
+
+            if (!await AuthoriseGroupJoinAsync(connection, groupName, cancellationToken).ConfigureAwait(false))
+            {
+                // A refusal has to revoke, not merely decline to add. The client may already be a member
+                // from an earlier join that was allowed — the same connection re-joining a group it is in,
+                // which is legal and idempotent — and if the authoriser has since changed its mind, leaving
+                // that membership in place would mean a deliberate "no" left the client still receiving the
+                // group's traffic and still entitled to send to it. Removing here also keeps the two sides
+                // in step: the client drops the group when it sees the refusal.
+                LeaveGroup(connection, groupName);
+                RefuseGroupJoin(connection, groupName, retainedNameBytes);
+                return;
+            }
+        }
+
+        AddToGroup(connection, groupName);
+    }
+
+    // How much of a group name is written to a log line. Group names are client-supplied and carry no
+    // length cap, so a name may be most of a 1 MiB frame. The refusal paths below log at Warning and
+    // Error and are reachable at will by any admitted client, so logging a name whole would let one
+    // client turn a rejected join into an arbitrary volume of log output. Long enough to identify a
+    // real group, short enough that the log line's size is the hub's decision rather than the client's.
+    private const int MaxLoggedGroupNameLength = 64;
+
+    /// <summary>
+    /// Renders a client-supplied group name for a log line, clipping it to a bounded length so that a
+    /// client cannot choose how much the hub writes.
+    /// </summary>
+    private static string ForLog(string groupName)
+    {
+        return groupName.Length <= MaxLoggedGroupNameLength
+            ? groupName
+            : string.Concat(groupName.AsSpan(0, MaxLoggedGroupNameLength), "… (truncated)");
+    }
+
+    /// <summary>
+    /// Asks the configured group authoriser whether a client may join a group, failing closed on every
+    /// outcome that is not an explicit approval.
+    /// </summary>
+    private async Task<bool> AuthoriseGroupJoinAsync(
+        ClientConnection connection, string groupName, CancellationToken cancellationToken)
+    {
+        var context = new GroupJoinContext
+        {
+            ClientId = connection.Id,
+            ClientName = connection.Name,
+            GroupName = groupName,
+        };
+
+        try
+        {
+            // Unlike the registration authenticator, this callback runs on input from an already-admitted
+            // client and is driven from that client's own receive loop, which reads nothing further from
+            // it until this returns. So there is no semaphore here: the registration authenticator has one
+            // because it runs on unauthenticated input, where any peer that reaches the port can drive it,
+            // and that is not the position this callback is in.
+            //
+            // What the wait below bounds is this hub's willingness to wait, not the callback's execution.
+            // A callback that outruns the timeout is abandoned and goes on running, so a client that keeps
+            // asking after each refusal can leave invocations piling up behind it. Across clients the
+            // ceiling is the connected client count, which is maxClients only if one was configured. An
+            // authoriser that holds a resource per call must therefore bound its own concurrency; this is
+            // documented on the delegate and in the README rather than guessed at with a limit here.
+            ValueTask<bool> pending = _groupAuthoriser!(context, cancellationToken);
+
+            // A decision taken synchronously — a lookup against a policy table is the common case — needs
+            // no task to bound, and joins recur across a connection's life rather than happening once at
+            // registration, so the fast path is worth keeping allocation-free. Anything else, including an
+            // already-faulted result, goes through the bounded wait below and is handled by the filters.
+            bool authorised = pending.IsCompletedSuccessfully
+                ? pending.Result
+                : await pending
+                    .AsTask()
+                    .WaitAsync(_groupAuthorisationTimeout, cancellationToken)
+                    .ConfigureAwait(false);
+
+            if (!authorised)
+            {
+                _logger.LogWarning(
+                    "Refusing client {ClientId} ({ClientName}) membership of group {GroupName}: not authorised",
+                    connection.Id,
+                    connection.Name,
+                    ForLog(groupName));
+            }
+
+            return authorised;
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning(
+                "The group authoriser did not complete within {Timeout} for client {ClientName} joining "
+                + "group {GroupName}; refusing the join",
+                _groupAuthorisationTimeout,
+                connection.Name,
+                ForLog(groupName));
+            return false;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // The cancellation came from inside the callback rather than from the client disconnecting or
+            // the hub shutting down — a lookup against an external policy store timing out is the common
+            // case. Refuse the join and say why, rather than letting it unwind into the receive loop's
+            // shutdown catch and drop a live connection. Callback boundary.
+            _logger.LogWarning(
+                "The group authoriser was cancelled for client {ClientName} joining group {GroupName}; "
+                + "refusing the join",
+                connection.Name,
+                ForLog(groupName));
+            return false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A throwing authoriser must refuse the join, not fault the client handler. Callback boundary.
+            _logger.LogError(
+                ex,
+                "The group authoriser threw for client {ClientName} joining group {GroupName}; refusing the join",
+                connection.Name,
+                ForLog(groupName));
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Tells a client its group join was refused, so it does not go on believing it is a member of a
+    /// group it will receive nothing from and may not send to.
+    /// </summary>
+    private void RefuseGroupJoin(
+        ClientConnection connection, string groupName, ReadOnlyMemory<byte> groupNameBytes)
+    {
+        // Echo the name bytes the client sent rather than re-encoding the string they were decoded from.
+        // Re-encoding is not size-preserving: every byte that is not valid UTF-8 decodes to U+FFFD and
+        // encodes back as three bytes, so a name of invalid bytes would triple. Group names are not
+        // length-capped, so the refusal could then exceed the transport's maximum payload and throw on
+        // send — which faults the send loop, and a faulted send loop is awaited during this connection's
+        // teardown, abandoning the rest of it including the release of the client's slot. Echoing keeps
+        // the refusal no larger than the frame that provoked it, which the transport already bounded.
+        var refusal = new byte[1 + groupNameBytes.Length];
+        refusal[0] = (byte)MessageType.GroupJoinRefused;
+        groupNameBytes.Span.CopyTo(refusal.AsSpan(1));
+
+        if (!connection.OutboundQueue.Writer.TryWrite(refusal))
+        {
+            _logger.LogWarning(
+                "Outbound queue for {ClientId} is full, group join refusal for {GroupName} dropped",
+                connection.Id,
+                ForLog(groupName));
+        }
+    }
+
+    private void AddToGroup(ClientConnection connection, string groupName)
+    {
         while (true)
         {
             Group group = _groups.GetOrAdd(groupName, static _ => new Group());
@@ -1188,19 +1418,32 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return;
         }
 
-        Guid[] recipients;
+        // Sending to a group is a member's privilege. Membership is what a join grants — and what the
+        // group authoriser decides — so a client that never joined, or was refused, must not be able to
+        // inject a frame that reaches every member carrying its id. The test is a set lookup against the
+        // live membership inside the lock, not a scan of the snapshot afterwards, so a sender removed
+        // from the group cannot slip a message through the gap. Null means not a member: taking that
+        // branch outside the lock keeps the logging call out of the critical section.
+        Guid[]? recipients = null;
         lock (group.Lock)
         {
-            if (group.Members.Count == 0)
+            if (group.Members.Contains(senderId))
             {
-                return;
+                // Snapshot membership with a plain CopyTo — no LINQ closure or enumerator in the
+                // critical section — so the queues can be written without holding the lock. The sender
+                // is filtered out during delivery below rather than inside the lock.
+                recipients = new Guid[group.Members.Count];
+                group.Members.CopyTo(recipients);
             }
+        }
 
-            // Snapshot membership with a plain CopyTo — no LINQ closure or enumerator in the
-            // critical section — so the queues can be written without holding the lock. The sender
-            // is filtered out during delivery below rather than inside the lock.
-            recipients = new Guid[group.Members.Count];
-            group.Members.CopyTo(recipients);
+        if (recipients is null)
+        {
+            _logger.LogDebug(
+                "Group message from {SenderId} to group {GroupName} dropped: the sender is not a member",
+                senderId,
+                ForLog(groupName));
+            return;
         }
 
         if (recipients.Length == 1 && recipients[0] == senderId)

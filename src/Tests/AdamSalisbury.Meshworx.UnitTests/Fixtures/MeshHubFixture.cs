@@ -22,7 +22,9 @@ internal sealed class MeshHubFixture
         TimeSpan? heartbeatInterval = null,
         int maxMissedHeartbeats = 2,
         ClientAuthenticator? authenticator = null,
-        int? maxConcurrentAuthentications = null)
+        int? maxConcurrentAuthentications = null,
+        GroupAuthoriser? groupAuthoriser = null,
+        TimeSpan? groupAuthorisationTimeout = null)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -45,7 +47,60 @@ internal sealed class MeshHubFixture
             heartbeatInterval,
             maxMissedHeartbeats,
             authenticator,
-            maxConcurrentAuthentications);
+            maxConcurrentAuthentications,
+            groupAuthoriser,
+            groupAuthorisationTimeout);
+    }
+
+    /// <summary>
+    /// Builds a ClientLookupRequest frame: [type][correlation id (4, big-endian)][UTF-8 name].
+    /// </summary>
+    public static byte[] CreateLookupRequest(int correlationId, string name)
+    {
+        byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+        var payload = new byte[1 + 4 + nameBytes.Length];
+        payload[0] = 0x06; // ClientLookupRequest
+        BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(1, 4), correlationId);
+        nameBytes.CopyTo(payload, 5);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a SendMessage frame: [type][recipient id (16)][message].
+    /// </summary>
+    public static byte[] CreateDirectMessage(Guid recipientId, byte[] message)
+    {
+        var payload = new byte[1 + 16 + message.Length];
+        payload[0] = 0x02; // SendMessage
+        recipientId.TryWriteBytes(payload.AsSpan(1));
+        message.CopyTo(payload, 17);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a JoinGroup frame: [type][UTF-8 group name].
+    /// </summary>
+    public static byte[] CreateJoinGroupRequest(string groupName)
+    {
+        byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
+        var payload = new byte[1 + nameBytes.Length];
+        payload[0] = 0x0C; // JoinGroup
+        nameBytes.CopyTo(payload, 1);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a GroupMessage frame: [type][name length (2, big-endian)][UTF-8 group name][message].
+    /// </summary>
+    public static byte[] CreateGroupMessage(string groupName, byte[] message)
+    {
+        byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
+        var payload = new byte[1 + 2 + nameBytes.Length + message.Length];
+        payload[0] = 0x0E; // GroupMessage
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(payload, 3);
+        message.CopyTo(payload, 3 + nameBytes.Length);
+        return payload;
     }
 
     /// <summary>
@@ -139,6 +194,82 @@ internal sealed class MeshHubFixture
         }
 
         return new MultiMessageRegisteredClient(clientId, transport, messageChannel, responseData);
+    }
+}
+
+/// <summary>
+/// Records every frame the hub sends to one client's transport and lets a test wait for the first frame
+/// matching a predicate. Waiting on a frame the hub must <i>not</i> send is never deterministic on its
+/// own, so tests pair this with a frame the hub certainly will send afterwards on the same connection:
+/// because a client's outbound queue is drained in order, the arrival of the later frame proves the
+/// earlier one was never queued.
+/// </summary>
+internal sealed class FrameRecorder
+{
+    private readonly Lock _lock = new();
+    private readonly List<byte[]> _frames = [];
+    private readonly List<(Func<byte[], bool> Predicate, TaskCompletionSource<byte[]> Completion)> _waiters = [];
+
+    public FrameRecorder(Mock<ITransport> transport)
+    {
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => Record(data.ToArray()))
+            .Returns(Task.CompletedTask);
+    }
+
+    /// <summary>
+    /// A snapshot of every frame recorded so far.
+    /// </summary>
+    public IReadOnlyList<byte[]> Frames
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return [.. _frames];
+            }
+        }
+    }
+
+    /// <summary>
+    /// Completes with the first frame matching the predicate, including one already recorded.
+    /// </summary>
+    public Task<byte[]> WaitForAsync(Func<byte[], bool> predicate)
+    {
+        var completion = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        lock (_lock)
+        {
+            foreach (byte[] frame in _frames)
+            {
+                if (predicate(frame))
+                {
+                    completion.SetResult(frame);
+                    return completion.Task;
+                }
+            }
+
+            _waiters.Add((predicate, completion));
+        }
+
+        return completion.Task;
+    }
+
+    private void Record(byte[] frame)
+    {
+        lock (_lock)
+        {
+            _frames.Add(frame);
+
+            for (int i = _waiters.Count - 1; i >= 0; i--)
+            {
+                if (_waiters[i].Predicate(frame))
+                {
+                    _waiters[i].Completion.TrySetResult(frame);
+                    _waiters.RemoveAt(i);
+                }
+            }
+        }
     }
 }
 

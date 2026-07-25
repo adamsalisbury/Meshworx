@@ -102,6 +102,14 @@ public interface IMeshClient : IAsyncDisposable
     /// <remarks>
     /// Groups are created implicitly on first join and removed once empty. Joining a group the client
     /// is already a member of has no effect.
+    /// <para>
+    /// The join is asynchronous and optimistic: this returns once the request has been sent, and the
+    /// group appears in <see cref="JoinedGroups"/> from that moment. A hub configured with a
+    /// <see cref="GroupAuthoriser"/> may refuse it, in which case the group is removed from
+    /// <see cref="JoinedGroups"/> again and <see cref="GroupJoinRefused"/> is raised. Applications that
+    /// depend on membership should therefore watch that event rather than treat this method's return as
+    /// proof of membership.
+    /// </para>
     /// </remarks>
     /// <param name="groupName">The name of the group to join.</param>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
@@ -123,9 +131,14 @@ public interface IMeshClient : IAsyncDisposable
     /// Sends a message to every other member of the named group.
     /// </summary>
     /// <remarks>
-    /// Delivery is best-effort and fire-and-forget. The message is not echoed back to the sender, and
-    /// the sender need not be a member of the group. Recipients receive it through
-    /// <see cref="GroupMessageReceived"/>, which carries the group name.
+    /// Delivery is best-effort and fire-and-forget. The message is not echoed back to the sender.
+    /// Recipients receive it through <see cref="GroupMessageReceived"/>, which carries the group name.
+    /// <para>
+    /// <b>The sender must be a member of the group.</b> The hub silently drops a group message from a
+    /// client that has not joined the group, so a send made before <see cref="JoinGroupAsync"/> has been
+    /// applied — or after a join was refused — reaches nobody. After a reconnect, membership is restored
+    /// by re-joining, so wait for that to complete before sending.
+    /// </para>
     /// </remarks>
     /// <param name="groupName">The name of the group to send to.</param>
     /// <param name="message">The message payload to deliver.</param>
@@ -152,6 +165,18 @@ public interface IMeshClient : IAsyncDisposable
     /// <see cref="MessageReceived"/>, the event carries the name of the group the message was sent to.
     /// </summary>
     event EventHandler<GroupMessageReceivedEventArgs> GroupMessageReceived;
+
+    /// <summary>
+    /// Raised when the hub refuses this client membership of a group it asked to join, because the hub's
+    /// <see cref="GroupAuthoriser"/> did not authorise it.
+    /// </summary>
+    /// <remarks>
+    /// The group has already been removed from <see cref="JoinedGroups"/> by the time this fires. The
+    /// refusal is not retried — including by <see cref="MeshClientReconnector"/>, which drops a refused
+    /// group from the membership it restores — so a handler that wants to try again must ask again
+    /// itself, having first dealt with whatever made the hub refuse.
+    /// </remarks>
+    event EventHandler<GroupJoinRefusedEventArgs> GroupJoinRefused;
 
     /// <summary>
     /// Raised when the connection to the hub ends for a reason other than a local call to

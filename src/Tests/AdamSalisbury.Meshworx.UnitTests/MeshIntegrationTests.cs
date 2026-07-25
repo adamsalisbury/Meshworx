@@ -104,7 +104,8 @@ public sealed class MeshIntegrationTests
     }
 
     /// <summary>
-    /// A message sent to a group is delivered to its members over the real protocol.
+    /// A message sent to a group by one of its members is delivered to the other members over the real
+    /// protocol.
     /// </summary>
     [Fact(Timeout = 10000)]
     public async Task EndToEnd_GroupMessageReachesGroupMembers()
@@ -128,6 +129,10 @@ public sealed class MeshIntegrationTests
         // client's frames in order, the join is guaranteed applied by the time this returns.
         await member.GetClientIdByNameAsync("Sender");
 
+        // The sender joins too: sending to a group is a member's privilege, so a non-member's message
+        // would be dropped by the hub (see EndToEnd_NonMemberCannotSendToGroup).
+        await sender.JoinGroupAsync("team");
+
         byte[] payload = Encoding.UTF8.GetBytes("team update");
         await sender.SendToGroupAsync("team", payload);
 
@@ -135,6 +140,92 @@ public sealed class MeshIntegrationTests
         Assert.Equal(sender.Id, received.SenderId);
         Assert.Equal("team", received.GroupName);
         Assert.Equal(payload, received.Data.ToArray());
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A client that has not joined a group cannot inject a message into it over the real protocol: the
+    /// hub drops the group message rather than fanning it out to the members.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_NonMemberCannotSendToGroup()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var outsider = CreateClient();
+        await using var member = CreateClient();
+
+        await outsider.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Outsider");
+        await member.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Member");
+
+        var directTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        member.MessageReceived += (_, e) => directTcs.TrySetResult(e);
+        var groupTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        member.GroupMessageReceived += (_, e) => groupTcs.TrySetResult(e);
+
+        await member.JoinGroupAsync("team");
+        await member.GetClientIdByNameAsync("Outsider"); // barrier: the join is applied
+
+        // The outsider never joined "team". Its group message must be dropped, while the direct message
+        // that follows it on the same connection still arrives — the hub processes one client's frames in
+        // order, so receiving the direct message proves the group message was never delivered.
+        await outsider.SendToGroupAsync("team", Encoding.UTF8.GetBytes("injected"));
+        await outsider.SendAsync(member.Id, Encoding.UTF8.GetBytes("direct"));
+
+        MessageReceivedEventArgs received = await directTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal("direct", Encoding.UTF8.GetString(received.Data.Span));
+        Assert.False(groupTcs.Task.IsCompleted, "A non-member's group message was delivered to the group.");
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A hub with a group authoriser makes groups an access-control boundary over the real protocol: an
+    /// unauthorised client is refused membership, told so, and receives none of the group's traffic.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_UnauthorisedClientIsRefusedGroupMembership()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = new MeshHub(
+            new Mock<ILogger<MeshHub>>().Object,
+            listener,
+            groupAuthoriser: (context, _) => ValueTask.FromResult(context.ClientName == "Insider"));
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var insider = CreateClient();
+        await using var outsider = CreateClient();
+
+        await insider.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Insider");
+        await outsider.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Outsider");
+
+        var refusedTcs = new TaskCompletionSource<GroupJoinRefusedEventArgs>();
+        outsider.GroupJoinRefused += (_, e) => refusedTcs.TrySetResult(e);
+        var directTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        outsider.MessageReceived += (_, e) => directTcs.TrySetResult(e);
+        var groupTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        outsider.GroupMessageReceived += (_, e) => groupTcs.TrySetResult(e);
+
+        await insider.JoinGroupAsync("secret");
+        await outsider.JoinGroupAsync("secret");
+
+        GroupJoinRefusedEventArgs refused = await refusedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal("secret", refused.GroupName);
+        Assert.DoesNotContain("secret", outsider.JoinedGroups);
+
+        // The insider sends to the group and then directly to the outsider; the direct message arriving
+        // proves the refused outsider was not among the group's recipients.
+        await insider.GetClientIdByNameAsync("Outsider"); // barrier: the insider's join is applied
+        await insider.SendToGroupAsync("secret", Encoding.UTF8.GetBytes("classified"));
+        await insider.SendAsync(outsider.Id, Encoding.UTF8.GetBytes("direct"));
+
+        await directTcs.Task.WaitAsync(WaitTimeout);
+        Assert.False(groupTcs.Task.IsCompleted, "A refused client received the group's traffic.");
 
         await hub.StopAsync();
     }
@@ -165,7 +256,12 @@ public sealed class MeshIntegrationTests
         await member.LeaveGroupAsync("team");
         await member.GetClientIdByNameAsync("Sender"); // barrier: join and leave both applied
 
-        // Send to the now-empty group, then a direct message. The hub processes the sender's frames
+        // The sender joins so that it is entitled to send to the group at all — otherwise the hub would
+        // drop the message for want of membership and the test would pass without proving the leave.
+        // Its own join and send travel the same connection, so the hub applies them in that order.
+        await sender.JoinGroupAsync("team");
+
+        // Send to the group the member has left, then a direct message. The hub processes the sender's frames
         // in order, so any (incorrect) group delivery would be enqueued before the direct message.
         // Receiving the direct message therefore proves the group message was not delivered.
         await sender.SendToGroupAsync("team", Encoding.UTF8.GetBytes("group"));

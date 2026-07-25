@@ -708,6 +708,109 @@ public sealed class MeshClientTests
         Assert.Empty(fixture.Client.JoinedGroups);
     }
 
+    /// <summary>
+    /// When the hub refuses a group join, the client stops claiming the membership and tells the
+    /// application, so it does not go on believing it is in a group it will receive nothing from.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task GroupJoinRefused_RemovesTheGroupAndRaisesTheEvent()
+    {
+        var fixture = new MeshClientFixture();
+        var inbound = Channel.CreateUnbounded<byte[]?>();
+        inbound.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await inbound.Reader.ReadAsync(ct));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "Alice");
+
+        var refusedTcs = new TaskCompletionSource<GroupJoinRefusedEventArgs>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Client.GroupJoinRefused += (_, e) => refusedTcs.TrySetResult(e);
+
+        await fixture.Client.JoinGroupAsync("secret");
+        Assert.Contains("secret", fixture.Client.JoinedGroups);
+
+        inbound.Writer.TryWrite(MeshClientFixture.CreateGroupJoinRefusal("secret"));
+
+        GroupJoinRefusedEventArgs refused = await refusedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("secret", refused.GroupName);
+        Assert.DoesNotContain("secret", fixture.Client.JoinedGroups);
+    }
+
+    /// <summary>
+    /// A refusal that arrives before JoinGroupAsync has resumed still leaves the client out of the group.
+    /// The hub can refuse the instant it reads the join frame, so the client must record the membership
+    /// before sending rather than after: recording it afterwards would reinstate a group the refusal had
+    /// already removed. The interleaving is pinned by holding the send open until the refusal has been
+    /// handled, rather than raced for.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task GroupJoinRefused_ArrivingBeforeTheJoinReturns_LeavesTheClientOutOfTheGroup()
+    {
+        var fixture = new MeshClientFixture();
+        var inbound = Channel.CreateUnbounded<byte[]?>();
+        inbound.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        var refusalHandled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns<ReadOnlyMemory<byte>, CancellationToken>(async (data, ct) =>
+            {
+                if (data.Span[0] != 0x0C) // JoinGroup
+                {
+                    return;
+                }
+
+                inbound.Writer.TryWrite(MeshClientFixture.CreateGroupJoinRefusal("secret"));
+                await refusalHandled.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+            });
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await inbound.Reader.ReadAsync(ct));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "Alice");
+        fixture.Client.GroupJoinRefused += (_, _) => refusalHandled.TrySetResult();
+
+        await fixture.Client.JoinGroupAsync("secret");
+
+        Assert.DoesNotContain("secret", fixture.Client.JoinedGroups);
+    }
+
+    /// <summary>
+    /// A failed re-join of a group the client is already in does not roll back the record its earlier,
+    /// successful join owns. Rolling it back would leave JoinedGroups missing a group the hub still has
+    /// the client in — and the reconnector restores from that snapshot, so the group would silently not
+    /// be restored after a drop.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task JoinGroupAsync_FailedRejoinOfAJoinedGroup_KeepsTheExistingMembershipRecord()
+    {
+        var fixture = new MeshClientFixture();
+        var inbound = Channel.CreateUnbounded<byte[]?>();
+        inbound.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        bool failSends = false;
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns<ReadOnlyMemory<byte>, CancellationToken>((_, _) => Volatile.Read(ref failSends)
+                ? Task.FromException(new IOException("transport failed"))
+                : Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await inbound.Reader.ReadAsync(ct));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "Alice");
+
+        await fixture.Client.JoinGroupAsync("team");
+        Assert.Contains("team", fixture.Client.JoinedGroups);
+
+        Volatile.Write(ref failSends, true);
+        await Assert.ThrowsAsync<IOException>(() => fixture.Client.JoinGroupAsync("team"));
+
+        Assert.Contains("team", fixture.Client.JoinedGroups);
+    }
+
     // GetClientIdByNameAsync
 
     /// <summary>
