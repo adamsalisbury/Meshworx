@@ -1,3 +1,5 @@
+using AdamSalisbury.Meshworx.Transport;
+
 namespace AdamSalisbury.Meshworx;
 
 public interface IMeshHub : IAsyncDisposable
@@ -5,14 +7,36 @@ public interface IMeshHub : IAsyncDisposable
     /// <summary>
     /// Starts the hub, binding to its configured endpoint and accepting client connections.
     /// </summary>
+    /// <remarks>
+    /// Concurrent calls are refused: one starts the hub and the rest throw. A call made while a shutdown
+    /// is still in progress is refused for the same reason.
+    /// </remarks>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
-    /// <exception cref="InvalidOperationException">The hub is already running.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The hub is already running, is already being started, or is still stopping.
+    /// </exception>
+    /// <exception cref="ObjectDisposedException">The hub has been disposed.</exception>
     Task StartAsync(CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Stops the hub, disconnecting all registered clients and releasing all resources.
     /// </summary>
-    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <remarks>
+    /// Idempotent and safe to call from more than one thread at a time. Calling it on a hub that is not
+    /// running does nothing. When several calls overlap, one of them performs the shutdown and the rest
+    /// await it, so every one of them returns only once the hub has actually stopped — the clients are
+    /// notified once, not once per caller.
+    /// <para>
+    /// This releases the hub's own state, but not the transport listener's: <see cref="ITransportListener"/>
+    /// has no stop, so the endpoint stays bound and both listeners in this library refuse a second
+    /// <see cref="ITransportListener.StartAsync"/>. Treat a stopped hub as spent and dispose it, unless the
+    /// listener is known to tolerate being started again.
+    /// </para>
+    /// </remarks>
+    /// <param name="cancellationToken">
+    /// A token to cancel the operation. Cancelling a call that joined a shutdown already in progress
+    /// abandons the wait; it does not cancel the shutdown.
+    /// </param>
     Task StopAsync(CancellationToken cancellationToken = default);
 
     /// <summary>

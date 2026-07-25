@@ -1,3 +1,4 @@
+using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.UnitTests.Fixtures;
 using Microsoft.Extensions.Logging;
@@ -110,6 +111,247 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
 
         Assert.False(fixture.Hub.IsClientRegistered(client.Id));
+    }
+
+    // StopAsync / DisposeAsync under concurrent invocation
+
+    /// <summary>
+    /// When StopAsync is called while a shutdown is already in flight, each connected client is notified
+    /// once rather than once per caller.
+    /// </summary>
+    /// <remarks>
+    /// The interleaving is pinned rather than hoped for: holding the client's transport open inside the
+    /// hub's disconnect notification parks the first caller in the middle of the shutdown, after it has
+    /// claimed the hub's state but before it has finished with it. StopAsync then takes its decision
+    /// synchronously, so by the time the second call has handed back a task it has provably either joined
+    /// that shutdown or begun one of its own — which is what the frame count distinguishes. No settling
+    /// delay is involved.
+    /// </remarks>
+    [Fact(Timeout = 10000)]
+    public async Task StopAsync_CalledWhileAShutdownIsInFlight_NotifiesEachClientOnce()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterMultiMessageClientAsync();
+
+        var notificationReached = new TaskCompletionSource();
+        var releaseNotification = new TaskCompletionSource();
+        int disconnectFrames = 0;
+
+        ParkOnDisconnectFrame(client.Transport, notificationReached, releaseNotification, () => Interlocked.Increment(ref disconnectFrames));
+
+        // Run the first stop on another thread: before the fix it blocks inside the notification rather
+        // than returning a task, so the test would otherwise park itself.
+        Task firstStop = Task.Run(() => fixture.Hub.StopAsync());
+        await notificationReached.Task.WaitAsync(WaitTimeout);
+
+        Task secondStop = fixture.Hub.StopAsync();
+
+        Assert.Equal(1, Volatile.Read(ref disconnectFrames));
+
+        releaseNotification.SetResult();
+        await Task.WhenAll(firstStop, secondStop).WaitAsync(WaitTimeout);
+
+        Assert.Equal(1, Volatile.Read(ref disconnectFrames));
+    }
+
+    /// <summary>
+    /// When StopAsync is called while a shutdown is already in flight, it returns only once that shutdown
+    /// has finished, rather than reporting the hub stopped while it is still stopping.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task StopAsync_CalledWhileAShutdownIsInFlight_ReturnsOnlyOnceTheShutdownCompletes()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterMultiMessageClientAsync();
+
+        var notificationReached = new TaskCompletionSource();
+        var releaseNotification = new TaskCompletionSource();
+
+        ParkOnDisconnectFrame(client.Transport, notificationReached, releaseNotification, static () => { });
+
+        Task firstStop = Task.Run(() => fixture.Hub.StopAsync());
+        await notificationReached.Task.WaitAsync(WaitTimeout);
+
+        Task secondStop = fixture.Hub.StopAsync();
+
+        // The shutdown is provably still parked, so a completed task here would mean the caller had been
+        // told the hub had stopped while it was still tearing itself down.
+        Assert.False(secondStop.IsCompleted);
+
+        releaseNotification.SetResult();
+        await Task.WhenAll(firstStop, secondStop).WaitAsync(WaitTimeout);
+
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+    }
+
+    /// <summary>
+    /// When several StopAsync calls run at once against a running hub, every one of them completes without
+    /// error and the hub is left stopped.
+    /// </summary>
+    /// <remarks>
+    /// Against the unguarded shutdown this reproduces the defect outright: the caller that finishes first
+    /// nulls the token source between another caller's null check and the dereference that follows it, and
+    /// the second caller dies with a <see cref="NullReferenceException"/>. It is still a thread race rather
+    /// than a pinned interleaving — it went red on all five attempts, but that is not a guarantee — so the
+    /// deterministic guard beside it is
+    /// <see cref="StopAsync_CalledWhileAShutdownIsInFlight_NotifiesEachClientOnce"/>, which admits no
+    /// timing at all.
+    /// </remarks>
+    [Fact(Timeout = 10000)]
+    public async Task StopAsync_CalledConcurrently_AllCallersCompleteWithoutError()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        await fixture.RegisterMultiMessageClientAsync();
+
+        Task[] stops = [.. Enumerable.Range(0, 8).Select(_ => Task.Run(() => fixture.Hub.StopAsync()))];
+
+        await Task.WhenAll(stops).WaitAsync(WaitTimeout);
+
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+    }
+
+    /// <summary>
+    /// When several DisposeAsync calls run at once, the hub is torn down once rather than once per caller.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task DisposeAsync_CalledConcurrently_TearsTheHubDownOnce()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        await fixture.RegisterMultiMessageClientAsync();
+
+        Task[] disposals =
+        [
+            .. Enumerable.Range(0, 8).Select(_ => Task.Run(async () => await fixture.Hub.DisposeAsync()))
+        ];
+
+        await Task.WhenAll(disposals).WaitAsync(WaitTimeout);
+
+        fixture.Listener.Verify(l => l.DisposeAsync(), Times.Once);
+    }
+
+    /// <summary>
+    /// When StartAsync is called on a hub that has been disposed, an ObjectDisposedException is thrown
+    /// rather than the hub coming back up on a listener that has been torn down.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task StartAsync_AfterDispose_ThrowsObjectDisposedException()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.DisposeAsync();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => fixture.Hub.StartAsync());
+    }
+
+    /// <summary>
+    /// When the listener fails to start, the hub does not hold on to the running slot it claimed, so it can
+    /// be started again once the cause is cleared.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task StartAsync_ListenerFailsToStart_LeavesTheHubStartable()
+    {
+        var fixture = new MeshHubFixture();
+        fixture.Listener.SetupSequence(l => l.StartAsync(It.IsAny<CancellationToken>()))
+            .Throws(new InvalidOperationException("The listener could not bind."))
+            .Returns(Task.CompletedTask);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => fixture.Hub.StartAsync());
+
+        await fixture.Hub.StartAsync();
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a shutdown completes, the hub releases its own running claim rather than staying wedged as
+    /// permanently stopping.
+    /// </summary>
+    /// <remarks>
+    /// This covers the hub's half only, which is all the hub controls. It is deliberately not a claim that
+    /// a stopped hub can be restarted in general: <see cref="ITransportListener"/> has no stop, so the hub's
+    /// shutdown leaves the endpoint bound, and both listeners in this library throw on a second
+    /// <see cref="ITransportListener.StartAsync"/>. The second start below succeeds only because the
+    /// fixture's listener is a mock that permits it.
+    /// </remarks>
+    [Fact(Timeout = 10000)]
+    public async Task StopAsync_AfterCompleting_ReleasesTheHubsRunningClaim()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        await fixture.Hub.StopAsync();
+
+        await fixture.Hub.StartAsync();
+
+        fixture.Listener.Verify(l => l.StartAsync(It.IsAny<CancellationToken>()), Times.Exactly(2));
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When StopAsync runs while a start is still in progress, that start completes and the hub is left
+    /// running over a listener it still owns, rather than abandoning a listener it has just bound.
+    /// </summary>
+    /// <remarks>
+    /// The interleaving is pinned by gating the listener's own StartAsync, which parks the hub's start at
+    /// the exact point where it has claimed the hub but not yet published an accept loop. A stop taking
+    /// ownership there would leave the endpoint bound with nothing serving it and no way to recover, since
+    /// the listener cannot be started a second time.
+    /// </remarks>
+    [Fact(Timeout = 10000)]
+    public async Task StopAsync_WhileAStartIsInProgress_LeavesTheStartedHubIntact()
+    {
+        var fixture = new MeshHubFixture();
+        var listenerStarting = new TaskCompletionSource();
+        var releaseListenerStart = new TaskCompletionSource();
+
+        fixture.Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                listenerStarting.TrySetResult();
+                await releaseListenerStart.Task.ConfigureAwait(false);
+            });
+
+        Task start = fixture.Hub.StartAsync();
+        await listenerStarting.Task.WaitAsync(WaitTimeout);
+
+        await fixture.Hub.StopAsync();
+
+        releaseListenerStart.SetResult();
+        await start.WaitAsync(WaitTimeout);
+
+        // The hub is genuinely running, so the client the listener goes on to accept is served.
+        var client = await fixture.RegisterClientAsync();
+        Assert.True(fixture.Hub.IsClientRegistered(client.Id));
+
+        client.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// Holds the hub's shutdown open inside the disconnect notification it sends to the given client, so a
+    /// concurrent caller can be observed while the shutdown is provably mid-flight.
+    /// </summary>
+    private static void ParkOnDisconnectFrame(
+        Mock<ITransport> transport,
+        TaskCompletionSource reached,
+        TaskCompletionSource release,
+        Action onFrame)
+    {
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns<ReadOnlyMemory<byte>, CancellationToken>(async (data, _) =>
+            {
+                if (data.Length == 0 || data.Span[0] != (byte)MessageType.Disconnect)
+                {
+                    return;
+                }
+
+                onFrame();
+                reached.TrySetResult();
+                await release.Task.ConfigureAwait(false);
+            });
     }
 
     // ClientConnected / ClientDisconnected events
