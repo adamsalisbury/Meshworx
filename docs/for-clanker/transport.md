@@ -46,7 +46,7 @@ Task SendAsync(IReadOnlyList<ReadOnlyMemory<byte>> messages, CancellationToken =
 ```
 
 An **optional capability**. The hub's send loop coalesces a burst of queued frames into one underlying
-write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:693-695`);
+write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:712-714`);
 transports that don't implement it just receive frames one at a time. It is deliberately **`internal`**:
 only the bundled `TcpTransport` benefits and only the in-assembly hub consumes it, so it stays off the
 public `ITransport` surface. Each element is delivered as its own message. **External transports cannot
