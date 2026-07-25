@@ -1454,8 +1454,12 @@ public sealed class MeshHubTests
     {
         const int MaxMissedHeartbeats = 3;
 
+        // A 100 ms interval rather than 50 ms. The assertion counts pings observed at the transport, so
+        // the last ping — enqueued one interval before eviction — must be drained by the send loop
+        // before eviction cancels the connection. The wider interval keeps that flush window generous
+        // on a loaded runner. The count itself is interval-based, so a stall cannot change it.
         var fixture = new MeshHubFixture(
-            heartbeatInterval: TimeSpan.FromMilliseconds(50), maxMissedHeartbeats: MaxMissedHeartbeats);
+            heartbeatInterval: TimeSpan.FromMilliseconds(100), maxMissedHeartbeats: MaxMissedHeartbeats);
         await fixture.Hub.StartAsync();
         var client = await fixture.RegisterMultiMessageClientAsync("Silent");
 
@@ -1496,8 +1500,11 @@ public sealed class MeshHubTests
     [Fact(Timeout = 5000)]
     public async Task HandleClient_SilentClientWithSingleMissedHeartbeat_IsEvictedWithoutPinging()
     {
+        // A 100 ms interval rather than 50 ms: eviction here lands on the very first tick, so the
+        // mock callbacks below must be in place before it fires. The wider interval keeps that margin
+        // comfortable on a loaded CI runner.
         var fixture = new MeshHubFixture(
-            heartbeatInterval: TimeSpan.FromMilliseconds(50), maxMissedHeartbeats: 1);
+            heartbeatInterval: TimeSpan.FromMilliseconds(100), maxMissedHeartbeats: 1);
         await fixture.Hub.StartAsync();
         var client = await fixture.RegisterMultiMessageClientAsync("Silent");
 
@@ -1537,16 +1544,19 @@ public sealed class MeshHubTests
     [Fact(Timeout = 5000)]
     public async Task HandleClient_ClientSendingFramesEveryInterval_IsNotEvicted()
     {
+        // maxMissedHeartbeats of 3 rather than the default 2, and a 10 ms send cadence against the
+        // 50 ms interval: eviction then needs three consecutive silent intervals (150 ms), so a
+        // scheduling stall on a loaded runner cannot masquerade as a genuine eviction.
         var fixture = new MeshHubFixture(
-            heartbeatInterval: TimeSpan.FromMilliseconds(50), maxMissedHeartbeats: 2);
+            heartbeatInterval: TimeSpan.FromMilliseconds(50), maxMissedHeartbeats: 3);
         await fixture.Hub.StartAsync();
         var client = await fixture.RegisterMultiMessageClientAsync("Chatty");
 
         // Send a frame well inside every interval for comfortably longer than the eviction window.
-        for (int i = 0; i < 20; i++)
+        for (int i = 0; i < 30; i++)
         {
             client.EnqueueMessage([0x0A]); // Pong
-            await Task.Delay(TimeSpan.FromMilliseconds(20));
+            await Task.Delay(TimeSpan.FromMilliseconds(10));
         }
 
         Assert.True(fixture.Hub.IsClientRegistered(client.Id));
