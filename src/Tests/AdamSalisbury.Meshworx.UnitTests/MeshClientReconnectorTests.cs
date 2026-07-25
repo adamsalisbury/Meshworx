@@ -114,6 +114,96 @@ public sealed class MeshClientReconnectorTests
         await hub.StopAsync();
     }
 
+    /// <summary>
+    /// The Reconnected handler idiom shown in the README contains a failure that happens after the
+    /// handler has already suspended. The reconnector raises the event synchronously and has no
+    /// completion to await, so the handler's own catch is the only thing standing between a faulted
+    /// restore and an unobserved exception on the thread pool; the reconnect loop carries on regardless.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task Reconnected_HandlerIdiomFromDocumentation_ContainsPostSuspensionFailure()
+    {
+        var transport = new Mock<ITransport>();
+        transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
+
+        bool[] connectedHolder = [false];
+
+        var client = new Mock<IMeshClient>();
+        client.Setup(c => c.DisconnectAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        client.Setup(c => c.DisposeAsync()).Returns(ValueTask.CompletedTask);
+        client.SetupGet(c => c.IsConnected).Returns(() => Volatile.Read(ref connectedHolder[0]));
+
+        client.Setup(c => c.ConnectAsync(
+                It.IsAny<ITransport>(),
+                It.IsAny<string>(),
+                It.IsAny<ReadOnlyMemory<byte>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(() =>
+            {
+                Volatile.Write(ref connectedHolder[0], true);
+                return Task.CompletedTask;
+            });
+
+        // The restore fails only once it has suspended — exactly the point at which an async void handler
+        // would have returned to the reconnect loop, putting everything after it beyond that loop's catch.
+        client.Setup(c => c.SendAsync(
+                It.IsAny<Guid>(),
+                It.IsAny<ReadOnlyMemory<byte>>(),
+                It.IsAny<CancellationToken>()))
+            .Returns(async () =>
+            {
+                await Task.Yield();
+                throw new IOException("the send failed after suspending");
+            });
+
+        await using var reconnector = new MeshClientReconnector(
+            client.Object,
+            "Alice",
+            _ => Task.FromResult<ITransport>(transport.Object),
+            retryDelay: TimeSpan.FromMilliseconds(10));
+
+        var serverId = Guid.NewGuid();
+        byte[] resumePayload = Encoding.UTF8.GetBytes("resume");
+        var containedTcs = new TaskCompletionSource<Exception>();
+
+        // The documented idiom, verbatim but for the catch block recording what it caught.
+        reconnector.Reconnected += (_, _) => _ = RestoreStateAsync();
+
+        async Task RestoreStateAsync()
+        {
+            try
+            {
+                await reconnector.Client.SendAsync(serverId, resumePayload);
+            }
+            catch (Exception ex)
+            {
+                containedTcs.TrySetResult(ex);
+            }
+        }
+
+        await reconnector.StartAsync();
+
+        Volatile.Write(ref connectedHolder[0], false);
+        client.Raise(
+            c => c.Disconnected += null,
+            new DisconnectedEventArgs { Reason = DisconnectReason.ConnectionLost });
+
+        Exception contained = await containedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.IsType<IOException>(contained);
+
+        // The loop neither waited for that work nor was harmed by its failure: a further drop still
+        // reconnects and still raises the event.
+        var reconnectedAgainTcs = new TaskCompletionSource();
+        reconnector.Reconnected += (_, _) => reconnectedAgainTcs.TrySetResult();
+
+        Volatile.Write(ref connectedHolder[0], false);
+        client.Raise(
+            c => c.Disconnected += null,
+            new DisconnectedEventArgs { Reason = DisconnectReason.ConnectionLost });
+
+        await reconnectedAgainTcs.Task.WaitAsync(WaitTimeout);
+    }
+
     // StartAsync
 
     /// <summary>

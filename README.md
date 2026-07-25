@@ -125,6 +125,44 @@ await reconnector.Client.SendAsync(recipientId, payload);
 // After an unexpected drop the connection — and membership of "news" — is restored automatically.
 ```
 
+### Event handlers
+
+`Reconnected`, and the client's `MessageReceived`, `GroupMessageReceived`, `GroupJoinRefused` and
+`Disconnected`, are plain `EventHandler` events. Each is raised synchronously from the loop that owns
+the connection — the reconnect loop, or the client's receive loop — which catches and logs whatever a
+handler throws and then carries on.
+
+That containment reaches only as far as the handler's first `await`. An `async void` handler returns
+to the loop at that point, so everything it does afterwards runs outside the loop's `try`/`catch`: an
+exception thrown after the first `await` is rethrown on the thread pool, or on whatever
+synchronisation context the handler captured, where nothing observes it and it can bring the process
+down. The loop carries on without waiting either, so an `async void` handler's work may still be in
+flight when the next event is raised.
+
+Keep handlers synchronous. Where one must do asynchronous work, start that work from the handler and
+contain its failures inside the task you start:
+
+```csharp
+reconnector.Reconnected += (_, _) => _ = RestoreStateAsync();
+
+async Task RestoreStateAsync()
+{
+    try
+    {
+        await reconnector.Client.SendAsync(serverId, resumePayload);
+    }
+    catch (Exception ex)
+    {
+        // The containment boundary: nothing else can observe this task.
+        logger.LogError(ex, "Restoring application state after a reconnect failed");
+    }
+}
+```
+
+The event signature carries no completion for the loop to await, so the handler is the only place
+that failure can be caught. `Reconnected` may fire more than once for a single drop, so the work it
+starts must be idempotent and safe to overlap with a run already under way.
+
 ## Configuration
 
 ### `MeshHub`
