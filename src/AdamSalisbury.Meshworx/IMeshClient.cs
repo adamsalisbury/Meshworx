@@ -163,7 +163,9 @@ public interface IMeshClient : IAsyncDisposable
     /// handler may immediately attempt to reconnect via <see cref="ConnectAsync"/>.
     /// <para>
     /// A remote drop that coincides with a local <see cref="DisconnectAsync"/> does not raise it:
-    /// the disconnect the application asked for wins, however narrowly the two overlap.
+    /// the disconnect the application asked for wins. The exception is the one noted on
+    /// <see cref="DisconnectAsync"/> — a call arriving after the client has published its
+    /// disconnected state is too late, because the decision to raise has already been taken.
     /// </para>
     /// </remarks>
     event EventHandler<DisconnectedEventArgs> Disconnected;

@@ -818,7 +818,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// ends for a remote reason. If a local <see cref="DisconnectAsync"/> already moved the
     /// client out of the connected state, that call owns cleanup and no event is raised.
     /// A <see cref="DisconnectAsync"/> arriving while this teardown is in flight also suppresses
-    /// the event, so a local disconnect racing a remote drop behaves the same whichever wins.
+    /// the event, so a local disconnect racing a remote drop behaves the same whichever wins. One
+    /// arriving after the disconnected state has been published is too late: the decision to raise
+    /// is taken in the same locked block that publishes it.
     /// </summary>
     private async Task HandleReceiveLoopTerminationAsync(DisconnectReason reason)
     {

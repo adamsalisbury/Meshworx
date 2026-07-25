@@ -1304,7 +1304,21 @@ public sealed class MeshClientTests
         // Release the teardown so it runs on to the point at which it would raise the event.
         releaseTeardown.TrySetResult();
 
-        await Task.WhenAny(disconnectedRaised.Task, Task.Delay(TimeSpan.FromSeconds(1)));
+        // The teardown clears Name in the same locked block in which it decides whether to raise,
+        // so waiting for that proves it reached the decision instead of stalling short of it —
+        // without which the assertion below could pass for the wrong reason. Read as a reference,
+        // which is atomic, and bounded generously because this only waits on a continuation hop.
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (fixture.Client.Name.Length != 0 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(10));
+        }
+
+        Assert.Empty(fixture.Client.Name);
+
+        // Only the few instructions between that lock being released and the event being invoked
+        // remain, so a short settle is ample to catch a raise that should not happen.
+        await Task.WhenAny(disconnectedRaised.Task, Task.Delay(TimeSpan.FromMilliseconds(250)));
 
         Assert.False(
             disconnectedRaised.Task.IsCompleted,

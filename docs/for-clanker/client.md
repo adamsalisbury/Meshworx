@@ -106,21 +106,59 @@ Preserve this reference-equality check if you refactor connect.
   lookup** with `InvalidOperationException` so a caller on a non-cancellable token is not left hanging
   and `_lookupLock` is released, then calls `HandleReceiveLoopTerminationAsync`.
 
-`HandleReceiveLoopTerminationAsync` (`MeshClient.cs:679`) raises `Disconnected` **only** if the client
-was still `Connected` — i.e. the loop ended for a **remote** reason. A local `DisconnectAsync` sets
-`Disconnecting` first, so it stays silent. This is the mechanism behind "graceful disconnect does not
-raise `Disconnected`".
+`HandleReceiveLoopTerminationAsync` (`MeshClient.cs:825`) decides whether the ending raises
+`Disconnected`. There are **two** gates and both must pass:
+
+1. **The entry gate** (`MeshClient.cs:827-838`). Under `_stateLock`, the teardown claims the connection
+   by moving `Connected` → `Disconnecting`. If the state was anything other than `Connected`, a local
+   `DisconnectAsync` already owns the teardown, so the loop returns immediately and stays silent.
+2. **The claim gate** (`MeshClient.cs:850-869`). After `CleanUpAsync`, the loop reads
+   `_localDisconnectRequested` into a local `raiseDisconnected` **in the same locked block that
+   publishes `_state = ConnectionState.Disconnected`** (`MeshClient.cs:852-862`). If a `DisconnectAsync`
+   claimed the teardown while it was in flight, the loop logs at Debug and returns without raising
+   (`MeshClient.cs:864-869`).
+
+Gate 1 alone used to be the whole mechanism, and it was **not sufficient**. If the receive loop won the
+race out of `Connected`, a concurrent `DisconnectAsync` found the client already `Disconnecting`,
+returned as a silent no-op, and the loop went on to raise `Disconnected(ConnectionLost)` for a
+disconnect the application had itself requested — issue #10, fixed by PR #62.
+
+#### The claim protocol (load-bearing)
+
+`DisconnectAsync`'s early return is no longer a pure no-op (`MeshClient.cs:274-292`): when it finds the
+state is `Disconnecting` it sets `_localDisconnectRequested = true`, claiming the in-flight teardown so
+that it stays silent. The flag is a plain `bool` guarded by `_stateLock` (`MeshClient.cs:28`).
+
+Because the claim and the loop's read of it are taken under that same lock, the outcome is decided
+atomically: either the claim lands before the loop publishes the disconnected state and the event is
+suppressed, or the state is already `Disconnected`, the decision has been taken, and there is nothing
+left to claim. `ConnectAsync` clears the flag in the same locked block that moves the state to
+`Connecting` (`MeshClient.cs:184`), so an unconsumed claim — a redundant second `DisconnectAsync`, say —
+cannot leak forward and silence a genuine drop on the *next* connection.
+
+The net contract is that **the outcome does not depend on which side wins the race**: whoever tears the
+connection down, an application-requested disconnect is silent. Do not "simplify" the early return back
+to a bare `return`, and do not move the `raiseDisconnected` read out of the locked block. One window is
+deliberately left open — see [known-issues.md](known-issues.md) KI-21.
 
 ### `Disconnected` semantics (important)
 
 - Fires **only** for unexpected endings: `RemoteDisconnect` (hub sent `Disconnect`) or `ConnectionLost`
   (transport failed or idle timeout tripped). Reason is a `DisconnectReason` on the event args.
-- **Never** fires for a local `DisconnectAsync`.
+- **Does not fire for a local `DisconnectAsync`** — including one that races a remote drop. Whichever
+  side tears the connection down, an application-requested disconnect stays silent: `DisconnectAsync`
+  either performs the teardown itself or claims the one already in flight (see the claim protocol
+  above). The interface XML docs state this contract (`IMeshClient.cs:58-70`, `:161-171`).
+  - **The one exception** is a narrow residual window: a `DisconnectAsync` arriving *after* the teardown
+    has published the disconnected state has nothing left to claim, and the event fires. Read
+    [known-issues.md](known-issues.md) KI-21 before you rely on the suppression being absolute.
 - When it fires the client has **already reset** to `Disconnected`, so a handler may immediately call
-  `ConnectAsync` again (this is how the reconnector works, and it is a supported pattern).
+  `ConnectAsync` again (this is how the reconnector works, and it is a supported pattern). This
+  pattern is also *why* KI-21 is left open: closing it would require invoking the event under
+  `_stateLock`, which would deadlock a handler that reconnects synchronously.
 - **Deadlock-safety:** you may call `DisconnectAsync` from inside a `MessageReceived` or `Disconnected`
   handler. The `_inReceiveLoop` `AsyncLocal` flows into the synchronous handler and makes
-  `DisconnectAsync` skip `await`-ing the receive loop task (`MeshClient.cs:236`). Do not remove this.
+  `DisconnectAsync` skip `await`-ing the receive loop task (`MeshClient.cs:318`). Do not remove this.
 
 ### `GetClientIdByNameAsync` — the correlated lookup
 
