@@ -29,6 +29,7 @@ the risk to a change, not a claim that the code is defective.
 | KI-18 | A failed TLS handshake is silent — the hub sees nothing at all | `TcpTransportListener.cs:446-460` | medium (maintainability) | open — by design |
 | KI-19 | A queued reconnect signal means the connection *was* lost, not that it still is | `MeshClientReconnector.cs:241-244`, `:168-171` | high (correctness) | **load-bearing** — guard added by PR #60; do not remove |
 | KI-20 | The caller owns the transport until `ConnectAsync` accepts it | `MeshClient.cs:163-177`, `MeshClientReconnector.cs:257-264`, `:139-153` | medium (resource correctness) | **partly addressed** — retry path fixed by PR #60; `StartAsync` still leaks |
+| KI-21 | A `DisconnectAsync` arriving after the teardown publishes its state still raises `Disconnected` | `MeshClient.cs:852-873`, `:286-289` | low (correctness) | open — **accepted residual** of PR #62 (issue #10); the claim protocol around it is **load-bearing**, do not remove |
 
 ---
 
@@ -335,6 +336,45 @@ the risk to a change, not a claim that the code is defective.
   call throws. If you write a custom `ITransport`, make `DisposeAsync` idempotent, as both shipped
   implementations are. If you fix the `StartAsync` path, mirror the retry path's shape exactly rather
   than inventing a second convention.
+
+### KI-21 — A `DisconnectAsync` arriving after the teardown publishes its state still raises `Disconnected`
+- **Where:** `HandleReceiveLoopTerminationAsync` releases `_stateLock` at `MeshClient.cs:862` and
+  invokes the event at `:873`. The claim `DisconnectAsync` would need to lay is at `:286-289`.
+- **Status:** **open, and deliberately so.** This is the residual window that PR #62 (issue #10)
+  knowingly did not close, not an oversight. The code says as much in the XML docs on
+  `HandleReceiveLoopTerminationAsync` (`MeshClient.cs:820-823`), `IMeshClient.DisconnectAsync`
+  (`IMeshClient.cs:58-71`) and `IMeshClient.Disconnected` (`:161-171`), and in `README.md`.
+- **Why it bites:** PR #62 made a local disconnect racing a remote drop silent whichever side wins, and
+  it is tempting to read that as an absolute guarantee. It is not. The guarantee holds only up to the
+  moment the teardown takes its raise decision. Concretely, `HandleReceiveLoopTerminationAsync` reads
+  `_localDisconnectRequested` into `raiseDisconnected` inside the same locked block that sets
+  `_state = ConnectionState.Disconnected` (`MeshClient.cs:852-862`), then **releases the lock** before
+  invoking the delegate (`:871-874`). A `DisconnectAsync` entering in that gap finds the state is
+  already `Disconnected`, not `Disconnecting`, so the `if (_state is ConnectionState.Disconnecting)`
+  claim at `:286` does not fire. It lays no claim, returns as a genuine no-op — and the event the
+  application was trying to suppress fires anyway, with `DisconnectReason.ConnectionLost`.
+  The window is a handful of instructions wide, so it is rare, but it is real and it is not testable by
+  the seam the PR's own tests use (those pin the *earlier* interleaving; see
+  [testing.md](testing.md#testing-conventions-follow-these)).
+- **Why it is not closed:** closing it would mean holding `_stateLock` across the
+  `Disconnected?.Invoke` so that no `DisconnectAsync` could interleave between the decision and the
+  raise. That directly contradicts a documented, supported pattern — **a handler may reconnect
+  synchronously via `ConnectAsync` from inside `Disconnected`** (`IMeshClient.cs:161-171`), which is
+  exactly how `MeshClientReconnector` behaves. `ConnectAsync` takes `_stateLock` itself
+  (`MeshClient.cs:171`), so invoking the event under the lock would deadlock every such handler. The
+  trade is deliberate: a rare spurious `Disconnected` is preferable to a guaranteed deadlock on a
+  supported path.
+- **What to do:**
+  - Treat "no `Disconnected` after `DisconnectAsync`" as **overwhelmingly reliable, not guaranteed**.
+    If your handler must be exactly-once, make it idempotent, or gate it on your own
+    "I asked for this" flag set before you call `DisconnectAsync` — do not rely solely on the client's
+    suppression.
+  - **Do not remove the claim protocol** (`MeshClient.cs:286-289`, `:850-869`, `:184`) on the reasoning
+    that it "does not fully work". It closes the wide, easily-hit window; only the narrow one remains.
+    This is load-bearing in the same sense as KI-19's revalidation guard.
+  - If you do attempt to close the residual window, the constraint to design against is the synchronous
+    reconnect-from-handler pattern, not the lock itself. Anything that ends with the event being raised
+    under `_stateLock` is wrong. Prove any change with a test that reconnects from inside `Disconnected`.
 
 ---
 

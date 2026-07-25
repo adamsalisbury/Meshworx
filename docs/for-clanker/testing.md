@@ -14,7 +14,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 | `Fixtures/MeshHubFixture.cs` | 173 | Hub test harness (mock listener/transport, register helpers, authenticator pass-through) |
 | `Fixtures/MeshClientFixture.cs` | 106 | Client test harness (mock transport, scripted receive) |
 | `MeshHubTests.cs` | 1709 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, capacity, lifecycle |
-| `MeshClientTests.cs` | 1367 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events |
+| `MeshClientTests.cs` | 1499 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race** |
 | `MeshClientReconnectorTests.cs` | 785 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal** |
 | `MeshIntegrationTests.cs` | 385 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** |
 | `Transport/InMemory/InMemoryTransportTests.cs` | 173 | Pair semantics, copy-on-send, close signalling |
@@ -62,6 +62,45 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   (`Fixtures/MeshClientFixture.cs:44-63`) writes the registration response and scripted frames into an
   **unbounded channel left uncompleted**, so the loop stays alive awaiting more — exactly like a live
   transport. The blocking read honours the cancellation token, so `DisconnectAsync` cancels cleanly.
+- **Pin a client-teardown race deterministically by parking the mocked `DisposeAsync`.** This is the
+  reusable seam for anything that has to interleave with `HandleReceiveLoopTerminationAsync`, and it is
+  worth knowing about before you invent something flakier. The teardown calls `CleanUpAsync`, which
+  awaits `transport.DisposeAsync()` (`MeshClient.cs:848`, disposal at `:605`) — and that await sits
+  **after** the loop has claimed the connection (`Connected` → `Disconnecting`, `:827-838`) but
+  **before** it decides whether to raise `Disconnected` (`:850-869`). Returning an incomplete
+  `ValueTask` from the `DisposeAsync` setup therefore parks the receive loop at precisely that point,
+  for as long as the test needs:
+
+  ```csharp
+  var teardownClaimed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+  var releaseTeardown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+  fixture.Transport.Setup(t => t.DisposeAsync())
+      .Returns(() =>
+      {
+          teardownClaimed.TrySetResult();
+          return new ValueTask(releaseTeardown.Task);
+      });
+  ```
+
+  `DisconnectAsync_RacesReceiveLoopTeardown_DoesNotRaiseDisconnected` (`MeshClientTests.cs:1267`) uses
+  it to reproduce the KI-21/issue-#10 race exactly rather than hoping for it: write `null` to the
+  receive channel to lose the connection remotely, `await teardownClaimed.Task`, call `DisconnectAsync`
+  while the loop is pinned, then release. The mirror-image seam is **holding the outgoing `Disconnect`
+  frame open in the `SendAsync` setup**, which parks `DisconnectAsync` itself in the `Disconnecting`
+  state; `Disconnected_AfterAConcurrentDisconnectClaimedATeardown_StillRaisedOnTheNextDrop`
+  (`:1334`) uses that to land a second, redundant `DisconnectAsync` on an in-flight first one, then
+  reconnects over a second transport and asserts a genuine drop **still** raises
+  `DisconnectReason.ConnectionLost` — the regression guard on the claim flag leaking across connections.
+  Both carry `[Fact(Timeout = 5000)]`, because the failure mode is a hang.
+- **When you park a race, prove the code reached the decision point — do not just settle.** The race
+  test above asserts a negative ("no event"), which a test that merely stalls short of the decision
+  would also satisfy, passing for entirely the wrong reason. It closes that hole by waiting on
+  observable state that the teardown mutates *in the same locked block* in which it decides whether to
+  raise: `Name` is cleared at `MeshClient.cs:855`, `raiseDisconnected` is read at `:861`. Only once
+  `Client.Name` is empty is a short 250 ms settle meaningful, because by then only the few instructions
+  between that lock release and the delegate invocation remain (`MeshClientTests.cs:1307-1321`). Copy
+  this two-step — *wait for a marker past the decision, then settle briefly* — for any "did not happen"
+  assertion where a stalled system-under-test would look identical to a correct one.
 - **Synchronise on observable state, not sleeps.** `MeshHubFixture.RegisterClientAsync`
   (`Fixtures/MeshHubFixture.cs`) captures the `RegistrationComplete` frame via a `SendAsync` callback,
   extracts the id, then spins on `IsClientRegistered(id)` with `Task.Yield()` until the hub has recorded

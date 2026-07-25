@@ -1258,6 +1258,138 @@ public sealed class MeshClientTests
     }
 
     /// <summary>
+    /// When the receive loop wins the race to claim the teardown at the very moment the application
+    /// calls DisconnectAsync, the disconnect the application asked for still wins: the Disconnected
+    /// event the loop was about to raise is suppressed rather than reported as a lost connection.
+    /// The outcome must not depend on which side of the race gets there first.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task DisconnectAsync_RacesReceiveLoopTeardown_DoesNotRaiseDisconnected()
+    {
+        var fixture = new MeshClientFixture();
+
+        var receiveChannel = Channel.CreateUnbounded<byte[]?>();
+        receiveChannel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await receiveChannel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        // The teardown disposes the transport after it has claimed the connection but before it
+        // decides whether to raise Disconnected. Holding that disposal open pins the interleaving
+        // exactly, so the race is reproduced deterministically rather than hoped for.
+        var teardownClaimed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseTeardown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Transport.Setup(t => t.DisposeAsync())
+            .Returns(() =>
+            {
+                teardownClaimed.TrySetResult();
+                return new ValueTask(releaseTeardown.Task);
+            });
+
+        var disconnectedRaised = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Client.Disconnected += (_, _) => disconnectedRaised.TrySetResult();
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        // Lose the connection remotely, then wait until the receive loop is inside its teardown.
+        receiveChannel.Writer.TryWrite(null);
+        await teardownClaimed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        // The application disconnects while that teardown is still in flight: the simultaneous case.
+        // The client is no longer Connected, so this returns without doing the teardown itself.
+        await fixture.Client.DisconnectAsync();
+
+        // Release the teardown so it runs on to the point at which it would raise the event.
+        releaseTeardown.TrySetResult();
+
+        // The teardown clears Name in the same locked block in which it decides whether to raise,
+        // so waiting for that proves it reached the decision instead of stalling short of it —
+        // without which the assertion below could pass for the wrong reason. Read as a reference,
+        // which is atomic, and bounded generously because this only waits on a continuation hop.
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (fixture.Client.Name.Length != 0 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(10));
+        }
+
+        Assert.Empty(fixture.Client.Name);
+
+        // Only the few instructions between that lock being released and the event being invoked
+        // remain, so a short settle is ample to catch a raise that should not happen.
+        await Task.WhenAny(disconnectedRaised.Task, Task.Delay(TimeSpan.FromMilliseconds(250)));
+
+        Assert.False(
+            disconnectedRaised.Task.IsCompleted,
+            "Disconnected was raised for a disconnect the application had already requested.");
+    }
+
+    /// <summary>
+    /// The claim a DisconnectAsync lays on an in-flight teardown belongs to that connection alone.
+    /// A later connection that is genuinely lost must still raise Disconnected, so the suppression
+    /// cannot leak forward and silence a real drop.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task Disconnected_AfterAConcurrentDisconnectClaimedATeardown_StillRaisedOnTheNextDrop()
+    {
+        await using var client = new MeshClient(new Mock<ILogger<MeshClient>>().Object);
+
+        // First transport: the outgoing Disconnect frame is held open, which parks DisconnectAsync
+        // in the disconnecting state for as long as the test needs.
+        var disconnectFrameSent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseDisconnectFrame = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstTransport = new Mock<ITransport>();
+        firstTransport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
+        firstTransport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                if (data.Span[0] != 0x08) // Disconnect
+                {
+                    return Task.CompletedTask;
+                }
+
+                disconnectFrameSent.TrySetResult();
+                return releaseDisconnectFrame.Task;
+            });
+        var firstChannel = Channel.CreateUnbounded<byte[]?>();
+        firstChannel.Writer.TryWrite(RegistrationComplete(Guid.NewGuid()));
+        firstTransport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await firstChannel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        // Second transport: registers, then is lost remotely.
+        var secondTransport = new Mock<ITransport>();
+        secondTransport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
+        secondTransport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        var secondChannel = Channel.CreateUnbounded<byte[]?>();
+        secondChannel.Writer.TryWrite(RegistrationComplete(Guid.NewGuid()));
+        secondTransport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await secondChannel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        var reasonTcs = new TaskCompletionSource<DisconnectReason>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.Disconnected += (_, e) => reasonTcs.TrySetResult(e.Reason);
+
+        await client.ConnectAsync(firstTransport.Object, "Racer");
+
+        Task localDisconnect = client.DisconnectAsync();
+        await disconnectFrameSent.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        // A second, redundant DisconnectAsync arrives while the first is still disconnecting and
+        // claims the teardown. Nothing consumes that claim, so it must not survive the reconnect.
+        await client.DisconnectAsync();
+
+        releaseDisconnectFrame.TrySetResult();
+        await localDisconnect;
+
+        await client.ConnectAsync(secondTransport.Object, "Racer");
+        secondChannel.Writer.TryWrite(null);
+
+        DisconnectReason reason = await reasonTcs.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(DisconnectReason.ConnectionLost, reason);
+    }
+
+    /// <summary>
     /// When a MessageReceived handler disconnects the client, DisconnectAsync must not deadlock by
     /// waiting on the receive loop it is being invoked from.
     /// </summary>

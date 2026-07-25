@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 4b352ef (branch fix/heartbeat-eviction-off-by-one, PR #61)
+reconciled-to-commit: c7fbb62 (branch fix/disconnect-async-suppresses-racing-disconnected-event, PR #62)
 reconciled-to-date: 2026-07-25
 mode: update
 -->
@@ -12,19 +12,24 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `fix/heartbeat-eviction-off-by-one` (PR #61), which is `main` plus the
-> heartbeat eviction fix (PR #61, closing issue #9). The heartbeat schedule in
-> [hub.md](for-clanker/hub.md#heartbeat-schedule), the `maxMissedHeartbeats` row in §5 below,
-> [known-issues.md](for-clanker/known-issues.md) KI-11 and the `MeshHubTests.cs` row in
-> [testing.md](for-clanker/testing.md) describe **that branch**; on `main` eviction fires one interval
-> later (`missedHeartbeats > _maxMissedHeartbeats`), there is no constructor warning for
-> `maxMissedHeartbeats: 1`, and every `MeshHub.cs` coordinate past line 61 is 6–22 lines lower.
+> **Documented tree:** branch `fix/disconnect-async-suppresses-racing-disconnected-event` (PR #62),
+> which is `main` plus the disconnect-race fix (PR #62, closing issue #10). The claim protocol in
+> [client.md](for-clanker/client.md#the-claim-protocol-load-bearing), the `DisconnectAsync` row in §2
+> below, [known-issues.md](for-clanker/known-issues.md) KI-21 and the `MeshClientTests.cs` row in
+> [testing.md](for-clanker/testing.md) describe **that branch**. On `main` a `DisconnectAsync` that
+> loses the race out of the connected state is a silent no-op and the receive loop still raises
+> `Disconnected(ConnectionLost)` for a disconnect the application requested; there is no
+> `_localDisconnectRequested` flag, and every `MeshClient.cs` coordinate past line 21 is 8–40 lines
+> lower.
 >
-> The reconnector race fix (PR #60, closing issue #8) is on `main` and is documented in the
-> `MeshClientReconnector` sections of [client.md](for-clanker/client.md) and KI-19/KI-20.
-> The TLS transport work (PR #59, closing issue #7) is documented in
-> [transport.md](for-clanker/transport.md); the registration-authentication work of PR #56 and protocol
-> version 3 are on `main`.
+> Everything else documented here is on `main`. The heartbeat eviction fix (PR #61, closing issue #9)
+> has since merged as `a005af2`, so the heartbeat schedule in
+> [hub.md](for-clanker/hub.md#heartbeat-schedule), the `maxMissedHeartbeats` row in §5 below, KI-11 and
+> every `MeshHub.cs` coordinate now describe `main` directly. The reconnector race fix (PR #60, closing
+> issue #8) is documented in the `MeshClientReconnector` sections of
+> [client.md](for-clanker/client.md) and KI-19/KI-20. The TLS transport work (PR #59, closing issue #7)
+> is documented in [transport.md](for-clanker/transport.md); the registration-authentication work of
+> PR #56 and protocol version 3 are on `main`.
 >
 > **Known documentation gap:** the coordinates (`path:line`) for `MeshClient.cs` and
 > `MeshClientReconnector.cs` outside the registration path were written against an older tree and have
@@ -151,7 +156,7 @@ complete, idiomatic client that uses every capability.
 | Resolve name → id | `GetClientIdByNameAsync(name)` | `null` if not found; serialised, one in flight |
 | Join / leave group | `JoinGroupAsync(name)` / `LeaveGroupAsync(name)` | Groups created on first join, removed when empty |
 | Group message | `SendToGroupAsync(name, payload)` | Every other member; sender need not be a member |
-| Graceful disconnect | `DisconnectAsync()` | Does **not** raise `Disconnected` |
+| Graceful disconnect | `DisconnectAsync()` | Does **not** raise `Disconnected`, even when it races a remote drop — see KI-21 for the one residual window |
 | Auto-reconnect | wrap in `MeshClientReconnector` | Re-establishes on drop; you restore app state |
 | Present a credential | `ConnectAsync(transport, name, credential)` | Opaque bytes; only meaningful if the hub has an `authenticator` |
 
@@ -370,6 +375,11 @@ there is no publish step in CI — CI only builds and tests.
   can encode to more bytes than you expect. Names are also case-sensitive and `Ordinal`-compared.
 - **Group membership is fire-and-forget and optimistic on the client.** The client's `JoinedGroups`
   can drift from the hub's view if a frame is lost; reconnects do not auto-rejoin.
+- **`DisconnectAsync` suppresses `Disconnected` even when it races a remote drop — but not absolutely.**
+  A claim protocol makes the outcome independent of which side tears the connection down, *except* in a
+  few-instruction window after the receive loop has already published the disconnected state, where the
+  event still fires with `ConnectionLost`. Treat the suppression as overwhelmingly reliable rather than
+  guaranteed, and make `Disconnected` handlers idempotent. KI-21.
 - **`ReadOnlyMemory<byte>` in event args is a view over the received frame.** It is currently backed by
   a per-frame allocation so retaining it is safe today, but the idiom is to copy if you keep it past the
   handler. A custom pooling transport could invalidate that assumption.

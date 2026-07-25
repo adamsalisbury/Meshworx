@@ -19,6 +19,14 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private readonly AsyncLocal<bool> _inReceiveLoop = new();
 
     private ConnectionState _state = ConnectionState.Disconnected;
+
+    // Set by DisconnectAsync when it finds a teardown already in flight, and read by that teardown
+    // immediately before it would raise Disconnected. Guarded by _stateLock. It exists so the outcome
+    // of a local disconnect racing a remote drop does not depend on which side wins: whoever tears the
+    // connection down, an application-initiated disconnect stays silent. Reset by ConnectAsync so a
+    // claim left over from one connection cannot silence a genuine drop on the next.
+    private bool _localDisconnectRequested;
+
     private ITransport? _transport;
     private CancellationTokenSource? _cts;
     private Task? _receiveLoopTask;
@@ -173,6 +181,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             }
 
             _state = ConnectionState.Connecting;
+            _localDisconnectRequested = false;
             _transport = transport;
         }
 
@@ -266,6 +275,19 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             if (_state is not ConnectionState.Connected)
             {
+                // A teardown is already under way. If the receive loop started it — the connection
+                // dropped remotely at the same moment the application asked to disconnect — it is
+                // about to raise Disconnected for a disconnect the application requested. Claim the
+                // teardown so it stays silent, matching what would have happened had this call won
+                // the race instead. Setting the flag here is atomic with the teardown's own read of
+                // it, because that read shares this lock with the move to Disconnected: once the
+                // state is Disconnected the decision has already been taken and there is nothing
+                // left to claim.
+                if (_state is ConnectionState.Disconnecting)
+                {
+                    _localDisconnectRequested = true;
+                }
+
                 return;
             }
 
@@ -795,6 +817,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// Tears the connection down and raises <see cref="Disconnected"/> when the receive loop
     /// ends for a remote reason. If a local <see cref="DisconnectAsync"/> already moved the
     /// client out of the connected state, that call owns cleanup and no event is raised.
+    /// A <see cref="DisconnectAsync"/> arriving while this teardown is in flight also suppresses
+    /// the event, so a local disconnect racing a remote drop behaves the same whichever wins. One
+    /// arriving after the disconnected state has been published is too late: the decision to raise
+    /// is taken in the same locked block that publishes it.
     /// </summary>
     private async Task HandleReceiveLoopTerminationAsync(DisconnectReason reason)
     {
@@ -821,11 +847,25 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         await CleanUpAsync().ConfigureAwait(false);
 
+        bool raiseDisconnected;
+
         lock (_stateLock)
         {
             Id = Guid.Empty;
             Name = string.Empty;
             _state = ConnectionState.Disconnected;
+
+            // Take the decision to raise under the same lock that publishes the disconnected state,
+            // so a DisconnectAsync racing this teardown either claims it before this point or finds
+            // the client already disconnected and has nothing to claim.
+            raiseDisconnected = !_localDisconnectRequested;
+        }
+
+        if (!raiseDisconnected)
+        {
+            _logger.LogDebug(
+                "Suppressing Disconnected: the application requested this disconnect while the connection was being torn down");
+            return;
         }
 
         try
