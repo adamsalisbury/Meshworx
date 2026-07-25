@@ -29,6 +29,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly ConcurrentDictionary<string, Guid> _clientNames = new();
     private readonly ConcurrentDictionary<Task, byte> _handlerTasks = new();
 
+    // How many client slots are currently claimed. This, rather than _clients.Count, is what maxClients
+    // is enforced against: a slot is claimed by a single atomic operation before the client is put into
+    // the registries and given back when its handler ends. Testing the client count and adding
+    // afterwards let concurrent registrations all read the same count and all admit, so the cap could be
+    // overshot by as many clients as happened to be registering at once. Every claim is owned by exactly
+    // one client handler and released in that handler's finally, so a shutdown that clears the registries
+    // deliberately does not reset this — the handlers still running own the outstanding claims and give
+    // them back themselves. A hub stopped while a handler is still unwinding therefore reports no
+    // connected clients while briefly still holding its slot, which is the safe way round.
+    private int _reservedClientSlots;
+
     // Each group is guarded by its own lock, so traffic to distinct groups routes in parallel and
     // only mutation of the same group contends. A group is created on first join and removed once
     // empty. Each connection also tracks the groups it joined so it can be removed from all of them
@@ -472,6 +483,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         Task? sendLoopTask = null;
         Task? heartbeatMonitorTask = null;
         CancellationTokenSource? clientCts = null;
+        bool slotReserved = false;
 
         try
         {
@@ -535,20 +547,19 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 return;
             }
 
-            // Refuse at-capacity connections before running the integrator's authenticator, so a
-            // connection flood cannot drive authentication work (or hold handler tasks on a slow
-            // authenticator) once the hub is already full.
-            if (_clients.Count >= _maxClients)
-            {
-                byte[] capacityError = [(byte)MessageType.Error, (byte)RegistrationErrorCode.HubAtCapacity];
-                await transport.SendAsync(capacityError, cancellationToken).ConfigureAwait(false);
-                _logger.LogWarning(
-                    "Refusing client {ClientId}: hub at capacity ({MaxClients} clients)", clientId, _maxClients);
-                return;
-            }
-
             if (_authenticator is not null)
             {
+                // Refuse an already-full hub before running the integrator's authenticator, so a
+                // connection flood cannot drive authentication work — or hold handler tasks on a slow
+                // authenticator — once there is nothing left to admit it to. This is only an early-out:
+                // the slot itself is claimed below, after authentication returns, so that a peer which
+                // never authenticates cannot hold capacity away from one that would.
+                if (Volatile.Read(ref _reservedClientSlots) >= _maxClients)
+                {
+                    await RefuseAtCapacityAsync(transport, clientId, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
                 if (!await AuthenticateAsync(
                         clientId, clientName, registrationData, registrationNameLength, cancellationToken)
                     .ConfigureAwait(false))
@@ -557,23 +568,20 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     await transport.SendAsync(authError, cancellationToken).ConfigureAwait(false);
                     return;
                 }
-
-                // Authentication awaits the integrator's callback, so the capacity checked above may have
-                // been consumed by concurrent registrations while it ran. Re-check before reserving the
-                // name, otherwise a burst arriving during a slow authenticator all passes the first check
-                // and admits together, overshooting maxClients by the size of the burst.
-                if (_clients.Count >= _maxClients)
-                {
-                    byte[] lateCapacityError =
-                        [(byte)MessageType.Error, (byte)RegistrationErrorCode.HubAtCapacity];
-                    await transport.SendAsync(lateCapacityError, cancellationToken).ConfigureAwait(false);
-                    _logger.LogWarning(
-                        "Refusing client {ClientId}: hub reached capacity ({MaxClients} clients) during authentication",
-                        clientId,
-                        _maxClients);
-                    return;
-                }
             }
+
+            // Claim a slot rather than testing the client count and adding to the registry afterwards.
+            // Any number of registrations can read the same count, all pass a test against it, and all
+            // then add — so the count-based check made maxClients a soft cap that a burst could overshoot
+            // by the size of the burst. The claim is one atomic operation, so exactly one of any number
+            // of concurrent registrations takes the last slot and the rest are refused here.
+            if (!TryReserveClientSlot())
+            {
+                await RefuseAtCapacityAsync(transport, clientId, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            slotReserved = true;
 
             if (!_clientNames.TryAdd(clientName, clientId))
             {
@@ -745,6 +753,21 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 RemoveFromAllGroups(connection);
                 _clientNames.TryRemove(connection.Name, out _);
                 _clients.TryRemove(clientId, out _);
+            }
+
+            // Give the slot back on every path that claimed one — a client that was admitted and has now
+            // disconnected, and one that claimed a slot but was then refused for a duplicate name.
+            // Released the moment the client is out of the registries, and deliberately before the
+            // transport is disposed: a transport that blocks on close would otherwise hold a slot for as
+            // long as it hangs, and it is the hub's registries rather than the socket that maxClients
+            // accounts for.
+            if (slotReserved)
+            {
+                ReleaseClientSlot();
+            }
+
+            if (connection is not null)
+            {
                 await connection.DisposeAsync().ConfigureAwait(false);
                 _logger.LogInformation("Client {ClientId} disconnected", clientId);
                 RaiseClientEvent(ClientDisconnected, connection.Id, connection.Name, nameof(ClientDisconnected));
@@ -754,6 +777,64 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 await transport.DisposeAsync().ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>
+    /// Claims one of the hub's client slots if one is free.
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> if a slot was claimed, in which case the caller owns it and must give it
+    /// back with <see cref="ReleaseClientSlot"/>; otherwise <see langword="false"/>.
+    /// </returns>
+    /// <remarks>
+    /// Internal rather than private so a test can put the hub into the state a concurrent registration
+    /// produces — a slot taken, but the client not yet in the registry — which is precisely the window a
+    /// check against the observable client count cannot see.
+    /// </remarks>
+    internal bool TryReserveClientSlot()
+    {
+        // Compare-and-swap rather than increment-then-test-and-undo. An increment that overshoots the cap
+        // is visible to every other registration until it is undone, so a burst that all overshot and all
+        // backed out would refuse clients for slots that were never really taken. Here a claim is only
+        // ever made from a count that was still under the cap at the instant the claim was made.
+        int claimed = Volatile.Read(ref _reservedClientSlots);
+
+        while (claimed < _maxClients)
+        {
+            int observed = Interlocked.CompareExchange(ref _reservedClientSlots, claimed + 1, claimed);
+            if (observed == claimed)
+            {
+                return true;
+            }
+
+            claimed = observed;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Gives back a client slot claimed by <see cref="TryReserveClientSlot"/>.
+    /// </summary>
+    /// <remarks>
+    /// Internal for the same reason as <see cref="TryReserveClientSlot"/>. Must be called exactly once
+    /// per successful claim.
+    /// </remarks>
+    internal void ReleaseClientSlot()
+    {
+        Interlocked.Decrement(ref _reservedClientSlots);
+    }
+
+    /// <summary>
+    /// Tells a registering client the hub is full and records why it was refused.
+    /// </summary>
+    private async Task RefuseAtCapacityAsync(
+        ITransport transport, Guid clientId, CancellationToken cancellationToken)
+    {
+        byte[] capacityError = [(byte)MessageType.Error, (byte)RegistrationErrorCode.HubAtCapacity];
+        await transport.SendAsync(capacityError, cancellationToken).ConfigureAwait(false);
+        _logger.LogWarning(
+            "Refusing client {ClientId}: hub at capacity ({MaxClients} clients)", clientId, _maxClients);
     }
 
     private async Task<bool> AuthenticateAsync(
