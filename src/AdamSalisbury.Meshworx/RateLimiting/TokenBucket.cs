@@ -36,24 +36,52 @@ internal sealed class TokenBucket
     }
 
     /// <summary>
+    /// Credits the bucket for whatever time has elapsed since the last call, then reports whether it
+    /// currently holds at least <paramref name="cost"/> tokens — without withdrawing anything. Paired
+    /// with <see cref="Consume"/> so a caller weighing more than one bucket can check every one of them
+    /// before committing to any of them, rather than withdrawing from an earlier bucket only to be
+    /// refused by a later one.
+    /// </summary>
+    public bool HasAvailable(double cost)
+    {
+        Refill();
+        return _tokens >= cost;
+    }
+
+    /// <summary>
+    /// Withdraws <paramref name="cost"/> tokens unconditionally. Only call this once a preceding
+    /// <see cref="HasAvailable"/> on the same instance has confirmed the balance covers it — this
+    /// performs no check of its own and can drive the balance negative if that has not been done.
+    /// </summary>
+    public void Consume(double cost)
+    {
+        _tokens -= cost;
+    }
+
+    /// <summary>
     /// Attempts to withdraw <paramref name="cost"/> tokens, having first credited the bucket for
     /// whatever time has elapsed since the last call. Returns <see langword="false"/>, withdrawing
-    /// nothing, when the balance after refill is short of the cost.
+    /// nothing, when the balance after refill is short of the cost. Equivalent to
+    /// <see cref="HasAvailable"/> followed by <see cref="Consume"/> when it returns
+    /// <see langword="true"/>, for a caller that only ever weighs one bucket at a time.
     /// </summary>
     public bool TryConsume(double cost)
+    {
+        if (!HasAvailable(cost))
+        {
+            return false;
+        }
+
+        Consume(cost);
+        return true;
+    }
+
+    private void Refill()
     {
         long now = Stopwatch.GetTimestamp();
         double elapsedSeconds = Stopwatch.GetElapsedTime(_lastRefillTimestamp, now).TotalSeconds;
         _lastRefillTimestamp = now;
 
         _tokens = Math.Min(_capacity, _tokens + (elapsedSeconds * _refillPerSecond));
-
-        if (_tokens < cost)
-        {
-            return false;
-        }
-
-        _tokens -= cost;
-        return true;
     }
 }

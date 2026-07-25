@@ -29,7 +29,8 @@ internal sealed class MeshHubFixture
         int? maxConnectionsPerRemoteEndpoint = null,
         int? maxInboundMessagesPerSecond = null,
         int? maxInboundBytesPerSecond = null,
-        int? maxFanOutMessagesPerSecond = null)
+        int? maxFanOutMessagesPerSecond = null,
+        int? maxFanOutDeliveriesPerSecond = null)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -58,7 +59,8 @@ internal sealed class MeshHubFixture
             maxConnectionsPerRemoteEndpoint,
             maxInboundMessagesPerSecond,
             maxInboundBytesPerSecond,
-            maxFanOutMessagesPerSecond);
+            maxFanOutMessagesPerSecond,
+            maxFanOutDeliveriesPerSecond);
     }
 
     /// <summary>
