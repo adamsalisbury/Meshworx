@@ -1154,11 +1154,23 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return;
         }
 
-        if (_groupAuthoriser is not null
-            && !await AuthoriseGroupJoinAsync(connection, groupName, cancellationToken).ConfigureAwait(false))
+        if (_groupAuthoriser is not null)
         {
-            RefuseGroupJoin(connection, groupName, groupNameBytes);
-            return;
+            // Copy the name out of the inbound frame before awaiting the authoriser. The refusal below
+            // echoes these bytes, and it is built after the await — the only place in the hub where a
+            // slice of a received buffer outlives one. ITransport promises nothing about how long the
+            // array it returned stays valid; both shipped transports hand back a freshly allocated one
+            // per frame, so nothing reuses it today, but a pooled-buffer transport would make this alias
+            // a buffer that had already been recycled. One array on a control-plane path settles the
+            // question rather than resting on an implementation detail of the transports in the box.
+            // The registration authenticator copies the credential out of its frame for the same reason.
+            byte[] retainedNameBytes = groupNameBytes.ToArray();
+
+            if (!await AuthoriseGroupJoinAsync(connection, groupName, cancellationToken).ConfigureAwait(false))
+            {
+                RefuseGroupJoin(connection, groupName, retainedNameBytes);
+                return;
+            }
         }
 
         AddToGroup(connection, groupName);
