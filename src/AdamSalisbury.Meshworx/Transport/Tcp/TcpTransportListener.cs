@@ -37,6 +37,12 @@ public sealed class TcpTransportListener : ITransportListener
     private readonly int _maxConcurrentTlsHandshakes;
     private readonly int _maxPendingTlsHandshakes;
 
+    // Guards every mutable field below. Starting, accepting and disposing can all be called from
+    // different threads, so each of them takes the state it needs under this lock and then works from
+    // locals: reading a field twice is what let a concurrent dispose null the listener between a check
+    // and the dereference that followed it. Nothing that blocks or awaits is done while holding it.
+    private readonly object _stateLock = new();
+
     private TcpListener? _listener;
 
     // Only used when TLS is configured. The handshake runs off the accept path, so a peer that opens a
@@ -45,7 +51,25 @@ public sealed class TcpTransportListener : ITransportListener
     private CancellationTokenSource? _handshakeCts;
     private Task? _handshakePumpTask;
 
-    internal EndPoint? LocalEndPoint => _listener?.LocalEndpoint;
+    // The first call to DisposeAsync stores its teardown here; every later or concurrent call awaits that
+    // same task instead of running a second teardown over half-cleared state. Read and written only under
+    // the lock.
+    private Task? _disposeTask;
+
+    // Set the instant disposal takes ownership of the state, before any teardown starts, so an accept
+    // already in flight can tell a stopped listener from a genuine socket failure without taking the lock.
+    private volatile bool _disposed;
+
+    internal EndPoint? LocalEndPoint
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _listener?.LocalEndpoint;
+            }
+        }
+    }
 
     /// <summary>
     /// Creates a listener bound to the given endpoint.
@@ -157,45 +181,73 @@ public sealed class TcpTransportListener : ITransportListener
     }
 
     /// <inheritdoc/>
+    /// <exception cref="ObjectDisposedException">The listener has been disposed.</exception>
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (_listener is not null)
+        lock (_stateLock)
         {
-            throw new InvalidOperationException("The listener is already running.");
-        }
+            // A disposed listener must stay disposed. Without this a start racing a dispose would bind a
+            // fresh socket onto an object that is being torn down, and the teardown would then leave a
+            // running listener behind that nothing owns.
+            ObjectDisposedException.ThrowIf(_disposed, this);
 
-        _listener = new TcpListener(_endPoint);
-        _listener.Start();
+            if (_listener is not null)
+            {
+                throw new InvalidOperationException("The listener is already running.");
+            }
 
-        if (_tlsOptions is not null)
-        {
-            // Hold at most one completed handshake per concurrent handshake slot, so a slow consumer
-            // exerts back-pressure through the pump rather than letting finished connections pile up.
-            _handshakenTransports = Channel.CreateBounded<TcpTransport>(
-                new BoundedChannelOptions(_maxConcurrentTlsHandshakes)
-                {
-                    SingleReader = true,
-                    SingleWriter = false,
-                });
+            var listener = new TcpListener(_endPoint);
 
-            _handshakeCts = new CancellationTokenSource();
-            _handshakePumpTask = HandshakePumpAsync(_listener, _handshakenTransports.Writer, _handshakeCts.Token);
+            // Bind before publishing the field, so a failed bind leaves the listener startable again
+            // rather than permanently reporting itself as already running.
+            listener.Start();
+            _listener = listener;
+
+            if (_tlsOptions is not null)
+            {
+                // Hold at most one completed handshake per concurrent handshake slot, so a slow consumer
+                // exerts back-pressure through the pump rather than letting finished connections pile up.
+                _handshakenTransports = Channel.CreateBounded<TcpTransport>(
+                    new BoundedChannelOptions(_maxConcurrentTlsHandshakes)
+                    {
+                        SingleReader = true,
+                        SingleWriter = false,
+                    });
+
+                _handshakeCts = new CancellationTokenSource();
+
+                // The pump yields before its first accept, so nothing here runs on this thread beyond
+                // creating the task — the lock is not held across any I/O.
+                _handshakePumpTask = HandshakePumpAsync(listener, _handshakenTransports.Writer, _handshakeCts.Token);
+            }
         }
 
         return Task.CompletedTask;
     }
 
     /// <inheritdoc/>
+    /// <exception cref="ObjectDisposedException">
+    /// The listener has been disposed, or was disposed while this accept was pending.
+    /// </exception>
     public async Task<ITransport> AcceptAsync(CancellationToken cancellationToken = default)
     {
-        if (_listener is null)
+        TcpListener listener;
+        Channel<TcpTransport>? handshakenTransports;
+
+        // Take everything this accept needs in one go and then work only from the locals. The fields are
+        // cleared by disposal, so re-reading them mid-accept is what could turn a concurrent dispose into
+        // a NullReferenceException.
+        lock (_stateLock)
         {
-            throw new InvalidOperationException("The listener has not been started.");
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            listener = _listener ?? throw new InvalidOperationException("The listener has not been started.");
+            handshakenTransports = _handshakenTransports;
         }
 
-        if (_handshakenTransports is { } handshaken)
+        if (handshakenTransports is { } handshaken)
         {
             try
             {
@@ -215,7 +267,22 @@ public sealed class TcpTransportListener : ITransportListener
             }
         }
 
-        TcpClient tcpClient = await _listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
+        TcpClient tcpClient;
+        try
+        {
+            tcpClient = await listener.AcceptTcpClientAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (_disposed && ex is SocketException or ObjectDisposedException)
+        {
+            // Disposal stopped the listener underneath this accept. What that surfaces as depends on the
+            // platform — a cancelled operation, or a socket already gone — so report the disposal itself,
+            // matching what the TLS path above and the in-memory listener both do. It matters: the hub's
+            // accept loop stops on ObjectDisposedException, whereas a raw socket error is logged and
+            // retried, which against a listener that is never coming back is an endless spin.
+            throw new ObjectDisposedException(
+                $"The {nameof(TcpTransportListener)} is no longer accepting connections.", ex);
+        }
+
         try
         {
             tcpClient.NoDelay = true;
@@ -232,39 +299,84 @@ public sealed class TcpTransportListener : ITransportListener
     }
 
     /// <inheritdoc/>
-    public async ValueTask DisposeAsync()
+    /// <remarks>
+    /// Safe to call more than once, and from more than one thread at a time. The first call takes
+    /// ownership of the listener's state and performs the teardown; every other call awaits that same
+    /// teardown, so each of them returns only once the socket is closed and every in-flight handshake has
+    /// finished, and none of them runs a second teardown over state the first has already cleared.
+    /// </remarks>
+    public ValueTask DisposeAsync()
+    {
+        Task disposal;
+
+        lock (_stateLock)
+        {
+            if (_disposeTask is null)
+            {
+                _disposed = true;
+
+                // Hand the state to the teardown and clear the fields in the same critical section, so no
+                // other caller can see a half-disposed listener or dispose anything twice.
+                TcpListener? listener = _listener;
+                CancellationTokenSource? handshakeCts = _handshakeCts;
+                Task? handshakePumpTask = _handshakePumpTask;
+                Channel<TcpTransport>? handshakenTransports = _handshakenTransports;
+
+                _listener = null;
+                _handshakeCts = null;
+                _handshakePumpTask = null;
+                _handshakenTransports = null;
+
+                // Only the synchronous head of the teardown runs here, and CancelAsync hands its callbacks
+                // to the thread pool rather than running them inline, so no cancellation callback can
+                // re-enter this lock.
+                _disposeTask = DisposeCoreAsync(listener, handshakeCts, handshakePumpTask, handshakenTransports);
+            }
+
+            disposal = _disposeTask;
+        }
+
+        return new ValueTask(disposal);
+    }
+
+    /// <summary>
+    /// Performs the one and only teardown of a listener's state, working entirely from values handed to it
+    /// so that it cannot race another caller over the fields.
+    /// </summary>
+    private static async Task DisposeCoreAsync(
+        TcpListener? listener,
+        CancellationTokenSource? handshakeCts,
+        Task? handshakePumpTask,
+        Channel<TcpTransport>? handshakenTransports)
     {
         // Cancel first, so in-flight handshakes unwind, then stop the listener to unblock the pump's
         // pending accept.
-        if (_handshakeCts is { } cts)
+        if (handshakeCts is not null)
         {
-            await cts.CancelAsync().ConfigureAwait(false);
+            await handshakeCts.CancelAsync().ConfigureAwait(false);
         }
 
-        _listener?.Stop();
-        _listener = null;
+        listener?.Stop();
 
-        if (_handshakePumpTask is { } pumpTask)
+        if (handshakePumpTask is not null)
         {
             // The pump never faults — it completes the channel with any error instead — so awaiting it
-            // cannot throw here.
-            await pumpTask.ConfigureAwait(false);
-            _handshakePumpTask = null;
+            // cannot throw here. It also waits for every handshake it started, so once it has returned
+            // nothing is still negotiating against the token source disposed just below.
+            await handshakePumpTask.ConfigureAwait(false);
         }
 
-        _handshakeCts?.Dispose();
-        _handshakeCts = null;
+        handshakeCts?.Dispose();
 
-        if (_handshakenTransports is { } handshaken)
+        if (handshakenTransports is not null)
         {
             // Connections that finished their handshake but were never accepted are owned by nobody else;
-            // close them rather than leaking the sockets.
-            while (handshaken.Reader.TryRead(out TcpTransport? pending))
+            // close them rather than leaking the sockets. The pump has finished by now, so nothing can add
+            // to the channel while it is being drained.
+            while (handshakenTransports.Reader.TryRead(out TcpTransport? pending))
             {
                 await pending.DisposeAsync().ConfigureAwait(false);
             }
-
-            _handshakenTransports = null;
         }
     }
 
