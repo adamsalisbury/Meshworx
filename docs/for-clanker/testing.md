@@ -11,12 +11,12 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 
 | File | Lines | Covers |
 |---|---|---|
-| `Fixtures/MeshHubFixture.cs` | 173 | Hub test harness (mock listener/transport, register helpers, authenticator pass-through) |
-| `Fixtures/MeshClientFixture.cs` | 106 | Client test harness (mock transport, scripted receive) |
-| `MeshHubTests.cs` | 2082 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, **capacity claim/release under a concurrent registration**, lifecycle, **concurrent stop/dispose and start-vs-stop races** |
-| `MeshClientTests.cs` | 1499 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race** |
-| `MeshClientReconnectorTests.cs` | 785 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal** |
-| `MeshIntegrationTests.cs` | 385 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** |
+| `Fixtures/MeshHubFixture.cs` | 304 | Hub test harness (mock listener/transport, register helpers, **authenticator and group-authoriser pass-throughs**, group/lookup/direct frame builders, `FrameRecorder`) |
+| `Fixtures/MeshClientFixture.cs` | 118 | Client test harness (mock transport, scripted receive, **`CreateGroupJoinRefusal`**) |
+| `MeshHubTests.cs` | 2498 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, **capacity claim/release under a concurrent registration**, **groups as an authorisation boundary**, lifecycle, **concurrent stop/dispose and start-vs-stop races** |
+| `MeshClientTests.cs` | 1602 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race**, **group-join refusal handling** |
+| `MeshClientReconnectorTests.cs` | 853 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal**, **restored membership re-authorised by the hub** |
+| `MeshIntegrationTests.cs` | 481 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** and **non-member/unauthorised group paths** |
 | `Transport/InMemory/InMemoryTransportTests.cs` | 173 | Pair semantics, copy-on-send, close signalling |
 | `Transport/InMemory/InMemoryTransportListenerTests.cs` | 90 | **Listener disposal contract in memory (4 tests):** accept after dispose, dispose-without-ever-starting, a queued connection closed rather than served, repeated/concurrent dispose |
 | `Transport/Tcp/TcpTransportTests.cs` | 342 | Framing, oversize rejection, invalid length, batch send |
@@ -69,7 +69,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   ([known-issues.md](known-issues.md) KI-22). Copy this shape whenever a guard is written against
   undocumented platform behaviour.
 - **When the bug is "one interval late", assert a count, not an outcome.** The heartbeat tests
-  (`MeshHubTests.cs:1826`, `:1874`) do not merely assert that a silent client was evicted — that passes
+  (`MeshHubTests.cs:1827`, `:1875`) do not merely assert that a silent client was evicted — that passes
   whether eviction fires on the Nth or the (N+1)th interval, which was exactly the KI-11 defect. They
   count `Ping` frames in the mock's `SendAsync` callback and **snapshot the count inside the
   `DisposeAsync` setup**, so the teardown itself latches the value and no later write can inflate it,
@@ -77,19 +77,19 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   `DisposeAsync` callback to wait for eviction rather than sleeping. Copy this shape for any timing
   contract where the wrong answer is still a *plausible* answer. The complementary direction — a client
   that keeps sending is never evicted — is `HandleClient_ClientSendingFramesEveryInterval_IsNotEvicted`
-  (`:1918`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
+  (`:1919`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
   interval so a scheduling stall on a loaded runner cannot masquerade as a genuine eviction.
 - **Drive the receive loop with a `Channel`, not `SetupSequence` returning `null`.** A completed/`null`
   receive is now interpreted as a lost connection and triggers teardown. `MeshClientFixture`
-  (`Fixtures/MeshClientFixture.cs:44-63`) writes the registration response and scripted frames into an
+  (`Fixtures/MeshClientFixture.cs:44-75`) writes the registration response and scripted frames into an
   **unbounded channel left uncompleted**, so the loop stays alive awaiting more — exactly like a live
   transport. The blocking read honours the cancellation token, so `DisconnectAsync` cancels cleanly.
 - **Pin a client-teardown race deterministically by parking the mocked `DisposeAsync`.** This is the
   reusable seam for anything that has to interleave with `HandleReceiveLoopTerminationAsync`, and it is
   worth knowing about before you invent something flakier. The teardown calls `CleanUpAsync`, which
-  awaits `transport.DisposeAsync()` (`MeshClient.cs:848`, disposal at `:605`) — and that await sits
-  **after** the loop has claimed the connection (`Connected` → `Disconnecting`, `:827-838`) but
-  **before** it decides whether to raise `Disconnected` (`:850-869`). Returning an incomplete
+  awaits `transport.DisposeAsync()` (`MeshClient.cs:909`, disposal at `:640`) — and that await sits
+  **after** the loop has claimed the connection (`Connected` → `Disconnecting`, `:888-899`) but
+  **before** it decides whether to raise `Disconnected` (`:911-930`). Returning an incomplete
   `ValueTask` from the `DisposeAsync` setup therefore parks the receive loop at precisely that point,
   for as long as the test needs:
 
@@ -104,13 +104,13 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
       });
   ```
 
-  `DisconnectAsync_RacesReceiveLoopTeardown_DoesNotRaiseDisconnected` (`MeshClientTests.cs:1267`) uses
+  `DisconnectAsync_RacesReceiveLoopTeardown_DoesNotRaiseDisconnected` (`MeshClientTests.cs:1370`) uses
   it to reproduce the KI-21/issue-#10 race exactly rather than hoping for it: write `null` to the
   receive channel to lose the connection remotely, `await teardownClaimed.Task`, call `DisconnectAsync`
   while the loop is pinned, then release. The mirror-image seam is **holding the outgoing `Disconnect`
   frame open in the `SendAsync` setup**, which parks `DisconnectAsync` itself in the `Disconnecting`
   state; `Disconnected_AfterAConcurrentDisconnectClaimedATeardown_StillRaisedOnTheNextDrop`
-  (`:1334`) uses that to land a second, redundant `DisconnectAsync` on an in-flight first one, then
+  (`:1437`) uses that to land a second, redundant `DisconnectAsync` on an in-flight first one, then
   reconnects over a second transport and asserts a genuine drop **still** raises
   `DisconnectReason.ConnectionLost` — the regression guard on the claim flag leaking across connections.
   Both carry `[Fact(Timeout = 5000)]`, because the failure mode is a hang.
@@ -118,9 +118,9 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   test above asserts a negative ("no event"), which a test that merely stalls short of the decision
   would also satisfy, passing for entirely the wrong reason. It closes that hole by waiting on
   observable state that the teardown mutates *in the same locked block* in which it decides whether to
-  raise: `Name` is cleared at `MeshClient.cs:855`, `raiseDisconnected` is read at `:861`. Only once
+  raise: `Name` is cleared at `MeshClient.cs:916`, `raiseDisconnected` is read at `:922`. Only once
   `Client.Name` is empty is a short 250 ms settle meaningful, because by then only the few instructions
-  between that lock release and the delegate invocation remain (`MeshClientTests.cs:1307-1321`). Copy
+  between that lock release and the delegate invocation remain (`MeshClientTests.cs:1410-1424`). Copy
   this two-step — *wait for a marker past the decision, then settle briefly* — for any "did not happen"
   assertion where a stalled system-under-test would look identical to a correct one.
 
@@ -133,13 +133,13 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   back. Prefer these over anything timing-based.
 
   1. **To park a caller *inside* a shutdown, hold the mocked `ITransport.SendAsync` open on the
-     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:310-320`) awaits each client's
+     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:358-368`) awaits each client's
      `SendAsync` in turn, and that await sits **after** the caller has claimed the hub's state but
      **before** the shutdown has finished — so returning an incomplete task there pins the hub
      mid-shutdown for as long as the test needs. The helper is already written:
 
      ```csharp
-     // MeshHubTests.cs:337 — fires onFrame, signals, then blocks until released
+     // MeshHubTests.cs:338 — fires onFrame, signals, then blocks until released
      ParkOnDisconnectFrame(client.Transport, notificationReached, releaseNotification,
          () => Interlocked.Increment(ref disconnectFrames));
 
@@ -152,9 +152,9 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
      Assert.Equal(1, Volatile.Read(ref disconnectFrames));   // no settle needed
      ```
 
-     `StopAsync_CalledWhileAShutdownIsInFlight_NotifiesEachClientOnce` (`MeshHubTests.cs:131`) counts
+     `StopAsync_CalledWhileAShutdownIsInFlight_NotifiesEachClientOnce` (`MeshHubTests.cs:132`) counts
      `Disconnect` frames to distinguish "joined the existing shutdown" from "started a second one";
-     `..._ReturnsOnlyOnceTheShutdownCompletes` (`:163`) asserts on the joining caller's task instead.
+     `..._ReturnsOnlyOnceTheShutdownCompletes` (`:164`) asserts on the joining caller's task instead.
      Note the first uses `RegisterMultiMessageClientAsync`, since the parked transport must survive more
      than one scripted frame.
 
@@ -172,7 +172,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
          });
      ```
 
-     `StopAsync_WhileAStartIsInProgress_LeavesTheStartedHubIntact` (`MeshHubTests.cs:304`) lands a full
+     `StopAsync_WhileAStartIsInProgress_LeavesTheStartedHubIntact` (`MeshHubTests.cs:305`) lands a full
      `StopAsync` in that window, releases the start, and then proves the hub is *genuinely* running by
      registering a client over it — not merely that no exception was thrown. Copy that "prove it still
      works" ending; asserting the absence of a throw would pass against a hub that had been left
@@ -187,7 +187,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   before the hub takes its capacity decision — the only window in which the racing state can be staged:
 
   ```csharp
-  // MeshHubTests.cs:822
+  // MeshHubTests.cs:823
   var fixture = new MeshHubFixture(
       maxClients: 1,
       authenticator: async (_, ct) =>
@@ -220,12 +220,20 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   (`MeshClientReconnectorTests.cs:305-308`, `:385-388`). Pair the delay with a count assertion, never a
   bare "still connected" check, which would pass with the guard removed. Every such test carries an
   explicit `[Fact(Timeout = …)]`, because the failure mode under test is a hang.
+- **The better way to prove "the hub did not send X": order, not time.** PR #66 added `FrameRecorder`
+  (`Fixtures/MeshHubFixture.cs:207`), which records every frame written to one client's transport and
+  lets a test await the first frame matching a predicate. The group-authorisation tests use it to assert
+  an *absence* deterministically: after the frame that must not appear, they have the hub send one that
+  certainly will — a direct message to the same client — and because a client's outbound queue is drained
+  **in order**, the later frame's arrival proves the earlier one was never queued. Prefer this to a
+  settle-and-count wherever the thing you are excluding shares a queue with something you can trigger.
+  See `SendToGroup_SenderIsNotAMember_MessageIsNotDelivered` (`MeshHubTests.cs:2072`).
 - **Fixture helpers build wire frames by hand** (`CreateRegistrationRequest`, `CreateDeliverMessagePayload`,
   `CreateLookupFound/NotFoundResponse`) with the raw opcodes — a useful cross-check of
   [protocol.md](protocol.md). If you change a frame layout, these helpers must change too.
   `CreateRegistrationRequest(name, credential)` builds a **version 3** frame
   (`[0x04][0x03][nameLen u16 BE][name][credential]`) and hard-codes the version byte, so a
-  `Protocol.Version` bump requires editing it (`Fixtures/MeshHubFixture.cs:60-72`).
+  `Protocol.Version` bump requires editing it (`Fixtures/MeshHubFixture.cs:115-127`).
 - **Test the authenticator through the hub, not in isolation.** `MeshHubFixture` takes `authenticator`
   and `maxConcurrentAuthentications` pass-throughs, so the seam is exercised over the real registration
   path. The `HandleClient_Authenticator*` tests in `MeshHubTests.cs` cover the outcomes worth copying:
@@ -233,6 +241,17 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   `registrationTimeout`, concurrency bounded by the semaphore, and a successful admit carrying name plus
   credential. `HandleClient_EmptyClientName_DropsConnectionWithoutRegistering` covers the malformed-frame
   path.
+- **Test the group authoriser the same way, through the hub.** `MeshHubFixture` takes `groupAuthoriser`
+  and `groupAuthorisationTimeout` (`Fixtures/MeshHubFixture.cs:26-27`). The twelve
+  `SendToGroup_*` / `JoinGroup_*` tests under the `// Groups as an authorisation boundary` banner
+  (`MeshHubTests.cs:2052`) are the reference set — they are enumerated in
+  [hub.md](hub.md#idiomatic-usage-from-tests). Note the hanging-authoriser test releases its callback at
+  the end (`MeshHubTests.cs:2272`) so an abandoned task does not outlive the test; do the same, because
+  the hub's timeout does not stop the callback (KI-28 in [known-issues.md](known-issues.md)).
+- **End-to-end coverage lives in `MeshIntegrationTests.cs`**: `EndToEnd_NonMemberCannotSendToGroup`
+  (`:152`) and `EndToEnd_UnauthorisedClientIsRefusedGroupMembership` (`:191`) run the rules over real
+  `MeshClient`s and `InMemoryTransport`, and `RestoredGroupMembership_IsAuthorisedAgainByTheHub`
+  (`MeshClientReconnectorTests.cs:631`) pins that a reconnect's restore goes through authorisation.
 - **`TlsOptionsCloneTests` is an intentional tripwire, not a normal test.** It reflects over every
   public settable property of `SslClientAuthenticationOptions` / `SslServerAuthenticationOptions`, sets
   each to a non-default value, clones, and asserts the value survived. **An unrecognised property type
