@@ -58,6 +58,18 @@ internal sealed class MeshClientFixture
             .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct).ConfigureAwait(false));
     }
 
+    /// <summary>
+    /// Builds a GroupJoinRefused frame: [type][UTF-8 group name].
+    /// </summary>
+    public static byte[] CreateGroupJoinRefusal(string groupName)
+    {
+        byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(groupName);
+        var payload = new byte[1 + nameBytes.Length];
+        payload[0] = 0x10; // GroupJoinRefused
+        nameBytes.CopyTo(payload, 1);
+        return payload;
+    }
+
     public static byte[] CreateLookupFoundResponse(Guid clientId, int correlationId = 0)
     {
         var response = new byte[22];

@@ -604,9 +604,12 @@ public sealed class MeshClientReconnectorTests
         // The reconnector should have re-joined "news" on the replacement hub before raising Reconnected.
         Assert.Contains("news", aliceClient.JoinedGroups);
 
-        // A sender on the replacement hub addresses the group; Alice receives it as a group member.
+        // A sender on the replacement hub addresses the group; Alice receives it as a group member. Bob
+        // joins first because sending to a group requires membership of it; his join and send travel the
+        // same connection, so the hub applies them in that order.
         await using var bob = CreateClient();
         await bob.ConnectAsync(secondListener.Connect(), "Bob");
+        await bob.JoinGroupAsync("news");
         byte[] payload = Encoding.UTF8.GetBytes("group message after reconnect");
         await bob.SendToGroupAsync("news", payload);
 
@@ -614,6 +617,65 @@ public sealed class MeshClientReconnectorTests
         Assert.Equal("news", received.GroupName);
         Assert.Equal(bob.Id, received.SenderId);
         Assert.Equal(payload, received.Data.ToArray());
+
+        await secondHub.StopAsync();
+    }
+
+    /// <summary>
+    /// Restored membership is re-authorised by the hub rather than reinstated. The reconnector restores
+    /// by re-joining over the wire, so a hub whose group authoriser has since changed its mind refuses
+    /// the re-join exactly as it would a fresh one — the restore path cannot smuggle a client back into
+    /// a group it is no longer entitled to.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task RestoredGroupMembership_IsAuthorisedAgainByTheHub()
+    {
+        int joinAttempts = 0;
+
+        // Allow the first join and refuse every later one, so a restore that bypassed authorisation
+        // would show up as a membership the hub never granted.
+        GroupAuthoriser authoriser = (_, _) =>
+            ValueTask.FromResult(Interlocked.Increment(ref joinAttempts) == 1);
+
+        var firstListener = new InMemoryTransportListener();
+        var firstHub = new MeshHub(
+            new Mock<ILogger<MeshHub>>().Object, firstListener, groupAuthoriser: authoriser);
+        await firstHub.StartAsync();
+        var listenerHolder = new[] { firstListener };
+
+        await using var aliceClient = CreateClient();
+
+        var refusedTcs = new TaskCompletionSource<GroupJoinRefusedEventArgs>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        aliceClient.GroupJoinRefused += (_, e) => refusedTcs.TrySetResult(e);
+
+        await using var reconnector = new MeshClientReconnector(
+            aliceClient,
+            "Alice",
+            _ => Task.FromResult<ITransport>(Volatile.Read(ref listenerHolder[0]).Connect()),
+            retryDelay: TimeSpan.FromMilliseconds(50),
+            connectTimeout: TimeSpan.FromSeconds(2));
+
+        await reconnector.StartAsync();
+        await aliceClient.JoinGroupAsync("news");
+
+        // Move the connection to a replacement hub that shares the authoriser, so the re-join is the
+        // second attempt it sees.
+        var secondListener = new InMemoryTransportListener();
+        await using var secondHub = new MeshHub(
+            new Mock<ILogger<MeshHub>>().Object, secondListener, groupAuthoriser: authoriser);
+        await secondHub.StartAsync();
+        Volatile.Write(ref listenerHolder[0], secondListener);
+        await firstHub.StopAsync();
+        await firstHub.DisposeAsync();
+
+        GroupJoinRefusedEventArgs refused = await refusedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal("news", refused.GroupName);
+        Assert.Equal(2, Volatile.Read(ref joinAttempts));
+
+        // The refused group is gone from the client's membership, so nothing goes on believing it is
+        // restored — and the reconnector has no membership left to restore on a later drop.
+        Assert.DoesNotContain("news", aliceClient.JoinedGroups);
 
         await secondHub.StopAsync();
     }

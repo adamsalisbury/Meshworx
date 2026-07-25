@@ -21,6 +21,12 @@ namespace AdamSalisbury.Meshworx;
 /// constructor to take full manual control and restore membership yourself in a <see cref="Reconnected"/>
 /// handler. In-flight messages are never re-sent — that remains the application's responsibility.
 /// </para>
+/// <para>
+/// Restoration re-joins over the wire rather than reinstating membership, so a hub with a
+/// <see cref="GroupAuthoriser"/> authorises every re-join afresh and may refuse one. A refused group is
+/// dropped from the client's membership and is not retried, and the client raises
+/// <see cref="IMeshClient.GroupJoinRefused"/> so the application can decide what to do about it.
+/// </para>
 /// </remarks>
 public sealed class MeshClientReconnector : IAsyncDisposable
 {

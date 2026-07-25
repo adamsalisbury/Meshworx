@@ -92,7 +92,10 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
   and `SendToGroupAsync(name, payload)` delivers to every other member of that group. Groups are
   created on first join and removed once empty; a client is removed from all its groups when it
   disconnects. Recipients receive group messages through the `GroupMessageReceived` event, which —
-  unlike `MessageReceived` — carries the name of the group the message was sent to.
+  unlike `MessageReceived` — carries the name of the group the message was sent to. **Sending to a
+  group requires membership of it**: the hub drops a group message from a client that has not joined.
+  Who may join is the hub's decision — see [Security](#security) for the authorisation seam; without
+  one, any client may join any group.
 - **Disconnect.** Calling `DisconnectAsync` is graceful and does not raise `Disconnected`. The
   `Disconnected` event fires only for unexpected endings — the hub closing the connection
   (`RemoteDisconnect`) or the transport failing (`ConnectionLost`). After it fires the client
@@ -104,7 +107,9 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
   fail-fast initial connect, then transparently re-establishes the connection (bounded per attempt,
   retried with a delay) whenever it drops. It automatically re-joins the groups the client belonged
   to before the drop, then raises `Reconnected` so the application can restore any further state. Pass
-  `restoreGroupMembership: false` to take full manual control of group restoration. `Reconnected` means
+  `restoreGroupMembership: false` to take full manual control of group restoration. Restoration re-joins
+  over the wire, so a hub with a `GroupAuthoriser` authorises each re-join afresh and may refuse it;
+  a refused group is dropped from the client's membership rather than retried. `Reconnected` means
   the connection is up again rather than that the reconnector re-established it, and it may fire more
   than once for a single drop, so keep your handlers idempotent.
 
@@ -133,7 +138,9 @@ new MeshHub(
     heartbeatInterval: TimeSpan.FromSeconds(30),    // ping idle clients (default: disabled)
     maxMissedHeartbeats: 2,                         // evict after this many silent intervals
     authenticator: authenticator,                   // decide who may register (default: none — see Security)
-    maxConcurrentAuthentications: 64);              // cap concurrent authenticator calls (default: 64)
+    maxConcurrentAuthentications: 64,               // cap concurrent authenticator calls (default: 64)
+    groupAuthoriser: groupAuthoriser,               // decide who may join a group (default: none — see Security)
+    groupAuthorisationTimeout: TimeSpan.FromSeconds(10)); // refuse a join whose authoriser hangs (default: 10s)
 ```
 
 When a heartbeat interval is set, the hub pings idle clients and evicts any that fail to send a
@@ -205,6 +212,44 @@ must make deliberately.
   expensive credential check into a denial of service; a connection that cannot get a slot within
   `registrationTimeout` is refused with `AuthenticationFailed`. An authenticator that throws, hangs
   past `registrationTimeout`, or cancels is treated as a refusal rather than faulting the hub.
+
+- **Authorisation: groups.** Authentication answers *who this peer is*; authorisation answers *what it
+  may do*. Once admitted, a client can still reach every other client by direct send, broadcast and
+  lookup — but groups are an enforceable boundary:
+
+  - **Sending to a group always requires membership of it**, with or without the callback below. The
+    hub drops a group message from a non-member rather than fanning it out, so a client cannot inject a
+    frame into a group it never joined.
+  - **Who may join is yours to decide.** Supply a `GroupAuthoriser` and it is consulted for every join.
+    Returning `false` refuses it, and the client is told so through its `GroupJoinRefused` event:
+
+    ```csharp
+    GroupAuthoriser groupAuthoriser = (context, _) =>
+        ValueTask.FromResult(TenantDirectory.MayJoin(context.ClientName, context.GroupName));
+
+    await using var hub = new MeshHub(
+        logger, listener, authenticator: authenticator, groupAuthoriser: groupAuthoriser);
+    ```
+
+  The authoriser composes with the authenticator rather than replacing it: `context.ClientName` is the
+  name that passed authentication, so it identifies the client exactly as strongly as your
+  `ClientAuthenticator` does — **with no authenticator configured the name is self-asserted and is not
+  an identity**. Authorise on that name and `context.ClientId`, and treat `context.GroupName` as
+  untrusted input, matching it against known groups rather than parsing meaning out of it.
+
+  Every join is authorised on its own, including the re-joins that follow a reconnect, so a decision is
+  never carried across a connection and `MeshClientReconnector`'s membership restoration cannot
+  reinstate a membership you would now refuse. A refusal is not retried, so an authoriser that fails
+  closed on a transient outage costs the client its membership until it asks again.
+
+  The callback runs on input from an already-admitted client, driven from that client's own receive
+  loop, which reads nothing further from it until the callback returns — so a slow decision stalls only
+  the client that asked, and concurrent invocations are bounded by the number of connected clients.
+  One that throws, cancels, or outruns `groupAuthorisationTimeout` refuses the join: the decision fails
+  closed.
+
+  **Without a `GroupAuthoriser` the hub authorises no joins and any client may join any group**, so
+  groups are then a routing convenience and must not be relied on for isolation.
 
 - **Network exposure.** The `TcpTransportListener(int port)` convenience constructor binds to
   `IPAddress.Loopback`, so a hub created that way is not reachable from other hosts. To listen on a
@@ -296,11 +341,18 @@ Protocol version: **3**.
 | `GroupMessage` | `0x0E` | client → hub | group-name length (2 bytes, big-endian), UTF-8 group name, message bytes |
 | `DeliverMessage` | `0x03` | hub → client | sender id (16 bytes), message bytes |
 | `DeliverGroupMessage` | `0x0F` | hub → client | sender id (16 bytes), group-name length (2 bytes, big-endian), UTF-8 group name, message bytes |
+| `GroupJoinRefused` | `0x10` | hub → client | UTF-8 group name |
 | `ClientLookupRequest` | `0x06` | client → hub | correlation id (4 bytes, big-endian), UTF-8 name |
 | `ClientLookupResponse` | `0x07` | hub → client | correlation id (4 bytes), found flag (1 byte), id (16 bytes if found) |
 | `Disconnect` | `0x08` | either | none |
 | `Ping` | `0x09` | hub → client | none |
 | `Pong` | `0x0A` | client → hub | none |
+
+`GroupJoinRefused` is an addition within version 3 rather than a new protocol version: it travels only
+from hub to client, and a client that does not recognise it ignores it, so it changes nothing for a peer
+that never sees one. A hub drops a `GroupMessage` from a client that is not a member of the target group,
+and does so silently — a correct client only sends to groups it has joined, and it learns of a refused
+join from `GroupJoinRefused`.
 
 Registration error codes (`RegistrationErrorCode`): `DuplicateClientName` (`0x01`),
 `UnsupportedProtocolVersion` (`0x02`), `ClientNameTooLong` (`0x03`), `HubAtCapacity` (`0x04`),
