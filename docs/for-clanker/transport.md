@@ -1,23 +1,25 @@
-# Transports — abstractions, TCP, WebSocket, Unix socket, named pipe, in-memory
+# Transports — abstractions, TCP, WebSocket, Unix socket, named pipe, QUIC, in-memory
 
 [← back to index](../for-clanker.md) · related: [hub.md](hub.md) · [client.md](client.md) · [protocol.md](protocol.md) · [known-issues.md](known-issues.md)
 
 The transport layer is the swap point. Hub and client depend only on `ITransport` /
-`ITransportListener`; five concrete implementations ship (`Tcp*`, `WebSocket*` — PR #78, issue #18 —
-`Unix*` and `NamedPipe*` — PR #81, issue #20, **not yet merged to `main`** — `InMemory*`), and you can
-add your own. A transport is a **dumb, message-oriented pipe** — it owns framing but knows nothing
-about opcodes. `TcpTransport`, `UnixSocketTransport` and `NamedPipeTransport` all frame identically
-over a plain `Stream` and now **share one internal helper**, `StreamFramer`, rather than each
-reimplementing the length prefix
-([Shared framing](#shared-framing-streamframer-internal--transportframingstreamframercs18) below). The
-TCP and WebSocket pairs are additionally **TLS-secured**: pass TLS options to the listener and to
-`TcpTransport.ConnectAsync` / `WebSocketTransport.ConnectAsync` and the framing is unchanged, only the
-byte stream differs ([Turning TLS on, TCP](#turning-tls-on-both-ends); [Turning TLS on,
-WebSocket](#turning-tls-on-websocket-both-ends)). `UnixSocketTransport` and `NamedPipeTransport` have
-**no TLS option at all** — they never leave the host, so the operating system's own filesystem/ACL
-access control is the trust boundary instead (see their own sections below).
+`ITransportListener`; six concrete implementations ship (`Tcp*`, `WebSocket*` — PR #78, issue #18 —
+`Unix*` and `NamedPipe*` — PR #81, issue #20 — `Quic*` — PR #82, issue #21, **not yet merged to
+`main`** — `InMemory*`), and you can add your own. A transport is a **dumb, message-oriented pipe** —
+it owns framing but knows nothing about opcodes. `TcpTransport`, `UnixSocketTransport`,
+`NamedPipeTransport` and `QuicTransport` all frame identically over a plain `Stream` and now **share
+one internal helper**, `StreamFramer`, rather than each reimplementing the length prefix
+([Shared framing](#shared-framing-streamframer-internal--transportframingstreamframercs18) below).
+TLS is a three-way split across the six: **optional** on TCP and WebSocket (pass TLS options to the
+listener and to `TcpTransport.ConnectAsync` / `WebSocketTransport.ConnectAsync` and the framing is
+unchanged, only the byte stream differs — [Turning TLS on, TCP](#turning-tls-on-both-ends); [Turning
+TLS on, WebSocket](#turning-tls-on-websocket-both-ends)); **mandatory** on QUIC, which requires it at
+the protocol level and so has no cleartext mode at all ([Turning TLS on,
+QUIC](#turning-tls-on-quic-both-ends)); and **absent** on `UnixSocketTransport`/`NamedPipeTransport`,
+which never leave the host and rely on the operating system's own filesystem/ACL access control
+instead (see their own sections below).
 
-Namespace `AdamSalisbury.Meshworx.Transport` (+ `.Tcp`, `.WebSocket`, `.Unix`, `.NamedPipes`,
+Namespace `AdamSalisbury.Meshworx.Transport` (+ `.Tcp`, `.WebSocket`, `.Unix`, `.NamedPipes`, `.Quic`,
 `.InMemory`, and the internal `.Framing`).
 
 ---
@@ -84,9 +86,10 @@ frame — what it saves is acquiring the write lock **once** for the whole batch
 message, which still matters for a fan-out burst (a broadcast or group send). See
 [`WebSocketTransport`](#websockettransport--transportwebsocketwebsockettransportcs23) below.
 
-`UnixSocketTransport` and `NamedPipeTransport` (PR #81, issue #20) implement it too, and — because both
-share `StreamFramer` with `TcpTransport` — get the **same** single-rented-buffer, one-write-one-flush
-coalescing `TcpTransport` gets, not the narrower WebSocket-style win. See their own sections below.
+`UnixSocketTransport`, `NamedPipeTransport` (PR #81, issue #20) and `QuicTransport` (PR #82, issue #21)
+implement it too, and — because all three share `StreamFramer` with `TcpTransport` — get the **same**
+single-rented-buffer, one-write-one-flush coalescing `TcpTransport` gets, not the narrower
+WebSocket-style win. See their own sections below.
 
 ### `IRemoteEndPointTransport` (public) — `Transport/IRemoteEndPointTransport.cs:16`
 
@@ -106,18 +109,24 @@ single remote address at once (`ExtractRemoteAddress`, `MeshHub.cs:743-748`) —
   the hub's per-remote-endpoint limit — `InMemoryTransport` falls into this bucket and always has.
 - The hub only recognises an `IPEndPoint`; it discards any other `EndPoint` subtype the same way as
   `null`.
-- **`TcpTransport` and `WebSocketTransport` both implement it** in this codebase (below). For
-  `WebSocketTransport` it is `null` on the client side (`ClientWebSocket` exposes no underlying socket to
-  report an address from) and the accepted socket's remote address on the listener side. If you write a
-  custom TCP-like transport and want it subject to `maxConnectionsPerRemoteEndpoint`, implement this
-  interface and report the genuine peer address — do not fabricate one, since the hub uses it as the
-  cap's dictionary key.
+- **`TcpTransport`, `WebSocketTransport` and `QuicTransport` all implement it** in this codebase
+  (below). For `WebSocketTransport` it is `null` on the client side (`ClientWebSocket` exposes no
+  underlying socket to report an address from) and the accepted socket's remote address on the listener
+  side. `QuicTransport` (PR #82, issue #21) reports the real `QuicConnection.RemoteEndPoint` on **both**
+  sides — QUIC runs over UDP, so a genuine connection endpoint exists as soon as the connection does,
+  unlike WebSocket's client-side gap — and so it participates in the hub's per-remote-endpoint cap
+  exactly as TCP does; this was a deliberate correctness point confirmed during review, not an
+  afterthought, and is the reason it is called out explicitly against the two local-IPC transports
+  below. If you write a custom TCP-like transport and want it subject to
+  `maxConnectionsPerRemoteEndpoint`, implement this interface and report the genuine peer address — do
+  not fabricate one, since the hub uses it as the cap's dictionary key.
 - **`UnixSocketTransport` and `NamedPipeTransport` do *not* implement it** (PR #81, issue #20). Both are
   local-only transports with no `IPEndPoint` to report in the first place, so this is not a bug in
   either transport considered alone — but it does mean **`maxConnectionsPerRemoteEndpoint` is silently
   inert for both**: a hub reached only over a Unix domain socket or a named pipe has no cap on
   connections from one source at all, short of `maxClients` itself. See
-  [known-issues.md](known-issues.md) KI-38 and the two transports' own sections below.
+  [known-issues.md](known-issues.md) KI-38 and the two transports' own sections below. **`QuicTransport`
+  is not in this bucket** — see the point above.
 
 ---
 
@@ -125,11 +134,12 @@ single remote address at once (`ExtractRemoteAddress`, `MeshHub.cs:743-748`) —
 
 Added by PR #81 (issue #20), factored out of what was previously `TcpTransport`'s own private framing
 code. `internal static class StreamFramer` holds the length-prefixed framing logic **every
-stream-oriented transport in this codebase needs identically**: `TcpTransport`, `UnixSocketTransport`
-and `NamedPipeTransport` all wrap a plain `.NET` `Stream` (a `NetworkStream`/`SslStream`, a
-`NetworkStream` over a Unix domain socket, or a `PipeStream`) and all frame the same way, so this is the
-one place that logic lives rather than three copies of it. `WebSocketTransport` does **not** use it —
-a WebSocket message already delimits one frame, so it needs no length prefix at all (see
+stream-oriented transport in this codebase needs identically**: `TcpTransport`, `UnixSocketTransport`,
+`NamedPipeTransport` and, since PR #82 (issue #21), `QuicTransport` all wrap a plain `.NET` `Stream` (a
+`NetworkStream`/`SslStream`, a `NetworkStream` over a Unix domain socket, a `PipeStream`, or a
+`QuicStream`) and all frame the same way, so this is the one place that logic lives rather than four
+copies of it. `WebSocketTransport` does **not** use it — a WebSocket message already delimits one
+frame, so it needs no length prefix at all (see
 [protocol.md](protocol.md#two-layers-framing-vs-message)).
 
 - **`HeaderSize = 4`** (`:23`), **`MaxPayloadSize = 1024 * 1024`** (`:28`) — the 4-byte big-endian
@@ -992,6 +1002,308 @@ await client.ConnectAsync(await NamedPipeTransport.ConnectAsync("meshworx"), "Al
 
 ---
 
+## `QuicTransport` / `QuicTransportListener` — `Transport/Quic/`
+
+Added by PR #82 (issue #21), **not yet merged to `main`**. Reaches a hub over QUIC
+(`System.Net.Quic`) using a single bidirectional `QuicStream` per connection — TLS 1.3 and faster
+connection setup versus TCP, and (unlike TCP) resistance to head-of-line blocking at the transport
+level, though Meshworx does not exploit multi-stream multiplexing today (see
+[Gotchas](#gotchas-4) below). Framing is the [shared `StreamFramer`
+helper](#shared-framing-streamframer-internal--transportframingstreamframercs18) — identical to
+`TcpTransport`'s. **Unlike every other transport in this codebase, TLS is not optional here**: QUIC
+mandates it at the protocol level, so both `QuicTransport.ConnectAsync` and the
+`QuicTransportListener` constructor take TLS options as a required parameter rather than a nullable
+one. **Requires `QuicListener.IsSupported`/`QuicConnection.IsSupported` to be `true`** — typically
+meaning the native `msquic` library is installed (`apt install libmsquic` on Debian/Ubuntu) and the
+platform's TLS stack supports TLS 1.3; both entry points throw `PlatformNotSupportedException` with
+that guidance in the message if it is not. CI installs `libmsquic` explicitly in a dedicated step
+(`.github/workflows/ci.yml`) rather than assuming the runner image already has it, precisely so the
+`IsSupported` checks never silently turn the whole QUIC test suite into a no-op without anyone
+noticing.
+
+### `QuicTransport` — `Transport/Quic/QuicTransport.cs:33`
+
+`public sealed class QuicTransport : ITransport, IBatchSendTransport, IRemoteEndPointTransport`.
+
+- **`DefaultApplicationProtocol`** (`:43`, `internal static readonly`) — the ALPN protocol name
+  (`"meshworx"`) both `ConnectAsync` and `QuicTransportListener` advertise when the caller's TLS
+  options leave `ApplicationProtocols` unset. QUIC mandates ALPN negotiation as part of the TLS 1.3
+  handshake, so — unlike TCP, where TLS itself is optional and ALPN doubly so — the two ends must agree
+  on at least one protocol name or the handshake fails outright. If you set `ApplicationProtocols`
+  yourself on either end, set it on **both**, matching.
+- **`RemoteEndPoint`** (`:83-91`) — the `IRemoteEndPointTransport` implementation; reads
+  `QuicConnection.RemoteEndPoint` directly. QUIC runs over UDP, so a real address is always available
+  once the connection exists — this is what makes `QuicTransport` subject to `MeshHub`'s
+  per-remote-endpoint cap on both the client and the listener side, unlike `WebSocketTransport` (`null`
+  client-side) and unlike `UnixSocketTransport`/`NamedPipeTransport` (no `IRemoteEndPointTransport` at
+  all). See [IRemoteEndPointTransport](#iremoteendpointtransport-public--transportiremoteendpointtransportcs16)
+  above.
+- **`ConnectAsync(host, port, tlsOptions, ct)`** (`:126-183`) — static factory, the **only** public way
+  to construct one. `ArgumentException` for a null/empty `host`; `ArgumentNullException` for a null
+  `tlsOptions` — there is no cleartext overload the way `TcpTransport` has one, because QUIC has no
+  cleartext mode. `PlatformNotSupportedException` if `QuicConnection.IsSupported` is `false`. Clones
+  `tlsOptions` via the same `TcpTransport.CloneClientOptions(tlsOptions, host)` the TLS `TcpTransport`
+  factory uses (`:143` — same `TargetHost`-defaulting, same reflection-tested completeness guarantee,
+  same shallow-copy caveat as [`TcpTransport`'s clone](#cloneclientoptions-internal--194)), then defaults
+  `ApplicationProtocols` to `[DefaultApplicationProtocol]` if the clone left it empty (`:144-147`).
+  Connects the `QuicConnection`, then opens **one** `QuicStreamType.Bidirectional` stream on it
+  (`:164-166`) — that stream *is* the `ITransport`; nothing about Meshworx's framing or opcodes touches
+  the connection object beyond that one stream. On any throw during either step, disposes whichever of
+  the stream/connection was actually created, in that order, before rethrowing (`:169-182`) — the same
+  dispose-on-throw-during-connect shape `TcpTransport.ConnectAsync` and `WebSocketTransport.ConnectAsync`
+  both follow.
+  - **The handshake and stream-open are both bounded only by your `cancellationToken`** — there is no
+    built-in timeout on the client side, exactly like `TcpTransport`'s TLS `ConnectAsync`. Pass a token
+    that expires if a hostile or dead peer must not be able to stall the caller indefinitely.
+- **`SendAsync(single)`** (`:186-189`), **`SendAsync(batch)`** (`:198-203`, `IBatchSendTransport`),
+  **`ReceiveAsync`** (`:206-209`) — one-line delegations to `StreamFramer`, identical in shape and
+  behaviour to `TcpTransport`'s and `UnixSocketTransport`'s equivalents: same 1 MiB cap, same
+  deliver-then-fault batch semantics, same `IOException`-on-corrupt-length/`null`-on-EOF receive
+  contract.
+- **`DisposeAsync`** (`:212-227`) — disposes the `QuicStream` first, then the `QuicConnection` if one
+  exists (it does not for the internal `Stream`-only test constructor, see below), then the write-lock
+  semaphore.
+- Internal ctors: `QuicTransport(QuicConnection, QuicStream)` (`:53-56`, used by
+  `ConnectAsync` above and by the listener's negotiation path) and `QuicTransport(Stream)` (`:64-67`,
+  used by `QuicTransportTests.cs`'s in-memory framing tests to drive `StreamFramer`'s error paths
+  against a plain `MemoryStream` — a real `QuicStream` cannot be constructed without a genuine
+  connection). The `Stream`-only constructor is also the one case where `RemoteEndPoint` returns `null`
+  (`_connection` is `null`), mirroring `TcpTransport`'s equivalent gap.
+
+<a id="gotchas-4"></a>
+
+### Gotchas
+
+- **A QUIC stream is invisible to the peer until data actually arrives on it.** Opening a stream
+  (`OpenOutboundStreamAsync`) is a purely local operation — QUIC does not notify the other end a stream
+  exists until data (or a FIN) is sent on it. Concretely: `QuicTransportListener.AcceptAsync` **cannot
+  complete** until the connecting `QuicTransport`'s `SendAsync` has been called at least once. This is
+  the opposite test shape from every other transport in this codebase, where the listener's `AcceptAsync`
+  completes as soon as the connection/handshake finishes and *then* the first message is sent — see
+  [testing.md](testing.md) for how the test suite handles this. It is never an issue in normal Meshworx
+  use, since `MeshClient.ConnectAsync` sends the registration frame immediately once handed a transport
+  (confirmed against `MeshClient.cs` directly, not assumed) — but anyone driving `QuicTransport`/
+  `QuicTransportListener` directly must call `SendAsync` before waiting on `AcceptAsync`, not after, or
+  the two ends deadlock waiting on each other. Documented on `ConnectAsync`'s own XML remarks
+  (`QuicTransport.cs:112-120`).
+- **Meshworx uses exactly one stream per connection, not QUIC's multiplexing.** `ITransport` models one
+  channel per client, so `QuicTransport` opens a single `QuicStreamType.Bidirectional` stream and never
+  more — the several-concurrent-streams capability a QUIC connection can offer is unused. Don't assume a
+  second stream exists to reach for; it doesn't, and adding one would be a design change to `ITransport`
+  itself, not a `QuicTransport`-local tweak.
+- **No cleartext mode, ever.** There is no `QuicTransport.ConnectAsync` overload that omits TLS options,
+  unlike `TcpTransport`/`WebSocketTransport`. If you want an unauthenticated/self-signed connection for
+  local testing, pass `SslClientAuthenticationOptions` with a validation callback that returns `true` (or
+  better, `TestCertificates.PinnedTo`) rather than looking for a cleartext path — there isn't one.
+- **`RemoteEndPoint`, `DisposeAsync`'s connection branch, and several call sites inside the listener
+  carry `#pragma warning disable CA1416`** (Windows/Linux/macOS-only API). Every one of them is reachable
+  only after a successful `QuicConnection.ConnectAsync`/`QuicListener.AcceptConnectionAsync`, both of
+  which already require `IsSupported` to be `true` — the same "verified, not merely asserted" pattern
+  the named-pipe listener's suppressions use (see [its own
+  section](#namedpipetransportlistener--transportnamedpipesnamedpipetransportlistenercs18)).
+
+### `QuicTransportListener` — `Transport/Quic/QuicTransportListener.cs:33`
+
+`public sealed class QuicTransportListener : ITransportListener`. **The state/threading discipline is
+the same shape as `TcpTransportListener`'s** — one `Lock _stateLock` (`:56`) guards every mutable
+field, and every entry point captures what it needs under the lock once before working from locals —
+**with one genuine structural difference from every other listener in this codebase**: `StartAsync`'s
+bind step, `QuicListener.ListenAsync`, is itself asynchronous. Every other listener here (`Tcp`,
+`WebSocket`, `Unix`, `NamedPipe`) binds synchronously, so its whole bind can run **inside** the lock,
+which is what makes a concurrent `DisposeAsync` trivially safe to reason about for them — there is no
+window in which the bind is in flight and the lock is not held. `QuicTransportListener` cannot do that:
+it awaits `QuicListener.ListenAsync` **outside** the lock (`:262`), then re-takes the lock afterwards
+and checks `_disposed` again before publishing state (`:265-284`) — the pattern the constructor's and
+`StartAsync`'s own doc comments describe as "a concurrent `DisposeAsync` is handled by rechecking the
+`_disposed` flag under lock once `ListenAsync`'s await completes" (`:239-243`). See
+[Gotchas](#gotchas-5) below for what this shape does **not** cover.
+
+#### Constructors
+
+```csharp
+QuicTransportListener(
+    IPEndPoint endPoint,                                          // :130
+    SslServerAuthenticationOptions tlsOptions,                    // required — QUIC mandates TLS
+    TimeSpan? streamOpenTimeout = null,                           // default 10s   (:35)
+    int? maxConcurrentNegotiations = null,                        // default 64    (:36)
+    int? maxConcurrentNegotiationsPerSource = null)                // default maxConcurrentNegotiations / 8, min 1
+
+QuicTransportListener(int port, ...)                              // :197 — binds IPAddress.Loopback, same caveat as the other `(int port)` constructors
+```
+
+**Constructor guards** (`:136-166`): `ArgumentNullException` for a null `endPoint` or `tlsOptions`;
+`ArgumentOutOfRangeException` for a non-positive `streamOpenTimeout`, `maxConcurrentNegotiations` or
+`maxConcurrentNegotiationsPerSource`; `ArgumentException` if `tlsOptions` supplies none of
+`ServerCertificate`, `ServerCertificateContext` or `ServerCertificateSelectionCallback` — the identical
+certificate guard `TcpTransportListener`/`WebSocketTransportListener` apply, necessarily unconditional
+here since there is no cleartext mode to fall back to. `tlsOptions` is copied via the same
+`TcpTransportListener.CloneServerOptions` (`:169`) every other listener's TLS options go through, and
+`ApplicationProtocols` defaults to `[QuicTransport.DefaultApplicationProtocol]` if the (cloned) options
+left it empty (`:170-173`).
+
+#### Lifecycle
+
+- **`StartAsync`** (`:217-291`) — checks `_disposed`/"already running" under the lock **before** the
+  async bind (`:221-229`, see [Gotchas](#gotchas-5) for what this does and does not guarantee), then
+  `QuicListener.IsSupported` (`:231-237`, `PlatformNotSupportedException` with install guidance if
+  false), builds `QuicListenerOptions` with a `ConnectionOptionsCallback` that hands every accepted
+  connection the same cloned `_tlsOptions` (`:245-260`), and awaits `QuicListener.ListenAsync` — the
+  actual bind (`:262`). Once that completes, re-takes the lock, and if still not disposed creates the
+  bounded `Channel<QuicTransport>` of capacity `maxConcurrentNegotiations` (`SingleReader = true`,
+  `:269-274`) and a fresh negotiation `CancellationTokenSource`, publishes all four fields together, and
+  launches `NegotiationPumpAsync` (`:265-283`). If disposed in the meantime, disposes the just-bound
+  `QuicListener` (nothing else owns it) and throws `ObjectDisposedException` (`:286-290`).
+- **`AcceptAsync`** (`:297-319`) — reads one negotiated `QuicTransport` off the channel under the same
+  shape every other listener uses; a `ChannelClosedException` (pump stopped, for any reason) is
+  translated to `ObjectDisposedException` carrying the original as `InnerException` (`:309-318`).
+- **`DisposeAsync`** (`:326-353`) / **`DisposeCoreAsync`** (`:355-391`) — the same elected-single-teardown
+  shape as `TcpTransportListener`'s and `WebSocketTransportListener`'s: the first caller takes ownership
+  under the lock, clears the fields and stores the resulting `Task`; every caller, first or not, awaits
+  that same task. Order: cancel the negotiation `CancellationTokenSource` → dispose the `QuicListener` →
+  **await the negotiation pump task** → dispose the CTS → drain the channel, disposing every
+  negotiated-but-never-accepted `QuicTransport` so those connections are not leaked.
+
+### The negotiation pump — two-tier admission, read this before touching it
+
+`NegotiationPumpAsync` (`:421-516`) and `NegotiateAsync` (`:518-565`) exist for the same reason every
+other listener's pump does — the hub's accept loop consumes one connection at a time, so waiting for a
+slow or hostile peer inline would head-of-line block every other client. The QUIC handshake itself
+(TLS 1.3, msquic's own amplification-limiting/retry handling) completes **inside**
+`QuicListener.AcceptConnectionAsync` before it ever returns a connection, so — unlike
+`TcpTransportListener`'s TLS handshake pump or `WebSocketTransportListener`'s negotiation pump — **there
+is no separate handshake step to run off the accept path and no CPU-expensive work left to bound**. What
+this pump waits for instead is each accepted connection's **first stream** (`AcceptInboundStreamAsync`),
+because a connection that never opens one is otherwise indistinguishable from one that eventually will.
+
+**This is the one respect in which QUIC is structurally harder to defend than TCP/WebSocket:** those two
+listeners gate a connection's admission into their negotiation pool on a **cheap pre-check** — a
+zero-byte socket read that completes only once the peer has sent *something*, consuming no CPU and no
+slot — before it ever occupies a handshake/negotiation slot (see
+[`TcpTransportListener`'s pump](#the-tls-handshake-pump--read-this-before-touching-it) and
+[`WebSocketTransportListener`'s pump](#the-negotiation-pump--read-this-before-touching-it) above). QUIC
+has no equivalent: by the time `AcceptConnectionAsync` returns a `QuicConnection` at all, msquic has
+already completed the full TLS 1.3 handshake internally, so there is nothing cheaper left to check
+before waiting for the first stream. **This is why the admission design here is two separate,
+independently-motivated caps layered in front of each other, not one**, and the shipped shape is the
+*final* state after a design history worth knowing before you touch it:
+
+1. **A global semaphore, `maxConcurrentNegotiations` (default 64)** (`:428`) — bounds how many
+   connections may be concurrently waiting for their first stream at all. A connection that finds it
+   full is **shed immediately** rather than queued (`negotiationSlots.Wait(0, …)`, `:481-490`).
+2. **A per-source cap, `maxConcurrentNegotiationsPerSource` (default one eighth of
+   `maxConcurrentNegotiations`, minimum 1 — 8 at the defaults)** (`:429`, `TryAdmitSource`/
+   `ReleaseSource`/`NormaliseForSourceCap`, `:572-643`) — checked **first**, ahead of the global
+   semaphore (`:475-479`), against a `ConcurrentDictionary<IPAddress, int>` keyed on the connection's
+   source address, with an IPv6 source masked to its `/64` network prefix first — the identical
+   normalisation and the identical reasoning as `MeshHub`'s own per-remote-endpoint cap (a single host
+   is routinely handed a whole `/64`, so keying on the full address would let one attacker defeat the
+   cap by rotating within it). Duplicated here rather than shared across the assembly boundary between
+   the transport layer and `MeshHub`.
+
+**Why both exist, in that order:** the global semaphore alone has no cheap pre-check to protect it —
+without the per-source cap, a single source completing genuine (not spoofed) QUIC handshakes and never
+opening a stream on any of them could occupy the *entire* `maxConcurrentNegotiations` pool by itself,
+starving every other source. The per-source cap is what actually bounds that, checked before the global
+pool is even consulted; a connection failing either check is shed immediately, and the shed itself runs
+**off the accept loop** — `ShedInBackground` (`:432-444`) tracks the disposal via the same `inFlight`
+`ConcurrentDictionary<Task, byte>` a genuine negotiation uses, rather than awaiting it inline, because
+disposing a fully-established QUIC connection tears down its TLS 1.3 session and is measurably
+expensive; awaiting it inline would serialise that cost onto the one loop that also has to keep
+accepting everyone else.
+
+**Design history — know this before "simplifying" it back:** an earlier version of this branch used a
+two-semaphore design mirroring `TcpTransportListener`'s TLS pump almost exactly (a global bound plus a
+much larger polled "pending" bound). A loopback test caught a head-of-line-queueing bug specific to
+QUIC's lack of a cheap pre-check — the pending-bound trick works for TCP/WebSocket precisely because the
+zero-byte-read pre-check keeps genuinely-idle peers out of the pool in the first place, and QUIC has no
+equivalent signal to gate that pre-check on — so the design was simplified to the single global
+semaphore above, then **hardened further during analyser review** by adding the per-source cap (found by
+a security-review pass) and the non-blocking, off-loop shed (found by a performance-review pass). **The
+two intermediate designs no longer exist in the shipped code — only the final combination (global
+semaphore + per-source cap, both non-blocking) does.** Do not reintroduce a "pending" bound on the
+reasoning that it worked for TCP; it would reintroduce exactly the queueing bug the loopback test caught,
+because QUIC still has no cheap pre-check to make it safe.
+
+Every negotiation is bounded by `streamOpenTimeout` (default 10 s) via a linked CTS with `CancelAfter`
+(`NegotiateAsync`, `:529-530`). A transient `QuicException` on `AcceptConnectionAsync` — a malformed
+initial packet, a peer that reset mid-handshake — pauses for `AcceptRetryDelay` (50 ms, `:38`) and
+continues rather than retiring the listener (`:457-464`), the same transient-failure shape every other
+pump uses.
+
+**What the per-source cap does *not* do — mitigates, does not eliminate:** it bounds how much of the
+global pool *one* source can hold, not how much a flood spread across *many distinct sources* can hold
+between them. A distributed flood of genuine QUIC handshakes from `maxConcurrentNegotiations` different
+source addresses, each opening no stream, can still exhaust the global pool exactly as it could before
+the per-source cap existed — the cap changes the shape of the attack a single source can mount, not the
+existence of the underlying "no cheap pre-check" gap. See [known-issues.md](known-issues.md) KI-40.
+
+<a id="gotchas-5"></a>
+
+### Gotchas
+
+- **Concurrent `StartAsync` calls are now guarded — see [known-issues.md](known-issues.md) KI-41 (fixed)
+  for the history.** Unlike every other listener here, `QuicListener.ListenAsync` is itself the
+  asynchronous bind, so the "already running" check alone (taken before that await) is not enough: a
+  second concurrent call could otherwise pass it too, before either had published anything. A `_starting`
+  flag, claimed under `_stateLock` alongside that check and cleared once the bind either fails or
+  publishes, closes the gap — mirroring `MeshHub.StartAsync`'s identical pattern.
+  `StartAsync_CalledConcurrently_OnlyOneSucceeds` (`QuicTransportListenerTests.cs`) drives two overlapping
+  calls and asserts exactly one succeeds and genuinely publishes usable state. Every other listener here
+  cannot have this problem by construction, because their binds are synchronous and run entirely inside
+  the lock.
+- **A QUIC stream is invisible to the peer until data arrives on it — see the identical gotcha on
+  [`QuicTransport`](#gotchas-4) above.** `AcceptAsync` will not return a connection until its client has
+  sent something.
+- **`maxConcurrentNegotiations` is not a connection-rate limiter, and its per-source sibling is a
+  mitigation, not a fix — see [above](#the-negotiation-pump--two-tier-admission-read-this-before-touching-it)
+  and [known-issues.md](known-issues.md) KI-40.** Size both, and `streamOpenTimeout`, for the deployment's
+  real expected concurrent-connection count with this in mind.
+- **No cleartext mode, ever** — same point as on `QuicTransport` above; the certificate guard in the
+  constructor is therefore unconditional, unlike the optional-TLS listeners.
+
+<a id="turning-tls-on-quic-both-ends"></a>
+
+### Turning TLS on (QUIC, both ends)
+
+TLS is not optional here, so this is simply "how to use the transport" rather than an opt-in step:
+
+```csharp
+// Hub
+var listener = new QuicTransportListener(
+    new IPEndPoint(IPAddress.Any, 22003),
+    new SslServerAuthenticationOptions { ServerCertificate = hubCertificate });
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client
+await using var client = new MeshClient(clientLogger);
+QuicTransport transport = await QuicTransport.ConnectAsync(
+    "hub.example.com", 22003, new SslClientAuthenticationOptions());
+await client.ConnectAsync(transport, "Alice");
+```
+
+As with the TCP and WebSocket pairs, **nothing above the transport changes** — `MeshHub`, `MeshClient`
+and the wire protocol are untouched (confirmed: this branch does not modify `MeshHub.cs`, `MeshClient.cs`
+or `IMeshClient.cs` at all). `QuicMeshIntegrationTests.EndToEnd_RegisterSendBroadcastAndGroupMessage_OverQuic`
+is the reference end-to-end example.
+
+### Usage
+
+```csharp
+// Hub
+var listener = new QuicTransportListener(22003, new SslServerAuthenticationOptions { ServerCertificate = hubCertificate });
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client
+await using var client = new MeshClient(clientLogger);
+QuicTransport transport = await QuicTransport.ConnectAsync(
+    "localhost", 22003, new SslClientAuthenticationOptions());
+await client.ConnectAsync(transport, "Alice");
+```
+
+---
+
 ## `InMemoryTransport` / `InMemoryTransportListener` — `Transport/InMemory/`
 
 In-process transport backed by `System.Threading.Channels`. No sockets, no framing (channels preserve
@@ -1059,15 +1371,23 @@ meet it.
    back to one-frame-at-a-time sends automatically.
 6. **If your transport wraps a plain `Stream`** (a socket, a pipe, anything duplex), reuse the internal
    [`StreamFramer`](#shared-framing-streamframer-internal--transportframingstreamframercs18) helper
-   rather than reimplementing the length-prefix framing — `TcpTransport`, `UnixSocketTransport` and
-   `NamedPipeTransport` all do. It is `internal`, so this only helps a transport added inside this
-   assembly; an external transport still needs its own framing (or its own length-prefix scheme
-   entirely, since none of this is part of the public contract).
+   rather than reimplementing the length-prefix framing — `TcpTransport`, `UnixSocketTransport`,
+   `NamedPipeTransport` and `QuicTransport` all do (a `QuicStream` is a plain `Stream` for this purpose
+   too). It is `internal`, so this only helps a transport added inside this assembly; an external
+   transport still needs its own framing (or its own length-prefix scheme entirely, since none of this
+   is part of the public contract).
 7. **If your transport is network-backed and has a meaningful remote address, implement the public
-   `IRemoteEndPointTransport`** so `maxConnectionsPerRemoteEndpoint` can see it — `TcpTransport` and
-   `WebSocketTransport` do this, `UnixSocketTransport` and `NamedPipeTransport` deliberately do not
-   (there is no `IPEndPoint` for a local IPC transport to report). See
+   `IRemoteEndPointTransport`** so `maxConnectionsPerRemoteEndpoint` can see it — `TcpTransport`,
+   `WebSocketTransport` and `QuicTransport` do this, `UnixSocketTransport` and `NamedPipeTransport`
+   deliberately do not (there is no `IPEndPoint` for a local IPC transport to report). See
    [known-issues.md](known-issues.md) KI-38 for what skipping this costs a hub reachable only over such
    a transport.
-8. Test doubles: the suite mocks `ITransport`/`ITransportListener` directly with Moq. See the fixtures
+8. **If accepting a connection requires an asynchronous bind step** (as QUIC's `QuicListener.ListenAsync`
+   does, unlike every socket-backed listener's synchronous bind), a `StartAsync`-vs-`DisposeAsync` race
+   is not the only one to defend against — a concurrent `StartAsync`-vs-`StartAsync` race needs its own
+   guard too, published *before* the await, the way `MeshHub.StartAsync` itself claims a `_starting` flag
+   before its own async work begins. `QuicTransportListener` does exactly this (see
+   [known-issues.md](known-issues.md) KI-41) — follow the same shape for a new async-bind transport rather
+   than reintroducing the gap it once had.
+9. Test doubles: the suite mocks `ITransport`/`ITransportListener` directly with Moq. See the fixtures
    in [testing.md](testing.md).

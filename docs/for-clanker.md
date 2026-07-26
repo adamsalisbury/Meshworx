@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 0ea35a8 (branch feat/issue-20-unix-socket-named-pipe-transport, PR #81, open, not yet merged to main) — two commits on top of main at dbb6709, clean working tree
+reconciled-to-commit: 1102c3f (branch feat/issue-21-quic-transport, PR #82, open, not yet merged to main) — two commits on top of main at 84fd51f, clean working tree
 reconciled-to-date: 2026-07-26
 mode: update
 -->
@@ -12,8 +12,100 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree, this pass:** branch `feat/issue-20-unix-socket-named-pipe-transport` (open **PR
-> #81**, closing issue #20, **not yet merged to `main`**), two commits on top of `main` at `dbb6709`
+> **Documented tree, this pass:** branch `feat/issue-21-quic-transport` (open **PR #82**, closing
+> issue #21, **not yet merged to `main`**), two commits on top of `main` at `84fd51f`
+> (`git merge-base main feat/issue-21-quic-transport` confirmed equal to `main`'s own tip), clean
+> working tree. Diffed with `git diff main...feat/issue-21-quic-transport --stat`: 9 files, 2016
+> insertions — two new source files (`Transport/Quic/QuicTransport.cs`,
+> `Transport/Quic/QuicTransportListener.cs`), five new test files (all under
+> `src/Tests/AdamSalisbury.Meshworx.UnitTests/Transport/Quic/`), a `README.md` update, and a
+> `.github/workflows/ci.yml` step installing `libmsquic` before build/test. **`MeshHub.cs`,
+> `MeshClient.cs` and `IMeshClient.cs` are all untouched** — confirmed directly from the diff stat, not
+> assumed from the branch's own description — so nothing in [hub.md](for-clanker/hub.md) or
+> [client.md](for-clanker/client.md) needed correcting; this branch is transport-only, exactly as issue
+> #21's own design scoped it.
+>
+> **This branch adds a seventh transport** (counting `InMemoryTransport`), `QuicTransport`/
+> `QuicTransportListener` (namespace `AdamSalisbury.Meshworx.Transport.Quic`), backed by
+> `System.Net.Quic` — one bidirectional `QuicStream` per connection, framed via the same shared
+> `StreamFramer` helper `TcpTransport`/`UnixSocketTransport`/`NamedPipeTransport` already use (now four
+> transports on one framing implementation, not three). **Two things distinguish it from every prior
+> transport added by these last three passes:** TLS is **mandatory**, not optional — QUIC requires it at
+> the protocol level, so there is no cleartext overload at all, unlike TCP/WebSocket's opt-in TLS and
+> unlike Unix-socket/named-pipe's total absence of a TLS concept — and it **does** implement the public
+> `IRemoteEndPointTransport`, reporting the connection's genuine remote address on both sides, so unlike
+> the two local-IPC transports from PR #81 it **is** subject to `MeshHub`'s per-remote-endpoint
+> connection cap. Both points were confirmed against the actual source, not assumed from the PR's own
+> framing, and the latter is corrected explicitly in [known-issues.md](for-clanker/known-issues.md) KI-38
+> so that entry does not read as though it now covers three transports instead of two. Full write-up in
+> [transport.md](for-clanker/transport.md#quictransport--transportquicquictransportcs33).
+>
+> **The listener's negotiation pump is the one genuinely novel design problem this branch solves**, and
+> is worth understanding before touching either it or a future transport with the same shape. QUIC's
+> `AcceptConnectionAsync` completes the *entire* TLS 1.3 handshake internally before ever handing back a
+> connection — unlike TCP/WebSocket, there is no cheap "has this peer sent anything yet" pre-check left
+> to gate a negotiation slot on, so a connection that will never open its first stream is
+> indistinguishable, cheaply, from one that eventually will. The **shipped** design (verified against the
+> final commit, not an intermediate one) is two caps layered in front of each other: a global semaphore
+> (`maxConcurrentNegotiations`, default 64) bounding how many connections may wait for their first stream
+> at once, and — checked first, ahead of it — a per-source cap
+> (`maxConcurrentNegotiationsPerSource`, default one eighth of the global figure) keyed on source address
+> with the identical IPv6 `/64` masking `MeshHub`'s own per-remote-endpoint cap uses, duplicated locally
+> rather than shared across the transport/hub assembly boundary. A connection failing either check is
+> shed **off the accept loop**, not awaited inline, because disposing an established QUIC connection is
+> measurably expensive. This is the *end state* of a two-stage hardening history (an earlier
+> single-global-semaphore design, then a two-intermediate-semaphore design mirroring TCP's pump that a
+> loopback test caught head-of-line-queueing on, before landing on the per-source-cap shape above) — the
+> intermediate designs are gone from the shipped code and are not documented as current anywhere; only
+> the final combination is. The per-source cap **mitigates, not eliminates**, a flood spread across many
+> distinct sources — recorded as [known-issues.md](for-clanker/known-issues.md) **KI-40** (new, open, by
+> design). Full write-up in
+> [transport.md](for-clanker/transport.md#the-negotiation-pump--two-tier-admission-read-this-before-touching-it).
+>
+> **A genuine, QUIC-specific behavioural quirk affects anyone driving this transport directly, though
+> never real Meshworx usage:** a QUIC stream is invisible to the receiving end until data actually
+> arrives on it — opening one is a purely local operation — so `QuicTransportListener.AcceptAsync` cannot
+> complete until the connecting client has called `SendAsync` at least once. Verified against
+> `MeshClient.cs` directly that this is a non-issue for the real flow, since `MeshClient.ConnectAsync`
+> sends the registration frame immediately once handed a transport. Every test in
+> `Transport/Quic/QuicTransportLoopbackTests.cs`/`QuicMeshIntegrationTests.cs` sends before accepting —
+> the reverse of every other transport's test shape — documented in
+> [testing.md](for-clanker/testing.md).
+>
+> **A genuine bug was found and is *not* fixed by this pass (docs-only): `QuicTransportListener.StartAsync`
+> is not safe under concurrent invocation**, unlike every other listener in this codebase. Because
+> `QuicListener.ListenAsync` is itself the asynchronous bind step — there is no synchronous constructor
+> phase to serialise under the lock the way every socket-backed listener's bind can be — the type
+> correctly guards a `StartAsync`-vs-`DisposeAsync` race (tested, `QuicTransportListenerTests.cs:286`)
+> and originally did **not** guard a `StartAsync`-vs-`StartAsync` race: two overlapping calls could both
+> pass the "already running" check, both genuinely bind a `QuicListener`, and the second to publish its
+> state would silently overwrite the first's, leaking a bound listener and an orphaned background task
+> rather than throwing `InvalidOperationException` the way a properly serialised second call does. **Fixed
+> in the same PR, immediately after this pass found it** (commit `d4de3b3`): a `_starting` flag now
+> serialises concurrent `StartAsync` calls, mirroring `MeshHub.StartAsync`'s identical pattern, and
+> `StartAsync_CalledConcurrently_OnlyOneSucceeds` covers the race directly. Recorded as
+> **[known-issues.md](for-clanker/known-issues.md) KI-41 (fixed)**.
+>
+> **A separate, out-of-scope finding, noted here rather than acted on:** `main`'s tip has advanced since
+> the previous documentation pass. That pass reconciled against an *open* PR #81 (Unix-socket/named-pipe
+> transport) at `0ea35a8`; `main` now sits at `84fd51f`, which **is** PR #81 merged (confirmed: `git log
+> --oneline main -3` shows `84fd51f feat: Unix domain socket / named-pipe transport for local IPC` as
+> `main`'s own tip, and it is the exact commit this QUIC branch is built on). **Every "PR #81, open, not
+> yet merged to `main`" callout elsewhere in this documentation set — in
+> [transport.md](for-clanker/transport.md), [known-issues.md](for-clanker/known-issues.md) (KI-38, KI-39)
+> and [testing.md](for-clanker/testing.md) — is therefore now stale**, and none of them were corrected in
+> this pass: the task was explicitly scoped to reconciling the QUIC branch's own diff, and a full
+> "PR #81 has merged" sweep would mean re-verifying every coordinate that pass wrote against `main`
+> directly, which is a materially larger job than this one. **A future pass should do exactly that sweep**
+> before trusting this document's PR #81 framing at face value; until then, treat every "not yet merged"
+> claim about the Unix-socket/named-pipe transport as describing history rather than the present, while
+> its actual technical content (the coordinates, the behaviour) is not known to be wrong — only its
+> merge-status framing is.
+>
+> ---
+>
+> **Documented tree (prior pass):** branch `feat/issue-20-unix-socket-named-pipe-transport` (open **PR
+> #81**, closing issue #20, **not yet merged to `main`, at the time of that pass**), two commits on top of `main` at `dbb6709`
 > (merge-base confirmed equal to `main`'s own tip), clean working tree. Diffed with
 > `git diff main...feat/issue-20-unix-socket-named-pipe-transport --stat`: 14 files — five new source
 > files (`Transport/Framing/StreamFramer.cs`, `Transport/Unix/UnixSocketTransport.cs`,
@@ -359,8 +451,8 @@ direct-send to any id it holds. Treat the transport boundary as the trust bounda
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
 | Wire protocol version | Negotiated range, currently `4`–`5` (was a fixed `3`, then a `4`–`4` range from PR #73; widened to `5` by PR #74 for the header envelope) | `Messages/Protocol.cs:8`, `:14`, `:21` |
-| Max frame payload | 1 MiB (`1024*1024`). `TcpTransport`/`UnixSocketTransport`/`NamedPipeTransport` share **one** constant (`StreamFramer.MaxPayloadSize`, PR #81); `WebSocketTransport` keeps its own independent constant of the same value | `Transport/Framing/StreamFramer.cs:28`, `Transport/WebSocket/WebSocketTransport.cs:25` |
-| TCP / WebSocket transport encryption | Optional TLS, **off by default** on both. `UnixSocketTransport`/`NamedPipeTransport` (PR #81) have **no TLS option at all** — local-only, access controlled by filesystem/ACL permissions instead | `Transport/Tcp/TcpTransport.cs:142`, `TcpTransportListener.cs:110`, `Transport/WebSocket/WebSocketTransportListener.cs:112` |
+| Max frame payload | 1 MiB (`1024*1024`). `TcpTransport`/`UnixSocketTransport`/`NamedPipeTransport`/`QuicTransport` share **one** constant (`StreamFramer.MaxPayloadSize`, PR #81, extended to `QuicTransport` by PR #82); `WebSocketTransport` keeps its own independent constant of the same value | `Transport/Framing/StreamFramer.cs:28`, `Transport/WebSocket/WebSocketTransport.cs:25` |
+| Transport encryption | TCP/WebSocket: optional TLS, **off by default**. `UnixSocketTransport`/`NamedPipeTransport` (PR #81): **no TLS option at all** — local-only, access controlled by filesystem/ACL permissions instead. `QuicTransport` (PR #82): TLS **mandatory** — QUIC requires it at the protocol level, so there is no cleartext mode | `Transport/Tcp/TcpTransport.cs:142`, `TcpTransportListener.cs:110`, `Transport/WebSocket/WebSocketTransportListener.cs:112`, `Transport/Quic/QuicTransport.cs:126-141` |
 | Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:23` |
 | Warnings as errors | Yes (`Directory.Build.props`) | `src/Directory.Build.props:3` |
 
@@ -514,7 +606,7 @@ receive loops never block on a slow recipient's socket; they just enqueue. See
 |---|---|---|
 | Hub: routing, groups, heartbeat, lifecycle, metrics | `MeshHub`, `IMeshHub` | [hub.md](for-clanker/hub.md#metrics) |
 | Client + reconnection + metrics | `MeshClient`, `IMeshClient`, `MeshClientReconnector` | [client.md](for-clanker/client.md#metrics) |
-| Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `IRemoteEndPointTransport`, `StreamFramer` (PR #81), `TcpTransport(Listener)`, `WebSocketTransport(Listener)` (PR #78), `UnixSocketTransport(Listener)` (PR #81, open), `NamedPipeTransport(Listener)` (PR #81, open), `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
+| Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `IRemoteEndPointTransport`, `StreamFramer` (PR #81), `TcpTransport(Listener)`, `WebSocketTransport(Listener)` (PR #78), `UnixSocketTransport(Listener)` (PR #81), `NamedPipeTransport(Listener)` (PR #81), `QuicTransport(Listener)` (PR #82, open), `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
 | Wire protocol & framing | `MessageType`, `Protocol`, handshake, opcode payloads | [protocol.md](for-clanker/protocol.md) |
 | Public value types | event args, `MessageHeaders`, `DisconnectReason`, `RegistrationErrorCode`, `ClientAuthenticator`, `RegistrationContext`, `GroupAuthoriser`, `GroupJoinContext`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
 | DI & generic-host integration | `AddMeshHub`, `AddMeshClient`, `MeshHubOptions`, `MeshClientOptions` | [dependency-injection.md](for-clanker/dependency-injection.md) |
@@ -707,6 +799,30 @@ No TLS parameter, same reasoning as the Unix socket listener. **Windows-only**: 
 API runs. Also does **not** implement `IRemoteEndPointTransport` — see
 [known-issues.md](for-clanker/known-issues.md) KI-38.
 
+**`QuicTransportListener` options** (`Transport/Quic/QuicTransportListener.cs:129-134`, all but the
+first two optional, added by PR #82 / issue #21, **not yet merged to `main`**):
+
+| Param | Default | Effect |
+|---|---|---|
+| `tlsOptions` | **required** — no default | `SslServerAuthenticationOptions`; QUIC mandates TLS, so unlike `TcpTransportListener`/`WebSocketTransportListener` there is no cleartext mode to fall back to |
+| `streamOpenTimeout` | 10 s | How long a connected peer has to open its first stream before the connection is abandoned; bounds how long a negotiation slot can be held |
+| `maxConcurrentNegotiations` | 64 | Connections waiting for their first stream at once; a connection beyond this is refused immediately (shed), not queued — there is no cheap pre-check to gate admission on the way TCP/WebSocket's pumps have, so this genuinely bounds how many connect-and-never-send peers can occupy the pool |
+| `maxConcurrentNegotiationsPerSource` | one eighth of `maxConcurrentNegotiations` (min 1) | Caps how much of that pool a single source address may hold at once, checked **before** the global cap; IPv6 masked to `/64` first, identically to `maxConnectionsPerRemoteEndpoint`. Mitigates, does not eliminate, a many-source flood — see [known-issues.md](for-clanker/known-issues.md) KI-40 |
+
+Client-side TLS is required, not optional: `QuicTransport.ConnectAsync(host, port,
+SslClientAuthenticationOptions, ct)` has no cleartext overload. Both ends default `ApplicationProtocols`
+to a shared internal `"meshworx"` ALPN constant if left unset — set it explicitly on both ends if you
+override it, so they still agree. **Reports a real `RemoteEndPoint` on both sides** (unlike
+`WebSocketTransport`'s client-side gap), so `QuicTransport` **is** subject to
+`maxConnectionsPerRemoteEndpoint` above — unlike `UnixSocketTransport`/`NamedPipeTransport`. Details in
+[transport.md](for-clanker/transport.md#quictransport--transportquicquictransportcs33).
+
+> **Concurrent `StartAsync` calls on `QuicTransportListener` are now guarded** — see
+> [known-issues.md](for-clanker/known-issues.md) KI-41 (fixed). Every other listener above binds
+> synchronously under its lock and so never had this problem; `QuicTransportListener`'s bind
+> (`QuicListener.ListenAsync`) is itself asynchronous, so it additionally claims a `_starting` flag
+> before that await and re-checks it, alongside disposal, once the await completes.
+
 ---
 
 ## 6. Cross-cutting conventions (imitate these)
@@ -826,11 +942,23 @@ there is no publish step in CI — CI only builds and tests.
   [known-issues.md](for-clanker/known-issues.md) KI-35.
 - **A failed TLS handshake is silent on the listener side** — no log, no exception, the hub simply never
   sees the connection. Diagnose from the client. KI-18.
-- **`UnixSocketTransport`/`NamedPipeTransport` (PR #81, issue #20, open) are invisible to
+- **`UnixSocketTransport`/`NamedPipeTransport` (PR #81, issue #20) are invisible to
   `maxConnectionsPerRemoteEndpoint`.** Neither implements `IRemoteEndPointTransport`, so a hub reached
   only over a Unix domain socket or a named pipe has no per-source connection cap short of `maxClients`
   itself — a single local peer with access to the path can claim the whole budget. Deliberately deferred,
-  not a bug to silently "fix" by changing `MeshHub.cs` — see KI-38 before touching this.
+  not a bug to silently "fix" by changing `MeshHub.cs` — see KI-38 before touching this. **`QuicTransport`
+  (PR #82, issue #21, open) is deliberately *not* in this bucket** — it implements
+  `IRemoteEndPointTransport` and reports a real address, so it **is** capped the same way TCP/WebSocket
+  are.
+- **QUIC has no cleartext mode, and its negotiation pool's per-source cap mitigates rather than
+  eliminates a many-source flood.** `QuicTransport`/`QuicTransportListener` (PR #82, issue #21, open)
+  always require TLS — there is no cleartext overload to reach for the way there is on TCP/WebSocket.
+  Because QUIC's handshake completes fully before a connection is ever handed back, there is no cheap
+  pre-check to gate a negotiation slot on the way TCP/WebSocket's pumps do; the per-source cap
+  (`maxConcurrentNegotiationsPerSource`) bounds how much of the pool one source can hold, not how much a
+  flood spread across many distinct sources can hold between them. See
+  [known-issues.md](for-clanker/known-issues.md) KI-40, and KI-41 for a separate
+  `StartAsync`-concurrency bug found in the listener by this documentation pass and fixed in the same PR.
 - **Client-name length is checked in `char`s (UTF-16 units), not UTF-8 bytes**, on both sides — a name
   can encode to more bytes than you expect. Names are also case-sensitive and `Ordinal`-compared.
 - **Group membership is fire-and-forget and optimistic on the client.** `JoinGroupAsync` returning means
