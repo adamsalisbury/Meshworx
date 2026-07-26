@@ -215,4 +215,121 @@ public sealed class QuicTransportListenerTests
 
         await Assert.ThrowsAsync<ObjectDisposedException>(() => listener.AcceptAsync());
     }
+
+    /// <summary>
+    /// A pending accept, raced against dispose, only ever ends in the disposal being reported — the same
+    /// guarantee <c>TcpTransportListenerTests</c> and <c>UnixSocketTransportListenerTests</c> lock in for
+    /// their own listeners.
+    /// </summary>
+    /// <remarks>
+    /// The accept and the dispose are dispatched to separate threads and released together. Calling them
+    /// in sequence on one thread would not race at all: an accept called first has always registered
+    /// itself before it yields, so it would only ever exercise the pending-accept path.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task AcceptAsync_RacedAgainstDispose_OnlyEverReportsDisposal()
+    {
+        if (!System.Net.Quic.QuicListener.IsSupported)
+        {
+            return;
+        }
+
+        const int attempts = 25;
+
+        for (int attempt = 0; attempt < attempts; attempt++)
+        {
+            using X509Certificate2 certificate = TestCertificates.CreateSelfSigned();
+            var listener = new QuicTransportListener(
+                new IPEndPoint(IPAddress.Loopback, 0),
+                new SslServerAuthenticationOptions { ServerCertificate = certificate });
+            await listener.StartAsync().ConfigureAwait(false);
+
+            using var released = new SemaphoreSlim(0, 2);
+
+            Task<Exception?> acceptTask = Task.Run<Exception?>(async () =>
+            {
+                await released.WaitAsync().ConfigureAwait(false);
+                return await Record.ExceptionAsync(() => listener.AcceptAsync()).ConfigureAwait(false);
+            });
+
+            Task disposeTask = Task.Run(async () =>
+            {
+                await released.WaitAsync().ConfigureAwait(false);
+                await listener.DisposeAsync().ConfigureAwait(false);
+            });
+
+            released.Release(2);
+
+            await disposeTask.ConfigureAwait(false);
+            Exception? caught = await acceptTask.ConfigureAwait(false);
+
+            Assert.IsType<ObjectDisposedException>(caught);
+        }
+    }
+
+    /// <summary>
+    /// A DisposeAsync racing an in-flight StartAsync never leaves a listener neither published nor
+    /// torn down. This race has no analogue on the other transport listeners in this repo: they all bind
+    /// synchronously inside a lock, so the equivalent window cannot exist for them —
+    /// <c>QuicListener.ListenAsync</c> is itself the async bind/listen call, with no synchronous
+    /// constructor to take the lock around, so
+    /// <see cref="QuicTransportListener.StartAsync"/> instead rechecks disposal once that await
+    /// completes.
+    /// </summary>
+    /// <remarks>
+    /// DisposeAsync does no I/O when nothing has been published yet, so it reliably completes before
+    /// StartAsync's own await on the real socket bind in practice — reliably enough to exercise the race
+    /// this test targets across repeated attempts, without needing an artificial synchronisation point
+    /// inside StartAsync itself.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task DisposeAsync_RacedAgainstStartAsync_NeverLeavesAnUnpublishedListenerRunning()
+    {
+        if (!System.Net.Quic.QuicListener.IsSupported)
+        {
+            return;
+        }
+
+        const int attempts = 25;
+
+        for (int attempt = 0; attempt < attempts; attempt++)
+        {
+            using X509Certificate2 certificate = TestCertificates.CreateSelfSigned();
+            var listener = new QuicTransportListener(
+                new IPEndPoint(IPAddress.Loopback, 0),
+                new SslServerAuthenticationOptions { ServerCertificate = certificate });
+
+            using var released = new SemaphoreSlim(0, 2);
+
+            Task<Exception?> startTask = Task.Run<Exception?>(async () =>
+            {
+                await released.WaitAsync().ConfigureAwait(false);
+                return await Record.ExceptionAsync(() => listener.StartAsync()).ConfigureAwait(false);
+            });
+
+            Task disposeTask = Task.Run(async () =>
+            {
+                await released.WaitAsync().ConfigureAwait(false);
+                await listener.DisposeAsync().ConfigureAwait(false);
+            });
+
+            released.Release(2);
+
+            await disposeTask.ConfigureAwait(false);
+            Exception? startException = await startTask.ConfigureAwait(false);
+
+            // Whichever way the race resolves, StartAsync either completed normally (it published the
+            // listener before Dispose's teardown ran) or reports the disposal — never anything else, and
+            // never a listener left running that nothing tracks.
+            if (startException is not null)
+            {
+                Assert.IsType<ObjectDisposedException>(startException);
+            }
+
+            await Assert.ThrowsAsync<ObjectDisposedException>(() => listener.AcceptAsync());
+
+            // Idempotent regardless of which side of the race published state that needs tearing down.
+            await listener.DisposeAsync().ConfigureAwait(false);
+        }
+    }
 }

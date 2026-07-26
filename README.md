@@ -364,6 +364,14 @@ must make deliberately.
   reports a real `RemoteEndPoint` and so participates in `MeshHub`'s per-remote-endpoint connection cap
   the same way TCP and WebSocket do.
 
+- **QUIC's negotiation pool has its own, separate per-source cap.** `QuicTransportListener` waits for
+  each connection's first stream off the accept path, bounded by `maxConcurrentNegotiations` (default
+  64) — but unlike the TCP and WebSocket listeners, there is no cheap way to tell a QUIC peer that will
+  eventually open a stream apart from one that never will before actually waiting for it, so a single
+  source completing real handshakes and never sending anything could otherwise occupy that entire pool
+  alone. `maxConcurrentNegotiationsPerSource` (default one eighth of `maxConcurrentNegotiations`) caps
+  how much of it any one source may hold, independently of the global limit.
+
 - **Transport encryption (TLS).** The TCP transport runs cleartext by default and secured when you
   give it TLS options. Pass `SslServerAuthenticationOptions` to the listener and
   `SslClientAuthenticationOptions` to `TcpTransport.ConnectAsync`; the framing is identical either
