@@ -195,4 +195,64 @@ public sealed class UnixSocketTransportListenerTests
 
         Assert.False(File.Exists(path));
     }
+
+    /// <summary>
+    /// The socket file is hardened to owner-only read/write by default, rather than being left at
+    /// whatever the ambient umask happens to produce — the entire access-control model for this
+    /// transport rests on the socket file's permissions, so a permissive default here would silently
+    /// defeat it.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task StartAsync_Default_HardensSocketFileToOwnerOnly()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // POSIX mode bits do not apply on Windows' AF_UNIX support, which uses NTFS ACLs instead.
+            return;
+        }
+
+        string path = TempSocketPath.Create();
+        var listener = new UnixSocketTransportListener(path);
+
+        try
+        {
+            await listener.StartAsync().ConfigureAwait(false);
+
+            UnixFileMode mode = File.GetUnixFileMode(path);
+            Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, mode);
+        }
+        finally
+        {
+            await listener.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// A caller that explicitly needs broader access — a group-shared sidecar layout, say — can widen
+    /// the socket file's mode via the constructor rather than being stuck with the owner-only default.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task StartAsync_CustomSocketFileMode_AppliesIt()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        string path = TempSocketPath.Create();
+        const UnixFileMode customMode = UnixFileMode.UserRead | UnixFileMode.UserWrite
+            | UnixFileMode.GroupRead | UnixFileMode.GroupWrite;
+        var listener = new UnixSocketTransportListener(path, socketFileMode: customMode);
+
+        try
+        {
+            await listener.StartAsync().ConfigureAwait(false);
+
+            Assert.Equal(customMode, File.GetUnixFileMode(path));
+        }
+        finally
+        {
+            await listener.DisposeAsync().ConfigureAwait(false);
+        }
+    }
 }

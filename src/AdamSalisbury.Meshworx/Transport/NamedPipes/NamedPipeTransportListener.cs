@@ -1,4 +1,7 @@
 using System.IO.Pipes;
+using System.Runtime.Versioning;
+using System.Security.AccessControl;
+using System.Security.Principal;
 
 namespace AdamSalisbury.Meshworx.Transport.NamedPipes;
 
@@ -16,6 +19,7 @@ public sealed class NamedPipeTransportListener : ITransportListener
 {
     private readonly string _pipeName;
     private readonly int _maxServerInstances;
+    private readonly PipeSecurity? _pipeSecurity;
 
     // Guards every mutable field below, following the same discipline as TcpTransportListener: each
     // caller takes the state it needs under the lock and then works from locals, and nothing that
@@ -34,9 +38,20 @@ public sealed class NamedPipeTransportListener : ITransportListener
     /// The maximum number of simultaneous instances of this pipe the operating system will allow.
     /// Defaults to <see cref="NamedPipeServerStream.MaxAllowedServerInstances"/>.
     /// </param>
+    /// <param name="pipeSecurity">
+    /// The security descriptor to apply to the pipe, restricting which local principals may open it.
+    /// Left unset, the pipe defaults to permitting only the current user — Windows' own platform
+    /// default for an unspecified <see cref="PipeSecurity"/> is considerably broader (it grants read
+    /// access to the Everyone group and the anonymous account alongside full control to LocalSystem,
+    /// administrators and the creator owner), which would silently defeat this transport's entire
+    /// pipe-name access-control model. Supply your own only for a deployment that genuinely needs a
+    /// different or wider set of principals — for example, several distinct service accounts on the
+    /// same host that all need to reach this pipe.
+    /// </param>
     /// <exception cref="ArgumentException"><paramref name="pipeName"/> is null or empty.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxServerInstances"/> is not positive.</exception>
-    public NamedPipeTransportListener(string pipeName, int? maxServerInstances = null)
+    public NamedPipeTransportListener(
+        string pipeName, int? maxServerInstances = null, PipeSecurity? pipeSecurity = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(pipeName);
 
@@ -48,6 +63,7 @@ public sealed class NamedPipeTransportListener : ITransportListener
 
         _pipeName = pipeName;
         _maxServerInstances = maxServerInstances ?? NamedPipeServerStream.MaxAllowedServerInstances;
+        _pipeSecurity = pipeSecurity;
     }
 
     /// <inheritdoc/>
@@ -101,12 +117,22 @@ public sealed class NamedPipeTransportListener : ITransportListener
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, acceptCts.Token);
 
-        var serverStream = new NamedPipeServerStream(
+        // StartAsync already refused to run at all on a non-Windows platform, so by the time any accept
+        // reaches here the process is guaranteed to be on Windows — the only platform PipeSecurity,
+        // PipeAccessRule and WindowsIdentity are meaningful on. NamedPipeServerStreamAcl.Create is the
+        // ACL-aware factory the System.IO.Pipes.AccessControl package provides in place of the
+        // PipeSecurity-accepting constructor .NET Framework used to have.
+#pragma warning disable CA1416 // Windows-only API: guarded at run time by the platform check in StartAsync.
+        NamedPipeServerStream serverStream = NamedPipeServerStreamAcl.Create(
             _pipeName,
             PipeDirection.InOut,
             _maxServerInstances,
             PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous);
+            PipeOptions.Asynchronous,
+            inBufferSize: 0,
+            outBufferSize: 0,
+            _pipeSecurity ?? CreateCurrentUserOnlyPipeSecurity());
+#pragma warning restore CA1416
         try
         {
             await serverStream.WaitForConnectionAsync(linkedCts.Token).ConfigureAwait(false);
@@ -166,4 +192,29 @@ public sealed class NamedPipeTransportListener : ITransportListener
             acceptCts.Dispose();
         }
     }
+
+    /// <summary>
+    /// Builds a <see cref="PipeSecurity"/> granting full control to the current user only.
+    /// </summary>
+    /// <remarks>
+    /// This is the default used when no <see cref="PipeSecurity"/> is supplied to the constructor.
+    /// Windows' own default for a <see cref="NamedPipeServerStream"/> constructed without one is
+    /// considerably broader — it also grants read access to the Everyone group and the anonymous
+    /// account — which would silently defeat the pipe-name access-control model this transport's
+    /// security relies on. Only reachable on Windows: every call site checks
+    /// <see cref="OperatingSystem.IsWindows"/> first.
+    /// </remarks>
+#pragma warning disable CA1416 // Windows-only API: every caller is already gated on OperatingSystem.IsWindows() in StartAsync.
+    [SupportedOSPlatform("windows")]
+    private static PipeSecurity CreateCurrentUserOnlyPipeSecurity()
+    {
+        SecurityIdentifier currentUser = WindowsIdentity.GetCurrent().User
+            ?? throw new InvalidOperationException("Unable to determine the current user's security identifier.");
+
+        var security = new PipeSecurity();
+        security.AddAccessRule(
+            new PipeAccessRule(currentUser, PipeAccessRights.FullControl, AccessControlType.Allow));
+        return security;
+    }
+#pragma warning restore CA1416
 }

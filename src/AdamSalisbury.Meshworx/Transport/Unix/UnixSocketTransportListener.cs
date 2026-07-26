@@ -14,8 +14,17 @@ namespace AdamSalisbury.Meshworx.Transport.Unix;
 /// </remarks>
 public sealed class UnixSocketTransportListener : ITransportListener
 {
+    // Owner read/write only. Connecting to a Unix domain socket requires write permission on the
+    // socket file (unix(7)), so this is the tightest mode that still lets the listener's own process
+    // (and, on some platforms, only that process) use the socket at all. Left unset, the file's mode
+    // would instead be whatever the hosting process's ambient umask happens to produce — commonly
+    // world- or group-writable — silently defeating the filesystem-permission access control this
+    // transport's whole security model rests on.
+    private static readonly UnixFileMode DefaultSocketFileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+
     private readonly string _path;
     private readonly bool _deleteExistingSocketFile;
+    private readonly UnixFileMode _socketFileMode;
 
     // Guards every mutable field below, following the same discipline as TcpTransportListener: each
     // caller takes the state it needs under the lock and then works from locals, and nothing that
@@ -39,13 +48,22 @@ public sealed class UnixSocketTransportListener : ITransportListener
     /// <see langword="true"/>. The same file is also deleted on <see cref="DisposeAsync"/>, so a clean
     /// shutdown leaves no artefact behind.
     /// </param>
+    /// <param name="socketFileMode">
+    /// The POSIX file mode to apply to the socket file once bound, on platforms that support setting
+    /// one (see <see cref="OperatingSystem.IsWindows"/> — ignored there, since Windows' AF_UNIX support
+    /// uses NTFS ACLs rather than POSIX mode bits). Defaults to owner read/write only, so no other local
+    /// account can connect unless you explicitly widen it here. Only relax this if every other account
+    /// that could reach the path is one you already trust with full access to the mesh.
+    /// </param>
     /// <exception cref="ArgumentException"><paramref name="path"/> is null or empty.</exception>
-    public UnixSocketTransportListener(string path, bool deleteExistingSocketFile = true)
+    public UnixSocketTransportListener(
+        string path, bool deleteExistingSocketFile = true, UnixFileMode? socketFileMode = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
 
         _path = path;
         _deleteExistingSocketFile = deleteExistingSocketFile;
+        _socketFileMode = socketFileMode ?? DefaultSocketFileMode;
     }
 
     /// <inheritdoc/>
@@ -72,6 +90,16 @@ public sealed class UnixSocketTransportListener : ITransportListener
             try
             {
                 socket.Bind(new UnixDomainSocketEndPoint(_path));
+
+                // Harden the socket file's permissions immediately after bind and before Listen, so
+                // there is no window in which the file exists with only the ambient umask's (commonly
+                // far looser) permissions applied. Windows' AF_UNIX support uses NTFS ACLs rather than
+                // POSIX mode bits, so File.SetUnixFileMode is neither meaningful nor supported there.
+                if (!OperatingSystem.IsWindows())
+                {
+                    File.SetUnixFileMode(_path, _socketFileMode);
+                }
+
                 socket.Listen();
             }
             catch

@@ -347,9 +347,15 @@ must make deliberately.
 
 - **Local IPC access control.** `UnixSocketTransportListener` and `NamedPipeTransportListener`
   never cross the network at all, so their access boundary is the operating system's own filesystem
-  permissions on the socket path or pipe name, not anything Meshworx enforces. Set those permissions
-  deliberately — anyone with access to the path can connect — and remember that neither transport
-  offers a TLS option, since encrypting traffic that never leaves the host adds nothing.
+  permissions on the socket path or pipe name, not anything Meshworx enforces at the wire level. Both
+  default to the tightest sensible permission for that boundary rather than leaving it to chance:
+  `UnixSocketTransportListener` hardens its socket file to owner read/write only immediately after
+  binding (an optional `socketFileMode` constructor parameter widens this if you genuinely need
+  another local account to connect), and `NamedPipeTransportListener` creates its pipe with a security
+  descriptor restricted to the current user (an optional `pipeSecurity` constructor parameter
+  overrides this) — Windows' own unrestricted default for a named pipe additionally grants read access
+  to the Everyone group and the anonymous account, which the explicit default here avoids. Neither
+  transport offers a TLS option, since encrypting traffic that never leaves the host adds nothing.
 
 - **Transport encryption (TLS).** The TCP transport runs cleartext by default and secured when you
   give it TLS options. Pass `SslServerAuthenticationOptions` to the listener and
