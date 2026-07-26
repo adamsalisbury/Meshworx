@@ -117,13 +117,31 @@ public static class MeshClientServiceCollectionExtensions
                 : CreateClient(serviceProvider, options);
         });
 
-        services.AddHostedService(serviceProvider => new MeshClientHostedService(
-            clientName,
-            serviceProvider,
-            serviceProvider.GetRequiredService<IOptionsMonitor<MeshClientOptions>>()));
+        // AddHostedService(Func<IServiceProvider, THostedService>) — unlike the type-parameter overload
+        // AddMeshHub uses — has no built-in deduplication, since a factory carries no identity the
+        // framework can compare. Without this guard, calling AddMeshClient twice for the same clientName
+        // would register two hosted services that both try to start the same keyed client, and the second
+        // would throw at host start. The keyed marker mirrors, per client name, what TryAddEnumerable
+        // already gives AddMeshHub for free.
+        if (!services.Any(descriptor =>
+            descriptor.ServiceType == typeof(MeshClientHostedServiceRegistrationMarker)
+            && Equals(descriptor.ServiceKey, clientName)))
+        {
+            services.AddKeyedSingleton<MeshClientHostedServiceRegistrationMarker>(clientName);
+            services.AddHostedService(serviceProvider => new MeshClientHostedService(
+                clientName,
+                serviceProvider,
+                serviceProvider.GetRequiredService<IOptionsMonitor<MeshClientOptions>>()));
+        }
 
         return services;
     }
+
+    /// <summary>
+    /// Marks that <see cref="MeshClientHostedService"/> has already been registered for a given client
+    /// name, so a repeat <c>AddMeshClient</c> call for the same name does not register it again.
+    /// </summary>
+    private sealed class MeshClientHostedServiceRegistrationMarker;
 
     private static MeshClient CreateClient(IServiceProvider serviceProvider, MeshClientOptions options)
     {

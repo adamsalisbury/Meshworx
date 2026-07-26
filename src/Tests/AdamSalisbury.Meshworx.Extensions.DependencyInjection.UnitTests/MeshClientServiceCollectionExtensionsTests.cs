@@ -149,6 +149,19 @@ public sealed class MeshClientServiceCollectionExtensionsTests
         Assert.Same(first, second);
     }
 
+    [Fact]
+    public void AddMeshClient_CalledTwiceForTheSameName_RegistersOnlyOneHostedService()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddMeshClient("Carol");
+        services.AddMeshClient("Carol", options => options.Port = 23456);
+
+        int hostedServiceRegistrations = services.Count(descriptor => descriptor.ServiceType == typeof(IHostedService));
+
+        Assert.Equal(1, hostedServiceRegistrations);
+    }
+
     [Fact(Timeout = 1000)]
     public async Task AddMeshClient_UseReconnector_KeyedClientIsTheReconnectorsManagedClient()
     {
