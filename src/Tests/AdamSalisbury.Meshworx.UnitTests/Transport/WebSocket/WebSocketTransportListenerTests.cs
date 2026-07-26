@@ -131,4 +131,77 @@ public sealed class WebSocketTransportListenerTests
         await listener.DisposeAsync().ConfigureAwait(false);
         await listener.DisposeAsync().ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Disposing the same listener from several threads at once does not throw: no call trips over state
+    /// another has already cleared, and the listener is disposed once they have all returned.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task DisposeAsync_CalledConcurrently_DoesNotThrowAndLeavesListenerDisposed()
+    {
+        const int disposers = 8;
+
+        var listener = new WebSocketTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await listener.StartAsync().ConfigureAwait(false);
+
+        using var start = new SemaphoreSlim(0, disposers);
+        var disposals = new Task[disposers];
+
+        for (int i = 0; i < disposers; i++)
+        {
+            disposals[i] = Task.Run(async () =>
+            {
+                await start.WaitAsync().ConfigureAwait(false);
+                await listener.DisposeAsync().ConfigureAwait(false);
+            });
+        }
+
+        start.Release(disposers);
+
+        await Task.WhenAll(disposals).ConfigureAwait(false);
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => listener.AcceptAsync());
+    }
+
+    /// <summary>
+    /// Repeatedly racing an accept against a dispose only ever ends in the disposal being reported,
+    /// mirroring the same guarantee TcpTransportListener locks in for its own pump-backed AcceptAsync.
+    /// </summary>
+    /// <remarks>
+    /// The accept and the dispose are dispatched to separate threads and released together. Calling them
+    /// in sequence on one thread would not race at all: an accept called first has always registered
+    /// itself before it yields, so it would only ever exercise the pending-accept path.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task AcceptAsync_RacedAgainstDispose_OnlyEverReportsDisposal()
+    {
+        const int attempts = 50;
+
+        for (int attempt = 0; attempt < attempts; attempt++)
+        {
+            var listener = new WebSocketTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+            await listener.StartAsync().ConfigureAwait(false);
+
+            using var released = new SemaphoreSlim(0, 2);
+
+            Task<Exception?> acceptTask = Task.Run<Exception?>(async () =>
+            {
+                await released.WaitAsync().ConfigureAwait(false);
+                return await Record.ExceptionAsync(() => listener.AcceptAsync()).ConfigureAwait(false);
+            });
+
+            Task disposeTask = Task.Run(async () =>
+            {
+                await released.WaitAsync().ConfigureAwait(false);
+                await listener.DisposeAsync().ConfigureAwait(false);
+            });
+
+            released.Release(2);
+
+            await disposeTask.ConfigureAwait(false);
+            Exception? caught = await acceptTask.ConfigureAwait(false);
+
+            Assert.IsType<ObjectDisposedException>(caught);
+        }
+    }
 }
