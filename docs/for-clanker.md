@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 7962961 (branch feature/di-generic-host-integration, PR #70, open) — based on main at 76f9c89, clean working tree
+reconciled-to-commit: 01f109d (branch feat/issue-23-health-checks, PR #71, open) — based on main at 0d0c6ff, clean working tree
 reconciled-to-date: 2026-07-26
 mode: update
 -->
@@ -12,26 +12,41 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `feature/di-generic-host-integration` (open **PR #70**), currently checked
-> out on top of `main` at `76f9c89` (clean working tree, no divergence). **This branch is purely
-> additive**: it adds a second library project, `AdamSalisbury.Meshworx.Extensions.DependencyInjection`
-> (`AddMeshHub` / `AddMeshClient`, registering a hub or client with `Microsoft.Extensions.DependencyInjection`
-> and running it alongside a generic host), plus its own test project, and updates both `.slnx` files,
-> `src/Directory.Packages.props` and `README.md`. **`MeshHub`, `MeshClient`, `MeshClientReconnector` and
-> every transport type are untouched** — confirmed by an empty `git diff main HEAD` on each of those
-> files — so **no `path:line` coordinate anywhere else in this file or in** [hub.md](for-clanker/hub.md),
-> [client.md](for-clanker/client.md), [transport.md](for-clanker/transport.md),
-> [protocol.md](for-clanker/protocol.md), [types.md](for-clanker/types.md) or
-> [known-issues.md](for-clanker/known-issues.md) **needed re-pointing this pass.** The new package is
-> documented in full in [dependency-injection.md](for-clanker/dependency-injection.md); a hosted-service
-> registration bug found during this documentation pass was fixed before merge — see
-> [known-issues.md](for-clanker/known-issues.md) KI-30.
+> **Documented tree:** branch `feat/issue-23-health-checks` (open **PR #71**, closing issue #23), currently
+> checked out on top of `main` at `0d0c6ff` (clean working tree, no divergence). **This branch adds three
+> public `IMeshHub` members and a health-check integration.** `IMeshHub` gains `IsRunning` (`bool`),
+> `MaxClients` (`int` — the constructor parameter was already stored in a private field; it is now also a
+> public getter) and `ClaimedClientSlots` (`int` — the pre-existing `_reservedClientSlots` counter, now
+> exposed: it is what admission is actually enforced against, not `ConnectedClientCount`), all implemented
+> on `MeshHub`. Alongside that, the existing `AdamSalisbury.Meshworx.Extensions.DependencyInjection`
+> package gains a health-check integration against `Microsoft.Extensions.Diagnostics.HealthChecks`:
+> `AddMeshHub`/`MeshHubHealthCheck` and `AddMeshClient`/`MeshClientHealthCheck` extension methods on
+> `IHealthChecksBuilder`. Full write-up in
+> [dependency-injection.md](for-clanker/dependency-injection.md#health-checks); an
+> HTTP-endpoint-exposure caveat for consumers who map these checks to a health endpoint is recorded as
+> [known-issues.md](for-clanker/known-issues.md) KI-31.
 >
-> The unbounded-resource-consumption-defaults fix (PR #68, closing issue #16) — draft at the time of the
-> previous pass — **has since merged as `76f9c89`**, which is the `main` commit this branch is built on.
-> The `MeshHub.cs`/`MeshHubTests.cs`/`TcpTransport.cs` coordinates below were already re-pointed against
-> that branch's own tree in the previous pass, and a diff against the merged commit confirms they are
-> unchanged, so nothing needed correcting. In summary: `maxClients` defaults to **1000** (was
+> **`MeshHub.cs` itself shifted**, because `private readonly int _maxClients` (removed) is now the
+> `MaxClients` auto-property (added, with `IsRunning` and `ClaimedClientSlots`, 18 net new lines): every
+> coordinate from the old field's line up to the insertion point shifted by **−1**, and every coordinate
+> from the insertion point onward shifted by **+17**. Both shifts were recomputed against the actual
+> source, line by line, for every citation below and in [hub.md](for-clanker/hub.md),
+> [known-issues.md](for-clanker/known-issues.md), [protocol.md](for-clanker/protocol.md),
+> [types.md](for-clanker/types.md), [transport.md](for-clanker/transport.md) and
+> [testing.md](for-clanker/testing.md) — this pass touched every `MeshHub.cs:` coordinate in the set, even
+> where the surrounding prose describes unrelated, untouched behaviour. `IMeshHub.cs`, `MeshClient.cs`,
+> `MeshClientReconnector.cs` and every transport type are otherwise untouched by this branch, so
+> [client.md](for-clanker/client.md) and [transport.md](for-clanker/transport.md)'s own coordinates needed
+> no changes beyond the `MeshHub.cs` ones transport.md happens to cite.
+>
+> The dependency-injection and generic-host integration work (PR #70, closing issue #22) — open at the
+> time of the previous pass — **has since merged as `0d0c6ff`**, which is the `main` commit this branch is
+> built on. It was purely additive as described below, and confirmed unchanged against the merged commit,
+> so nothing in [dependency-injection.md](for-clanker/dependency-injection.md) needed correcting beyond
+> updating its own "currently open" references to describe `main` directly.
+>
+> The unbounded-resource-consumption-defaults fix (PR #68, closing issue #16) merged as `76f9c89`, which is
+> the `main` commit PR #70 was built on. In summary: `maxClients` defaults to **1000** (was
 > `int.MaxValue`/unlimited); `heartbeatInterval` defaults to **30 s** (was `null`/disabled), with
 > `Timeout.InfiniteTimeSpan` as the explicit opt-out sentinel; a new `maxConnectionsPerRemoteEndpoint`
 > constructor parameter (default **100**) caps connections from a single remote address, backed by a new
@@ -115,9 +130,19 @@ rather than read directly, it says so.
 > resolve to unrelated lines. Names and behaviour are accurate throughout; jump by symbol, not by line.
 >
 > Every `MeshHub.cs`, `MeshHubTests.cs`, `TcpTransport.cs`, `ITransportListener.cs`,
-> `TcpTransportListener.cs` and `InMemoryTransportListener.cs` coordinate is current. The `MeshHub.cs`
+> `TcpTransportListener.cs` and `InMemoryTransportListener.cs` coordinate is current. The `MeshHub.cs` and
+> `MeshHubTests.cs` sets were most recently re-pointed in full for **PR #71** (issue #23, this pass — see
+> the top of this document): `MeshHub.cs` lost one field (`_maxClients`, folded into the new `MaxClients`
+> auto-property) and gained 18 net new lines (`IsRunning`, `MaxClients`, `ClaimedClientSlots`) right after
+> `ConnectedClientCount`, which shifted every coordinate between the removed field and that insertion
+> point by **−1** and every coordinate from the insertion point onward by **+17**.
+> `MeshHubTests.cs` gained 46 lines of new tests (`IsRunning`/`MaxClients` coverage) inserted after its
+> existing `ConnectedClientCount` tests, shifting every coordinate below that point by the same amount;
+> coordinates above it (mostly the lifecycle-concurrency tests near the top of the file) are unchanged.
+> Both were re-pointed line by line against the source, not by a single computed offset, exactly as the
+> PR #68 pass below describes doing for its own, differently-shaped change. Before PR #71, the `MeshHub.cs`
 > and `MeshHubTests.cs` sets were most recently re-pointed in full for **PR #68** (issue #16, merged as
-> `76f9c89` — see above): `MeshHub.cs` gained ~270 lines across new constructor
+> `76f9c89`): `MeshHub.cs` gained ~270 lines across new constructor
 > defaults, validation, an `internal` testing accessor and the whole per-remote-endpoint cap (new
 > constants, a new field, `AcceptLoopAsync`'s cap check, and five new private helpers inserted before
 > `HandleClientAsync`), which shifted every coordinate below the new `DefaultMaxClients` constant by
@@ -127,11 +152,11 @@ rather than read directly, it says so.
 > (before the "unsupported protocol version" region), shifting everything after that insertion point by
 > the same amount. `TcpTransport.cs` was re-pointed for the same PR, which added the
 > `IRemoteEndPointTransport` implementation (+1 line from a new `using`, +9 more from the `RemoteEndPoint`
-> property and its XML doc, from `IsEncrypted` onward). Before PR #68, the `MeshHub.cs` set was re-pointed
-> in full for PR #66, which moved everything below its new `_groupAuthoriser` field and rewrote the group
-> helpers wholesale, the `MeshHubTests.cs` set likewise (PR #66 appended its tests but also added a
-> `using`, shifting every pre-existing coordinate by one), and the listener sets were re-pointed in full
-> for PR #63 and remain untouched by PR #68.
+> property and its XML doc, from `IsEncrypted` onward) and **remains untouched by PR #71**. Before PR #68,
+> the `MeshHub.cs` set was re-pointed in full for PR #66, which moved everything below its new
+> `_groupAuthoriser` field and rewrote the group helpers wholesale, the `MeshHubTests.cs` set likewise
+> (PR #66 appended its tests but also added a `using`, shifting every pre-existing coordinate by one), and
+> the listener sets were re-pointed in full for PR #63 and remain untouched by PR #68 or PR #71.
 
 ---
 
@@ -352,21 +377,21 @@ deadlocks or dropped messages that tests may not catch.
   `DisposeAsync` must be idempotent, safe to call concurrently, and return only once teardown is
   complete (`Transport/ITransportListener.cs:6-22`). The type matters:
   `MeshHub.AcceptLoopAsync` stops on `ObjectDisposedException` but logs-and-retries **without delay**
-  on anything else (`MeshHub.cs:587-595`), so a finished listener that reports itself any other way
+  on anything else (`MeshHub.cs:604-612`), so a finished listener that reports itself any other way
   spins the hub hot. See [known-issues.md](for-clanker/known-issues.md) KI-22.
 - **Hub lifecycle is serialised behind one lock.** `MeshHub.StartAsync`, `StopAsync` and `DisposeAsync`
   may all be called concurrently. Every lifecycle field (`_cts`, `_acceptLoopTask`, `_stopTask`,
-  `_disposeTask`, `_starting`, `_disposed`) is guarded by `Lock _stateLock` (`MeshHub.cs:89`), and each
+  `_disposeTask`, `_starting`, `_disposed`) is guarded by `Lock _stateLock` (`MeshHub.cs:88`), and each
   entry point **captures what it needs once into locals and never awaits while holding the lock**.
-  `StopAsync` is deliberately **not `async`** (`MeshHub.cs:382`): it decides synchronously under the
+  `StopAsync` is deliberately **not `async`** (`MeshHub.cs:381`): it decides synchronously under the
   lock, so overlapping callers provably share one shutdown — clients are notified once, and every caller
   returns only when the hub has actually stopped. Do not re-read a lifecycle field outside the lock and
   do not make `StopAsync` `async` again. See [hub.md](for-clanker/hub.md#lifecycle) and
   [known-issues.md](for-clanker/known-issues.md) KI-23.
 - **Client admission is an atomic claim, not a count check.** `maxClients` is enforced against
-  `_reservedClientSlots` (`MeshHub.cs:75`), which a registration takes with a single compare-and-swap
-  (`TryReserveClientSlot`, `MeshHub.cs:1081`) and gives back in its handler's `finally`
-  (`MeshHub.cs:1043-1046`). The claim sits **after** the authenticator so an unauthenticated peer cannot
+  `_reservedClientSlots` (`MeshHub.cs:74`), which a registration takes with a single compare-and-swap
+  (`TryReserveClientSlot`, `MeshHub.cs:1098`) and gives back in its handler's `finally`
+  (`MeshHub.cs:1060-1063`). The claim sits **after** the authenticator so an unauthenticated peer cannot
   hold capacity, with a cheap at-capacity early-out **before** it so a full hub still never runs the
   callback. Consequence for any code you write here: `ConnectedClientCount` can transiently read *below*
   the number of claimed slots, so never gate admission on it. See
@@ -375,17 +400,17 @@ deadlocks or dropped messages that tests may not catch.
 - **A second, independent cap bounds connections per remote address, checked in the accept loop before
   any handler exists.** `maxConnectionsPerRemoteEndpoint` guards the pre-registration window
   `maxClients` cannot see — a connection flood that never completes a handshake — via a CAS claim
-  (`TryReserveEndpointSlot`, `MeshHub.cs:705`) against a `ConcurrentDictionary<IPAddress, int>`
-  (`MeshHub.cs:56`) keyed on the transport's `IRemoteEndPointTransport.RemoteEndPoint` (only checked when
+  (`TryReserveEndpointSlot`, `MeshHub.cs:722`) against a `ConcurrentDictionary<IPAddress, int>`
+  (`MeshHub.cs:55`) keyed on the transport's `IRemoteEndPointTransport.RemoteEndPoint` (only checked when
   the transport reports one). Refused connections are disposed immediately, before any registration
-  frame is read (`AcceptLoopAsync`, `MeshHub.cs:602-612`). Added by PR #68 (issue #16). See
+  frame is read (`AcceptLoopAsync`, `MeshHub.cs:619-629`). Added by PR #68 (issue #16). See
   [hub.md](for-clanker/hub.md#per-remote-endpoint-connection-cap) and
   [known-issues.md](for-clanker/known-issues.md) KI-29.
 - **Group membership is the hub's only enforceable boundary, and the join gate is an awaited callback.**
   A group send is dropped unless the sender is in the group — tested **inside** the group's lock
-  (`MeshHub.cs:1666`) so a sender removed concurrently cannot slip through. A join, when a
+  (`MeshHub.cs:1683`) so a sender removed concurrently cannot slip through. A join, when a
   `GroupAuthoriser` is configured, awaits that callback **from the calling client's own receive loop**
-  (`MeshHub.cs:926-927`), which therefore reads nothing else from that client until it returns. Two
+  (`MeshHub.cs:943-944`), which therefore reads nothing else from that client until it returns. Two
   consequences: a slow authoriser stalls only its own client, and a client parked on a decision looks
   idle to the heartbeat monitor and can be evicted mid-decision. Keep integrator awaits out of
   `Group.Lock`. See [hub.md](for-clanker/hub.md#group-authorisation) and
@@ -425,7 +450,7 @@ deadlocks or dropped messages that tests may not catch.
 There is **no config file, no environment variables, no external services**. Everything is configured
 through constructor parameters. The only ambient dependency is an `ILogger<T>` you supply.
 
-**`MeshHub` options** (`MeshHub.cs:154-249`, all optional):
+**`MeshHub` options** (`MeshHub.cs:153-248`, all optional):
 
 | Param | Default | Effect |
 |---|---|---|
@@ -490,8 +515,8 @@ full house style; the points below are the ones the code actually enforces and d
 - **Guard clauses first:** `ArgumentNullException.ThrowIfNull`, `ArgumentException.ThrowIfNullOrEmpty`,
   explicit range checks. Every public entry point does this.
 - **Catch specific exceptions.** Broad `catch (Exception)` appears **only** at loop/callback boundaries
-  and is always logged with a comment explaining why it is intentional (e.g. `MeshHub.cs:587-595`,
-  `:1222`, and the three catches in `AuthenticateAsync` `:1167-1191`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
+  and is always logged with a comment explaining why it is intentional (e.g. `MeshHub.cs:604-612`,
+  `:1239`, and the three catches in `AuthenticateAsync` `:1184-1208`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
 - **No blocking, no `.Result`.** `CA2007` (ConfigureAwait) is a build error in the library.
 - **Binary wire work uses `System.Buffers.Binary.BinaryPrimitives`** (big-endian) and
   `Guid.TryWriteBytes` / `new Guid(span)` for the 16-byte ids. Frame buffers on hot paths are rented

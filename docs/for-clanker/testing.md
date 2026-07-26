@@ -7,12 +7,13 @@ The test suite is the best source of **intended usage** and the required place t
 wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test names), `CA2007`, and
 `xUnit1030`.
 
-**A second, separate suite** covers the DI/hosting package (PR #70):
+**A second, separate suite** covers the DI/hosting package (PR #70, plus health checks added by PR #71):
 `src/Tests/AdamSalisbury.Meshworx.Extensions.DependencyInjection.UnitTests`, same stack and
-`NoWarn` set, three files —
-`MeshHubServiceCollectionExtensionsTests.cs` (202 lines), `MeshClientServiceCollectionExtensionsTests.cs`
-(276 lines) and `MeshHubHostedServiceTests.cs` (30 lines). Most tests build a
-`ServiceCollection`/`ServiceProvider` or a real `HostBuilder`/`IHost` directly, mocking only
+`NoWarn` set, seven files —
+`MeshHubServiceCollectionExtensionsTests.cs`, `MeshClientServiceCollectionExtensionsTests.cs`,
+`MeshHubHostedServiceTests.cs`, `MeshHubHealthCheckTests.cs`, `MeshClientHealthCheckTests.cs`,
+`MeshHubHealthCheckBuilderExtensionsTests.cs` and `MeshClientHealthCheckBuilderExtensionsTests.cs`. Most
+tests build a `ServiceCollection`/`ServiceProvider` or a real `HostBuilder`/`IHost` directly, mocking only
 `ITransportListener`/`IMeshHub`/`ILogger`; the hosted-service **lifecycle** tests (host start/stop
 connecting and disconnecting a client) run against a real `MeshHub` over `InMemoryTransport` rather than
 a mock, because `ConnectAsync` performs a genuine registration handshake a bare transport mock cannot
@@ -23,13 +24,25 @@ covers the double-registration guard described in [known-issues.md](known-issues
 framework itself (`AddHostedService<T>()`) rather than by anything this repo wrote. See
 [dependency-injection.md](dependency-injection.md) for what the package does.
 
+**The health-check test files follow the same "mock for unit behaviour, real object for the end-to-end
+flip" split as the rest of the suite.** `MeshHubHealthCheckTests.cs`/`MeshClientHealthCheckTests.cs` test
+`MeshHubHealthCheck`/`MeshClientHealthCheck` directly against a mocked `IMeshHub`/`IMeshClient` resolved
+from a small `ServiceProvider`, including a not-registered case that asserts
+`CheckHealthAsync` throws `InvalidOperationException` (proving the health check service, not the check
+itself, is what turns that into a status — see [dependency-injection.md](dependency-injection.md#health-checks)).
+`MeshHubHealthCheckBuilderExtensionsTests.cs`/`MeshClientHealthCheckBuilderExtensionsTests.cs` test
+`AddMeshHub`/`AddMeshClient` through a real `HealthCheckService`, including one test each that drives a
+**real** `MeshHub`/`MeshClient` through its actual start/stop or connect/disconnect lifecycle and asserts
+the reported `HealthStatus` flips `Unhealthy` → `Healthy` → `Unhealthy` — the acceptance criteria from
+issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand in for the real thing.
+
 ## Layout
 
 | File | Lines | Covers |
 |---|---|---|
 | `Fixtures/MeshHubFixture.cs` | 304 | Hub test harness (mock listener/transport, register helpers, **authenticator and group-authoriser pass-throughs**, group/lookup/direct frame builders, `FrameRecorder`) |
 | `Fixtures/MeshClientFixture.cs` | 118 | Client test harness (mock transport, scripted receive, **`CreateGroupJoinRefusal`**) |
-| `MeshHubTests.cs` | 2498 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, **capacity claim/release under a concurrent registration**, **groups as an authorisation boundary**, lifecycle, **concurrent stop/dispose and start-vs-stop races** |
+| `MeshHubTests.cs` | 2498 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, **capacity claim/release under a concurrent registration**, **groups as an authorisation boundary**, lifecycle, **concurrent stop/dispose and start-vs-stop races**, **`IsRunning`/`MaxClients` accessors (PR #71)** |
 | `MeshClientTests.cs` | 1602 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race**, **group-join refusal handling** |
 | `MeshClientReconnectorTests.cs` | 944 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal**, **restored membership re-authorised by the hub**, **the documented `Reconnected` handler idiom containing a post-suspension failure** |
 | `MeshIntegrationTests.cs` | 481 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** and **non-member/unauthorised group paths** |
@@ -85,7 +98,7 @@ framework itself (`AddHostedService<T>()`) rather than by anything this repo wro
   ([known-issues.md](known-issues.md) KI-22). Copy this shape whenever a guard is written against
   undocumented platform behaviour.
 - **When the bug is "one interval late", assert a count, not an outcome.** The heartbeat tests
-  (`MeshHubTests.cs:2057`, `:2105`) do not merely assert that a silent client was evicted — that passes
+  (`MeshHubTests.cs:2103`, `:2151`) do not merely assert that a silent client was evicted — that passes
   whether eviction fires on the Nth or the (N+1)th interval, which was exactly the KI-11 defect. They
   count `Ping` frames in the mock's `SendAsync` callback and **snapshot the count inside the
   `DisposeAsync` setup**, so the teardown itself latches the value and no later write can inflate it,
@@ -93,7 +106,7 @@ framework itself (`AddHostedService<T>()`) rather than by anything this repo wro
   `DisposeAsync` callback to wait for eviction rather than sleeping. Copy this shape for any timing
   contract where the wrong answer is still a *plausible* answer. The complementary direction — a client
   that keeps sending is never evicted — is `HandleClient_ClientSendingFramesEveryInterval_IsNotEvicted`
-  (`:2149`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
+  (`:2195`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
   interval so a scheduling stall on a loaded runner cannot masquerade as a genuine eviction.
 - **Drive the receive loop with a `Channel`, not `SetupSequence` returning `null`.** A completed/`null`
   receive is now interpreted as a lost connection and triggers teardown. `MeshClientFixture`
@@ -149,7 +162,7 @@ framework itself (`AddHostedService<T>()`) rather than by anything this repo wro
   back. Prefer these over anything timing-based.
 
   1. **To park a caller *inside* a shutdown, hold the mocked `ITransport.SendAsync` open on the
-     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:427-437`) awaits each client's
+     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:426-436`) awaits each client's
      `SendAsync` in turn, and that await sits **after** the caller has claimed the hub's state but
      **before** the shutdown has finished — so returning an incomplete task there pins the hub
      mid-shutdown for as long as the test needs. The helper is already written:
@@ -200,14 +213,14 @@ framework itself (`AddHostedService<T>()`) rather than by anything this repo wro
 - **Assert a resolved default through an `internal` accessor rather than waiting out a real interval.**
   Added with the finite-defaults work in PR #68 (issue #16), and following the same shape as
   `TryReserveClientSlot`/`ReleaseClientSlot` below: `GetHeartbeatIntervalForTesting()`
-  (`MeshHub.cs:529-532`) is `internal` rather than `private` purely so a test can assert what
+  (`MeshHub.cs:546-549`) is `internal` rather than `private` purely so a test can assert what
   `heartbeatInterval` resolved to — including the 30 s default and the
   `Timeout.InfiniteTimeSpan` opt-out — without a real `PeriodicTimer` interval ever having to elapse.
-  `Constructor_HeartbeatIntervalNotSpecified_DefaultsToThirtySeconds` (`MeshHubTests.cs:989`) and
-  `Constructor_HeartbeatIntervalSetToInfinite_DisablesIdleEviction` (`:1002`) are the
+  `Constructor_HeartbeatIntervalNotSpecified_DefaultsToThirtySeconds` (`MeshHubTests.cs:1035`) and
+  `Constructor_HeartbeatIntervalSetToInfinite_DisablesIdleEviction` (`:1048`) are the
   reference pair. Copy this shape — an `internal` read-only accessor plus `InternalsVisibleTo` — for any
   future constructor-resolved default that would otherwise need a real timer/interval to observe.
-  `Constructor_MaxClientsNotSpecified_DefaultsToOneThousand` (`:970`) pins the `maxClients` default the
+  `Constructor_MaxClientsNotSpecified_DefaultsToOneThousand` (`:1016`) pins the `maxClients` default the
   same way, but through `TryReserveClientSlot` directly (claiming it 1000 times) rather than a dedicated
   accessor, since `maxClients` has no equivalent private field worth exposing.
 <a id="per-remote-endpoint-connection-cap"></a>
@@ -217,7 +230,7 @@ framework itself (`AddHostedService<T>()`) rather than by anything this repo wro
   optional `remoteEndPoint` parameter — when given, the mock also implements
   `IRemoteEndPointTransport` and reports it, so it participates in the cap exactly as `TcpTransport`
   does. The four tests under the `// AcceptLoop — per-remote-endpoint connection cap` banner
-  (`MeshHubTests.cs:1040`) are the reference set:
+  (`MeshHubTests.cs:1086`) are the reference set:
   - `AcceptLoop_TooManyConnectionsFromSameAddress_RefusesFurtherConnectionWithoutHandshake` proves the
     refusal happens **before any handshake** — it asserts `ReceiveAsync` was `Times.Never` called on the
     refused mock, not merely that registration failed.
@@ -241,7 +254,7 @@ framework itself (`AddHostedService<T>()`) rather than by anything this repo wro
   before the hub takes its capacity decision — the only window in which the racing state can be staged:
 
   ```csharp
-  // MeshHubTests.cs:824
+  // MeshHubTests.cs:870
   var fixture = new MeshHubFixture(
       maxClients: 1,
       authenticator: async (_, ct) =>
@@ -281,7 +294,7 @@ framework itself (`AddHostedService<T>()`) rather than by anything this repo wro
   certainly will — a direct message to the same client — and because a client's outbound queue is drained
   **in order**, the later frame's arrival proves the earlier one was never queued. Prefer this to a
   settle-and-count wherever the thing you are excluding shares a queue with something you can trigger.
-  See `SendToGroup_SenderIsNotAMember_MessageIsNotDelivered` (`MeshHubTests.cs:2302`).
+  See `SendToGroup_SenderIsNotAMember_MessageIsNotDelivered` (`MeshHubTests.cs:2348`).
 - **Fixture helpers build wire frames by hand** (`CreateRegistrationRequest`, `CreateDeliverMessagePayload`,
   `CreateLookupFound/NotFoundResponse`) with the raw opcodes — a useful cross-check of
   [protocol.md](protocol.md). If you change a frame layout, these helpers must change too.
@@ -298,9 +311,9 @@ framework itself (`AddHostedService<T>()`) rather than by anything this repo wro
 - **Test the group authoriser the same way, through the hub.** `MeshHubFixture` takes `groupAuthoriser`
   and `groupAuthorisationTimeout` (`Fixtures/MeshHubFixture.cs:27-28`). The twelve
   `SendToGroup_*` / `JoinGroup_*` tests under the `// Groups as an authorisation boundary` banner
-  (`MeshHubTests.cs:2282`) are the reference set — they are enumerated in
+  (`MeshHubTests.cs:2328`) are the reference set — they are enumerated in
   [hub.md](hub.md#idiomatic-usage-from-tests). Note the hanging-authoriser test releases its callback at
-  the end (`MeshHubTests.cs:2502`) so an abandoned task does not outlive the test; do the same, because
+  the end (`MeshHubTests.cs:2548`) so an abandoned task does not outlive the test; do the same, because
   the hub's timeout does not stop the callback (KI-28 in [known-issues.md](known-issues.md)).
 - **End-to-end coverage lives in `MeshIntegrationTests.cs`**: `EndToEnd_NonMemberCannotSendToGroup`
   (`:152`) and `EndToEnd_UnauthorisedClientIsRefusedGroupMembership` (`:191`) run the rules over real
