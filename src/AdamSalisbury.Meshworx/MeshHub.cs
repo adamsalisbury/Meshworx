@@ -1515,11 +1515,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
         messageData.CopyTo(deliveryPayload.AsMemory(17));
 
-        // Recorded once per broadcast rather than once per recipient: this counts the message the hub
-        // routed, not the number of deliveries it fanned out to. Each recipient whose queue is full is
-        // still counted separately below as its own dropped message.
-        _messagesRoutedCounter.Add(1, BroadcastDirectionTag);
-        _bytesRoutedCounter.Add(messageData.Length, BroadcastDirectionTag);
+        // Recorded once per broadcast that actually reaches somebody, rather than once per recipient —
+        // this counts the message the hub routed, not the number of deliveries it fanned out to — and
+        // not at all when the sender is the only client connected, mirroring SendToGroup's equivalent
+        // "sender is the group's only member" case. hasRecipient is discovered in the same pass as
+        // delivery, rather than pre-checked via _clients.Count, so this stays a single lock-free
+        // traversal of the registry. Each recipient whose queue is full is still counted separately
+        // below as its own dropped message.
+        bool hasRecipient = false;
 
         foreach (KeyValuePair<Guid, ClientConnection> entry in _clients)
         {
@@ -1529,6 +1532,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 continue;
             }
 
+            hasRecipient = true;
+
             if (!entry.Value.OutboundQueue.Writer.TryWrite(deliveryPayload))
             {
                 _logger.LogWarning(
@@ -1537,6 +1542,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     senderId);
                 _messagesDroppedCounter.Add(1, QueueFullDropTag);
             }
+        }
+
+        if (hasRecipient)
+        {
+            _messagesRoutedCounter.Add(1, BroadcastDirectionTag);
+            _bytesRoutedCounter.Add(messageData.Length, BroadcastDirectionTag);
         }
     }
 

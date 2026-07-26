@@ -553,7 +553,7 @@ component recorded it:
 | Instrument | Kind | Tags | Description |
 |---|---|---|---|
 | `meshworx.hub.clients.connected` | up/down counter | — | Clients currently registered with the hub. |
-| `meshworx.hub.messages.routed` | counter | `direction`: `direct`, `broadcast`, `group` | Messages the hub has routed. A broadcast or group send counts once per call, not once per recipient — it is the message the hub routed, not the number of deliveries it fanned out to. |
+| `meshworx.hub.messages.routed` | counter | `direction`: `direct`, `broadcast`, `group` | Messages the hub has routed. A broadcast or group send counts once per call that reaches at least one recipient, not once per recipient — it is the message the hub routed, not the number of deliveries it fanned out to — and not at all when there was nobody to receive it (the sender was the only client, or the group's only member). |
 | `meshworx.hub.bytes.routed` | counter | `direction`: `direct`, `broadcast`, `group` | Message payload bytes the hub has routed, tagged the same way. |
 | `meshworx.hub.messages.dropped` | counter | `reason`: `unknown-recipient`, `queue-full` | Messages the hub could not deliver: a direct send to a Guid nobody is registered under, or a write to a recipient's outbound queue that was already full. |
 | `meshworx.hub.outbound_queue.depth` | observable gauge | — | The total number of frames currently queued for delivery, summed across every connected client's outbound queue. A single aggregate rather than one series per client, since tagging by client id would give the gauge unbounded cardinality over the hub's lifetime. |

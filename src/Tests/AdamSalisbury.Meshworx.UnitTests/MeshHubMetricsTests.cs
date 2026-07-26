@@ -273,6 +273,39 @@ public sealed class MeshHubMetricsTests
         await fixture.Hub.StopAsync();
     }
 
+    /// <summary>
+    /// A broadcast from a hub's only connected client has nobody to deliver to, so it does not increment
+    /// the routed-messages counter at all — mirroring SendToGroup, which likewise records nothing when
+    /// the sender is the group's only member.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task BroadcastMessage_SenderIsOnlyClient_DoesNotIncrementRoutedCounter()
+    {
+        var fixture = new MeshHubFixture();
+        using var routedCapture = new MetricsCapture<long>(
+            fixture.Hub.GetMeterForTesting(), "meshworx.hub.messages.routed");
+
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var senderFrames = new FrameRecorder(sender.Transport);
+
+        byte[] messageContent = [1, 2, 3];
+        var broadcastFrame = new byte[1 + messageContent.Length];
+        broadcastFrame[0] = 0x0B; // BroadcastMessage
+        messageContent.CopyTo(broadcastFrame, 1);
+        sender.EnqueueMessage(broadcastFrame);
+
+        // Barrier: a lookup processed after the broadcast on the same connection proves the broadcast
+        // itself has already been handled, since the hub processes one client's frames in order.
+        sender.EnqueueMessage(MeshHubFixture.CreateLookupRequest(0, "Sender"));
+        await senderFrames.WaitForAsync(f => f[0] == 0x07).WaitAsync(WaitTimeout); // ClientLookupResponse
+
+        Assert.DoesNotContain(routedCapture.Tags, tags => TagValue(tags, "direction") == "broadcast");
+
+        sender.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // SendToGroup
 
     /// <summary>
