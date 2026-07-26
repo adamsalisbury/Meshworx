@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 63d0a34 (branch feat/issue-18-websocket-transport, PR #78, open) — three commits on top of main at dbb6709, clean working tree
+reconciled-to-commit: 0ea35a8 (branch feat/issue-20-unix-socket-named-pipe-transport, PR #81, open, not yet merged to main) — two commits on top of main at dbb6709, clean working tree
 reconciled-to-date: 2026-07-26
 mode: update
 -->
@@ -12,35 +12,70 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree, this pass:** branch `feat/issue-18-websocket-transport` (open **PR #78**, closing
-> issue #18), three commits on top of `main` at `dbb6709` (merge-base confirmed equal to `main`'s own tip —
-> the branch has no drift from `main`), clean working tree. Diffed with
-> `git diff main...feat/issue-18-websocket-transport --stat`: **six files, all new** —
-> `Transport/WebSocket/WebSocketTransport.cs`, `Transport/WebSocket/WebSocketTransportListener.cs`, three
-> new test files under the equivalent `Transport/WebSocket/` test path, and a README addition. **Nothing
-> else changed** — confirmed from the diff stat directly, not assumed from the PR's own description:
-> `MeshHub.cs`, `MeshClient.cs`, `IMeshClient.cs` and the wire protocol are untouched, so nothing in
-> [hub.md](for-clanker/hub.md), [client.md](for-clanker/client.md), [protocol.md](for-clanker/protocol.md)
-> or [types.md](for-clanker/types.md) needed correcting beyond one line noted below. This branch adds a
-> **fourth transport**, `WebSocketTransport`/`WebSocketTransportListener`
-> (namespace `AdamSalisbury.Meshworx.Transport.WebSocket`) — reachable from a browser and through proxies/
-> firewalls that block arbitrary TCP ports. One WebSocket binary message carries exactly one Meshworx frame
-> (no length prefix needed, unlike TCP); the shared 1 MiB payload cap, `IBatchSendTransport` (per-batch
-> lock, but one WebSocket message per frame — no wire-level coalescing, since WebSocket has no equivalent)
-> and the public `IRemoteEndPointTransport` are all implemented, following the patterns `TcpTransport`
-> already set. `WebSocketTransportListener` reuses `TcpTransportListener.CloneServerOptions` for its TLS
-> option copy and mirrors `TcpTransportListener`'s state-lock discipline and negotiation-pump hardening
-> (zero-byte-read-before-slot-acquisition, polled pending bound, retry-with-delay on transient accept
-> failure) almost exactly — **the one real behavioural difference is that this listener's negotiation pump
-> runs unconditionally, cleartext or not**, because the RFC 6455 HTTP upgrade handshake has to happen off
-> the accept path regardless of TLS, unlike `TcpTransportListener`'s pump, which exists only when TLS is
-> configured (see [known-issues.md](for-clanker/known-issues.md) KI-35). Full write-up in
-> [transport.md](for-clanker/transport.md#websockettransport--transportwebsocketwebsockettransportcs23); a
-> documentation-accuracy mismatch found in the source's own XML doc comments (KI-36, low severity, not a
-> behavioural bug) and an untested edge case in the pipelined-first-frame handling (KI-37) are recorded in
-> [known-issues.md](for-clanker/known-issues.md). [testing.md](for-clanker/testing.md) gained three new
-> rows for the new test files and a note on the conventions they follow, copied deliberately from the TCP
-> transport's own test conventions.
+> **Documented tree, this pass:** branch `feat/issue-20-unix-socket-named-pipe-transport` (open **PR
+> #81**, closing issue #20, **not yet merged to `main`**), two commits on top of `main` at `dbb6709`
+> (merge-base confirmed equal to `main`'s own tip), clean working tree. Diffed with
+> `git diff main...feat/issue-20-unix-socket-named-pipe-transport --stat`: 14 files — five new source
+> files (`Transport/Framing/StreamFramer.cs`, `Transport/Unix/UnixSocketTransport.cs`,
+> `Transport/Unix/UnixSocketTransportListener.cs`, `Transport/NamedPipes/NamedPipeTransport.cs`,
+> `Transport/NamedPipes/NamedPipeTransportListener.cs`), one existing source file refactored
+> (`Transport/Tcp/TcpTransport.cs` — its length-prefixed framing extracted into the new `StreamFramer`,
+> confirmed a **pure, behaviour-preserving refactor**: all 48 pre-existing `Transport/Tcp/*Tests.cs` tests
+> pass unmodified against the delegating implementation, verified by building and running them against
+> this branch during this pass), seven new test files, and a README addition. **`MeshHub.cs`,
+> `MeshClient.cs` and `IMeshClient.cs` are all untouched** — confirmed from the diff stat directly, not
+> assumed from the PR's own description — so nothing in [hub.md](for-clanker/hub.md) or
+> [client.md](for-clanker/client.md) needed correcting. This is **exactly why** the gap noted below
+> (KI-38) is recorded as a known issue rather than fixed: closing it properly requires changing
+> `MeshHub.cs`, which issue #20's own accepted design explicitly scoped out ("new transport only;
+> hub/client untouched").
+>
+> This branch adds a **fifth and sixth transport**, `UnixSocketTransport`/`UnixSocketTransportListener`
+> (namespace `AdamSalisbury.Meshworx.Transport.Unix`, Linux/macOS) and
+> `NamedPipeTransport`/`NamedPipeTransportListener`
+> (namespace `AdamSalisbury.Meshworx.Transport.NamedPipes`, Windows-only — throws
+> `PlatformNotSupportedException` elsewhere) — both for fast, same-host inter-process communication with
+> no open network port, and both framed identically to `TcpTransport` via the new shared
+> `Transport.Framing.StreamFramer` helper (extracted from what was previously `TcpTransport`'s own
+> private framing code). Neither implements `IBatchSendTransport`'s WebSocket-style narrower win — both
+> get `TcpTransport`'s full single-rented-buffer coalescing, since both share its exact framing code.
+> **Neither has a TLS option, and neither implements the public `IRemoteEndPointTransport`** — the first
+> is deliberate (traffic never leaves the host), the second is the source of KI-38 below. Security
+> hardening was added to both listeners during a review pass on this PR, not present in the PR's first
+> commit: `UnixSocketTransportListener` now calls `File.SetUnixFileMode` immediately after `Bind` and
+> before `Listen` to restrict the socket file to owner read/write only by default (an optional
+> `socketFileMode` constructor parameter widens it), and `NamedPipeTransportListener` now creates its
+> server stream via `NamedPipeServerStreamAcl.Create` with an explicit `PipeSecurity` restricted to the
+> current user by default (an optional `pipeSecurity` constructor parameter overrides it) rather than
+> Windows' own broader platform default, which additionally grants read access to the `Everyone` group
+> and the anonymous account. Both suppressions of `CA1416` (the Windows-only-API analyser rule) around
+> the named-pipe ACL calls were checked against the actual runtime guard during this pass — `StartAsync`
+> really does check `OperatingSystem.IsWindows()` before `_acceptCts` is ever assigned, so the
+> suppressions' stated justification holds. Full write-up in
+> [transport.md](for-clanker/transport.md#unixsockettransport--unixsockettransportlistener--transportunix)
+> and
+> [transport.md](for-clanker/transport.md#namedpipetransport--namedpipetransportlistener--transportnamedpipes).
+> Two new known issues are recorded: **KI-38** (high severity, open, deliberately deferred) — neither new
+> transport implements `IRemoteEndPointTransport`, so `maxConnectionsPerRemoteEndpoint` cannot see
+> connections over either one, and a single local peer can claim up to the hub's full `MaxClients` budget
+> instead of the intended per-source ceiling — and **KI-39** (low severity, open) — the
+> `deleteExistingSocketFile` constructor parameter on `UnixSocketTransportListener` doubles up as the
+> switch for delete-on-dispose too, correctly documented but untested for the `false` case. Both are in
+> [known-issues.md](for-clanker/known-issues.md). [testing.md](for-clanker/testing.md) gained seven new
+> rows for the new test files and two new conventions paragraphs — one on the Unix socket transport's
+> `MemoryStream`-driven framing tests (mirroring `TcpTransportTests.cs`'s malformed-frame coverage, since
+> both transports now share the framing code being tested), one on the named-pipe tests being
+> platform-guard-only on this repo's `ubuntu-latest`-only CI.
+>
+> **An unrelated, pre-existing documentation inconsistency was noticed but not corrected in this pass**
+> (out of scope — it predates this branch and this branch does not touch the affected file): the summary
+> table's KI-37 row in [known-issues.md](for-clanker/known-issues.md) states the pipelined-first-WebSocket-
+> frame path now **has** a dedicated regression test and is **fixed**, while that entry's own body text
+> still says the opposite (**no** dedicated test, gap still open). The test the table row names
+> (`WebSocketTransportLoopbackTests.ConnectAndAccept_ClientPipelinesFirstFrameAheadOfUpgradeResponse_LeftoverBytesAreNotLost`)
+> does genuinely exist on `main` — confirmed by this pass — so the table row is the accurate half and the
+> body text is the stale one. A future pass touching `known-issues.md` for its own reasons should
+> reconcile KI-37's body to match its table row.
 >
 > **A note on the PR #74 narrative immediately below: it has since merged to `main`.** `main`'s tip at the
 > time this pass began (and the commit this branch is built on) is `dbb6709`, "feat: structured
@@ -324,8 +359,8 @@ direct-send to any id it holds. Treat the transport boundary as the trust bounda
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
 | Wire protocol version | Negotiated range, currently `4`–`5` (was a fixed `3`, then a `4`–`4` range from PR #73; widened to `5` by PR #74 for the header envelope) | `Messages/Protocol.cs:8`, `:14`, `:21` |
-| Max frame payload (TCP, WebSocket) | 1 MiB (`1024*1024`) each, independent constants | `Transport/Tcp/TcpTransport.cs:29`, `Transport/WebSocket/WebSocketTransport.cs:25` |
-| TCP / WebSocket transport encryption | Optional TLS, **off by default** on both | `Transport/Tcp/TcpTransport.cs:146`, `TcpTransportListener.cs:110`, `Transport/WebSocket/WebSocketTransportListener.cs:112` |
+| Max frame payload | 1 MiB (`1024*1024`). `TcpTransport`/`UnixSocketTransport`/`NamedPipeTransport` share **one** constant (`StreamFramer.MaxPayloadSize`, PR #81); `WebSocketTransport` keeps its own independent constant of the same value | `Transport/Framing/StreamFramer.cs:28`, `Transport/WebSocket/WebSocketTransport.cs:25` |
+| TCP / WebSocket transport encryption | Optional TLS, **off by default** on both. `UnixSocketTransport`/`NamedPipeTransport` (PR #81) have **no TLS option at all** — local-only, access controlled by filesystem/ACL permissions instead | `Transport/Tcp/TcpTransport.cs:142`, `TcpTransportListener.cs:110`, `Transport/WebSocket/WebSocketTransportListener.cs:112` |
 | Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:23` |
 | Warnings as errors | Yes (`Directory.Build.props`) | `src/Directory.Build.props:3` |
 
@@ -479,7 +514,7 @@ receive loops never block on a slow recipient's socket; they just enqueue. See
 |---|---|---|
 | Hub: routing, groups, heartbeat, lifecycle, metrics | `MeshHub`, `IMeshHub` | [hub.md](for-clanker/hub.md#metrics) |
 | Client + reconnection + metrics | `MeshClient`, `IMeshClient`, `MeshClientReconnector` | [client.md](for-clanker/client.md#metrics) |
-| Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `IRemoteEndPointTransport`, `TcpTransport(Listener)`, `WebSocketTransport(Listener)` (PR #78), `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
+| Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `IRemoteEndPointTransport`, `StreamFramer` (PR #81), `TcpTransport(Listener)`, `WebSocketTransport(Listener)` (PR #78), `UnixSocketTransport(Listener)` (PR #81, open), `NamedPipeTransport(Listener)` (PR #81, open), `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
 | Wire protocol & framing | `MessageType`, `Protocol`, handshake, opcode payloads | [protocol.md](for-clanker/protocol.md) |
 | Public value types | event args, `MessageHeaders`, `DisconnectReason`, `RegistrationErrorCode`, `ClientAuthenticator`, `RegistrationContext`, `GroupAuthoriser`, `GroupJoinContext`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
 | DI & generic-host integration | `AddMeshHub`, `AddMeshClient`, `MeshHubOptions`, `MeshClientOptions` | [dependency-injection.md](for-clanker/dependency-injection.md) |
@@ -499,7 +534,8 @@ deadlocks or dropped messages that tests may not catch.
   block on async (`.Result` / `.Wait()`).
 - **`ITransport` contract:** `SendAsync` must be safe to call **concurrently**; `ReceiveAsync` is
   **single-reader** (never called concurrently). Both hub and client rely on this. `TcpTransport`
-  enforces send-concurrency with an internal `SemaphoreSlim` write lock (`TcpTransport.cs:33`).
+  enforces send-concurrency with an internal `SemaphoreSlim` write lock (`TcpTransport.cs:29`), now via
+  the shared `StreamFramer` helper (PR #81) — see [transport.md](for-clanker/transport.md#shared-framing-streamframer-internal--transportframingstreamframercs18).
 - **`ITransportListener` contract:** a listener disposed with an accept still pending must end that
   accept with **`ObjectDisposedException`**, must throw the same for every later accept, and its
   `DisposeAsync` must be idempotent, safe to call concurrently, and return only once teardown is
@@ -644,6 +680,33 @@ ranges the same way the TCP pair does, throwing `ArgumentOutOfRangeException` fo
 timeouts/counts and `ArgumentException` if `tlsOptions` carries no certificate, certificate context, or
 certificate-selection callback.
 
+**`UnixSocketTransportListener` options** (`Transport/Unix/UnixSocketTransportListener.cs:59-67`, all
+optional, added by PR #81 / issue #20, **not yet merged to `main`**):
+
+| Param | Default | Effect |
+|---|---|---|
+| `deleteExistingSocketFile` | `true` | Deletes a stale socket file at `path` before binding (recovers from a crashed previous instance), **and** deletes this instance's own socket file on `DisposeAsync` — one flag controls both; see [known-issues.md](for-clanker/known-issues.md) KI-39 |
+| `socketFileMode` | Owner read/write only (`UserRead \| UserWrite`) | POSIX mode applied to the socket file immediately after bind, before `Listen()`; ignored on Windows (NTFS ACLs apply there instead). Widen only for a local account you already trust with full mesh access |
+
+No TLS parameter — this transport never leaves the host, so there is nothing to secure at that layer.
+Client-side: `UnixSocketTransport.ConnectAsync(path, ct)`. **Does not implement
+`IRemoteEndPointTransport`**, so `maxConnectionsPerRemoteEndpoint` (above) cannot see connections over
+this transport — see [known-issues.md](for-clanker/known-issues.md) KI-38.
+
+**`NamedPipeTransportListener` options** (`Transport/NamedPipes/NamedPipeTransportListener.cs:53-67`,
+all optional, added by PR #81 / issue #20, **not yet merged to `main`**):
+
+| Param | Default | Effect |
+|---|---|---|
+| `maxServerInstances` | `NamedPipeServerStream.MaxAllowedServerInstances` | The operating system's own cap on simultaneous instances of this pipe — not a Meshworx admission control, and unrelated to `maxClients`/`maxConnectionsPerRemoteEndpoint` |
+| `pipeSecurity` | Current user only, full control (`PipeAccessRights.FullControl`) | Windows' own unset-`PipeSecurity` default is considerably broader — it also grants read access to `Everyone` and the anonymous account — so this listener always builds an explicit, narrower one unless you override it |
+
+No TLS parameter, same reasoning as the Unix socket listener. **Windows-only**: both
+`NamedPipeTransport.ConnectAsync` and `NamedPipeTransportListener.StartAsync` throw
+`PlatformNotSupportedException` on every other operating system, checked before any platform-specific
+API runs. Also does **not** implement `IRemoteEndPointTransport` — see
+[known-issues.md](for-clanker/known-issues.md) KI-38.
+
 ---
 
 ## 6. Cross-cutting conventions (imitate these)
@@ -763,6 +826,11 @@ there is no publish step in CI — CI only builds and tests.
   [known-issues.md](for-clanker/known-issues.md) KI-35.
 - **A failed TLS handshake is silent on the listener side** — no log, no exception, the hub simply never
   sees the connection. Diagnose from the client. KI-18.
+- **`UnixSocketTransport`/`NamedPipeTransport` (PR #81, issue #20, open) are invisible to
+  `maxConnectionsPerRemoteEndpoint`.** Neither implements `IRemoteEndPointTransport`, so a hub reached
+  only over a Unix domain socket or a named pipe has no per-source connection cap short of `maxClients`
+  itself — a single local peer with access to the path can claim the whole budget. Deliberately deferred,
+  not a bug to silently "fix" by changing `MeshHub.cs` — see KI-38 before touching this.
 - **Client-name length is checked in `char`s (UTF-16 units), not UTF-8 bytes**, on both sides — a name
   can encode to more bytes than you expect. Names are also case-sensitive and `Ordinal`-compared.
 - **Group membership is fire-and-forget and optimistic on the client.** `JoinGroupAsync` returning means

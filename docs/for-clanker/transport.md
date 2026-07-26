@@ -1,16 +1,24 @@
-# Transports — abstractions, TCP, in-memory
+# Transports — abstractions, TCP, WebSocket, Unix socket, named pipe, in-memory
 
 [← back to index](../for-clanker.md) · related: [hub.md](hub.md) · [client.md](client.md) · [protocol.md](protocol.md) · [known-issues.md](known-issues.md)
 
 The transport layer is the swap point. Hub and client depend only on `ITransport` /
-`ITransportListener`; three concrete implementations ship (`Tcp*`, `WebSocket*` — PR #78, issue #18 —
-`InMemory*`), and you can add your own. A transport is a **dumb, message-oriented pipe** — it owns
-framing but knows nothing about opcodes. The TCP and WebSocket pairs are both optionally
-**TLS-secured**: pass TLS options to the listener and to `TcpTransport.ConnectAsync` /
-`WebSocketTransport.ConnectAsync` and the framing is unchanged, only the byte stream differs
-([Turning TLS on, TCP](#turning-tls-on-both-ends); [Turning TLS on, WebSocket](#turning-tls-on-websocket-both-ends)).
+`ITransportListener`; five concrete implementations ship (`Tcp*`, `WebSocket*` — PR #78, issue #18 —
+`Unix*` and `NamedPipe*` — PR #81, issue #20, **not yet merged to `main`** — `InMemory*`), and you can
+add your own. A transport is a **dumb, message-oriented pipe** — it owns framing but knows nothing
+about opcodes. `TcpTransport`, `UnixSocketTransport` and `NamedPipeTransport` all frame identically
+over a plain `Stream` and now **share one internal helper**, `StreamFramer`, rather than each
+reimplementing the length prefix
+([Shared framing](#shared-framing-streamframer-internal--transportframingstreamframercs18) below). The
+TCP and WebSocket pairs are additionally **TLS-secured**: pass TLS options to the listener and to
+`TcpTransport.ConnectAsync` / `WebSocketTransport.ConnectAsync` and the framing is unchanged, only the
+byte stream differs ([Turning TLS on, TCP](#turning-tls-on-both-ends); [Turning TLS on,
+WebSocket](#turning-tls-on-websocket-both-ends)). `UnixSocketTransport` and `NamedPipeTransport` have
+**no TLS option at all** — they never leave the host, so the operating system's own filesystem/ACL
+access control is the trust boundary instead (see their own sections below).
 
-Namespace `AdamSalisbury.Meshworx.Transport` (+ `.Tcp`, `.WebSocket`, `.InMemory`).
+Namespace `AdamSalisbury.Meshworx.Transport` (+ `.Tcp`, `.WebSocket`, `.Unix`, `.NamedPipes`,
+`.InMemory`, and the internal `.Framing`).
 
 ---
 
@@ -53,7 +61,8 @@ implementation:**
 The exception *type* is load-bearing. `MeshHub.AcceptLoopAsync` uses it to tell **"this listener is
 finished"** (break the loop) from **"that one connection failed"** (log and `continue`), and the retry
 has no delay (`MeshHub.cs:691-699`) — so a listener that is never coming back but reports anything else
-spins the hub's accept loop hot. Both shipped listeners translate accordingly; see
+spins the hub's accept loop hot. All four socket/pipe-backed listeners (`Tcp`, `WebSocket`, `Unix`,
+`NamedPipe`) plus `InMemoryTransportListener` translate accordingly; see
 [known-issues.md](known-issues.md) KI-22.
 
 ### `IBatchSendTransport` (internal) — `Transport/IBatchSendTransport.cs:14`
@@ -65,15 +74,19 @@ Task SendAsync(IReadOnlyList<ReadOnlyMemory<byte>> messages, CancellationToken =
 An **optional capability**. The hub's send loop coalesces a burst of queued frames into one underlying
 write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:1471-1473`);
 transports that don't implement it just receive frames one at a time. It is deliberately **`internal`**:
-only the bundled `TcpTransport`/`WebSocketTransport` benefit and only the in-assembly hub consumes it, so
-it stays off the public `ITransport` surface. Each element is delivered as its own message. **External
-transports cannot and need not implement it.**
+only the bundled stream-oriented/WebSocket transports benefit and only the in-assembly hub consumes it,
+so it stays off the public `ITransport` surface. Each element is delivered as its own message.
+**External transports cannot and need not implement it.**
 
 `WebSocketTransport` implements it too, but gets a narrower win than `TcpTransport`: WebSocket has no
 equivalent of TCP's single-write coalescing, so a batch still costs one WebSocket message per queued
 frame — what it saves is acquiring the write lock **once** for the whole batch rather than once per
 message, which still matters for a fan-out burst (a broadcast or group send). See
 [`WebSocketTransport`](#websockettransport--transportwebsocketwebsockettransportcs23) below.
+
+`UnixSocketTransport` and `NamedPipeTransport` (PR #81, issue #20) implement it too, and — because both
+share `StreamFramer` with `TcpTransport` — get the **same** single-rented-buffer, one-write-one-flush
+coalescing `TcpTransport` gets, not the narrower WebSocket-style win. See their own sections below.
 
 ### `IRemoteEndPointTransport` (public) — `Transport/IRemoteEndPointTransport.cs:16`
 
@@ -99,10 +112,59 @@ single remote address at once (`ExtractRemoteAddress`, `MeshHub.cs:743-748`) —
   custom TCP-like transport and want it subject to `maxConnectionsPerRemoteEndpoint`, implement this
   interface and report the genuine peer address — do not fabricate one, since the hub uses it as the
   cap's dictionary key.
+- **`UnixSocketTransport` and `NamedPipeTransport` do *not* implement it** (PR #81, issue #20). Both are
+  local-only transports with no `IPEndPoint` to report in the first place, so this is not a bug in
+  either transport considered alone — but it does mean **`maxConnectionsPerRemoteEndpoint` is silently
+  inert for both**: a hub reached only over a Unix domain socket or a named pipe has no cap on
+  connections from one source at all, short of `maxClients` itself. See
+  [known-issues.md](known-issues.md) KI-38 and the two transports' own sections below.
 
 ---
 
-## `TcpTransport` — `Transport/Tcp/TcpTransport.cs:26`
+## Shared framing: `StreamFramer` (internal) — `Transport/Framing/StreamFramer.cs:18`
+
+Added by PR #81 (issue #20), factored out of what was previously `TcpTransport`'s own private framing
+code. `internal static class StreamFramer` holds the length-prefixed framing logic **every
+stream-oriented transport in this codebase needs identically**: `TcpTransport`, `UnixSocketTransport`
+and `NamedPipeTransport` all wrap a plain `.NET` `Stream` (a `NetworkStream`/`SslStream`, a
+`NetworkStream` over a Unix domain socket, or a `PipeStream`) and all frame the same way, so this is the
+one place that logic lives rather than three copies of it. `WebSocketTransport` does **not** use it —
+a WebSocket message already delimits one frame, so it needs no length prefix at all (see
+[protocol.md](protocol.md#two-layers-framing-vs-message)).
+
+- **`HeaderSize = 4`** (`:23`), **`MaxPayloadSize = 1024 * 1024`** (`:28`) — the 4-byte big-endian
+  length prefix and the 1 MiB payload cap, both `internal const`. Every transport that shares this
+  helper shares these two numbers; there is now exactly one place to change either.
+- **`SendAsync(stream, writeLock, data, ct)`** (`:38-77`) — the single-frame send: rejects an oversize
+  payload with `ArgumentException` up front (also guards the frame-size addition against overflow),
+  rents the frame buffer from `ArrayPool<byte>.Shared`, writes the header and payload, then writes and
+  flushes **under the caller-supplied `writeLock`**. The lock and the reused header buffer are owned by
+  the caller — this class is stateless — so each transport controls its own concurrency and allocation
+  lifetime exactly as `TcpTransport` did before this helper existed.
+- **`SendBatchAsync(stream, writeLock, messages, ct)`** (`:93-166`) — frames a whole batch into one
+  rented buffer and issues one `WriteAsync` + one `FlushAsync` under the lock. Deliver-then-fault:
+  frames the valid prefix up to the first oversize element, writes it, **then** throws
+  `ArgumentException` for the offending element — so frames coalesced ahead of a bad one are still
+  delivered. Empty batch is a no-op; single-element batch delegates to `SendAsync`.
+- **`ReceiveAsync(stream, headerBuffer, ct)`** (`:179-211`) — reads the 4-byte prefix into the
+  **caller-owned, reused** `headerBuffer` (safe only because every consuming transport is
+  single-reader, per the `ITransport` contract), then allocates a fresh `byte[payloadLength]` for the
+  body. A length `< 0` or `> MaxPayloadSize` throws `IOException` ("Invalid payload length") — the
+  framing is no longer trustworthy, so a receive loop treats it as a transport failure. Length `0`
+  returns `[]`. A clean or mid-frame EOF (`EndOfStreamException` from the private `ReadExactlyAsync`
+  helper, `:213-225`) returns `null`.
+- **Contract:** every method is stateless with respect to the class itself — all mutable state (the
+  stream, the write lock, the header buffer) is passed in by the caller on every call. This is what lets
+  three unrelated transport implementations share the code safely without sharing an instance.
+
+**Verified behaviourally unchanged for `TcpTransport`:** the extraction was a pure refactor — the 48
+existing `Transport/Tcp/*Tests.cs` tests pass unmodified against the delegating implementation, and the
+byte-for-byte framing (header layout, cap, error types) is identical to what `TcpTransport` implemented
+inline before this branch.
+
+---
+
+## `TcpTransport` — `Transport/Tcp/TcpTransport.cs:25`
 
 `public sealed class TcpTransport : ITransport, IBatchSendTransport, IRemoteEndPointTransport`.
 Length-prefixed framing over a
@@ -111,48 +173,59 @@ arbitrary `Stream` via an internal ctor used by loopback tests.
 
 ### Framing
 
-Every message: **4-byte big-endian length prefix** (`HeaderSize=4`, `TcpTransport.cs:28`) followed by
-the payload. `MaxPayloadSize = 1 MiB` (`:29`). See [protocol.md](protocol.md) for the byte layout.
-**TLS does not change the framing** — the identical frames simply travel inside the TLS record layer,
-so every send/receive path below behaves the same either way.
+Every message: **4-byte big-endian length prefix** followed by the payload, capped at **1 MiB**. Since
+PR #81 (issue #20) this is no longer implemented inline here — `TcpTransport` delegates every send/
+receive to the shared
+[`StreamFramer`](#shared-framing-streamframer-internal--transportframingstreamframercs18) helper
+(`StreamFramer.HeaderSize`/`StreamFramer.MaxPayloadSize`, `Transport/Framing/StreamFramer.cs:23`,
+`:28`), which is also what `UnixSocketTransport` and `NamedPipeTransport` now use. See
+[protocol.md](protocol.md) for the byte layout. **TLS does not change the framing** — the identical
+frames simply travel inside the TLS record layer, so every send/receive path below behaves the same
+either way.
 
 ### Behaviour
 
-- **`RemoteEndPoint`** (`:70`) — `public EndPoint?`; the `IRemoteEndPointTransport` implementation.
+- **`RemoteEndPoint`** (`:66`) — `public EndPoint?`; the `IRemoteEndPointTransport` implementation.
   `null` only for the internal `Stream`-only constructor tests use; every socket-backed instance reports
   `TcpClient.Client.RemoteEndPoint`. See [IRemoteEndPointTransport](#iremoteendpointtransport-public--transportiremoteendpointtransportcs16)
   above.
-- **`ConnectAsync(host, port, ct)`** (`:86`) — static factory; sets `NoDelay = true`, connects, returns
+- **`ConnectAsync(host, port, ct)`** (`:82`) — static factory; sets `NoDelay = true`, connects, returns
   a ready **cleartext** transport. Disposes the socket if connect throws.
-- **`ConnectAsync(host, port, SslClientAuthenticationOptions, ct)`** (`:146`) — the TLS factory.
+- **`ConnectAsync(host, port, SslClientAuthenticationOptions, ct)`** (`:142`) — the TLS factory.
   Connects, wraps the `NetworkStream` in an `SslStream` (`leaveInnerStreamOpen: false`), runs
   `AuthenticateAsClientAsync`, and returns a transport over the authenticated stream. `tlsOptions` is
   **required** and non-null (`ArgumentNullException` otherwise) — use the cleartext overload if you do
   not want TLS. A failed handshake surfaces as `AuthenticationException`; on any throw the `SslStream`
-  is disposed **before** the `TcpClient` (`:171-182`) so the partially negotiated session unwinds before
+  is disposed **before** the `TcpClient` (`:167-178`) so the partially negotiated session unwinds before
   the socket goes away.
   - **The handshake is bounded only by your `cancellationToken`.** There is no built-in client-side
     handshake timeout (unlike the listener's). Pass a token that expires if a hostile or dead peer must
     not be able to stall the caller indefinitely.
-- **`IsEncrypted`** (`:62`) — `public bool`; true only when the underlying stream is an `SslStream` with
+- **`IsEncrypted`** (`:58`) — `public bool`; true only when the underlying stream is an `SslStream` with
   `IsEncrypted` set. Cheap; intended for a start-up/health assertion that a deployment really is
   encrypted.
-- **`SendAsync(single)`** (`:230`) — rejects payloads over 1 MiB with `ArgumentException` **before**
-  writing (also guards the size addition against overflow). Rents the frame buffer from
-  `ArrayPool<byte>.Shared`, writes header+payload, then **writes and flushes under an internal
-  `SemaphoreSlim` write lock** — this is what makes concurrent `SendAsync` safe.
-- **`SendAsync(batch)`** (`:273`) — frames the whole batch into one rented buffer, one `WriteAsync` +
-  one `FlushAsync` under the write lock. Subtlety: if a payload in the batch is oversize, it frames and
-  writes the **valid prefix up to** the first oversize frame, **then throws** — preserving the
-  single-send "deliver-then-fault" behaviour so coalesced frames ahead of the bad one still go out
-  (`:290-347`). Empty batch is a no-op; single-element batch delegates to the scalar path.
-- **`ReceiveAsync`** (`:351`) — reads the 4-byte prefix into a **reused** `_headerBuffer` (safe because
-  single-reader), then allocates a fresh `byte[payloadLength]` for the body and returns it. A length
-  `< 0` or `> 1 MiB` throws `IOException` ("Invalid payload length") — framing is no longer trustworthy,
-  so receive loops treat it as a transport failure and close cleanly. Length `0` returns `[]`. A clean
-  or mid-frame EOF (`EndOfStreamException` in `ReadExactlyAsync`, `:400`) returns `null`.
-- **`DisposeAsync`** (`:386`) — disposes the stream (the `SslStream` when TLS is in use, which closes
-  the `NetworkStream` it owns), the `TcpClient` (if owned), and the write lock.
+- **`SendAsync(single)`** (`:226-229`) — a one-line delegation to `StreamFramer.SendAsync(_stream,
+  _writeLock, data, cancellationToken)`. Oversize rejection, the `ArrayPool` rental and the write-lock
+  discipline all now live in the shared helper — see
+  [Shared framing](#shared-framing-streamframer-internal--transportframingstreamframercs18) above for
+  exactly what it does; the behaviour is unchanged from before the extraction.
+- **`SendAsync(batch)`** (`:237-242`) — likewise delegates to `StreamFramer.SendBatchAsync`. Same
+  deliver-then-fault semantics as before: coalesced frames ahead of an oversize element are still sent
+  before the batch throws `ArgumentException`. Empty batch is a no-op; single-element batch delegates to
+  the scalar path (inside `StreamFramer` now, not here).
+- **`ReceiveAsync`** (`:245-250`) — delegates to `StreamFramer.ReceiveAsync(_stream, _headerBuffer,
+  cancellationToken)`. `_headerBuffer` (`:33`) is still owned and reused by `TcpTransport` itself — only
+  the read logic moved, not the buffer's lifetime — which is what keeps this transport's
+  single-reader-safe reuse guarantee intact. A length `< 0` or `> 1 MiB` throws `IOException` ("Invalid
+  payload length"); length `0` returns `[]`; a clean or mid-frame EOF returns `null`.
+- **`DisposeAsync`** (`:253-258`) — disposes the stream (the `SslStream` when TLS is in use, which
+  closes the `NetworkStream` it owns), the `TcpClient` (if owned), and the write lock. Unaffected by the
+  framing extraction.
+
+> **If you are reading this transport to learn the framing shape for a new stream-oriented transport,
+> read [`StreamFramer`](#shared-framing-streamframer-internal--transportframingstreamframercs18)
+> instead** — that is where the logic actually lives now; this section only covers what is still
+> genuinely `TcpTransport`'s own (the socket/TLS plumbing, `IsEncrypted`, `RemoteEndPoint`).
 
 ### `CloneClientOptions` (internal) — `:194`
 
@@ -194,8 +267,8 @@ The copy is **shallow**. Mutating an object you passed in — the `ClientCertifi
 - **Leave `EnabledSslProtocols` at its default** (`SslProtocols.None`) so the platform negotiates its
   best available version rather than a pinned, ageing one. `CertificateRevocationCheckMode` is passed
   through untouched, so revocation is **not** checked unless you ask for it.
-- Internal ctors (`TcpTransport(TcpClient)` `:39`, `TcpTransport(Stream)` `:44`,
-  `TcpTransport(TcpClient, Stream)` `:49` — the last used by both TLS paths to pair the socket with its
+- Internal ctors (`TcpTransport(TcpClient)` `:35`, `TcpTransport(Stream)` `:40`,
+  `TcpTransport(TcpClient, Stream)` `:45` — the last used by both TLS paths to pair the socket with its
   `SslStream`) are `internal` and reached by the listener and by `InternalsVisibleTo` tests; not part of
   the public API. The `Stream`-only constructor is also the one case where `RemoteEndPoint` returns
   `null` — see [Behaviour](#behaviour) above.
@@ -679,6 +752,246 @@ actual `MeshHub`/`MeshClient`.
 
 ---
 
+## `UnixSocketTransport` / `UnixSocketTransportListener` — `Transport/Unix/`
+
+Added by PR #81 (issue #20), **not yet merged to `main`**. Fast, portless, same-host inter-process
+communication on Linux and macOS — a sidecar process, or a multi-process desktop/daemon layout, where
+opening a loopback TCP port is unnecessary overhead. Framing is the [shared `StreamFramer`
+helper](#shared-framing-streamframer-internal--transportframingstreamframercs18) — identical to
+`TcpTransport`'s. **There is no TLS option here at all** (unlike TCP/WebSocket): a Unix domain socket
+never leaves the host, so the trust boundary is the operating system's filesystem permissions on the
+socket path, not a cryptographic one.
+
+### `UnixSocketTransport` — `Transport/Unix/UnixSocketTransport.cs:22`
+
+`public sealed class UnixSocketTransport : ITransport, IBatchSendTransport` — **note, no
+`IRemoteEndPointTransport`** (see [Gotchas](#gotchas-3) below).
+
+- **`ConnectAsync(path, ct)`** (`:56-73`) — static factory. Creates a raw `Socket`
+  (`AddressFamily.Unix`, `SocketType.Stream`), connects to a `UnixDomainSocketEndPoint(path)`, wraps it
+  in a `NetworkStream(socket, ownsSocket: true)`. `ArgumentException` for a null/empty `path`. Disposes
+  the socket if the connect throws.
+- **`SendAsync(single)`** (`:76-79`), **`SendAsync(batch)`** (`:88-93`), **`ReceiveAsync`** (`:96-99`) —
+  each a one-line delegation to `StreamFramer`, exactly like `TcpTransport`'s equivalents. Same 1 MiB
+  cap, same deliver-then-fault batch semantics, same `IOException`-on-corrupt-length/`null`-on-EOF
+  receive contract.
+- **`DisposeAsync`** (`:102-107`) — disposes the stream (which owns and disposes the socket), then the
+  write lock.
+- Internal ctors: `UnixSocketTransport(Socket)` (`:32-35`, used by the listener's `AcceptAsync`) and
+  `UnixSocketTransport(Stream)` (`:37-40`, used by `UnixSocketTransportTests.cs`'s in-memory framing
+  tests to drive `StreamFramer`'s error paths against a plain `MemoryStream` without a real socket).
+
+### `UnixSocketTransportListener` — `Transport/Unix/UnixSocketTransportListener.cs:15`
+
+`public sealed class UnixSocketTransportListener : ITransportListener`. Binds a `Socket
+(AddressFamily.Unix)` at a filesystem path. **The state/threading discipline is the same shape as
+`TcpTransportListener`'s** — one `Lock _stateLock` (`:32`) guards every mutable field, every entry point
+captures what it needs under the lock once and works from locals afterwards, and nothing that blocks or
+awaits runs while the lock is held.
+
+- **Constructor** (`:59-67`): `UnixSocketTransportListener(string path, bool
+  deleteExistingSocketFile = true, UnixFileMode? socketFileMode = null)`. `ArgumentException` for a
+  null/empty `path`.
+- **`StartAsync`** (`:71-115`) — deletes a pre-existing file at `path` first if
+  `deleteExistingSocketFile` is true (`:84-87`, the default — recovers from a previous instance that
+  crashed without cleaning up its socket file, which would otherwise fail the bind with "address already
+  in use" even though nothing is listening), binds, **hardens the socket file's permissions, then
+  calls `Listen()`** (`:94-103` — see [Permission hardening](#permission-hardening) below), and only
+  then publishes `_listenSocket`. `InvalidOperationException` if already running; `ObjectDisposedException`
+  if disposed.
+- **`AcceptAsync`** (`:121-148`) — takes `_listenSocket` under the lock, then awaits `AcceptAsync` on it
+  outside the lock. A disposal-interrupted accept is translated to `ObjectDisposedException` via a
+  `catch (Exception ex) when (_disposed)` filter (`:137-145`), the same shape
+  `TcpTransportListener`'s cleartext path uses. `InvalidOperationException` if never started.
+- **`DisposeAsync`** (`:156-175`) — idempotent, guarded entirely under `_stateLock` rather than via an
+  elected async teardown task the way `TcpTransportListener`/`WebSocketTransportListener` do (there is
+  no background pump here to await, so the simpler shape is sufficient): disposes the listen socket and,
+  if `deleteExistingSocketFile` was true, deletes the socket file
+  (`TryDeleteSocketFile`, `:177-195` — swallows `IOException`/`UnauthorizedAccessException`, best-effort
+  only).
+
+#### Permission hardening
+
+`UnixSocketTransportListener`'s entire access-control model rests on the socket file's filesystem
+permissions, so the listener does not leave that to the hosting process's ambient umask:
+
+- **`File.SetUnixFileMode(_path, _socketFileMode)` runs immediately after `Bind` and before `Listen`**
+  (`:94-103`) — added during a security-review pass on this PR, after an initial pass found the socket
+  file had no explicit permission hardening at all. There is no window in which the file exists with
+  only the umask's (commonly far looser) permissions applied.
+- **Default is owner read/write only** (`UnixFileMode.UserRead | UnixFileMode.UserWrite`,
+  `DefaultSocketFileMode`, `:23`). An optional `socketFileMode` constructor parameter widens this for a
+  deployment that genuinely needs another local account to connect (a group-shared sidecar layout, for
+  instance).
+- **Skipped on Windows** (`if (!OperatingSystem.IsWindows())`, `:98-101`) — Windows' own `AF_UNIX`
+  support uses NTFS ACLs rather than POSIX mode bits, so `File.SetUnixFileMode` is neither meaningful nor
+  supported there. There is no equivalent hardening applied on Windows for this transport; if you need
+  Unix-domain-socket IPC with an explicit access-control default on Windows, this is a gap, not something
+  handled elsewhere.
+
+<a id="gotchas-3"></a>
+
+### Gotchas
+
+- **`UnixSocketTransport` does not implement `IRemoteEndPointTransport`, so it is never subject to
+  `maxConnectionsPerRemoteEndpoint`.** A single local peer with filesystem access to the socket path can
+  open connections up to the hub's full `maxClients` budget, not a per-source ceiling. This was a
+  deliberate scope decision for this PR (issue #20's design says "new transport only; hub/client
+  untouched") — **do not treat it as fixed**, and do not extend `MeshHub.cs` to work around it without
+  reading the discussion first. See [known-issues.md](known-issues.md) KI-38 for the full reasoning.
+- **The `deleteExistingSocketFile` constructor parameter is dual-purpose, and only its "before bind"
+  half is exercised by name in most callers' minds.** The same flag also controls whether `DisposeAsync`
+  deletes the socket file on clean shutdown (`:167-170`) — pass `false` for "don't clean up a stale file
+  before binding" and you also silently opt out of your *own* instance's file being deleted on
+  disposal. Documented correctly on the constructor's own XML doc, but easy to miss; see
+  [known-issues.md](known-issues.md) KI-39.
+- **No TLS option, by design.** Encrypting traffic that never leaves the host adds nothing; the socket
+  file's permissions are the entire access boundary. Do not add a `tlsOptions` parameter here on the
+  reasoning that "the TCP/WebSocket pair both have one" — it would be dead weight.
+- **The socket path has a platform length limit** (`sun_path`, typically 108 bytes on Linux). The test
+  suite's `TempSocketPath` helper (`Transport/Unix/TempSocketPath.cs`) generates a short
+  `{Guid:N}.sock` name under the temp directory for exactly this reason — a long, descriptive path can
+  fail to bind with an unhelpful error.
+- **Constructing a listener does not create the socket file — `StartAsync` does**, and only
+  `StartAsync` running to completion applies the permission hardening. A listener that is constructed
+  but never started leaves no file behind at all.
+
+### Usage
+
+```csharp
+// Hub (Linux/macOS)
+var listener = new UnixSocketTransportListener("/tmp/meshworx.sock");
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client (Linux/macOS)
+await using var client = new MeshClient(clientLogger);
+await client.ConnectAsync(await UnixSocketTransport.ConnectAsync("/tmp/meshworx.sock"), "Alice");
+```
+
+---
+
+## `NamedPipeTransport` / `NamedPipeTransportListener` — `Transport/NamedPipes/`
+
+Added by PR #81 (issue #20), **not yet merged to `main`**. The Windows equivalent of
+`UnixSocketTransport` — same-host inter-process communication with no open port — for the platform that
+has no `AF_UNIX`-over-a-path convention Meshworx relies on elsewhere.  **Windows-only**: every entry
+point throws `PlatformNotSupportedException` on any other operating system, checked **before** any
+platform-specific API is touched. Framing is the same shared
+[`StreamFramer`](#shared-framing-streamframer-internal--transportframingstreamframercs18) helper as
+`TcpTransport` and `UnixSocketTransport`. No TLS option, for the same reason as the Unix socket
+transport: traffic never leaves the host.
+
+### `NamedPipeTransport` — `Transport/NamedPipes/NamedPipeTransport.cs:23`
+
+`public sealed class NamedPipeTransport : ITransport, IBatchSendTransport` — **also no
+`IRemoteEndPointTransport`**, same gap as `UnixSocketTransport`; see
+[known-issues.md](known-issues.md) KI-38.
+
+- **`ConnectAsync(pipeName, serverName = ".", ct)`** (`:49-75`) — static factory. `ArgumentException`
+  for a null/empty `pipeName`; **`PlatformNotSupportedException` if `!OperatingSystem.IsWindows()`**
+  (`:56-61`), checked before a `NamedPipeClientStream` is even constructed. Otherwise creates one
+  (`PipeDirection.InOut`, `PipeOptions.Asynchronous`), connects, and disposes it if the connect throws.
+- **`SendAsync(single)`** (`:78-81`), **`SendAsync(batch)`** (`:90-95`), **`ReceiveAsync`** (`:98-101`)
+  — one-line delegations to `StreamFramer` over the underlying `PipeStream`, identical in shape and
+  behaviour to `UnixSocketTransport`'s.
+- **`DisposeAsync`** (`:104-108`) — disposes the `PipeStream`, then the write lock.
+
+### `NamedPipeTransportListener` — `Transport/NamedPipes/NamedPipeTransportListener.cs:18`
+
+`public sealed class NamedPipeTransportListener : ITransportListener`. Unlike the socket-based
+listeners, there is no single long-lived listen handle here — the Win32 named-pipe API models "one
+waiting connection slot" as **one `NamedPipeServerStream` instance**, so a fresh instance is created for
+every `AcceptAsync` call rather than one instance being reused.
+
+- **Constructor** (`:53-67`): `NamedPipeTransportListener(string pipeName, int? maxServerInstances =
+  null, PipeSecurity? pipeSecurity = null)`. `ArgumentException` for a null/empty `pipeName`;
+  `ArgumentOutOfRangeException` for a non-positive `maxServerInstances`. `maxServerInstances` defaults to
+  `NamedPipeServerStream.MaxAllowedServerInstances`.
+- **`StartAsync`** (`:72-96`) — **`PlatformNotSupportedException` if `!OperatingSystem.IsWindows()`**
+  (`:85-90`), checked under the lock **before** `_acceptCts` is ever assigned — this ordering is what
+  makes the CA1416 suppressions below sound (see [Windows-only API
+  suppressions](#windows-only-api-suppressions)). Otherwise just creates the shared
+  `CancellationTokenSource` that every `AcceptAsync` links against; there is no socket/handle to bind
+  yet.
+- **`AcceptAsync`** (`:107-157`) — creates a **new** `NamedPipeServerStream` via
+  `NamedPipeServerStreamAcl.Create` (see [Permission hardening](#permission-hardening-1) below) and
+  awaits `WaitForConnectionAsync` on it. A cancellation caused by disposal is translated to
+  `ObjectDisposedException` (`:140-149`, disposing the half-created stream first); any other failure
+  also disposes the stream before rethrowing (`:150-154`). `InvalidOperationException` if never started.
+- **`DisposeAsync`** (`:165-194`) — the same elected-single-teardown shape as
+  `TcpTransportListener`/`WebSocketTransportListener`: the first caller cancels the shared
+  `CancellationTokenSource` and disposes it (`DisposeCoreAsync`, `:187-194`); every caller, first or not,
+  awaits the same stored `Task`.
+
+#### Permission hardening
+
+Same underlying concern as `UnixSocketTransportListener`'s socket-file mode, different mechanism:
+
+- **`NamedPipeServerStreamAcl.Create`** (`:125-134`), not the plain `NamedPipeServerStream` constructor
+  — the ACL-aware factory `System.IO.Pipes.AccessControl` provides in place of the
+  `PipeSecurity`-accepting constructor .NET Framework used to have.
+- **Default is a `PipeSecurity` granting `PipeAccessRights.FullControl` to the current user only**
+  (`CreateCurrentUserOnlyPipeSecurity`, `:196-219`) — added during the same security-review pass as the
+  Unix socket file hardening above, because **Windows' own default for an unspecified `PipeSecurity` is
+  considerably broader**: it also grants read access to the `Everyone` group and the anonymous account,
+  alongside full control to `LocalSystem`, administrators and the creator owner. Left unset, that
+  platform default would silently defeat the pipe-name access-control model this transport's whole
+  security posture rests on.
+  - **Cross-check against the code:** `CreateCurrentUserOnlyPipeSecurity` reads
+    `WindowsIdentity.GetCurrent().User`, throwing `InvalidOperationException` if it cannot be resolved,
+    and grants that one identity `FullControl`. It grants nothing to any group.
+- An optional `pipeSecurity` constructor parameter overrides the default for a deployment that
+  genuinely needs a different or wider set of principals.
+
+<a id="windows-only-api-suppressions"></a>
+
+**Windows-only API suppressions (`#pragma warning disable CA1416`):** `NamedPipeServerStreamAcl.Create`
+in `AcceptAsync` (`:125-135`) and `CreateCurrentUserOnlyPipeSecurity` itself (`:207-219`, also marked
+`[SupportedOSPlatform("windows")]`) are both Windows-only APIs the analyser would otherwise flag. Both
+suppressions carry a comment pointing at the actual runtime guard: `StartAsync` throws
+`PlatformNotSupportedException` on every non-Windows platform **before** `_acceptCts` is ever set
+(`:85-92`), and `AcceptAsync` requires a non-null `_acceptCts` (`:115`) — so by construction, neither
+Windows-only call can be reached from a non-Windows process. **Verified in this pass:** the ordering
+inside `StartAsync`'s lock really does check the platform before assigning `_acceptCts` in every code
+path, so the suppression's stated justification holds; this is not a case of a suppression comment
+promising a guard that isn't actually there.
+
+### Gotchas
+
+- **Windows-only, and the two guard points are in different files.** `NamedPipeTransport.ConnectAsync`
+  and `NamedPipeTransportListener.StartAsync` each independently check
+  `OperatingSystem.IsWindows()` and throw `PlatformNotSupportedException` — there is no shared guard
+  helper. If you add a third entry point (a hypothetical reconnect helper, say), it needs its own check;
+  nothing enforces this for you.
+- **No `IRemoteEndPointTransport`, same as `UnixSocketTransport`** — never capped by
+  `maxConnectionsPerRemoteEndpoint`. See [known-issues.md](known-issues.md) KI-38.
+- **The happy path (`AcceptAsync` actually accepting, a real round-trip) cannot run on this repo's CI at
+  all.** `.github/workflows/ci.yml` runs `ubuntu-latest` only, so every named-pipe test that would
+  exercise real pipe I/O is a documented no-op there — see [testing.md](testing.md) for exactly which
+  tests fall into this bucket and why that is an accepted, not accidental, gap.
+- **`maxServerInstances` bounds the operating system's own pipe-instance limit, not a Meshworx-level
+  admission control** — it is a `NamedPipeServerStream` construction parameter, unrelated to
+  `MeshHub.MaxClients` or `maxConnectionsPerRemoteEndpoint` (which, per the point above, cannot see this
+  transport at all).
+- **No TLS option, by design** — same reasoning as `UnixSocketTransport`: traffic never leaves the host,
+  so the pipe's ACL is the entire access boundary.
+
+### Usage
+
+```csharp
+// Hub (Windows)
+var listener = new NamedPipeTransportListener("meshworx");
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client (Windows)
+await using var client = new MeshClient(clientLogger);
+await client.ConnectAsync(await NamedPipeTransport.ConnectAsync("meshworx"), "Alice");
+```
+
+---
+
 ## `InMemoryTransport` / `InMemoryTransportListener` — `Transport/InMemory/`
 
 In-process transport backed by `System.Threading.Channels`. No sockets, no framing (channels preserve
@@ -741,8 +1054,20 @@ meet it.
    ([above](#itransportlistener--transportitransportlistenercs23)): a pending accept must end in
    `ObjectDisposedException`, later accepts must throw the same, and `DisposeAsync` must be idempotent,
    concurrency-safe and return only once teardown is complete. Getting the exception type wrong spins
-   `MeshHub.AcceptLoopAsync` hot rather than stopping it. Both shipped listeners are worked examples.
+   `MeshHub.AcceptLoopAsync` hot rather than stopping it. All four shipped listeners are worked examples.
 5. You **cannot** implement `IBatchSendTransport` (it's internal) — you don't need to; the hub falls
    back to one-frame-at-a-time sends automatically.
-6. Test doubles: the suite mocks `ITransport`/`ITransportListener` directly with Moq. See the fixtures
+6. **If your transport wraps a plain `Stream`** (a socket, a pipe, anything duplex), reuse the internal
+   [`StreamFramer`](#shared-framing-streamframer-internal--transportframingstreamframercs18) helper
+   rather than reimplementing the length-prefix framing — `TcpTransport`, `UnixSocketTransport` and
+   `NamedPipeTransport` all do. It is `internal`, so this only helps a transport added inside this
+   assembly; an external transport still needs its own framing (or its own length-prefix scheme
+   entirely, since none of this is part of the public contract).
+7. **If your transport is network-backed and has a meaningful remote address, implement the public
+   `IRemoteEndPointTransport`** so `maxConnectionsPerRemoteEndpoint` can see it — `TcpTransport` and
+   `WebSocketTransport` do this, `UnixSocketTransport` and `NamedPipeTransport` deliberately do not
+   (there is no `IPEndPoint` for a local IPC transport to report). See
+   [known-issues.md](known-issues.md) KI-38 for what skipping this costs a hub reachable only over such
+   a transport.
+8. Test doubles: the suite mocks `ITransport`/`ITransportListener` directly with Moq. See the fixtures
    in [testing.md](testing.md).
