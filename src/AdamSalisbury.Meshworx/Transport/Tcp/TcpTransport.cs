@@ -1,9 +1,8 @@
-using System.Buffers;
-using System.Buffers.Binary;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using AdamSalisbury.Meshworx.Transport.Framing;
 
 namespace AdamSalisbury.Meshworx.Transport.Tcp;
 
@@ -25,16 +24,13 @@ namespace AdamSalisbury.Meshworx.Transport.Tcp;
 /// </remarks>
 public sealed class TcpTransport : ITransport, IBatchSendTransport, IRemoteEndPointTransport
 {
-    private const int HeaderSize = 4;
-    private const int MaxPayloadSize = 1024 * 1024;
-
     private readonly TcpClient? _tcpClient;
     private readonly Stream _stream;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
     // Reused across reads to hold each frame's length prefix. The transport is single-reader (see
     // ITransport), so ReceiveAsync is never called concurrently and the buffer cannot be aliased.
-    private readonly byte[] _headerBuffer = new byte[HeaderSize];
+    private readonly byte[] _headerBuffer = new byte[StreamFramer.HeaderSize];
 
     internal TcpTransport(TcpClient tcpClient)
         : this(tcpClient, tcpClient.GetStream())
@@ -227,41 +223,9 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport, IRemoteEndPo
     }
 
     /// <inheritdoc/>
-    public async Task SendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+    public Task SendAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
-        // Reject oversized payloads up front. The receiving peer enforces the same limit and
-        // would otherwise treat the frame as corrupt and drop the connection — a clear
-        // ArgumentException to the caller is far better than a surprise disconnect. This also
-        // guards the frameSize addition below against integer overflow.
-        if (data.Length > MaxPayloadSize)
-        {
-            throw new ArgumentException(
-                $"Payload size {data.Length} exceeds the maximum frame payload of {MaxPayloadSize} bytes.",
-                nameof(data));
-        }
-
-        int frameSize = HeaderSize + data.Length;
-        byte[] frame = ArrayPool<byte>.Shared.Rent(frameSize);
-        try
-        {
-            BinaryPrimitives.WriteInt32BigEndian(frame, data.Length);
-            data.Span.CopyTo(frame.AsSpan(HeaderSize));
-
-            await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                await _stream.WriteAsync(frame.AsMemory(0, frameSize), cancellationToken).ConfigureAwait(false);
-                await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-            }
-            finally
-            {
-                _writeLock.Release();
-            }
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(frame);
-        }
+        return StreamFramer.SendAsync(_stream, _writeLock, data, cancellationToken);
     }
 
     /// <inheritdoc/>
@@ -270,116 +234,19 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport, IRemoteEndPo
     /// buffered <see cref="Stream.WriteAsync(ReadOnlyMemory{byte}, CancellationToken)"/> and flush,
     /// so a burst of queued frames costs one syscall and one flush instead of one per frame.
     /// </remarks>
-    public async Task SendAsync(
+    public Task SendAsync(
         IReadOnlyList<ReadOnlyMemory<byte>> messages,
         CancellationToken cancellationToken = default)
     {
-        ArgumentNullException.ThrowIfNull(messages);
-
-        if (messages.Count == 0)
-        {
-            return;
-        }
-
-        if (messages.Count == 1)
-        {
-            await SendAsync(messages[0], cancellationToken).ConfigureAwait(false);
-            return;
-        }
-
-        // Frame only the valid prefix up to the first oversize payload (if any). Writing that prefix
-        // before throwing preserves the single-send path's deliver-then-fault behaviour: frames
-        // coalesced ahead of an oversize one are still delivered, rather than the whole batch being
-        // discarded because a later frame is invalid.
-        long frameSize = 0;
-        int validCount = messages.Count;
-        for (int i = 0; i < messages.Count; i++)
-        {
-            if (messages[i].Length > MaxPayloadSize)
-            {
-                validCount = i;
-                break;
-            }
-
-            frameSize += HeaderSize + messages[i].Length;
-        }
-
-        if (frameSize > 0)
-        {
-            // The send loop bounds a batch's total size, so frameSize is well within int range here;
-            // the cast is safe. Renting a single buffer keeps the prefix to one write and one flush.
-            byte[] frame = ArrayPool<byte>.Shared.Rent((int)frameSize);
-            try
-            {
-                int offset = 0;
-                for (int i = 0; i < validCount; i++)
-                {
-                    ReadOnlyMemory<byte> message = messages[i];
-                    BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(offset), message.Length);
-                    offset += HeaderSize;
-                    message.Span.CopyTo(frame.AsSpan(offset));
-                    offset += message.Length;
-                }
-
-                await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-                try
-                {
-                    await _stream.WriteAsync(frame.AsMemory(0, offset), cancellationToken).ConfigureAwait(false);
-                    await _stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-                }
-                finally
-                {
-                    _writeLock.Release();
-                }
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(frame);
-            }
-        }
-
-        if (validCount < messages.Count)
-        {
-            int length = messages[validCount].Length;
-            throw new ArgumentException(
-                $"Payload size {length} exceeds the maximum frame payload of {MaxPayloadSize} bytes.",
-                nameof(messages));
-        }
+        return StreamFramer.SendBatchAsync(_stream, _writeLock, messages, cancellationToken);
     }
 
     /// <inheritdoc/>
-    public async Task<byte[]?> ReceiveAsync(CancellationToken cancellationToken = default)
+    public Task<byte[]?> ReceiveAsync(CancellationToken cancellationToken = default)
     {
-        // Read the length prefix into the reused header buffer; only the payload array below is
-        // allocated per frame, because it is handed back to the caller.
-        if (!await ReadExactlyAsync(_headerBuffer, cancellationToken).ConfigureAwait(false))
-        {
-            return null;
-        }
-
-        int payloadLength = BinaryPrimitives.ReadInt32BigEndian(_headerBuffer);
-
-        if (payloadLength is < 0 or > MaxPayloadSize)
-        {
-            // A corrupt or out-of-range length prefix means the stream framing is no longer
-            // trustworthy. Surface it as an I/O error so receive loops treat it as a transport
-            // failure and terminate the connection cleanly, rather than faulting on an
-            // unhandled exception type.
-            throw new IOException($"Invalid payload length: {payloadLength}");
-        }
-
-        if (payloadLength == 0)
-        {
-            return [];
-        }
-
-        var payload = new byte[payloadLength];
-        if (!await ReadExactlyAsync(payload, cancellationToken).ConfigureAwait(false))
-        {
-            return null;
-        }
-
-        return payload;
+        // Only the payload array is allocated per frame, because it is handed back to the caller; the
+        // length-prefix read reuses _headerBuffer, which is safe because this transport is single-reader.
+        return StreamFramer.ReceiveAsync(_stream, _headerBuffer, cancellationToken);
     }
 
     /// <inheritdoc/>
@@ -388,19 +255,5 @@ public sealed class TcpTransport : ITransport, IBatchSendTransport, IRemoteEndPo
         await _stream.DisposeAsync().ConfigureAwait(false);
         _tcpClient?.Dispose();
         _writeLock.Dispose();
-    }
-
-    private async Task<bool> ReadExactlyAsync(byte[] buffer, CancellationToken cancellationToken)
-    {
-        try
-        {
-            await _stream.ReadExactlyAsync(buffer, cancellationToken).ConfigureAwait(false);
-            return true;
-        }
-        catch (EndOfStreamException)
-        {
-            // The peer closed the connection (cleanly, or mid-frame); signal end of stream.
-            return false;
-        }
     }
 }

@@ -11,7 +11,8 @@ substituted.
 - **Target framework:** .NET 10
 - **Namespaces:** `AdamSalisbury.Meshworx`, `AdamSalisbury.Meshworx.Messages`,
   `AdamSalisbury.Meshworx.Transport`, `AdamSalisbury.Meshworx.Transport.Tcp`,
-  `AdamSalisbury.Meshworx.Transport.WebSocket`,
+  `AdamSalisbury.Meshworx.Transport.WebSocket`, `AdamSalisbury.Meshworx.Transport.Unix`,
+  `AdamSalisbury.Meshworx.Transport.NamedPipes`, `AdamSalisbury.Meshworx.Transport.Framing`,
   `AdamSalisbury.Meshworx.Extensions.DependencyInjection`
 
 ## Architecture
@@ -24,6 +25,8 @@ substituted.
 | `ITransportListener` | Accepts inbound transport connections for the hub. |
 | `TcpTransport` / `TcpTransportListener` | TCP implementation using a 4-byte big-endian length prefix per frame. |
 | `WebSocketTransport` / `WebSocketTransportListener` | WebSocket implementation reachable from a browser and through proxies and firewalls that block arbitrary TCP ports; one WebSocket binary message carries one Meshworx frame. |
+| `UnixSocketTransport` / `UnixSocketTransportListener` | Unix domain socket implementation for fast, local, same-host inter-process communication on Linux and macOS; shares the same length-prefixed framing as TCP. |
+| `NamedPipeTransport` / `NamedPipeTransportListener` | Windows named-pipe implementation for the same same-host inter-process case on Windows; also shares the length-prefixed framing. |
 | `InMemoryTransport` / `InMemoryTransportListener` | In-process implementation backed by channels, for hosting a hub and clients in one process and for fast, deterministic testing. |
 | `AddMeshHub` / `AddMeshClient` | `IServiceCollection` extension methods, in the `AdamSalisbury.Meshworx.Extensions.DependencyInjection` package, that register a hub or client for dependency injection and the generic host. |
 
@@ -342,6 +345,12 @@ must make deliberately.
   public interface, pass an explicit `IPEndPoint` — and only do so behind an authenticator, a
   network boundary, or both.
 
+- **Local IPC access control.** `UnixSocketTransportListener` and `NamedPipeTransportListener`
+  never cross the network at all, so their access boundary is the operating system's own filesystem
+  permissions on the socket path or pipe name, not anything Meshworx enforces. Set those permissions
+  deliberately — anyone with access to the path can connect — and remember that neither transport
+  offers a TLS option, since encrypting traffic that never leaves the host adds nothing.
+
 - **Transport encryption (TLS).** The TCP transport runs cleartext by default and secured when you
   give it TLS options. Pass `SslServerAuthenticationOptions` to the listener and
   `SslClientAuthenticationOptions` to `TcpTransport.ConnectAsync`; the framing is identical either
@@ -411,7 +420,11 @@ must make deliberately.
 
 The TCP transport frames every message as a **4-byte big-endian length prefix** followed by the
 payload (maximum 1 MiB). The first payload byte is the message type. Enabling TLS does not change
-any of this — the same frames simply travel inside the TLS record layer.
+any of this — the same frames simply travel inside the TLS record layer. The Unix domain socket and
+named-pipe transports use the identical framing — both are stream-oriented exactly as TCP is, so all
+three share one internal `StreamFramer` helper rather than reimplementing the length prefix and its
+bounds checking three times. The WebSocket transport is the exception: one WebSocket binary message
+already delimits one Meshworx frame, so it needs no length prefix of its own.
 
 Protocol version: negotiated between **4** (minimum) and **5** (maximum). Registration advertises a
 range rather than a single value — `[versionMin, versionMax]` — and the hub picks the highest version
@@ -537,6 +550,44 @@ await WebSocketTransport.ConnectAsync(
 Negotiation — the TLS handshake where configured, then parsing the HTTP upgrade request — runs
 off the accept path, exactly as the TCP transport's TLS handshake does, so one slow or hostile
 peer cannot head-of-line block every other client waiting to connect.
+
+When a hub and its clients all run on the same host — a sidecar process, or a multi-process
+desktop or daemon layout — `UnixSocketTransport`/`UnixSocketTransportListener` (Linux and macOS)
+and `NamedPipeTransport`/`NamedPipeTransportListener` (Windows) avoid the network stack overhead
+and open port a loopback TCP listener would otherwise cost. Both share the same length-prefixed
+framing as TCP:
+
+```csharp
+// Hub (Linux/macOS)
+var listener = new UnixSocketTransportListener("/tmp/meshworx.sock");
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client (Linux/macOS)
+await using var client = new MeshClient(clientLogger);
+await client.ConnectAsync(await UnixSocketTransport.ConnectAsync("/tmp/meshworx.sock"), "Alice");
+```
+
+```csharp
+// Hub (Windows)
+var listener = new NamedPipeTransportListener("meshworx");
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client (Windows)
+await using var client = new MeshClient(clientLogger);
+await client.ConnectAsync(await NamedPipeTransport.ConnectAsync("meshworx"), "Alice");
+```
+
+`UnixSocketTransportListener` deletes a stale socket file left behind by a previous instance
+before binding (and its own file on clean disposal), so restarting a crashed hub does not fail
+with "address already in use". `NamedPipeTransportListener.StartAsync` and
+`NamedPipeTransport.ConnectAsync` throw `PlatformNotSupportedException` on any operating system
+other than the one each is built for — check `OperatingSystem.IsWindows()` before choosing between
+the two at run time if the same binary needs to run cross-platform. Neither transport has a TLS
+option: access is controlled by filesystem permissions on the socket path or pipe name, not by
+encryption, which is appropriate only when every peer that can reach the path is already trusted —
+exactly the same trust boundary the operating system itself enforces for local IPC.
 
 ## Dependency injection and hosting
 
