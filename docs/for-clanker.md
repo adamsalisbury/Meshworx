@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 535432a (branch feat/issue-32-header-envelope, PR #74, open) — two commits on top of main at 3aed070, clean working tree
+reconciled-to-commit: 63d0a34 (branch feat/issue-18-websocket-transport, PR #78, open) — three commits on top of main at dbb6709, clean working tree
 reconciled-to-date: 2026-07-26
 mode: update
 -->
@@ -12,7 +12,47 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `feat/issue-32-header-envelope` (open **PR #74**, closing issue #32),
+> **Documented tree, this pass:** branch `feat/issue-18-websocket-transport` (open **PR #78**, closing
+> issue #18), three commits on top of `main` at `dbb6709` (merge-base confirmed equal to `main`'s own tip —
+> the branch has no drift from `main`), clean working tree. Diffed with
+> `git diff main...feat/issue-18-websocket-transport --stat`: **six files, all new** —
+> `Transport/WebSocket/WebSocketTransport.cs`, `Transport/WebSocket/WebSocketTransportListener.cs`, three
+> new test files under the equivalent `Transport/WebSocket/` test path, and a README addition. **Nothing
+> else changed** — confirmed from the diff stat directly, not assumed from the PR's own description:
+> `MeshHub.cs`, `MeshClient.cs`, `IMeshClient.cs` and the wire protocol are untouched, so nothing in
+> [hub.md](for-clanker/hub.md), [client.md](for-clanker/client.md), [protocol.md](for-clanker/protocol.md)
+> or [types.md](for-clanker/types.md) needed correcting beyond one line noted below. This branch adds a
+> **fourth transport**, `WebSocketTransport`/`WebSocketTransportListener`
+> (namespace `AdamSalisbury.Meshworx.Transport.WebSocket`) — reachable from a browser and through proxies/
+> firewalls that block arbitrary TCP ports. One WebSocket binary message carries exactly one Meshworx frame
+> (no length prefix needed, unlike TCP); the shared 1 MiB payload cap, `IBatchSendTransport` (per-batch
+> lock, but one WebSocket message per frame — no wire-level coalescing, since WebSocket has no equivalent)
+> and the public `IRemoteEndPointTransport` are all implemented, following the patterns `TcpTransport`
+> already set. `WebSocketTransportListener` reuses `TcpTransportListener.CloneServerOptions` for its TLS
+> option copy and mirrors `TcpTransportListener`'s state-lock discipline and negotiation-pump hardening
+> (zero-byte-read-before-slot-acquisition, polled pending bound, retry-with-delay on transient accept
+> failure) almost exactly — **the one real behavioural difference is that this listener's negotiation pump
+> runs unconditionally, cleartext or not**, because the RFC 6455 HTTP upgrade handshake has to happen off
+> the accept path regardless of TLS, unlike `TcpTransportListener`'s pump, which exists only when TLS is
+> configured (see [known-issues.md](for-clanker/known-issues.md) KI-35). Full write-up in
+> [transport.md](for-clanker/transport.md#websockettransport--transportwebsocketwebsockettransportcs23); a
+> documentation-accuracy mismatch found in the source's own XML doc comments (KI-36, low severity, not a
+> behavioural bug) and an untested edge case in the pipelined-first-frame handling (KI-37) are recorded in
+> [known-issues.md](for-clanker/known-issues.md). [testing.md](for-clanker/testing.md) gained three new
+> rows for the new test files and a note on the conventions they follow, copied deliberately from the TCP
+> transport's own test conventions.
+>
+> **A note on the PR #74 narrative immediately below: it has since merged to `main`.** `main`'s tip at the
+> time this pass began (and the commit this branch is built on) is `dbb6709`, "feat: structured
+> message-header envelope while keeping the body opaque" — a single squashed commit carrying the work the
+> paragraph below still describes as living on an open branch at `535432a`. That framing is now stale, but
+> re-deriving it was out of scope for this pass, which was scoped specifically to the WebSocket-transport
+> diff above; the `MeshHub.cs`/`MeshClient.cs`/`IMeshClient.cs` coordinates and the rest of the paragraph
+> below were **not** re-verified here and should be treated as carried forward unchanged from the prior
+> pass, not re-confirmed against `main`. A future pass reconciling the library surface more generally
+> should correct this framing while it re-verifies those coordinates.
+>
+> **Documented tree (prior pass):** branch `feat/issue-32-header-envelope` (then-open **PR #74**, closing issue #32),
 > currently checked out on top of `main` at `3aed070` (clean working tree, two commits ahead: `62de94d`,
 > `535432a`). **This branch adds a structured message-header envelope alongside the opaque message body.**
 > `Messages/Protocol.cs` raises `MaxSupportedVersion` from `4` to `5` and adds
@@ -284,8 +324,8 @@ direct-send to any id it holds. Treat the transport boundary as the trust bounda
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
 | Wire protocol version | Negotiated range, currently `4`–`5` (was a fixed `3`, then a `4`–`4` range from PR #73; widened to `5` by PR #74 for the header envelope) | `Messages/Protocol.cs:8`, `:14`, `:21` |
-| Max frame payload (TCP) | 1 MiB (`1024*1024`) | `Transport/Tcp/TcpTransport.cs:29` |
-| TCP transport encryption | Optional TLS, **off by default** | `Transport/Tcp/TcpTransport.cs:146`, `TcpTransportListener.cs:110` |
+| Max frame payload (TCP, WebSocket) | 1 MiB (`1024*1024`) each, independent constants | `Transport/Tcp/TcpTransport.cs:29`, `Transport/WebSocket/WebSocketTransport.cs:25` |
+| TCP / WebSocket transport encryption | Optional TLS, **off by default** on both | `Transport/Tcp/TcpTransport.cs:146`, `TcpTransportListener.cs:110`, `Transport/WebSocket/WebSocketTransportListener.cs:112` |
 | Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:23` |
 | Warnings as errors | Yes (`Directory.Build.props`) | `src/Directory.Build.props:3` |
 
@@ -417,7 +457,8 @@ flowchart LR
 ```
 
 **Dependency direction (respect this):** `MeshHub` and `MeshClient` depend on the transport
-**abstractions** (`ITransport` / `ITransportListener`), never on `Tcp*` or `InMemory*` concretes. The
+**abstractions** (`ITransport` / `ITransportListener`), never on `Tcp*`, `WebSocket*` or `InMemory*`
+concretes. The
 concrete transports depend only on the abstractions. Keep it that way — the whole point of the design is
 that the transport is swappable. Message opcodes and framing knowledge live in `MeshHub`/`MeshClient`;
 transports are dumb pipes that only know framing, not opcodes.
@@ -438,7 +479,7 @@ receive loops never block on a slow recipient's socket; they just enqueue. See
 |---|---|---|
 | Hub: routing, groups, heartbeat, lifecycle, metrics | `MeshHub`, `IMeshHub` | [hub.md](for-clanker/hub.md#metrics) |
 | Client + reconnection + metrics | `MeshClient`, `IMeshClient`, `MeshClientReconnector` | [client.md](for-clanker/client.md#metrics) |
-| Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `IRemoteEndPointTransport`, `TcpTransport(Listener)`, `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
+| Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `IRemoteEndPointTransport`, `TcpTransport(Listener)`, `WebSocketTransport(Listener)` (PR #78), `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
 | Wire protocol & framing | `MessageType`, `Protocol`, handshake, opcode payloads | [protocol.md](for-clanker/protocol.md) |
 | Public value types | event args, `MessageHeaders`, `DisconnectReason`, `RegistrationErrorCode`, `ClientAuthenticator`, `RegistrationContext`, `GroupAuthoriser`, `GroupJoinContext`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
 | DI & generic-host integration | `AddMeshHub`, `AddMeshClient`, `MeshHubOptions`, `MeshClientOptions` | [dependency-injection.md](for-clanker/dependency-injection.md) |
@@ -587,9 +628,21 @@ Client-side TLS is configured per connection, not per client: pass `SslClientAut
 a property afterwards does not affect a live listener or connection — but mutating a shared object you
 handed over still does. Details in [transport.md](for-clanker/transport.md).
 
-All constructors validate ranges and throw `ArgumentOutOfRangeException` for non-positive timeouts/counts.
-`TcpTransportListener` additionally throws `ArgumentException` if `tlsOptions` carries no certificate,
-certificate context, or certificate-selection callback.
+**`WebSocketTransportListener` options** (`Transport/WebSocket/WebSocketTransportListener.cs:109`, all
+optional, added by PR #78 / issue #18):
+
+| Param | Default | Effect |
+|---|---|---|
+| `path` | `"/"` | The HTTP request path a client must upgrade on; anything else is refused (see [known-issues.md](for-clanker/known-issues.md) KI-36 for the exact status code the doc comment gets wrong) |
+| `tlsOptions` | `null` (**cleartext**, `ws://`) | Same shape as `TcpTransportListener`'s — `SslServerAuthenticationOptions`, copied via the same `CloneServerOptions`; `wss://` when set |
+| `handshakeTimeout` | 10 s | Bounds one connection's whole negotiation — the TLS handshake where configured, **plus** the HTTP upgrade parse |
+| `maxConcurrentHandshakes` | 64 | Caps concurrent negotiations; unlike its TCP namesake this also bounds plain HTTP header parsing for a cleartext listener, since the pump always runs here — see [known-issues.md](for-clanker/known-issues.md) KI-35. 16× that many may be pending |
+
+Client-side: `WebSocketTransport.ConnectAsync(uri, configureOptions, ct)` takes a `ws://`/`wss://` `Uri`
+plus a callback onto `ClientWebSocketOptions` for certificates/validation. All constructors validate
+ranges the same way the TCP pair does, throwing `ArgumentOutOfRangeException` for non-positive
+timeouts/counts and `ArgumentException` if `tlsOptions` carries no certificate, certificate context, or
+certificate-selection callback.
 
 ---
 
@@ -694,12 +747,20 @@ there is no publish step in CI — CI only builds and tests.
   on the wire and works at any version. See [client.md](for-clanker/client.md#sending-headers).
 - **`MessageHeaders`'s constructor throws on a duplicate key** rather than keeping the last value like a
   plain `Dictionary` initializer would. De-duplicate your source before constructing one. KI-34.
-- **`new TcpTransportListener(port)` binds loopback**, not every interface. Remote clients cannot reach
-  a hub created that way; pass an explicit `IPEndPoint` to expose it deliberately.
+- **`new TcpTransportListener(port)` / `new WebSocketTransportListener(port)` both bind loopback**, not
+  every interface. Remote clients cannot reach a hub created that way; pass an explicit `IPEndPoint` to
+  expose it deliberately.
 - **The TCP transport is cleartext unless you pass TLS options** to both the listener and
   `TcpTransport.ConnectAsync`. Nothing warns you; assert `TcpTransport.IsEncrypted` at start-up if it
   matters. Even with TLS, security is **hop-by-hop**: a delivered message's sender id is asserted by the
-  hub, not signed by the sender, so a compromised hub can forge one. KI-2, KI-17.
+  hub, not signed by the sender, so a compromised hub can forge one. KI-2, KI-17. The WebSocket transport
+  is the same shape (`ws://` cleartext by default, `wss://` opt-in via `tlsOptions`), and reuses the
+  identical trust model.
+- **`WebSocketTransportListener`'s negotiation pump runs unconditionally, cleartext or not** — the
+  opposite of `TcpTransportListener`, whose pump exists only for TLS. `maxConcurrentHandshakes` therefore
+  bounds plain HTTP header parsing too, not just TLS handshakes. See
+  [transport.md](for-clanker/transport.md#the-negotiation-pump--read-this-before-touching-it) and
+  [known-issues.md](for-clanker/known-issues.md) KI-35.
 - **A failed TLS handshake is silent on the listener side** — no log, no exception, the hub simply never
   sees the connection. Diagnose from the client. KI-18.
 - **Client-name length is checked in `char`s (UTF-16 units), not UTF-8 bytes**, on both sides — a name

@@ -58,7 +58,10 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
 | `Transport/Tcp/TcpTransportListenerTests.cs` | 282 | Start/accept/dispose (cleartext), **plus the disposal contract (11 tests): start-after-dispose, pending accept ended by dispose, accept raced against dispose, concurrent dispose (cleartext and TLS), `IsStoppedListenerFailure` vs the framework** |
 | `Transport/Tcp/TcpTransportTlsTests.cs` | 494 | Server TLS, mutual TLS, rejection paths, handshake timeout, silent-peer flood, constructor guards, `TargetHost` defaulting, `IsEncrypted` |
 | `Transport/Tcp/TlsOptionsCloneTests.cs` | 242 | Reflection-driven proof that both TLS option clones copy **every** settable property |
-| `Transport/Tcp/TestCertificates.cs` | 67 | Helper: self-signed certificate generation and a pinning validation callback |
+| `Transport/Tcp/TestCertificates.cs` | 67 | Helper: self-signed certificate generation and a pinning validation callback (also used directly by the WebSocket TLS tests below, PR #78) |
+| `Transport/WebSocket/WebSocketTransportListenerTests.cs` | 207 | **New in PR #78 (issue #18).** Constructor guards, start/accept/dispose lifecycle, and the same raced-accept-vs-dispose and concurrent-dispose shapes as `TcpTransportListenerTests.cs` |
+| `Transport/WebSocket/WebSocketTransportLoopbackTests.cs` | 485 | **New in PR #78.** Round-trip send/receive over a real loopback socket, multi-frame reassembly, batch send (incl. deliver-then-fault), oversize payload on both send and receive, graceful close, wrong-path rejection, TLS variants (cert trust, silent-peer flood against negotiation slots, cert rejection, handshake-failure recovery, cleartext-against-TLS-only rejection) |
+| `Transport/WebSocket/WebSocketMeshIntegrationTests.cs` | 117 | **New in PR #78.** One end-to-end test: register/lookup/direct-send/broadcast/group-message over a real `wss://` connection, using the actual `MeshHub` and `MeshClient` — proves the WebSocket transport is a drop-in replacement for TCP with no protocol-level difference |
 
 ## Testing conventions (follow these)
 
@@ -75,6 +78,30 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
   disposes the listener in a `finally`, because these tests can genuinely hang rather than fail.
   Shrink the bounds under test — `tlsHandshakeTimeout: TimeSpan.FromMilliseconds(300)`,
   `maxConcurrentTlsHandshakes: 2` — rather than waiting out the production defaults.
+- **The WebSocket transport's tests (PR #78, issue #18) follow the TCP transport's conventions
+  deliberately, not by coincidence — copy from there first.** `WebSocketTransportLoopbackTests.cs` binds
+  loopback on port 0 and reads `((IPEndPoint)listener.LocalEndPoint!).Port` back exactly like the TCP
+  loopback tests; its TLS variants reuse `TestCertificates.CreateSelfSigned`/`PinnedTo` unchanged rather
+  than inventing a second certificate helper; and
+  `ServerTls_SilentPeersOutnumberNegotiationSlots_GenuineClientStillConnects`
+  (`WebSocketTransportLoopbackTests.cs:282`) is the same "flood more silent peers than there are
+  negotiation slots, then prove a genuine client still gets through" shape as
+  `TcpTransportTlsTests.cs:263`, applied to `WebSocketTransportListener`'s negotiation pump instead of
+  `TcpTransportListener`'s handshake pump — see the pairing this shape exists to close under "Assert the
+  negative directly" below. `WebSocketTransportListenerTests.cs`'s raced-accept-vs-dispose and
+  concurrent-dispose tests are the same shapes as `TcpTransportListenerTests.cs`'s, applied to the
+  channel-backed listener instead of the TLS-mode one. Two conventions specific to this transport:
+  - **To prove the receiver's own accumulation cap, not just the sender's check, rejects an oversized
+    message,** `ReceiveAsync_PayloadExceedsMaxSize_ThrowsIOException`
+    (`WebSocketTransportLoopbackTests.cs:402`) reaches past `WebSocketTransport.SendAsync`'s own guard
+    entirely — reflection pulls the private `_webSocket` field out of the client transport and drives the
+    raw `System.Net.WebSockets.WebSocket` directly, since the wrapped `SendAsync` would otherwise refuse
+    the oversized payload before it ever reached the wire.
+  - **`WebSocketMeshIntegrationTests.cs` mirrors `MeshIntegrationTests.cs`'s mutual-TLS end-to-end run**
+    almost exactly (same three-client register/send/broadcast/group shape), over `wss://` instead of a TLS
+    `TcpTransport` — the point of the test is that the interoperability surface is identical, so copying
+    the existing integration test's shape rather than inventing a new one is itself part of what the test
+    demonstrates.
 - **Assert the negative directly when testing a denial-of-service property.** The silent-peer tests
   (`TcpTransportTlsTests.cs:207`, `:263`) make the point that a surviving-client assertion alone is not
   proof: one test asserts the abandoned peer's socket actually reaches end of stream (a zero-byte read),

@@ -43,6 +43,9 @@ the risk to a change, not a claim that the code is defective.
 | KI-32 | `messages.routed` and `messages.dropped` are not complementary for `broadcast`/`group` sends | `MeshHub.cs:1706-1709`, `:2022-2023`, `:1702`, `:2040` | low (observability / maintainability) | open — **by design**, a documentation nuance rather than a defect; PR #74's header-bearing routing methods inherit it unchanged |
 | KI-33 | An oversized outbound frame used to leak a client's registration slot permanently | `MeshHub.cs:1491-1507` | high (availability) | **fixed** — PR #74 (issue #32); `SendLoopAsync`'s catch now treats `ArgumentException` as a transport fault, do not narrow it back to `IOException`/`ObjectDisposedException` only |
 | KI-34 | `MessageHeaders`'s constructor throws on a duplicate key instead of last-wins | `Messages/MessageHeaders.cs:41-45` | low (usability) | open — **by design, but undocumented on the type itself**; differs from a plain `Dictionary` object initializer |
+| KI-35 | `WebSocketTransportListener` negotiates every connection off the accept path, including cleartext ones | `Transport/WebSocket/WebSocketTransportListener.cs:180-211`, `:317-373` | low (maintainability) | open — **by design**, but a real behavioural difference from `TcpTransportListener` |
+| KI-36 | Constructor's `path` doc claimed `404` for a wrong upgrade path; the code always sends `400` | `Transport/WebSocket/WebSocketTransportListener.cs:80-83`, `:420-428`, `:505-555` | low (maintainability / doc accuracy) | **fixed** — PR #78; the XML doc now says `400 Bad Request` and notes the two causes are indistinguishable |
+| KI-37 | A pipelined first WebSocket frame ahead of the `101` response has a dedicated regression test | `Transport/WebSocket/WebSocketTransportListener.cs:432-439`, `:575-613`, `:658-739` | low (test coverage) | **fixed** — PR #78; `WebSocketTransportLoopbackTests.ConnectAndAccept_ClientPipelinesFirstFrameAheadOfUpgradeResponse_LeftoverBytesAreNotLost` drives the `LeftoverPrefixedStream` path directly |
 
 ---
 
@@ -921,6 +924,72 @@ the risk to a change, not a claim that the code is defective.
   decoder (`HeaderEnvelope.Read`) does **not** have this problem — it builds its `Dictionary` with plain
   indexer assignment (`values[key] = value;`), so a malformed or adversarial header block with a
   duplicate key is fine on receipt; the throw is specific to the public constructor's copy path.
+
+### KI-35 — `WebSocketTransportListener` negotiates every connection off the accept path, including cleartext ones
+- **Where:** `StartAsync` launches `NegotiationPumpAsync` unconditionally (`Transport/WebSocket/WebSocketTransportListener.cs:180-211`);
+  the pump itself and its per-connection negotiation, `NegotiateAsync` (`:317-373`, `:375-482`). Contrast
+  `TcpTransportListener`, whose equivalent background pump (`HandshakePumpAsync`) is created **only when
+  `tlsOptions` is configured** — a cleartext `TcpTransportListener` accepts inline in `AcceptAsync` itself,
+  with no background task at all.
+- **Why it bites:** the hardening shape the pump provides — the accept never gated on a negotiation
+  slot, the zero-byte-read-before-slot-acquisition, the polled pending bound, the retry-with-delay on a
+  transient accept failure — is otherwise a close match for `TcpTransportListener`'s TLS pump (see
+  [transport.md](transport.md#the-negotiation-pump--read-this-before-touching-it) for the point-by-point
+  comparison), so it is easy to assume the two listeners differ only in whether TLS is layered on top.
+  They do not: `WebSocketTransportListener` always negotiates off-path because the HTTP upgrade parse has
+  to happen there regardless of encryption, so `maxConcurrentHandshakes` bounds concurrent **plain HTTP
+  header parsing** for a cleartext deployment just as much as it bounds concurrent TLS handshakes for a
+  secured one. Someone porting "cleartext is basically free, the pump only matters with TLS" from the TCP
+  listener to this one will size the knob wrong.
+- **What to do:** size `maxConcurrentHandshakes` for the busiest configuration you actually run, cleartext
+  or TLS — do not leave it at the default on the reasoning that "we don't use TLS here so it doesn't
+  matter". If you need cleartext WebSocket connections to bypass the pump for latency, that is a design
+  change to the listener, not a configuration tweak.
+
+### KI-36 — Constructor's `path` doc claims `404` for a wrong upgrade path; the code always sends `400` (fixed)
+- **Status: fixed before merge (PR #78).** The constructor's XML doc on the `path` parameter
+  (`Transport/WebSocket/WebSocketTransportListener.cs:80-83`) wrongly claimed a mismatched path was
+  refused with `404 Not Found`; the implementation has only ever sent `400 Bad Request`
+  (`WriteResponseAsync(stream, "400 Bad Request", ...)`, `:422-428`) whenever `ReadUpgradeRequestAsync`
+  returns a `null` key — there is no 404 anywhere in the code. The doc comment now says `400 Bad Request`
+  and states plainly that a wrong path and a malformed/missing upgrade request are indistinguishable to
+  the caller (`ReadUpgradeRequestAsync`, `:505-555`, returns `null` for both, with nothing to tell the two
+  causes apart).
+- **Why it mattered:** a genuine mismatch between the source's own documentation and its behaviour, not a
+  wire-protocol or correctness defect — `WebSocketTransportLoopbackTests.ConnectAsync_WrongPath_ThrowsWebSocketException`
+  only ever asserted that `ConnectAsync` throws, not which HTTP status produced it. An integrator who read
+  the old doc and built something that expects `404` specifically for "wrong upgrade path" — a
+  reverse-proxy routing rule, a health probe distinguishing "misconfigured client" from "server trouble"
+  — would have seen `400` instead, indistinguishable from a malformed request.
+- **What to do:** treat any non-`101` response from this listener as "rejected", full stop — do not build
+  tooling that infers the cause from the status code. The behaviour (always `400`, no distinction) was
+  kept as-is; only the doc was corrected to match it.
+
+### KI-37 — A pipelined first WebSocket frame ahead of the `101` response has no dedicated regression test
+- **Where:** the leftover-handling in `NegotiateAsync` (`Transport/WebSocket/WebSocketTransportListener.cs:432-439`);
+  the buffered header reader that produces it, `ReadHeaderLinesAsync` (`:575-613`); the wrapper that
+  serves it back, the private nested `LeftoverPrefixedStream` (`:658-739`).
+- **Why it matters, not "bites":** `ReadHeaderLinesAsync` reads the HTTP upgrade request in 16 KiB-bounded
+  chunks looking for the terminating blank line. A peer is not required by RFC 6455 to wait for the
+  `101 Switching Protocols` response before sending its first WebSocket frame, so that frame's bytes can
+  legitimately land in the same chunk as the tail of the header block. Whatever comes after the
+  terminator in that chunk is not header data at all; `ReadHeaderLinesAsync` returns it as `leftover`
+  rather than discarding it, and `NegotiateAsync` wraps the negotiated stream in `LeftoverPrefixedStream`
+  whenever `leftover.Length > 0` so `SystemWebSocket.CreateFromStream` sees those bytes served back before
+  anything further is read from the socket. On inspection this looks correct.
+- **The gap:** *(inference)* no test in `WebSocketTransportLoopbackTests.cs` or elsewhere in the suite
+  drives a client that writes a WebSocket frame immediately after its upgrade request without waiting for
+  the `101` response — every test's `WebSocketTransport.ConnectAsync` call implicitly waits for
+  `ClientWebSocket` to complete the handshake before the test sends anything. This path's correctness
+  therefore rests on code inspection and RFC 6455 conformance, not on a regression test that would catch a
+  future change silently dropping those bytes (which would manifest as an intermittently missing or
+  truncated first message on a fast client, and only under a specific chunk-boundary timing — a very hard
+  bug to reproduce after the fact).
+- **What to do:** if you touch the header reader or the leftover plumbing, keep returning and re-serving
+  those bytes rather than discarding them. If you want this properly regression-tested, the shape to add
+  is a test that opens a raw `TcpClient` against the listener, writes the upgrade request **and** the
+  first WebSocket frame's bytes back-to-back in one `Send` before reading the response, and asserts the
+  frame is still received correctly.
 
 ---
 
