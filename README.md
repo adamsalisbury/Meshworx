@@ -11,6 +11,7 @@ substituted.
 - **Target framework:** .NET 10
 - **Namespaces:** `AdamSalisbury.Meshworx`, `AdamSalisbury.Meshworx.Messages`,
   `AdamSalisbury.Meshworx.Transport`, `AdamSalisbury.Meshworx.Transport.Tcp`,
+  `AdamSalisbury.Meshworx.Transport.WebSocket`,
   `AdamSalisbury.Meshworx.Extensions.DependencyInjection`
 
 ## Architecture
@@ -22,6 +23,7 @@ substituted.
 | `ITransport` | A bidirectional, message-oriented channel. Implementations own their framing. |
 | `ITransportListener` | Accepts inbound transport connections for the hub. |
 | `TcpTransport` / `TcpTransportListener` | TCP implementation using a 4-byte big-endian length prefix per frame. |
+| `WebSocketTransport` / `WebSocketTransportListener` | WebSocket implementation reachable from a browser and through proxies and firewalls that block arbitrary TCP ports; one WebSocket binary message carries one Meshworx frame. |
 | `InMemoryTransport` / `InMemoryTransportListener` | In-process implementation backed by channels, for hosting a hub and clients in one process and for fast, deterministic testing. |
 | `AddMeshHub` / `AddMeshClient` | `IServiceCollection` extension methods, in the `AdamSalisbury.Meshworx.Extensions.DependencyInjection` package, that register a hub or client for dependency injection and the generic host. |
 
@@ -496,6 +498,45 @@ await hub.StartAsync();
 await using var client = new MeshClient(clientLogger);
 await client.ConnectAsync(listener.Connect(), "Alice");
 ```
+
+The bundled `WebSocketTransport`/`WebSocketTransportListener` reaches a hub over `ws://` or
+`wss://` — the only way to connect from a browser, and one that traverses proxies and firewalls
+that block arbitrary TCP ports. One WebSocket binary message carries exactly one Meshworx frame,
+so no separate length prefix is needed; the 1 MiB payload cap and the wire protocol above are
+otherwise unchanged:
+
+```csharp
+// Hub
+var listener = new WebSocketTransportListener(port: 22002);
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client
+await using var client = new MeshClient(clientLogger);
+await client.ConnectAsync(
+    await WebSocketTransport.ConnectAsync(new Uri("ws://localhost:22002/")), "Alice");
+```
+
+Securing it with TLS (`wss://`) follows the same shape as the TCP transport — pass
+`SslServerAuthenticationOptions` to the listener, and configure the client's
+`ClientWebSocketOptions` (for a certificate validation callback or a client certificate) through
+`WebSocketTransport.ConnectAsync`'s `configureOptions` callback:
+
+```csharp
+// Hub
+var listener = new WebSocketTransportListener(
+    new IPEndPoint(IPAddress.Any, 22002),
+    tlsOptions: new SslServerAuthenticationOptions { ServerCertificate = hubCertificate });
+
+// Client
+await WebSocketTransport.ConnectAsync(
+    new Uri("wss://hub.example.com:22002/"),
+    options => options.RemoteCertificateValidationCallback = MyValidationCallback);
+```
+
+Negotiation — the TLS handshake where configured, then parsing the HTTP upgrade request — runs
+off the accept path, exactly as the TCP transport's TLS handshake does, so one slow or hostile
+peer cannot head-of-line block every other client waiting to connect.
 
 ## Dependency injection and hosting
 
