@@ -90,14 +90,67 @@ public sealed class HeaderEnvelopeTests
         Assert.Throws<ArgumentException>(() => HeaderEnvelope.Write(headers, buffer));
     }
 
+    /// <summary>
+    /// A single value this long already exceeds the maximum block-length prefix too, so whichever check
+    /// runs first — Write's own per-value check, or GetEncodedLength's aggregate check when the caller
+    /// sizes its buffer the usual way — the whole pipeline must still reject it as an ArgumentException.
+    /// </summary>
     [Fact]
     public void Write_ValueTooLong_ThrowsArgumentException()
     {
         string longValue = new('v', 65536);
         var headers = new MessageHeaders([new("key", longValue)]);
-        int length = HeaderEnvelope.GetEncodedLength(headers);
-        var buffer = new byte[length];
 
-        Assert.Throws<ArgumentException>(() => HeaderEnvelope.Write(headers, buffer));
+        Assert.Throws<ArgumentException>(() =>
+        {
+            int length = HeaderEnvelope.GetEncodedLength(headers);
+            var buffer = new byte[length];
+            HeaderEnvelope.Write(headers, buffer);
+        });
+    }
+
+    /// <summary>
+    /// Every individual key and value here is within its own per-entry limit, but their combined
+    /// encoded length exceeds what the wire format's 2-byte block-length prefix can represent. This
+    /// must be rejected rather than silently truncated when narrowed to a ushort by the caller.
+    /// </summary>
+    [Fact]
+    public void GetEncodedLength_AggregateExceedsBlockLengthLimit_ThrowsArgumentException()
+    {
+        string largeValue = new('v', 65000);
+        var headers = new MessageHeaders(
+        [
+            new("first", largeValue),
+            new("second", largeValue),
+        ]);
+
+        Assert.Throws<ArgumentException>(() => HeaderEnvelope.GetEncodedLength(headers));
+    }
+
+    [Fact]
+    public void Read_KeyRunsPastBlockLength_ThrowsFormatException()
+    {
+        // keyLength byte declares 5, but no bytes follow within the 1-byte block.
+        byte[] block = [5];
+
+        Assert.Throws<FormatException>(() => HeaderEnvelope.Read(block, block.Length));
+    }
+
+    [Fact]
+    public void Read_TruncatedBeforeValueLengthField_ThrowsFormatException()
+    {
+        // keyLength(1)=1, key="a", then nothing — the 2-byte value-length field is missing entirely.
+        byte[] block = [1, (byte)'a'];
+
+        Assert.Throws<FormatException>(() => HeaderEnvelope.Read(block, block.Length));
+    }
+
+    [Fact]
+    public void Read_ValueRunsPastBlockLength_ThrowsFormatException()
+    {
+        // keyLength(1)=1, key="a", valueLength(2, BE)=10, but no value bytes follow.
+        byte[] block = [1, (byte)'a', 0, 10];
+
+        Assert.Throws<FormatException>(() => HeaderEnvelope.Read(block, block.Length));
     }
 }

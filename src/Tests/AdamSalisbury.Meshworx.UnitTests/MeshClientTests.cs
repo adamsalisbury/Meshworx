@@ -495,6 +495,28 @@ public sealed class MeshClientTests
             () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, null!));
     }
 
+    /// <summary>
+    /// Headers whose combined encoded length exceeds what the wire format's 2-byte block-length prefix
+    /// can represent are rejected before anything is sent, rather than silently truncating the length
+    /// written to the wire and corrupting the frame for the recipient.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_HeadersAggregateTooLarge_ThrowsArgumentException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        string largeValue = new('v', 65000);
+        var headers = new MessageHeaders(
+        [
+            new("first", largeValue),
+            new("second", largeValue),
+        ]);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, headers));
+    }
+
     // Send policy (timeout and retry)
 
     /// <summary>
@@ -1368,6 +1390,39 @@ public sealed class MeshClientTests
         await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
 
         Assert.Equal(2, handlerInvocations);
+    }
+
+    /// <summary>
+    /// A DeliverMessageWithHeaders frame whose header block is internally malformed — an outer length
+    /// prefix the hub only ever forwards unchanged, never validates — is discarded rather than crashing
+    /// the receive loop. The message it was queued behind (a plain DeliverMessage) still arrives.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_DeliverMessageWithHeaders_MalformedHeaderBlock_DiscardsFrameAndSurvives()
+    {
+        var fixture = new MeshClientFixture();
+
+        // DeliverMessageWithHeaders: [type][senderId(16)][headerBlockLength(2)=1][headerBlock=[5]][body].
+        // A declared header-block length of 1 byte whose sole byte claims a 5-byte key is internally
+        // malformed: the key runs straight past the end of the block.
+        var senderId = Guid.NewGuid();
+        var malformedFrame = new byte[1 + 16 + 2 + 1 + 3];
+        malformedFrame[0] = 0x12; // DeliverMessageWithHeaders
+        senderId.TryWriteBytes(malformedFrame.AsSpan(1, 16));
+        BinaryPrimitives.WriteUInt16BigEndian(malformedFrame.AsSpan(17, 2), 1);
+        malformedFrame[19] = 5; // claims a 5-byte key within a 1-byte block
+        new byte[] { 9, 9, 9 }.CopyTo(malformedFrame, 20);
+
+        byte[] validFrame = fixture.CreateDeliverMessagePayload(Guid.NewGuid(), [1, 2, 3]);
+        fixture.SetupSuccessfulRegistration(malformedFrame, validFrame);
+
+        var receivedEvents = new List<MessageReceivedEventArgs>();
+        fixture.Client.MessageReceived += (_, e) => receivedEvents.Add(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        Assert.Single(receivedEvents);
+        Assert.Equal(new byte[] { 1, 2, 3 }, receivedEvents[0].Data.ToArray());
     }
 
     /// <summary>

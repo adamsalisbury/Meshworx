@@ -14,7 +14,8 @@ namespace AdamSalisbury.Meshworx.Messages;
 /// big-endian)][value]</c> — with no entry count: a reader consumes entries until it has read exactly
 /// as many bytes as the block's own length prefix declared. Keys and values are UTF-8. A key longer
 /// than 255 bytes once encoded, or a value longer than 65535 bytes, cannot be represented and is
-/// rejected at encode time.
+/// rejected at encode time — as is a block whose overall encoded length would not fit the wire
+/// format's own 2-byte block-length prefix.
 /// </remarks>
 internal static class HeaderEnvelope
 {
@@ -25,15 +26,29 @@ internal static class HeaderEnvelope
     /// Computes the number of bytes <see cref="Write"/> would write for the given headers, excluding
     /// the block-length prefix that precedes it on the wire.
     /// </summary>
+    /// <exception cref="ArgumentException">
+    /// The headers' total encoded length exceeds <see cref="ushort.MaxValue"/>, the largest value the
+    /// wire format's block-length prefix can represent.
+    /// </exception>
     public static int GetEncodedLength(MessageHeaders headers)
     {
-        int length = 0;
+        // Summed as a long so an implausibly large header set cannot wrap the running total past
+        // int.MaxValue before the check below has a chance to reject it.
+        long length = 0;
         foreach (KeyValuePair<string, string> header in headers)
         {
             length += 1 + Encoding.UTF8.GetByteCount(header.Key) + 2 + Encoding.UTF8.GetByteCount(header.Value);
         }
 
-        return length;
+        if (length > ushort.MaxValue)
+        {
+            throw new ArgumentException(
+                $"The headers encode to {length} bytes, exceeding the maximum header-block length of "
+                + $"{ushort.MaxValue} bytes representable by the wire format's block-length prefix.",
+                nameof(headers));
+        }
+
+        return (int)length;
     }
 
     /// <summary>
@@ -48,35 +63,37 @@ internal static class HeaderEnvelope
         int offset = 0;
         foreach (KeyValuePair<string, string> header in headers)
         {
-            byte[] keyBytes = Encoding.UTF8.GetBytes(header.Key);
-            if (keyBytes.Length > MaxKeyByteLength)
+            int keyByteLength = Encoding.UTF8.GetByteCount(header.Key);
+            if (keyByteLength > MaxKeyByteLength)
             {
                 throw new ArgumentException(
-                    $"Header key '{header.Key}' is {keyBytes.Length} bytes once UTF-8 encoded, "
+                    $"Header key '{header.Key}' is {keyByteLength} bytes once UTF-8 encoded, "
                     + $"exceeding the maximum of {MaxKeyByteLength}.",
                     nameof(headers));
             }
 
-            byte[] valueBytes = Encoding.UTF8.GetBytes(header.Value);
-            if (valueBytes.Length > MaxValueByteLength)
+            int valueByteLength = Encoding.UTF8.GetByteCount(header.Value);
+            if (valueByteLength > MaxValueByteLength)
             {
                 throw new ArgumentException(
-                    $"The value for header key '{header.Key}' is {valueBytes.Length} bytes once UTF-8 "
+                    $"The value for header key '{header.Key}' is {valueByteLength} bytes once UTF-8 "
                     + $"encoded, exceeding the maximum of {MaxValueByteLength}.",
                     nameof(headers));
             }
 
-            destination[offset] = (byte)keyBytes.Length;
+            // Encoded directly into the destination span rather than via an intermediate byte[] per
+            // entry — GetByteCount above already gives the length needed for the prefixes and bounds
+            // checks, so nothing needs the encoded bytes before they can be written straight to their
+            // final position.
+            destination[offset] = (byte)keyByteLength;
             offset += 1;
 
-            keyBytes.CopyTo(destination[offset..]);
-            offset += keyBytes.Length;
+            offset += Encoding.UTF8.GetBytes(header.Key, destination[offset..]);
 
-            BinaryPrimitives.WriteUInt16BigEndian(destination.Slice(offset, 2), (ushort)valueBytes.Length);
+            BinaryPrimitives.WriteUInt16BigEndian(destination.Slice(offset, 2), (ushort)valueByteLength);
             offset += 2;
 
-            valueBytes.CopyTo(destination[offset..]);
-            offset += valueBytes.Length;
+            offset += Encoding.UTF8.GetBytes(header.Value, destination[offset..]);
         }
     }
 
@@ -85,6 +102,13 @@ internal static class HeaderEnvelope
     /// <paramref name="source"/>.
     /// </summary>
     /// <returns><see cref="MessageHeaders.Empty"/> when <paramref name="blockLength"/> is zero.</returns>
+    /// <exception cref="FormatException">
+    /// The block is internally malformed — a key or value length runs past the end of the block, or
+    /// the final entry does not end exactly on the block's own boundary. The <paramref name="source"/>
+    /// span itself is trusted to be at least <paramref name="blockLength"/> bytes long (the caller has
+    /// already validated that against the outer frame); everything past that point is untrusted
+    /// sender-supplied data and is bounds-checked here before use.
+    /// </exception>
     public static MessageHeaders Read(ReadOnlySpan<byte> source, int blockLength)
     {
         if (blockLength == 0)
@@ -98,14 +122,34 @@ internal static class HeaderEnvelope
 
         while (offset < block.Length)
         {
+            // offset < block.Length is already guaranteed by the loop condition, so the key-length
+            // byte itself is always safe to read; only the fields after it can run past the block.
             int keyLength = block[offset];
             offset += 1;
+
+            if (offset + keyLength > block.Length)
+            {
+                throw new FormatException(
+                    "Malformed header block: a header key runs past the declared block length.");
+            }
 
             string key = Encoding.UTF8.GetString(block.Slice(offset, keyLength));
             offset += keyLength;
 
+            if (offset + 2 > block.Length)
+            {
+                throw new FormatException(
+                    "Malformed header block: truncated before a header's value-length field.");
+            }
+
             int valueLength = BinaryPrimitives.ReadUInt16BigEndian(block.Slice(offset, 2));
             offset += 2;
+
+            if (offset + valueLength > block.Length)
+            {
+                throw new FormatException(
+                    "Malformed header block: a header value runs past the declared block length.");
+            }
 
             string value = Encoding.UTF8.GetString(block.Slice(offset, valueLength));
             offset += valueLength;

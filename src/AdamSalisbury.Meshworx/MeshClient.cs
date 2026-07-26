@@ -860,23 +860,26 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
                     if (data.Length >= 19 + headerBlockLength)
                     {
-                        MessageHeaders headers = HeaderEnvelope.Read(data.AsSpan(19), headerBlockLength);
-                        ReadOnlyMemory<byte> messageData = data.AsMemory(19 + headerBlockLength);
+                        MessageHeaders? headers = TryReadHeaderBlock(data.AsSpan(19), headerBlockLength, senderId);
+                        if (headers is not null)
+                        {
+                            ReadOnlyMemory<byte> messageData = data.AsMemory(19 + headerBlockLength);
 
-                        try
-                        {
-                            MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                            try
                             {
-                                SenderId = senderId,
-                                Data = messageData,
-                                Headers = headers,
-                            });
-                        }
-                        catch (Exception ex)
-                        {
-                            // A throwing subscriber must not tear down the receive loop and
-                            // silently halt all further delivery. This is a callback boundary.
-                            _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                                MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                                {
+                                    SenderId = senderId,
+                                    Data = messageData,
+                                    Headers = headers,
+                                });
+                            }
+                            catch (Exception ex)
+                            {
+                                // A throwing subscriber must not tear down the receive loop and
+                                // silently halt all further delivery. This is a callback boundary.
+                                _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                            }
                         }
                     }
                 }
@@ -896,24 +899,28 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         if (data.Length >= bodyOffset)
                         {
                             string groupName = Encoding.UTF8.GetString(data.AsSpan(19, nameLength));
-                            MessageHeaders headers = HeaderEnvelope.Read(
-                                data.AsSpan(headerLengthOffset + 2), headerBlockLength);
-                            ReadOnlyMemory<byte> messageData = data.AsMemory(bodyOffset);
+                            MessageHeaders? headers = TryReadHeaderBlock(
+                                data.AsSpan(headerLengthOffset + 2), headerBlockLength, senderId);
 
-                            try
+                            if (headers is not null)
                             {
-                                GroupMessageReceived?.Invoke(this, new GroupMessageReceivedEventArgs
+                                ReadOnlyMemory<byte> messageData = data.AsMemory(bodyOffset);
+
+                                try
                                 {
-                                    SenderId = senderId,
-                                    GroupName = groupName,
-                                    Data = messageData,
-                                    Headers = headers,
-                                });
-                            }
-                            catch (Exception ex)
-                            {
-                                // Callback boundary — a throwing subscriber must not halt the loop.
-                                _logger.LogError(ex, "A GroupMessageReceived handler threw an exception");
+                                    GroupMessageReceived?.Invoke(this, new GroupMessageReceivedEventArgs
+                                    {
+                                        SenderId = senderId,
+                                        GroupName = groupName,
+                                        Data = messageData,
+                                        Headers = headers,
+                                    });
+                                }
+                                catch (Exception ex)
+                                {
+                                    // Callback boundary — a throwing subscriber must not halt the loop.
+                                    _logger.LogError(ex, "A GroupMessageReceived handler threw an exception");
+                                }
                             }
                         }
                     }
@@ -1091,6 +1098,31 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             // A throwing subscriber must not fault the receive loop task. Callback boundary.
             _logger.LogError(ex, "A Disconnected handler threw an exception");
+        }
+    }
+
+    /// <summary>
+    /// Decodes a header block, returning <see langword="null"/> instead of throwing if it is internally
+    /// malformed.
+    /// </summary>
+    /// <remarks>
+    /// The hub relays a header block byte-for-byte without decoding it, so a peer sending a
+    /// well-formed outer frame with an internally corrupt header block reaches this decoder unfiltered.
+    /// A single bad frame must not tear down the receive loop and disconnect an otherwise healthy
+    /// connection — the same reasoning already applied to a throwing event handler at every call site
+    /// below applies here too, just one step earlier.
+    /// </remarks>
+    private MessageHeaders? TryReadHeaderBlock(ReadOnlySpan<byte> source, int blockLength, Guid senderId)
+    {
+        try
+        {
+            return HeaderEnvelope.Read(source, blockLength);
+        }
+        catch (FormatException ex)
+        {
+            _logger.LogWarning(
+                ex, "Discarding a message from {SenderId} with a malformed header block", senderId);
+            return null;
         }
     }
 

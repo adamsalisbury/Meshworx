@@ -1488,8 +1488,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             // Expected during shutdown.
         }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or ArgumentException)
         {
+            // ArgumentException here means a transport (TcpTransport, notably) rejected a delivery
+            // frame as oversized — the routing methods above can grow a near-maximum-size inbound
+            // payload past the transport's cap by adding the sender id, group name and, for a
+            // header-bearing frame, the header block. Left uncaught, this would fault the task that
+            // HandleClientAsync's own cleanup awaits from inside its finally block, aborting that
+            // finally partway through and skipping the slot release, name removal, group removal and
+            // disposal that follow it — leaking the client's registration permanently rather than
+            // merely losing the one oversized message. Treating it exactly like a transport fault, by
+            // cancelling the client here instead of letting it propagate, keeps that cleanup intact.
             _logger.LogWarning(
                 ex,
                 "Send loop for client {ClientId} terminated due to transport error",

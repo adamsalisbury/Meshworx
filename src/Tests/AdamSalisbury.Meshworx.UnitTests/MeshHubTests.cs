@@ -2219,6 +2219,58 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    /// <summary>
+    /// A transport's SendAsync can reject an oversized delivery frame with an ArgumentException — as
+    /// TcpTransport does when a near-maximum-size inbound payload grows past the frame cap once the
+    /// hub adds routing fields (and, for a header-bearing message, the header block). This must be
+    /// treated exactly like a transport fault: the recipient is evicted with its slot, name and group
+    /// memberships released, not left to fault the send loop's awaiting task and skip that cleanup.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_RecipientTransportRejectsOversizedDelivery_EvictsRecipientAndReleasesItsSlot()
+    {
+        var fixture = new MeshHubFixture(maxClients: 2);
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterMultiMessageClientAsync("Recipient");
+
+        var recipientDisposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => recipientDisposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ArgumentException("Payload size exceeds the maximum frame payload of 1048576 bytes."));
+
+        var sendPayload = new byte[1 + 16 + 3];
+        sendPayload[0] = 0x02; // SendMessage
+        recipient.Id.TryWriteBytes(sendPayload.AsSpan(1));
+        new byte[] { 1, 2, 3 }.CopyTo(sendPayload, 17);
+        sender.EnqueueMessage(sendPayload);
+
+        await recipientDisposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.False(fixture.Hub.IsClientRegistered(recipient.Id));
+        Assert.True(fixture.Hub.IsClientRegistered(sender.Id));
+
+        // The recipient's claimed slot must have been released too, not just its registry entry
+        // removed — otherwise a third client could never register against the 2-client cap.
+        var thirdClient = MeshHubFixture.CreateMockTransport();
+        var thirdRegisteredTcs = new TaskCompletionSource<byte[]>();
+        thirdClient.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Third"));
+        thirdClient.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => thirdRegisteredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+        fixture.EnqueueClient(thirdClient.Object);
+
+        byte[] thirdResponse = await thirdRegisteredTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(0x01, thirdResponse[0]); // RegistrationComplete, not HubAtCapacity
+
+        sender.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // HandleClient — heartbeat
 
     /// <summary>
