@@ -3,13 +3,14 @@
 [← back to index](../for-clanker.md) · related: [hub.md](hub.md) · [client.md](client.md) · [protocol.md](protocol.md) · [known-issues.md](known-issues.md)
 
 The transport layer is the swap point. Hub and client depend only on `ITransport` /
-`ITransportListener`; two concrete implementations ship (`Tcp*`, `InMemory*`), and you can add your own.
-A transport is a **dumb, message-oriented pipe** — it owns framing but knows nothing about opcodes.
-The TCP pair is optionally **TLS-secured**: pass TLS options to the listener and to
-`TcpTransport.ConnectAsync` and the framing is unchanged, only the byte stream differs
-([Turning TLS on](#turning-tls-on-both-ends)).
+`ITransportListener`; three concrete implementations ship (`Tcp*`, `WebSocket*` — PR #78, issue #18 —
+`InMemory*`), and you can add your own. A transport is a **dumb, message-oriented pipe** — it owns
+framing but knows nothing about opcodes. The TCP and WebSocket pairs are both optionally
+**TLS-secured**: pass TLS options to the listener and to `TcpTransport.ConnectAsync` /
+`WebSocketTransport.ConnectAsync` and the framing is unchanged, only the byte stream differs
+([Turning TLS on, TCP](#turning-tls-on-both-ends); [Turning TLS on, WebSocket](#turning-tls-on-websocket-both-ends)).
 
-Namespace `AdamSalisbury.Meshworx.Transport` (+ `.Tcp`, `.InMemory`).
+Namespace `AdamSalisbury.Meshworx.Transport` (+ `.Tcp`, `.WebSocket`, `.InMemory`).
 
 ---
 
@@ -64,9 +65,15 @@ Task SendAsync(IReadOnlyList<ReadOnlyMemory<byte>> messages, CancellationToken =
 An **optional capability**. The hub's send loop coalesces a burst of queued frames into one underlying
 write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:1471-1473`);
 transports that don't implement it just receive frames one at a time. It is deliberately **`internal`**:
-only the bundled `TcpTransport` benefits and only the in-assembly hub consumes it, so it stays off the
-public `ITransport` surface. Each element is delivered as its own message. **External transports cannot
-and need not implement it.**
+only the bundled `TcpTransport`/`WebSocketTransport` benefit and only the in-assembly hub consumes it, so
+it stays off the public `ITransport` surface. Each element is delivered as its own message. **External
+transports cannot and need not implement it.**
+
+`WebSocketTransport` implements it too, but gets a narrower win than `TcpTransport`: WebSocket has no
+equivalent of TCP's single-write coalescing, so a batch still costs one WebSocket message per queued
+frame — what it saves is acquiring the write lock **once** for the whole batch rather than once per
+message, which still matters for a fan-out burst (a broadcast or group send). See
+[`WebSocketTransport`](#websockettransport--transportwebsocketwebsockettransportcs23) below.
 
 ### `IRemoteEndPointTransport` (public) — `Transport/IRemoteEndPointTransport.cs:16`
 
@@ -86,10 +93,12 @@ single remote address at once (`ExtractRemoteAddress`, `MeshHub.cs:743-748`) —
   the hub's per-remote-endpoint limit — `InMemoryTransport` falls into this bucket and always has.
 - The hub only recognises an `IPEndPoint`; it discards any other `EndPoint` subtype the same way as
   `null`.
-- **Only `TcpTransport` implements it** in this codebase (below). If you write a custom TCP-like
-  transport and want it subject to `maxConnectionsPerRemoteEndpoint`, implement this interface and
-  report the genuine peer address — do not fabricate one, since the hub uses it as the cap's dictionary
-  key.
+- **`TcpTransport` and `WebSocketTransport` both implement it** in this codebase (below). For
+  `WebSocketTransport` it is `null` on the client side (`ClientWebSocket` exposes no underlying socket to
+  report an address from) and the accepted socket's remote address on the listener side. If you write a
+  custom TCP-like transport and want it subject to `maxConnectionsPerRemoteEndpoint`, implement this
+  interface and report the genuine peer address — do not fabricate one, since the hub uses it as the
+  cap's dictionary key.
 
 ---
 
@@ -407,6 +416,266 @@ Notes for anyone wiring this up:
 - **The listener owns no certificate lifetime.** It holds the `X509Certificate2` you passed (via the
   shallow options copy); disposing that certificate while the listener is running breaks every
   subsequent handshake.
+
+---
+
+## `WebSocketTransport` / `WebSocketTransportListener` — `Transport/WebSocket/`
+
+Added by PR #78 (issue #18). Reaches a hub over `ws://`/`wss://` — the only way to connect from a
+browser, and one that traverses proxies and firewalls that block arbitrary TCP ports. **The wire
+protocol, `MeshHub` and `MeshClient` are all completely untouched by this transport** — nothing above
+`ITransport` changed to support it, exactly as nothing changed for the TCP TLS work. See
+[protocol.md](protocol.md#two-layers-framing-vs-message) for how this transport's framing fits the
+two-layer model.
+
+### Framing
+
+One WebSocket **binary** message carries exactly one Meshworx frame — **no separate length prefix**,
+unlike `TcpTransport`, because the WebSocket protocol already delimits messages
+(`WebSocketTransport.cs:13-17`). The 1 MiB payload cap is shared in *value* with `TcpTransport`
+(`MaxPayloadSize`, `WebSocketTransport.cs:25`) but is its own constant, checked independently on both
+send and receive — there is no shared code path with the TCP transport's cap enforcement, so if you ever
+change one you must change the other by hand to keep them in agreement.
+
+### `WebSocketTransport` — `Transport/WebSocket/WebSocketTransport.cs:23`
+
+`public sealed class WebSocketTransport : ITransport, IBatchSendTransport, IRemoteEndPointTransport`.
+Wraps a `System.Net.WebSockets.WebSocket`. The constructor is `internal` (`:31`) — reached only via
+`ConnectAsync` below (client side) or `WebSocketTransportListener.NegotiateAsync` (server side); there is
+no public way to wrap an arbitrary `WebSocket` yourself.
+
+- **`IsEncrypted`** (`:46`) — `public bool`, but derived **differently on each side**, unlike
+  `TcpTransport.IsEncrypted` which always introspects the live `SslStream`:
+  - **Client side:** set once at connect time from the URI scheme
+    (`string.Equals(uri.Scheme, "wss", StringComparison.OrdinalIgnoreCase)`, `:88`) — **not** by
+    inspecting the socket, because `ClientWebSocket` exposes nothing equivalent to `SslStream.IsEncrypted`
+    to inspect. Reliable in practice, since a `wss://` `ConnectAsync` cannot succeed without completing a
+    TLS handshake, but it is an inference from the URI, not a read of the live connection's state.
+  - **Server side:** set once at construction from whether the *listener* was configured with
+    `tlsOptions` (`isEncrypted: _tlsOptions is not null`, `WebSocketTransportListener.cs:445`) — a
+    property of the listener, not of the individual connection. Every connection off a TLS-configured
+    listener has already been through `AuthenticateAsServerAsync` by the time this constructor runs, so
+    it is accurate, just derived per-listener rather than per-socket.
+- **`RemoteEndPoint`** (`:54`) — the `IRemoteEndPointTransport` implementation. `null` for every
+  client-side connection (`ConnectAsync` always passes `remoteEndPoint: null`, `:89`); the accepted
+  socket's `TcpClient.Client.RemoteEndPoint` for a server-side one, captured once at negotiation
+  (`WebSocketTransportListener.cs:445`) before the raw socket is wrapped in a `WebSocket`.
+- **`ConnectAsync(uri, configureOptions, ct)`** (`:75-96`) — static factory. Accepts `ws://` or `wss://`;
+  `configureOptions` is your hook onto the underlying `ClientWebSocketOptions` — certificate validation
+  callback, client certificates for mutual TLS, anything else `ClientWebSocketOptions` exposes. Disposes
+  the `ClientWebSocket` if `ConnectAsync`/the callback throws (`:91-95`), mirroring `TcpTransport`'s
+  dispose-on-throw-during-connect behaviour.
+- **`SendAsync(single)`** (`:99-120`) — rejects payloads over 1 MiB with `ArgumentException` up front
+  (matching `TcpTransport`); otherwise takes the internal `SemaphoreSlim` write lock and sends one
+  `WebSocketMessageType.Binary` message with `endOfMessage: true`.
+- **`SendAsync(batch)`** (`:130-182`, `IBatchSendTransport`) — takes the write lock **once** for the
+  whole batch rather than once per message (the concurrency win — see
+  [`IBatchSendTransport`](#ibatchsendtransport-internal--transportibatchsendtransportcs14) above for why
+  it cannot also coalesce into one wire write the way TCP does). Same deliver-then-fault semantics as
+  `TcpTransport`'s batch path: if an element partway through the batch is oversize, every valid element
+  ahead of it is still sent before the batch throws `ArgumentException` (`:175-181`). Empty batch is a
+  no-op; single-element batch delegates to the scalar path.
+- **`ReceiveAsync`** (`:191-236`) — rents an 8 KiB chunk (`ReceiveChunkSize`, `:26`) from
+  `ArrayPool<byte>.Shared`. **Fast path:** a message that fits in one WebSocket frame (every message up to
+  8 KiB) costs one copy — `chunk.AsSpan(0, count).ToArray()` (`:206`) — matching `TcpTransport`'s single
+  exact-size read. **Slow path:** a message spanning several frames accumulates in a `MemoryStream`,
+  checking the running total against the 1 MiB cap on every chunk and throwing `IOException` if it would
+  be exceeded (`:221-225`) — a second copy on the final `ToArray()`. This receive path is a genuinely
+  separate implementation from `TcpTransport.ReceiveAsync`, not shared code, so a change to one's framing
+  or cap behaviour does not propagate to the other.
+  - **`ReceiveChunkAsync`** (`:243-272`) — the single-frame primitive underneath both paths above.
+    Translates `WebSocketException` with `WebSocketError.ConnectionClosedPrematurely` into a synthetic
+    `Close` result (`:250-256`), so a peer that drops without completing the WebSocket close handshake is
+    treated as a clean EOF, exactly like TCP's mid-frame-EOF-returns-`null` case, rather than propagating
+    as an exception from `ReceiveAsync`. A non-`Binary`, non-`Close` frame (i.e. a `Text` frame — Meshworx
+    never sends one) throws `IOException` (`:263-269`), the same "framing can no longer be trusted, treat
+    it as a transport fault" response `TcpTransport` gives an invalid length prefix.
+- **`DisposeAsync`** (`:275-299`) — best-effort graceful close: if the socket is `Open` or
+  `CloseReceived`, sends a normal-closure `CloseAsync` bounded by a 2-second internal timeout, swallowing
+  `OperationCanceledException`/`WebSocketException` from that attempt (the peer may already be gone).
+  Always disposes the `WebSocket` and the write-lock semaphore in `finally`, so the close attempt failing
+  never leaks either.
+
+### `WebSocketTransportListener` — `Transport/WebSocket/WebSocketTransportListener.cs:29`
+
+`public sealed class WebSocketTransportListener : ITransportListener`. Built on a `TcpListener` plus an
+optional `SslServerAuthenticationOptions`, exactly like `TcpTransportListener`, but negotiation here means
+**two** things in sequence rather than one: the TLS handshake where configured, **then** parsing the RFC
+6455 HTTP upgrade request by hand (not `HttpListener`/ASP.NET Core). Both happen off the accept path for
+the identical reason `TcpTransportListener`'s TLS handshake does — the hub's accept loop consumes one
+connection at a time, so negotiating inline would let one slow or hostile peer head-of-line block every
+other client waiting to connect.
+
+**The state/threading discipline is identical to `TcpTransportListener`'s** — one `Lock _stateLock`
+(`:56`) guards every mutable field, every entry point captures what it needs under the lock **once** and
+then works from locals, and nothing that blocks or awaits runs while the lock is held. `internal
+LocalEndPoint` (`:65-74`) exists for the same reason as `TcpTransportListener`'s — so tests can read back
+an ephemeral (`0`) port.
+
+#### Constructors
+
+```csharp
+WebSocketTransportListener(
+    IPEndPoint endPoint,                                  // :109
+    string path = "/",                                    // the HTTP upgrade path clients must hit
+    SslServerAuthenticationOptions? tlsOptions = null,
+    TimeSpan? handshakeTimeout = null,                    // default 10s
+    int? maxConcurrentHandshakes = null)                  // default 64
+
+WebSocketTransportListener(int port, ...)                 // :168 — binds IPAddress.Loopback, same caveat as TcpTransportListener(int port)
+```
+
+Guards mirror `TcpTransportListener`'s exactly: `ArgumentNullException` for a null `endPoint`,
+`ArgumentException` for an empty `path` or `tlsOptions` with none of `ServerCertificate` /
+`ServerCertificateContext` / `ServerCertificateSelectionCallback`, `ArgumentOutOfRangeException` for a
+non-positive `handshakeTimeout`/`maxConcurrentHandshakes` (`:116-140`). `path` is normalised to start with
+`/` if you omit it (`:143`) but is otherwise matched **ordinally** against the request line — case
+matters. TLS options are copied via the **same** `TcpTransportListener.CloneServerOptions` (`:144`) —
+the same shallow-copy caveat and the same `TlsOptionsCloneTests` reflection tripwire cover this listener
+too, since it is literally the same clone method.
+
+#### Lifecycle
+
+- **`StartAsync`** (`:180-211`) creates and starts a `TcpListener`, creates a bounded
+  `Channel<WebSocketTransport>` of capacity `maxConcurrentHandshakes` (`SingleReader = true`, `:199-204`),
+  and launches `NegotiationPumpAsync` — **unconditionally**, not gated on `tlsOptions` the way
+  `TcpTransportListener` only launches its pump for TLS. See [Gotchas](#gotchas-2) below for why that
+  matters.
+- **`AcceptAsync`** (`:217-242`) reads one negotiated transport off the channel. A `ChannelClosedException`
+  (pump stopped, for any reason — disposal or an outright accept failure) is translated to
+  `ObjectDisposedException` carrying the original as `InnerException` (`:233-241`) — the same
+  unconditional translation shape as `TcpTransportListener`'s **TLS-mode** `AcceptAsync`, applied here to
+  every connection since there is only the one accept path.
+- **`DisposeAsync`** (`:250-277`) / **`DisposeCoreAsync`** (`:279-310`) — the same elected-single-teardown
+  shape as `TcpTransportListener`: the first caller takes ownership under the lock, clears the fields and
+  stores the resulting `Task`; every caller, first or not, awaits that same task. Order: cancel the
+  negotiation `CancellationTokenSource` → stop the `TcpListener` → **await the pump task** → dispose the
+  CTS → drain the channel, disposing every negotiated-but-never-accepted transport so those sockets are
+  not leaked.
+
+### The negotiation pump — read this before touching it
+
+`NegotiationPumpAsync` (`:317-373`) and `NegotiateAsync` (`:375-482`) are the WebSocket equivalent of
+`TcpTransportListener`'s `HandshakePumpAsync`/`HandshakeAsync`, and reuse the **same** hardening shape
+almost line for line:
+
+1. **The accept is never gated on a negotiation slot** — a flood of connect-then-idle peers must not be
+   able to hold the listener by occupying every slot before they are even asked to negotiate.
+2. **A connection only spends a negotiation slot once its peer has sent something.** `NegotiateAsync`
+   awaits a **zero-byte read** on the raw `NetworkStream` (`:407`) — completes only once data arrives,
+   consumes nothing — **before** acquiring from `negotiationSlots` (`:409`), exactly mirroring
+   `TcpTransportListener.HandshakeAsync`'s identical zero-byte-read-before-slot-acquisition (comment at
+   `:400-406` says so explicitly). A silent peer waits out its own timeout without ever occupying part of
+   the negotiation budget.
+3. **A separate, much larger pending bound is polled, never waited on.** `_maxPendingHandshakes =
+   maxConcurrentHandshakes * 16` (`PendingHandshakeMultiplier`, `:40`); `pendingSlots.Wait(0, …)`
+   (`:344-348`) sheds a connection immediately once full rather than parking the accept loop — the same
+   `* 16` multiplier and the same reasoning as `TcpTransportListener.PendingHandshakeMultiplier`.
+4. **A transient `SocketException` on accept does not retire the listener** (`:338-342`) — pauses for
+   `AcceptRetryDelay` (50 ms, `:44`) and continues, identically to `TcpTransportListener`'s pump.
+
+**One genuine difference, and it is the one to know before touching either listener:**
+`TcpTransportListener` only runs this whole pump machinery **when TLS is configured** — a cleartext
+`TcpTransportListener` accepts inline in `AcceptAsync` itself, with no background task at all.
+`WebSocketTransportListener` runs the pump **always**, TLS or not, because the HTTP upgrade parse has to
+happen off the accept path regardless of encryption — a hostile or slow peer that never finishes sending
+its upgrade request would head-of-line block the hub's accept loop exactly as an unfinished TLS handshake
+would. One consequence: `maxConcurrentHandshakes` bounds concurrent **plain HTTP header parsing** for a
+cleartext deployment just as much as it bounds concurrent TLS handshakes for a secured one — it is not a
+"TLS-only" knob here the way its TCP namesake effectively is.
+
+Once inside a negotiation slot, `NegotiateAsync` optionally wraps the stream in an `SslStream` and
+authenticates (`:413-417`), then reads and validates the HTTP upgrade request
+(`ReadUpgradeRequestAsync`, `:420-421`), writes the `101 Switching Protocols` response
+(`WriteUpgradeResponseAsync`, `:430`), and only then constructs the `WebSocketTransport` (`:444-445`) —
+**unlike** `TcpTransportListener.HandshakeAsync`, which constructs its owning `TcpTransport` immediately
+so any later failure can dispose it uniformly. `WebSocketTransport` cannot exist until the WebSocket
+object does, which needs the completed HTTP upgrade, so the catch-all instead tracks whichever `Stream`
+is currently negotiating (`:390` comment explains this explicitly) and disposes *that* on failure — same
+intent as the TCP path, different mechanics forced by the different construction order. Every negotiation
+is bounded by `_handshakeTimeout` via a linked CTS (`:395-396`).
+
+### The HTTP upgrade handshake
+
+`ReadUpgradeRequestAsync` (`:496-556`) validates the request line (`GET`, exact path match — ordinal),
+`Upgrade: websocket`, a `Connection` header whose comma-separated tokens include `Upgrade`,
+`Sec-WebSocket-Version: 13`, and a non-empty `Sec-WebSocket-Key` — returning the key on success or `null`
+on **any** failure, including a path mismatch (see [Gotchas](#gotchas-2)). `WriteUpgradeResponseAsync`
+computes `Sec-WebSocket-Accept` per RFC 6455 with `SHA1.HashData` (`:620-623`; `#pragma warning disable
+CA5350` because the algorithm is a protocol requirement, not a security control here — it only proves the
+server read the client's key).
+
+`ReadHeaderLinesAsync` (`:575-613`) reads in **16 KiB-bounded, chunked** reads (`MaxRequestHeaderBytes`,
+`:32`) rather than byte-at-a-time — deliberately, since a per-byte read would multiply badly across many
+concurrently-negotiating connections, particularly under a reconnect storm. Because the terminating blank
+line can be read past within the same chunk that contains it, whatever comes after it in that chunk is
+not header data at all — **a peer is not required to wait for the `101` response before sending its first
+WebSocket frame**, so those bytes can legitimately be the start of one. `ReadHeaderLinesAsync` returns
+them as `leftover` rather than discarding them, and `NegotiateAsync` wraps the negotiated stream in a
+private nested `LeftoverPrefixedStream` (`:658-739`) whenever `leftover.Length > 0` (`:436-439`) so
+`SystemWebSocket.CreateFromStream` sees those bytes served back before anything further is read from the
+underlying socket. *(Inference: no test in this repo specifically drives a client that writes a WebSocket
+frame ahead of receiving the `101` response, so this path's correctness rests on code inspection and RFC
+6455 conformance rather than a dedicated regression test — a coverage gap, not a known defect.)*
+
+<a id="turning-tls-on-websocket-both-ends"></a>
+
+### Turning TLS on (WebSocket, both ends)
+
+```csharp
+// Hub
+var listener = new WebSocketTransportListener(
+    new IPEndPoint(IPAddress.Any, 22002),
+    tlsOptions: new SslServerAuthenticationOptions { ServerCertificate = hubCertificate });
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client
+await using WebSocketTransport transport = await WebSocketTransport.ConnectAsync(
+    new Uri("wss://hub.example.com:22002/"),
+    options => options.RemoteCertificateValidationCallback = MyValidationCallback);
+Assert.True(transport.IsEncrypted);
+await client.ConnectAsync(transport, "Alice");
+```
+
+Cleartext is `ws://` plus no `tlsOptions`; nothing else about the shape changes. As with the TCP pair,
+**nothing above the transport changes** — `MeshHub`, `MeshClient` and the wire protocol are untouched, so
+the whole feature lives in these two files. `WebSocketMeshIntegrationTests.cs`
+(`EndToEnd_RegisterSendBroadcastAndGroupMessage_OverSecureWebSocket`) is the reference end-to-end example,
+running registration, direct send, broadcast and a group message over a real `wss://` connection with the
+actual `MeshHub`/`MeshClient`.
+
+<a id="gotchas-2"></a>
+
+### Gotchas
+
+- **The negotiation pump always runs, cleartext or not — the opposite of `TcpTransportListener`, whose
+  pump exists only for TLS.** Do not port an assumption from the TCP listener that a cleartext accept is
+  inline with no background task, or that the handshake-concurrency knob "only matters with TLS" — here
+  it bounds plain HTTP header parsing too. See [above](#the-negotiation-pump--read-this-before-touching-it)
+  and [known-issues.md](known-issues.md) KI-35.
+- **The leftover-bytes handling for a pipelined first frame has no dedicated test.** It looks correct on
+  inspection, but nothing in the suite drives a client that writes its first WebSocket frame ahead of the
+  `101` response. See [known-issues.md](known-issues.md) KI-37.
+- **A wrong upgrade path and a malformed/missing upgrade request are indistinguishable to the caller.**
+  `ReadUpgradeRequestAsync` returns `null` for *both* a path mismatch and a malformed request, and
+  `NegotiateAsync` always responds `400 Bad Request` for a `null` key (`:422-428`) — there is no 404
+  anywhere in the implementation, and the constructor's `path` XML doc now says so correctly (previously
+  it wrongly claimed a mismatched path got a `404 Not Found`; fixed before merge — see
+  [known-issues.md](known-issues.md) KI-36, now closed). Do not build anything — a proxy rule, a health
+  probe — that expects a distinct status for "wrong path" versus "malformed request"; both produce `400`.
+- **`IsEncrypted` is an inference on both sides, not a live read of the connection.** Client-side it comes
+  from the connect URI's scheme; server-side from whether the *listener* was configured with `tlsOptions`.
+  Reliable given how `ClientWebSocket`/`AuthenticateAsServerAsync` behave, but neither is the direct
+  `SslStream.IsEncrypted` read `TcpTransport.IsEncrypted` does.
+- **No wire-level batch coalescing.** `IBatchSendTransport` still sends one WebSocket message per queued
+  frame; only the write-lock acquisition is shared across a batch.
+- **`ReceiveChunkSize` (8 KiB) is unrelated to the 1 MiB payload cap** — it only decides how many messages
+  take the single-copy fast path in `ReceiveAsync` versus the `MemoryStream` slow path; both are capped
+  at `MaxPayloadSize` regardless.
+- **The public server-side construction path is only through the listener.** `WebSocketTransport`'s
+  constructor and `WebSocketTransportListener.NegotiateAsync` are both `internal`; there is no supported
+  way to hand this transport an already-established `WebSocket` from outside the assembly.
 
 ---
 
