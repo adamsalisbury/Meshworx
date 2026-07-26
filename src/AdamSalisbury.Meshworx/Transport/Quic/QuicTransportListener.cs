@@ -1,0 +1,485 @@
+using System.Collections.Concurrent;
+using System.Net;
+using System.Net.Quic;
+using System.Net.Security;
+using System.Threading.Channels;
+using AdamSalisbury.Meshworx.Transport.Tcp;
+
+namespace AdamSalisbury.Meshworx.Transport.Quic;
+
+/// <summary>
+/// An <see cref="ITransportListener"/> implementation that accepts incoming QUIC connections and, for
+/// each one, the single bidirectional stream Meshworx uses to back an <see cref="ITransport"/>.
+/// </summary>
+/// <remarks>
+/// QUIC mandates TLS at the protocol level, so — unlike <see cref="TcpTransportListener"/> — TLS options
+/// are required rather than optional here. Requires <see cref="QuicListener.IsSupported"/> to be
+/// <see langword="true"/>; on Linux this typically means the native <c>libmsquic</c> package is
+/// installed.
+/// <para>
+/// Accepting a connection is not the same as it being ready to use: the QUIC handshake itself completes
+/// inside <see cref="QuicListener.AcceptConnectionAsync"/> (msquic handles amplification limiting and
+/// retry internally, the way TLS 1.3 0-RTT/1-RTT setup requires), but the client's first stream can still
+/// arrive — or never arrive — after that. Waiting for that stream runs off the accept path, the same
+/// shape as <see cref="AdamSalisbury.Meshworx.Transport.WebSocket.WebSocketTransportListener"/> waiting
+/// for the HTTP upgrade request and <see cref="TcpTransportListener"/> waiting for a TLS handshake, so a
+/// connected-but-silent peer cannot head-of-line block every other client's own accept call. Unlike
+/// those two, though, there is no cheap way here to tell a peer that will eventually open a stream apart
+/// from one that never will before actually waiting for it — see the <c>maxConcurrentNegotiations</c>
+/// constructor parameter for what that means for a flood of such peers.
+/// </para>
+/// </remarks>
+public sealed class QuicTransportListener : ITransportListener
+{
+    private static readonly TimeSpan DefaultStreamOpenTimeout = TimeSpan.FromSeconds(10);
+    private const int DefaultMaxConcurrentNegotiations = 64;
+
+    private static readonly TimeSpan AcceptRetryDelay = TimeSpan.FromMilliseconds(50);
+
+    private readonly IPEndPoint _endPoint;
+    private readonly SslServerAuthenticationOptions _tlsOptions;
+    private readonly List<SslApplicationProtocol> _applicationProtocols;
+    private readonly TimeSpan _streamOpenTimeout;
+    private readonly int _maxConcurrentNegotiations;
+
+    // Guards every mutable field below, following the same discipline as TcpTransportListener: each
+    // caller takes the state it needs under the lock and then works from locals, and nothing that
+    // blocks or awaits runs while holding it.
+    private readonly Lock _stateLock = new();
+
+    private QuicListener? _listener;
+    private Channel<QuicTransport>? _negotiatedTransports;
+
+    /// <summary>
+    /// The address and port actually bound, once <see cref="StartAsync"/> has completed — useful when
+    /// constructed with an ephemeral port (0) to discover which one was assigned.
+    /// </summary>
+    internal EndPoint? LocalEndPoint
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+#pragma warning disable CA1416 // Windows/Linux/macOS-only API: only non-null once StartAsync has already confirmed QuicListener.IsSupported.
+                return _listener?.LocalEndPoint;
+#pragma warning restore CA1416
+            }
+        }
+    }
+
+    private CancellationTokenSource? _negotiationCts;
+    private Task? _negotiationPumpTask;
+    private Task? _disposeTask;
+    private volatile bool _disposed;
+
+    /// <summary>
+    /// Creates a listener bound to the given endpoint.
+    /// </summary>
+    /// <param name="endPoint">The endpoint to bind to.</param>
+    /// <param name="tlsOptions">
+    /// TLS options to authenticate accepted connections as the server. Required — QUIC mandates TLS,
+    /// unlike the optional TLS on <see cref="TcpTransportListener"/>. The options are copied, so later
+    /// mutation of the caller's instance does not affect this listener. If
+    /// <see cref="SslServerAuthenticationOptions.ApplicationProtocols"/> is left unset it defaults to
+    /// <see cref="QuicTransport.DefaultApplicationProtocol"/>, which a connecting
+    /// <see cref="QuicTransport.ConnectAsync"/> caller must then also leave unset (or match explicitly).
+    /// </param>
+    /// <param name="streamOpenTimeout">
+    /// How long a connected peer has to open its first stream before the connection is abandoned.
+    /// Bounds how long an accepted-but-silent connection can occupy a negotiation slot. Defaults to 10
+    /// seconds.
+    /// </param>
+    /// <param name="maxConcurrentNegotiations">
+    /// The maximum number of connections waiting for their first stream at once. A connection beyond
+    /// this limit is refused immediately rather than queued — unlike <see cref="TcpTransportListener"/>'s
+    /// TLS handshake pump, there is no cheap way to tell a connection that will eventually open a stream
+    /// apart from one that never will, so a flood of connect-and-never-send peers up to this limit will
+    /// genuinely occupy every slot for up to <paramref name="streamOpenTimeout"/>. Defaults to 64.
+    /// </param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="endPoint"/> or <paramref name="tlsOptions"/> is <see langword="null"/>.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="tlsOptions"/> was supplied with neither a
+    /// <see cref="SslServerAuthenticationOptions.ServerCertificate"/> nor a
+    /// <see cref="SslServerAuthenticationOptions.ServerCertificateContext"/> nor a
+    /// <see cref="SslServerAuthenticationOptions.ServerCertificateSelectionCallback"/>.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="streamOpenTimeout"/> or <paramref name="maxConcurrentNegotiations"/> is not
+    /// positive.
+    /// </exception>
+    public QuicTransportListener(
+        IPEndPoint endPoint,
+        SslServerAuthenticationOptions tlsOptions,
+        TimeSpan? streamOpenTimeout = null,
+        int? maxConcurrentNegotiations = null)
+    {
+        ArgumentNullException.ThrowIfNull(endPoint);
+        ArgumentNullException.ThrowIfNull(tlsOptions);
+
+        if (streamOpenTimeout is { } timeout && timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(streamOpenTimeout), "The stream-open timeout must be positive.");
+        }
+
+        if (maxConcurrentNegotiations is { } maxNegotiations && maxNegotiations <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxConcurrentNegotiations), "The maximum concurrent negotiation count must be positive.");
+        }
+
+        if (tlsOptions.ServerCertificate is null
+            && tlsOptions.ServerCertificateContext is null
+            && tlsOptions.ServerCertificateSelectionCallback is null)
+        {
+            throw new ArgumentException(
+                "The TLS options must supply a server certificate, a certificate context, or a certificate "
+                    + "selection callback — QUIC requires TLS, so this cannot be left unset.",
+                nameof(tlsOptions));
+        }
+
+        _endPoint = endPoint;
+        _tlsOptions = TcpTransportListener.CloneServerOptions(tlsOptions);
+        _applicationProtocols = _tlsOptions.ApplicationProtocols is { Count: > 0 } protocols
+            ? protocols
+            : [QuicTransport.DefaultApplicationProtocol];
+        _tlsOptions.ApplicationProtocols = _applicationProtocols;
+        _streamOpenTimeout = streamOpenTimeout ?? DefaultStreamOpenTimeout;
+        _maxConcurrentNegotiations = maxConcurrentNegotiations ?? DefaultMaxConcurrentNegotiations;
+    }
+
+    /// <summary>
+    /// Creates a listener bound to the loopback interface on the given port.
+    /// </summary>
+    /// <remarks>
+    /// Binds to <see cref="IPAddress.Loopback"/>, not every interface, so a hub created this way is not
+    /// exposed to other hosts by default. Use the
+    /// <see cref="QuicTransportListener(IPEndPoint, SslServerAuthenticationOptions, TimeSpan?, int?)"/>
+    /// constructor with the desired address to listen more broadly.
+    /// </remarks>
+    /// <param name="port">The UDP port to listen on.</param>
+    /// <param name="tlsOptions">TLS options to authenticate accepted connections as the server. Required.</param>
+    /// <param name="streamOpenTimeout">How long a connected peer has to open its first stream. Defaults to 10 seconds.</param>
+    /// <param name="maxConcurrentNegotiations">The maximum number of connections negotiating at once. Defaults to 64.</param>
+    public QuicTransportListener(
+        int port,
+        SslServerAuthenticationOptions tlsOptions,
+        TimeSpan? streamOpenTimeout = null,
+        int? maxConcurrentNegotiations = null)
+        : this(new IPEndPoint(IPAddress.Loopback, port), tlsOptions, streamOpenTimeout, maxConcurrentNegotiations)
+    {
+    }
+
+    /// <inheritdoc/>
+    /// <exception cref="ObjectDisposedException">
+    /// The listener has been disposed, including while this call was itself in flight.
+    /// </exception>
+    /// <exception cref="PlatformNotSupportedException"><see cref="QuicListener.IsSupported"/> is <see langword="false"/>.</exception>
+    public async Task StartAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (_negotiationCts is not null)
+            {
+                throw new InvalidOperationException("The listener is already running.");
+            }
+        }
+
+        if (!QuicListener.IsSupported)
+        {
+            throw new PlatformNotSupportedException(
+                "QUIC is not supported on this platform. This typically means the native msquic library "
+                    + "is not installed (on Debian/Ubuntu: 'apt install libmsquic'), or the platform's TLS "
+                    + "stack does not support TLS 1.3.");
+        }
+
+        // Windows/Linux/macOS-only APIs from here down to the ListenAsync call: guarded at run time by
+        // the QuicListener.IsSupported check above. QuicListener.ListenAsync is itself the async
+        // bind/listen call — there is no synchronous constructor to take a lock around the way
+        // TcpListener has, so a concurrent DisposeAsync is handled by checking _disposed again once this
+        // completes, rather than before it starts.
+#pragma warning disable CA1416
+        var options = new QuicListenerOptions
+        {
+            ListenEndPoint = _endPoint,
+            ApplicationProtocols = _applicationProtocols,
+            ConnectionOptionsCallback = (_, _, _) => ValueTask.FromResult(
+                new QuicServerConnectionOptions
+                {
+                    ServerAuthenticationOptions = _tlsOptions,
+
+                    // The framework's own default (-1) is rejected by validation; Meshworx never
+                    // aborts a stream or connection with an application-defined error code, so 0 is
+                    // simply "none".
+                    DefaultStreamErrorCode = 0,
+                    DefaultCloseErrorCode = 0,
+                }),
+        };
+
+        QuicListener listener = await QuicListener.ListenAsync(options, cancellationToken).ConfigureAwait(false);
+#pragma warning restore CA1416
+
+        lock (_stateLock)
+        {
+            if (!_disposed)
+            {
+                var negotiatedTransports = Channel.CreateBounded<QuicTransport>(
+                    new BoundedChannelOptions(_maxConcurrentNegotiations)
+                    {
+                        SingleReader = true,
+                        SingleWriter = false,
+                    });
+
+                var negotiationCts = new CancellationTokenSource();
+
+                _listener = listener;
+                _negotiatedTransports = negotiatedTransports;
+                _negotiationCts = negotiationCts;
+                _negotiationPumpTask = NegotiationPumpAsync(listener, negotiatedTransports.Writer, negotiationCts.Token);
+                return;
+            }
+        }
+
+        // Disposed while this start was in flight. Nothing else owns the listener created above.
+#pragma warning disable CA1416
+        await listener.DisposeAsync().ConfigureAwait(false);
+#pragma warning restore CA1416
+        throw new ObjectDisposedException(nameof(QuicTransportListener));
+    }
+
+    /// <inheritdoc/>
+    /// <exception cref="ObjectDisposedException">
+    /// The listener has been disposed, or was disposed while this accept was pending.
+    /// </exception>
+    public async Task<ITransport> AcceptAsync(CancellationToken cancellationToken = default)
+    {
+        Channel<QuicTransport> negotiatedTransports;
+
+        lock (_stateLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            negotiatedTransports = _negotiatedTransports
+                ?? throw new InvalidOperationException("The listener has not been started.");
+        }
+
+        try
+        {
+            return await negotiatedTransports.Reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (ChannelClosedException ex)
+        {
+            throw new ObjectDisposedException(
+                $"The {nameof(QuicTransportListener)} is no longer accepting connections.",
+                ex.InnerException ?? ex);
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Safe to call more than once, and from more than one thread at a time. Only the first call tears
+    /// the listener down; every call — first or not — returns only once that teardown is complete.
+    /// </remarks>
+    public ValueTask DisposeAsync()
+    {
+        Task disposal;
+
+        lock (_stateLock)
+        {
+            if (_disposeTask is null)
+            {
+                _disposed = true;
+
+                QuicListener? listener = _listener;
+                CancellationTokenSource? negotiationCts = _negotiationCts;
+                Task? negotiationPumpTask = _negotiationPumpTask;
+                Channel<QuicTransport>? negotiatedTransports = _negotiatedTransports;
+
+                _listener = null;
+                _negotiatedTransports = null;
+                _negotiationCts = null;
+                _negotiationPumpTask = null;
+
+                _disposeTask = DisposeCoreAsync(listener, negotiationCts, negotiationPumpTask, negotiatedTransports);
+            }
+
+            disposal = _disposeTask;
+        }
+
+        return new ValueTask(disposal);
+    }
+
+    private static async Task DisposeCoreAsync(
+        QuicListener? listener,
+        CancellationTokenSource? negotiationCts,
+        Task? negotiationPumpTask,
+        Channel<QuicTransport>? negotiatedTransports)
+    {
+        if (negotiationCts is not null)
+        {
+            await negotiationCts.CancelAsync().ConfigureAwait(false);
+        }
+
+        if (listener is not null)
+        {
+#pragma warning disable CA1416 // Windows/Linux/macOS-only API: only reachable once StartAsync has already confirmed QuicListener.IsSupported.
+            await listener.DisposeAsync().ConfigureAwait(false);
+#pragma warning restore CA1416
+        }
+
+        if (negotiationPumpTask is not null)
+        {
+            // The pump never faults — it completes the channel with any error instead — so awaiting it
+            // cannot throw here.
+            await negotiationPumpTask.ConfigureAwait(false);
+        }
+
+        negotiationCts?.Dispose();
+
+        if (negotiatedTransports is not null)
+        {
+            // Connections that finished negotiation but were never accepted are owned by nobody else;
+            // close them rather than leaking them.
+            while (negotiatedTransports.Reader.TryRead(out QuicTransport? pending))
+            {
+                await pending.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Accepts connections and waits for each one's first stream off the accept path, publishing the
+    /// successfully negotiated transports for <see cref="AcceptAsync"/> to return.
+    /// </summary>
+    /// <remarks>
+    /// The QUIC handshake itself — including TLS 1.3 and msquic's own amplification-limiting and retry
+    /// handling — completes inside <see cref="QuicListener.AcceptConnectionAsync"/> before it ever
+    /// returns a connection, so unlike <see cref="TcpTransportListener"/>'s TLS pump there is no separate
+    /// handshake step to run off this path, and no CPU-expensive work left to bound. What is bounded here
+    /// is simply how many connections may be concurrently waiting for their first stream: a single
+    /// <see cref="SemaphoreSlim"/> admits up to <see cref="_maxConcurrentNegotiations"/> at once, and a
+    /// connection that finds it full is dropped immediately rather than queued.
+    /// <para>
+    /// Unlike <see cref="TcpTransportListener"/>'s handshake pump or
+    /// <see cref="AdamSalisbury.Meshworx.Transport.WebSocket.WebSocketTransportListener"/>'s negotiation
+    /// pump, there is no cheap way to tell a connection that will eventually open a stream apart from one
+    /// that never will before actually waiting for it — <see cref="QuicConnection.AcceptInboundStreamAsync"/>
+    /// is the only detection mechanism there is. A flood of connect-and-never-open-a-stream peers up to
+    /// this limit will therefore genuinely occupy every slot for up to <see cref="_streamOpenTimeout"/>,
+    /// during which a further connection is shed rather than delayed — this listener cannot distinguish
+    /// the two cases the way the TLS-handshake pumps can distinguish "sent nothing yet" from "consuming a
+    /// handshake slot". Size <see cref="_maxConcurrentNegotiations"/> and <see cref="_streamOpenTimeout"/>
+    /// for the deployment's real concurrent-connection expectations with this in mind.
+    /// </para>
+    /// </remarks>
+    private async Task NegotiationPumpAsync(
+        QuicListener listener,
+        ChannelWriter<QuicTransport> writer,
+        CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+
+        using var negotiationSlots = new SemaphoreSlim(_maxConcurrentNegotiations, _maxConcurrentNegotiations);
+        var inFlight = new ConcurrentDictionary<Task, byte>();
+
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                QuicConnection connection;
+                try
+                {
+#pragma warning disable CA1416 // Windows/Linux/macOS-only API: only reachable once StartAsync has already confirmed QuicListener.IsSupported.
+                    connection = await listener.AcceptConnectionAsync(cancellationToken).ConfigureAwait(false);
+#pragma warning restore CA1416
+                }
+                catch (QuicException)
+                {
+                    // A single connection attempt failing — a malformed initial packet, a peer that
+                    // reset mid-handshake — must not end the listener for good. Pause briefly so a
+                    // persistent failure cannot spin this loop hot.
+                    await Task.Delay(AcceptRetryDelay, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (!negotiationSlots.Wait(0, CancellationToken.None))
+                {
+#pragma warning disable CA1416
+                    await connection.DisposeAsync().ConfigureAwait(false);
+#pragma warning restore CA1416
+                    continue;
+                }
+
+                Task negotiationTask = NegotiateAsync(connection, writer, negotiationSlots, cancellationToken);
+                inFlight.TryAdd(negotiationTask, 0);
+                _ = negotiationTask.ContinueWith(t => inFlight.TryRemove(t, out _), TaskScheduler.Default);
+            }
+
+            writer.TryComplete();
+        }
+        catch (OperationCanceledException)
+        {
+            writer.TryComplete();
+        }
+        catch (ObjectDisposedException)
+        {
+            writer.TryComplete();
+        }
+        catch (Exception ex)
+        {
+            writer.TryComplete(ex);
+        }
+        finally
+        {
+            await Task.WhenAll(inFlight.Keys).ConfigureAwait(false);
+        }
+    }
+
+    private async Task NegotiateAsync(
+        QuicConnection connection,
+        ChannelWriter<QuicTransport> writer,
+        SemaphoreSlim negotiationSlots,
+        CancellationToken cancellationToken)
+    {
+        QuicTransport? transport = null;
+        try
+        {
+            using var negotiationCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            negotiationCts.CancelAfter(_streamOpenTimeout);
+
+#pragma warning disable CA1416
+            QuicStream stream = await connection.AcceptInboundStreamAsync(negotiationCts.Token).ConfigureAwait(false);
+#pragma warning restore CA1416
+            transport = new QuicTransport(connection, stream);
+
+            await writer.WriteAsync(transport, cancellationToken).ConfigureAwait(false);
+            transport = null;
+        }
+        catch
+        {
+            // A failed negotiation — the peer never opened a stream, a timeout, a reset — concerns only
+            // this connection. Drop it quietly and keep the listener serving; anything else would let
+            // one bad peer stop the hub.
+            if (transport is not null)
+            {
+                await transport.DisposeAsync().ConfigureAwait(false);
+            }
+            else
+            {
+#pragma warning disable CA1416
+                await connection.DisposeAsync().ConfigureAwait(false);
+#pragma warning restore CA1416
+            }
+        }
+        finally
+        {
+            negotiationSlots.Release();
+        }
+    }
+}

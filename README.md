@@ -12,8 +12,8 @@ substituted.
 - **Namespaces:** `AdamSalisbury.Meshworx`, `AdamSalisbury.Meshworx.Messages`,
   `AdamSalisbury.Meshworx.Transport`, `AdamSalisbury.Meshworx.Transport.Tcp`,
   `AdamSalisbury.Meshworx.Transport.WebSocket`, `AdamSalisbury.Meshworx.Transport.Unix`,
-  `AdamSalisbury.Meshworx.Transport.NamedPipes`, `AdamSalisbury.Meshworx.Transport.Framing`,
-  `AdamSalisbury.Meshworx.Extensions.DependencyInjection`
+  `AdamSalisbury.Meshworx.Transport.NamedPipes`, `AdamSalisbury.Meshworx.Transport.Quic`,
+  `AdamSalisbury.Meshworx.Transport.Framing`, `AdamSalisbury.Meshworx.Extensions.DependencyInjection`
 
 ## Architecture
 
@@ -27,6 +27,7 @@ substituted.
 | `WebSocketTransport` / `WebSocketTransportListener` | WebSocket implementation reachable from a browser and through proxies and firewalls that block arbitrary TCP ports; one WebSocket binary message carries one Meshworx frame. |
 | `UnixSocketTransport` / `UnixSocketTransportListener` | Unix domain socket implementation for fast, local, same-host inter-process communication on Linux and macOS; shares the same length-prefixed framing as TCP. |
 | `NamedPipeTransport` / `NamedPipeTransportListener` | Windows named-pipe implementation for the same same-host inter-process case on Windows; also shares the length-prefixed framing. |
+| `QuicTransport` / `QuicTransportListener` | QUIC implementation (`System.Net.Quic`) using one bidirectional stream per connection; TLS 1.3 is mandatory rather than optional, and the same length-prefixed framing runs over the stream. |
 | `InMemoryTransport` / `InMemoryTransportListener` | In-process implementation backed by channels, for hosting a hub and clients in one process and for fast, deterministic testing. |
 | `AddMeshHub` / `AddMeshClient` | `IServiceCollection` extension methods, in the `AdamSalisbury.Meshworx.Extensions.DependencyInjection` package, that register a hub or client for dependency injection and the generic host. |
 
@@ -357,6 +358,12 @@ must make deliberately.
   to the Everyone group and the anonymous account, which the explicit default here avoids. Neither
   transport offers a TLS option, since encrypting traffic that never leaves the host adds nothing.
 
+- **QUIC is TLS-only.** Unlike TCP and WebSocket, `QuicTransportListener` and `QuicTransport.ConnectAsync`
+  cannot be used cleartext at all — QUIC mandates TLS 1.3 at the protocol level, so both always take
+  TLS options. Because it is a genuine network transport (unlike the two local-IPC ones above), it also
+  reports a real `RemoteEndPoint` and so participates in `MeshHub`'s per-remote-endpoint connection cap
+  the same way TCP and WebSocket do.
+
 - **Transport encryption (TLS).** The TCP transport runs cleartext by default and secured when you
   give it TLS options. Pass `SslServerAuthenticationOptions` to the listener and
   `SslClientAuthenticationOptions` to `TcpTransport.ConnectAsync`; the framing is identical either
@@ -426,11 +433,12 @@ must make deliberately.
 
 The TCP transport frames every message as a **4-byte big-endian length prefix** followed by the
 payload (maximum 1 MiB). The first payload byte is the message type. Enabling TLS does not change
-any of this — the same frames simply travel inside the TLS record layer. The Unix domain socket and
-named-pipe transports use the identical framing — both are stream-oriented exactly as TCP is, so all
-three share one internal `StreamFramer` helper rather than reimplementing the length prefix and its
-bounds checking three times. The WebSocket transport is the exception: one WebSocket binary message
-already delimits one Meshworx frame, so it needs no length prefix of its own.
+any of this — the same frames simply travel inside the TLS record layer. The Unix domain socket,
+named-pipe and QUIC transports use the identical framing — each runs over a stream-oriented channel
+exactly as TCP does (QUIC's single bidirectional stream included), so all four share one internal
+`StreamFramer` helper rather than reimplementing the length prefix and its bounds checking four
+times. The WebSocket transport is the exception: one WebSocket binary message already delimits one
+Meshworx frame, so it needs no length prefix of its own.
 
 Protocol version: negotiated between **4** (minimum) and **5** (maximum). Registration advertises a
 range rather than a single value — `[versionMin, versionMax]` — and the hub picks the highest version
@@ -594,6 +602,45 @@ the two at run time if the same binary needs to run cross-platform. Neither tran
 option: access is controlled by filesystem permissions on the socket path or pipe name, not by
 encryption, which is appropriate only when every peer that can reach the path is already trusted —
 exactly the same trust boundary the operating system itself enforces for local IPC.
+
+`QuicTransport`/`QuicTransportListener` reach a hub over QUIC (`System.Net.Quic`), giving TLS 1.3,
+faster connection setup, and head-of-line-blocking resistance versus TCP. Unlike the TCP and
+WebSocket transports, TLS is mandatory rather than optional — QUIC requires it at the protocol
+level — so both ends always take TLS options:
+
+```csharp
+// Hub
+var listener = new QuicTransportListener(
+    new IPEndPoint(IPAddress.Any, 22003),
+    new SslServerAuthenticationOptions { ServerCertificate = hubCertificate });
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client
+await using var client = new MeshClient(clientLogger);
+await client.ConnectAsync(
+    await QuicTransport.ConnectAsync("hub.example.com", 22003, new SslClientAuthenticationOptions()),
+    "Alice");
+```
+
+**Platform requirements.** Both `QuicTransportListener.StartAsync` and `QuicTransport.ConnectAsync`
+throw `PlatformNotSupportedException` unless `QuicListener.IsSupported`/`QuicConnection.IsSupported`
+are `true` — check either before relying on this transport. That typically means the native
+`msquic` library is present and the platform's TLS stack supports TLS 1.3: on Debian/Ubuntu, install
+it with `apt install libmsquic`; it is not guaranteed to be preinstalled on every runner or host, so
+CI and deployment images should install it explicitly rather than assume it.
+
+Meshworx uses exactly one bidirectional QUIC stream per connection — matching the one-channel-per-
+client shape `ITransport` models — rather than the several concurrent streams a single QUIC
+connection can multiplex; that capability is what makes QUIC a natural fit for a future large-message
+or multi-channel feature, not something this transport itself needs yet. One consequence worth
+knowing: a QUIC stream is not visible to the receiving end until data actually arrives on it —
+opening one is a purely local operation — so `QuicTransportListener.AcceptAsync` will not return a
+connection until the client has sent at least one frame. This is never an issue in the normal
+Meshworx flow, since `MeshClient.ConnectAsync` sends the registration frame immediately once handed
+a transport, but it matters if you drive `QuicTransport`/`QuicTransportListener` directly: call
+`SendAsync` before waiting on the listener's `AcceptAsync`, not after, or the two ends deadlock
+waiting on each other.
 
 ## Dependency injection and hosting
 
