@@ -8,7 +8,7 @@ up peers, manages group membership, and raises events for inbound traffic and di
 
 - `public sealed class MeshClient : IMeshClient, IAsyncDisposable` — `src/AdamSalisbury.Meshworx/MeshClient.cs:9`
 - `public interface IMeshClient : IAsyncDisposable` — `src/AdamSalisbury.Meshworx/IMeshClient.cs:6`
-- `public sealed class MeshClientReconnector : IAsyncDisposable` — `src/AdamSalisbury.Meshworx/MeshClientReconnector.cs:31`
+- `public sealed class MeshClientReconnector : IAsyncDisposable` — `src/AdamSalisbury.Meshworx/MeshClientReconnector.cs:33`
 
 ---
 
@@ -247,26 +247,27 @@ connection lifecycle** — you still use `reconnector.Client` to send/receive.
 
 | Member | Notes | Source |
 |---|---|---|
-| ctor | `(IMeshClient client, string clientName, Func<CancellationToken,Task<ITransport>> transportFactory, TimeSpan? retryDelay=null, TimeSpan? connectTimeout=null, bool restoreGroupMembership=true, ILogger<MeshClientReconnector>?=null, ReadOnlyMemory<byte> credential=default)` | `MeshClientReconnector.cs:79` |
-| `Client` | `IMeshClient` — the managed client | `MeshClientReconnector.cs:92` |
-| `StartAsync` | Fail-fast initial connect; then begins monitoring. Throws if already started or if the first connect fails (retryable). | `MeshClientReconnector.cs:105` |
-| `Reconnected` | `event EventHandler` — raised after a re-established connection | `MeshClientReconnector.cs:98` |
-| `DisposeAsync` | Stops monitoring, unsubscribes, disconnects the client | `MeshClientReconnector.cs:196` |
+| ctor | `(IMeshClient client, string clientName, Func<CancellationToken,Task<ITransport>> transportFactory, TimeSpan? retryDelay=null, TimeSpan? connectTimeout=null, bool restoreGroupMembership=true, ILogger<MeshClientReconnector>?=null, ReadOnlyMemory<byte> credential=default)` | `MeshClientReconnector.cs:86` |
+| `Client` | `IMeshClient` — the managed client | `MeshClientReconnector.cs:128` |
+| `StartAsync` | Fail-fast initial connect; then begins monitoring. Throws if already started or if the first connect fails (retryable). | `MeshClientReconnector.cs:164` |
+| `Reconnected` | `event EventHandler` — raised after a re-established connection | `MeshClientReconnector.cs:143` |
+| `GetMeterForTesting` | `internal Meter` — the `Meter` this reconnector publishes `meshworx.client.reconnects` to (PR #72, issue #24). Internal so a test can filter a `MeterListener` to exactly this instance | `MeshClientReconnector.cs:154` |
+| `DisposeAsync` | Stops monitoring, unsubscribes, disconnects the client | `MeshClientReconnector.cs:358` |
 
 ### How it works
 
 - **`transportFactory` produces a fresh transport per attempt** — because the client consumes/disposes a
   transport per connection. Defaults: `retryDelay` 1 s, `connectTimeout` 10 s.
 - **The `credential` is stored and re-sent on every connect and reconnect**
-  (`MeshClientReconnector.cs:151`, `:261`), so an authenticated client keeps its credential across drops
+  (`MeshClientReconnector.cs:112`, `:287`), so an authenticated client keeps its credential across drops
   without any work from you. It is captured once at construction: **there is no way to rotate it** on a
   live reconnector — a credential that expires mid-session will cause every subsequent reconnect attempt
   to fail with `AuthenticationFailed`, retried at `retryDelay` forever. If your credentials expire,
   dispose the reconnector and build a new one with the fresh credential.
-- `StartAsync` (`MeshClientReconnector.cs:130`) does one bounded connect; **throws on failure** and
-  resets the started flag so it can be retried (`:145-151`). On success it subscribes `OnDisconnected`
-  to `Client.Disconnected` (`:153`), then **re-reads `Client.IsConnected` and queues a reconnect signal
-  itself if the connection has already gone** (`:174-177`), and only then starts the loop.
+- `StartAsync` (`MeshClientReconnector.cs:164`) does one bounded connect; **throws on failure** and
+  resets the started flag so it can be retried (`:179-185`). On success it subscribes `OnDisconnected`
+  to `Client.Disconnected` (`:187`), then **re-reads `Client.IsConnected` and queues a reconnect signal
+  itself if the connection has already gone** (`:200-203`), and only then starts the loop.
   That re-read is not belt-and-braces — it closes a race. `Client.ConnectAsync` returns with the
   client's receive loop already running on a background task, so a drop landing between it returning and
   the subscription line is raised with **no subscriber**: the event is genuinely lost. Without the
@@ -274,28 +275,59 @@ connection lifecycle** — you still use `reconnector.Client` to send/receive.
   disconnected client that never recovers (issue #8, fixed in PR #60). The client resets itself to a
   disconnected state *before* raising `Disconnected`, which is what makes the state re-read a reliable
   detector of a drop in that window.
-- `OnDisconnected` (`:132`) just `TryWrite`s to a **capacity-1 `DropWrite` channel** — disconnect
+- `OnDisconnected` (`:208`) just `TryWrite`s to a **capacity-1 `DropWrite` channel** (`:225`) — disconnect
   notifications are coalesced (many drops → at most one queued reconnect) and the client's receive loop
   is never blocked.
-- `ReconnectLoopAsync` (`:138`) drains the signal, calls `ConnectWithRetryAsync`, then raises
+- `ReconnectLoopAsync` (`:228`) drains the signal, calls `ConnectWithRetryAsync`, then raises
   `Reconnected` (throwing handler logged, loop survives).
-- `ConnectWithRetryAsync` (`MeshClientReconnector.cs:225`) retries each bounded attempt after
+- `ConnectWithRetryAsync` (`MeshClientReconnector.cs:263`) retries each bounded attempt after
   `retryDelay` until it succeeds or the reconnector is disposed. Two guards inside it are load-bearing,
   not incidental — both were added by PR #60 and removing either reintroduces a hang or a leak:
-  - **It returns immediately if `Client.IsConnected` is already true** (`:247-250`). The trigger is
+  - **It returns immediately if `Client.IsConnected` is already true** (`:273-276`). The trigger is
     **level-based, not edge-based**: a queued signal records that the connection *was* lost, not that it
     still is. Read [known-issues.md](known-issues.md) KI-19 before touching this.
-  - **It disposes the transport the factory produced if `Client.ConnectAsync` rejects it** (`:263-270`),
+  - **It disposes the transport the factory produced if `Client.ConnectAsync` rejects it** (`:289-296`),
     because the client only takes ownership once it accepts the transport. See KI-20 — note the same
-    guard is **not** present on `StartAsync`'s connect (`:137-151`).
+    guard is **not** present on `StartAsync`'s connect (`:171-185`).
+  - **Only once this method has itself re-established the connection does it increment
+    `meshworx.client.reconnects`** (`:301`, PR #72) — the early return above, for a drop signal that
+    turned out stale, never reaches it, so a no-op reconnect pass is never counted. See
+    [Metrics](#metrics) below.
+
+<a id="metrics"></a>
+
+### Metrics
+
+Added by PR #72 (issue #24). `MeshClientReconnector` owns its own `System.Diagnostics.Metrics.Meter`
+(`_meter`, `MeshClientReconnector.cs:61`), created inline at field-initialisation time rather than in the
+constructor body, and disposed in `DisposeAsync` (`:382`). It is named via the same shared internal
+constant `MeshHub` uses (`MeshworxMeterName.Value`, `"AdamSalisbury.Meshworx"`), so one
+`AddMeter("AdamSalisbury.Meshworx")` call collects both components' instruments — see
+[hub.md](hub.md#metrics). `GetMeterForTesting()` (`:154-157`) exposes the instance for a test to filter a
+`MeterListener` to exactly this reconnector, the same reasoning as the equivalent method on `MeshHub`.
+
+The one instrument, `meshworx.client.reconnects` (`Counter<long>`, created `:119-122`), is incremented
+**only** at `:301` inside `ConnectWithRetryAsync`, immediately after `Client.ConnectAsync` succeeds and
+before the early return — see the bullet above. Two connect paths that are **not** counted:
+
+- **`StartAsync`'s own initial connect never reaches `ConnectWithRetryAsync` at all** — `StartAsync`
+  calls `Client.ConnectAsync` directly (`:177`), so the first connection a reconnector makes is never
+  recorded as a reconnect, only genuine re-establishments after a drop are.
+- **A stale reconnect signal that turns out to be a no-op** (`Client.IsConnected` already true when
+  `ConnectWithRetryAsync` is entered, `:273-276`) returns before the increment, so a duplicate signal or
+  a drop an application handler already recovered from does not inflate the count.
+
+Pinned by `MeshClientReconnectorMetricsTests.cs` — see [testing.md](testing.md#metrics-tests), whose one
+test asserts both exclusions directly: `capture.Values` is empty immediately after `StartAsync`, and
+reads exactly `[1L]` after one genuine drop-and-reconnect.
 
 ### Contract & gotcha
 
 - **It DOES re-join groups by default; it does not re-send in-flight messages.** `restoreGroupMembership`
-  defaults to `true`, and `RestoreGroupMembershipAsync` (`MeshClientReconnector.cs:286`) re-joins each
-  pending group by calling `Client.JoinGroupAsync` (`:305`). Pass `restoreGroupMembership: false` to take
+  defaults to `true`, and `RestoreGroupMembershipAsync` (`MeshClientReconnector.cs:316`) re-joins each
+  pending group by calling `Client.JoinGroupAsync` (`:335`). Pass `restoreGroupMembership: false` to take
   manual control. In-flight messages are never re-sent — that part remains your responsibility.
-  (This corrects a claim that predated PR #52; the type's `<remarks>` state it, `:18-29`.)
+  (This corrects a claim that predated PR #52; the type's `<remarks>` state it, `:20-25`.)
 - **Restoration re-joins over the wire, so every re-join is authorised afresh.** A hub with a
   `GroupAuthoriser` sees each restored join as a new request and may refuse it — a restore cannot
   reinstate a membership the hub would now deny. A refused group is dropped from the client's membership
@@ -304,11 +336,14 @@ connection lifecycle** — you still use `reconnector.Client` to send/receive.
 - `Reconnected` fires after every successful re-establish but **not** after the initial `StartAsync`
   connect.
 - **`Reconnected` can fire without this reconnector having reconnected anything.** Since the loop treats
-  an already-connected client as the goal met (`MeshClientReconnector.cs:247-250`), a signal that has
+  an already-connected client as the goal met (`MeshClientReconnector.cs:273-276`), a signal that has
   gone stale — a duplicate for a drop already serviced, or a drop an application `Disconnected` handler
   recovered from itself — still runs the loop through to raising `Reconnected`. Treat the event as
   "the connection is up again", not as "I re-established it", and make your handlers safe to run more
-  than once for a single drop. See [known-issues.md](known-issues.md) KI-19.
+  than once for a single drop. See [known-issues.md](known-issues.md) KI-19. Note that `Reconnected` and
+  `meshworx.client.reconnects` are not the same signal: the metric only increments when
+  `ConnectWithRetryAsync` itself did the reconnecting, whereas `Reconnected` fires on this same stale-goal-met
+  path too — the counter is the stricter of the two.
 
 ```csharp
 await using var reconnector = new MeshClientReconnector(
@@ -327,4 +362,5 @@ await reconnector.StartAsync();
 await reconnector.Client.SendAsync(recipientId, payload);
 ```
 
-Tested in `MeshClientReconnectorTests.cs` (302 lines) — see [testing.md](testing.md).
+Tested in `MeshClientReconnectorTests.cs` (944 lines) plus, for the metrics added by PR #72,
+`MeshClientReconnectorMetricsTests.cs` — see [testing.md](testing.md#metrics-tests).

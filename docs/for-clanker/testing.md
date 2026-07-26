@@ -42,9 +42,12 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
 |---|---|---|
 | `Fixtures/MeshHubFixture.cs` | 304 | Hub test harness (mock listener/transport, register helpers, **authenticator and group-authoriser pass-throughs**, group/lookup/direct frame builders, `FrameRecorder`) |
 | `Fixtures/MeshClientFixture.cs` | 118 | Client test harness (mock transport, scripted receive, **`CreateGroupJoinRefusal`**) |
-| `MeshHubTests.cs` | 2498 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, **capacity claim/release under a concurrent registration**, **groups as an authorisation boundary**, lifecycle, **concurrent stop/dispose and start-vs-stop races**, **`IsRunning`/`MaxClients` accessors (PR #71)** |
+| `Fixtures/MetricsCapture.cs` | 88 | **Metrics test harness (PR #72):** a `MeterListener` filtered to one `Meter` reference plus one instrument name, capturing every measurement and its tags in recording order |
+| `MeshHubTests.cs` | 2774 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, **capacity claim/release under a concurrent registration**, **groups as an authorisation boundary**, lifecycle, **concurrent stop/dispose and start-vs-stop races**, **`IsRunning`/`MaxClients` accessors (PR #71)** |
+| `MeshHubMetricsTests.cs` | 422 | **All five `MeshHub` instruments (PR #72):** connected-clients up/down counter, routed/dropped counters per direction/reason, the zero-recipient exclusion for broadcast, the outbound-queue-depth gauge |
 | `MeshClientTests.cs` | 1602 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race**, **group-join refusal handling** |
 | `MeshClientReconnectorTests.cs` | 944 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal**, **restored membership re-authorised by the hub**, **the documented `Reconnected` handler idiom containing a post-suspension failure** |
+| `MeshClientReconnectorMetricsTests.cs` | 73 | **The `meshworx.client.reconnects` counter (PR #72):** excluded on the initial `StartAsync` connect, incremented exactly once on a genuine reconnect |
 | `MeshIntegrationTests.cs` | 481 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** and **non-member/unauthorised group paths** |
 | `Transport/InMemory/InMemoryTransportTests.cs` | 173 | Pair semantics, copy-on-send, close signalling |
 | `Transport/InMemory/InMemoryTransportListenerTests.cs` | 90 | **Listener disposal contract in memory (4 tests):** accept after dispose, dispose-without-ever-starting, a queued connection closed rather than served, repeated/concurrent dispose |
@@ -162,7 +165,7 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
   back. Prefer these over anything timing-based.
 
   1. **To park a caller *inside* a shutdown, hold the mocked `ITransport.SendAsync` open on the
-     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:426-436`) awaits each client's
+     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:499-509`) awaits each client's
      `SendAsync` in turn, and that await sits **after** the caller has claimed the hub's state but
      **before** the shutdown has finished — so returning an incomplete task there pins the hub
      mid-shutdown for as long as the test needs. The helper is already written:
@@ -213,7 +216,7 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
 - **Assert a resolved default through an `internal` accessor rather than waiting out a real interval.**
   Added with the finite-defaults work in PR #68 (issue #16), and following the same shape as
   `TryReserveClientSlot`/`ReleaseClientSlot` below: `GetHeartbeatIntervalForTesting()`
-  (`MeshHub.cs:546-549`) is `internal` rather than `private` purely so a test can assert what
+  (`MeshHub.cs:619-622`) is `internal` rather than `private` purely so a test can assert what
   `heartbeatInterval` resolved to — including the 30 s default and the
   `Timeout.InfiniteTimeSpan` opt-out — without a real `PeriodicTimer` interval ever having to elapse.
   `Constructor_HeartbeatIntervalNotSpecified_DefaultsToThirtySeconds` (`MeshHubTests.cs:1035`) and
@@ -343,6 +346,38 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
   fix the clone in `TcpTransport.CloneClientOptions` / `TcpTransportListener.CloneServerOptions` — do
   not add an exclusion.
 - Test names use `Method_State_ExpectedBehaviour` with underscores (hence `CA1707` suppressed).
+
+<a id="metrics-tests"></a>
+- **Filter a `MeterListener` by `Meter` reference, not by instrument name alone, when testing metrics.**
+  Added with the instrumentation in PR #72 (issue #24). `MetricsCapture<T>`
+  (`Fixtures/MetricsCapture.cs`) wraps a `MeterListener` whose `InstrumentPublished` callback enables
+  measurement events only when `ReferenceEquals(instrument.Meter, meter)` **and** the name matches
+  (`:27`); every value and its tags are appended in recording order (`Values`, `Tags`). Construct one
+  from `fixture.Hub.GetMeterForTesting()` or `reconnector.GetMeterForTesting()` — both `internal`
+  accessors exist for exactly this — so a test is immune to another `MeshHub`/`MeshClientReconnector`
+  publishing to the same meter name concurrently, in the same test class or a parallel one. Call
+  `RecordObservableInstruments()` to force an `ObservableGauge` to report immediately rather than waiting
+  out its own collection cycle — `OutboundQueueDepth_MessagesQueued_ReportsPositiveAggregateDepth`
+  (`MeshHubMetricsTests.cs:375`) does this to assert `meshworx.hub.outbound_queue.depth` without a real
+  collector attached.
+  - **Proving a broadcast/group send recorded `messages.routed` exactly once, not once per recipient,**
+    needs a genuine multi-recipient send: `BroadcastMessage_MultipleRecipients_IncrementsRoutedCounterOnceTaggedBroadcast`
+    (`:238`) registers three clients, asserts `routedCapture.Values` filtered to `direction=broadcast`
+    contains a **single** `1L`, not a count matching the recipient total.
+  - **Proving the zero-recipient case records nothing** is the harder direction, and both fan-out kinds
+    have a dedicated test: `BroadcastMessage_SenderIsOnlyClient_DoesNotIncrementRoutedCounter` (`:282`)
+    registers only the sender, sends a broadcast, then a **lookup on the same connection** as a barrier —
+    since the hub processes one client's frames in order, the lookup's response proves the broadcast was
+    already handled, so asserting `routedCapture.Tags` contains no `direction=broadcast` entry at that
+    point is deterministic rather than a timing guess. Copy this barrier-then-assert-absence shape (the
+    same one `FrameRecorder` uses elsewhere in this suite) for any "this must not have recorded" metrics
+    assertion — a bare settle-and-check would pass just as easily against a regression that recorded the
+    zero-recipient case anyway.
+  - **`MeshClientReconnectorMetricsTests.cs`'s one test**,
+    `Reconnects_AfterConnectionLost_IncrementsReconnectsCounter` (`:28`), asserts **both** halves of the
+    exclusion in one run: `capture.Values` is empty immediately after `StartAsync`'s initial connect, then
+    reads exactly `[1L]` after a real hub-initiated drop and reconnect to a second, freshly stood-up hub.
+    Asserting only the second half would miss a regression that counted the initial connect too.
 
 ### Minimal end-to-end pattern (integration style)
 
