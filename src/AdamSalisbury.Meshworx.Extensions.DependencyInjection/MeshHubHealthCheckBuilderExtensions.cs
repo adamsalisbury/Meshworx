@@ -37,7 +37,7 @@ public static class MeshHubHealthCheckBuilderExtensions
 
         return builder.Add(new HealthCheckRegistration(
             name,
-            serviceProvider => new MeshHubHealthCheck(serviceProvider.GetRequiredService<IMeshHub>()),
+            serviceProvider => new MeshHubHealthCheck(serviceProvider),
             failureStatus,
             tags));
     }

@@ -525,6 +525,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     public int MaxClients { get; }
 
     /// <inheritdoc/>
+    public int ClaimedClientSlots => Volatile.Read(ref _reservedClientSlots);
+
+    /// <inheritdoc/>
     public bool IsClientRegistered(Guid clientId)
     {
         return _clients.ContainsKey(clientId);

@@ -39,8 +39,7 @@ public static class MeshClientHealthCheckBuilderExtensions
 
         return builder.Add(new HealthCheckRegistration(
             name ?? $"meshclient:{clientName}",
-            serviceProvider => new MeshClientHealthCheck(
-                serviceProvider.GetRequiredKeyedService<IMeshClient>(clientName)),
+            serviceProvider => new MeshClientHealthCheck(serviceProvider, clientName),
             failureStatus,
             tags));
     }

@@ -81,6 +81,19 @@ public interface IMeshHub : IAsyncDisposable
     int MaxClients { get; }
 
     /// <summary>
+    /// Gets the number of client slots currently claimed against <see cref="MaxClients"/>.
+    /// </summary>
+    /// <remarks>
+    /// This is what admission is actually enforced against, not <see cref="ConnectedClientCount"/>: a slot
+    /// is claimed as soon as a connection is accepted — before registration completes — and given back
+    /// only once its handler has fully finished, so it stays ahead of <see cref="ConnectedClientCount"/>
+    /// while a client is still mid-handshake or mid-teardown. A caller checking whether the hub is at
+    /// capacity should compare this, not <see cref="ConnectedClientCount"/>, against <see cref="MaxClients"/>.
+    /// The value is a point-in-time snapshot; clients may connect or disconnect concurrently.
+    /// </remarks>
+    int ClaimedClientSlots { get; }
+
+    /// <summary>
     /// Determines whether a client with the specified identifier is currently registered.
     /// </summary>
     /// <param name="clientId">The unique identifier of the client to look up.</param>
