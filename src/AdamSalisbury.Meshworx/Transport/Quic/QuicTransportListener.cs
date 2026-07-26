@@ -80,6 +80,15 @@ public sealed class QuicTransportListener : ITransportListener
     private Task? _disposeTask;
     private volatile bool _disposed;
 
+    // Claims the right to proceed past the "already running" check while QuicListener.ListenAsync is
+    // in flight. Unlike every other listener in this library, that call is itself the async bind step —
+    // there is no synchronous constructor to serialise concurrent starts around — so without this flag
+    // two overlapping StartAsync calls could both pass the check, both genuinely bind a QuicListener,
+    // and the second to publish would silently overwrite the first's fields: leaking a bound listener
+    // and orphaning its negotiation pump task rather than the second call failing the way it should.
+    // Always read and written under _stateLock, mirroring MeshHub.StartAsync's identical pattern.
+    private bool _starting;
+
     /// <summary>
     /// Creates a listener bound to the given endpoint.
     /// </summary>
@@ -222,48 +231,70 @@ public sealed class QuicTransportListener : ITransportListener
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
 
-            if (_negotiationCts is not null)
+            if (_negotiationCts is not null || _starting)
             {
                 throw new InvalidOperationException("The listener is already running.");
             }
+
+            // Claim the running slot with a flag rather than by publishing state early. QuicListener's
+            // async-only bind means a second concurrent StartAsync could otherwise pass the check above
+            // too, genuinely bind a second QuicListener, and overwrite this call's fields once it
+            // publishes — leaking the first listener and orphaning its negotiation pump task instead of
+            // the second call failing the way it should.
+            _starting = true;
         }
 
-        if (!QuicListener.IsSupported)
+        QuicListener listener;
+        try
         {
-            throw new PlatformNotSupportedException(
-                "QUIC is not supported on this platform. This typically means the native msquic library "
-                    + "is not installed (on Debian/Ubuntu: 'apt install libmsquic'), or the platform's TLS "
-                    + "stack does not support TLS 1.3.");
-        }
+            if (!QuicListener.IsSupported)
+            {
+                throw new PlatformNotSupportedException(
+                    "QUIC is not supported on this platform. This typically means the native msquic "
+                        + "library is not installed (on Debian/Ubuntu: 'apt install libmsquic'), or the "
+                        + "platform's TLS stack does not support TLS 1.3.");
+            }
 
-        // Windows/Linux/macOS-only APIs from here down to the ListenAsync call: guarded at run time by
-        // the QuicListener.IsSupported check above. QuicListener.ListenAsync is itself the async
-        // bind/listen call — there is no synchronous constructor to take a lock around the way
-        // TcpListener has, so a concurrent DisposeAsync is handled by checking _disposed again once this
-        // completes, rather than before it starts.
+            // Windows/Linux/macOS-only APIs from here down to the ListenAsync call: guarded at run time
+            // by the QuicListener.IsSupported check above.
 #pragma warning disable CA1416
-        var options = new QuicListenerOptions
-        {
-            ListenEndPoint = _endPoint,
-            ApplicationProtocols = _applicationProtocols,
-            ConnectionOptionsCallback = (_, _, _) => ValueTask.FromResult(
-                new QuicServerConnectionOptions
-                {
-                    ServerAuthenticationOptions = _tlsOptions,
+            var options = new QuicListenerOptions
+            {
+                ListenEndPoint = _endPoint,
+                ApplicationProtocols = _applicationProtocols,
+                ConnectionOptionsCallback = (_, _, _) => ValueTask.FromResult(
+                    new QuicServerConnectionOptions
+                    {
+                        ServerAuthenticationOptions = _tlsOptions,
 
-                    // The framework's own default (-1) is rejected by validation; Meshworx never
-                    // aborts a stream or connection with an application-defined error code, so 0 is
-                    // simply "none".
-                    DefaultStreamErrorCode = 0,
-                    DefaultCloseErrorCode = 0,
-                }),
-        };
+                        // The framework's own default (-1) is rejected by validation; Meshworx never
+                        // aborts a stream or connection with an application-defined error code, so 0 is
+                        // simply "none".
+                        DefaultStreamErrorCode = 0,
+                        DefaultCloseErrorCode = 0,
+                    }),
+            };
 
-        QuicListener listener = await QuicListener.ListenAsync(options, cancellationToken).ConfigureAwait(false);
+            listener = await QuicListener.ListenAsync(options, cancellationToken).ConfigureAwait(false);
 #pragma warning restore CA1416
+        }
+        catch
+        {
+            // Release the claim, so a listener that failed to bind is startable again rather than
+            // permanently reporting itself as already running. Nothing else has seen any state from
+            // this attempt, so releasing here cannot race a concurrent DisposeAsync.
+            lock (_stateLock)
+            {
+                _starting = false;
+            }
+
+            throw;
+        }
 
         lock (_stateLock)
         {
+            _starting = false;
+
             if (!_disposed)
             {
                 var negotiatedTransports = Channel.CreateBounded<QuicTransport>(

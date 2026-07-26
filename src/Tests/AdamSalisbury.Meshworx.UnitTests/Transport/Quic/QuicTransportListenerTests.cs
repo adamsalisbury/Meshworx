@@ -105,6 +105,73 @@ public sealed class QuicTransportListenerTests
     }
 
     /// <summary>
+    /// Two overlapping StartAsync calls on the same listener never both succeed: exactly one binds and
+    /// publishes state, and the other is refused with InvalidOperationException — never silently
+    /// overwriting the winner's fields, which would leak the loser's bound listener and orphan its
+    /// negotiation pump task. Unlike every other listener in this repo, QuicListener.ListenAsync is
+    /// itself the async bind step, so this race has no synchronous constructor serialising it away the
+    /// way it does for TcpTransportListener/UnixSocketTransportListener/NamedPipeTransportListener.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task StartAsync_CalledConcurrently_OnlyOneSucceeds()
+    {
+        if (!System.Net.Quic.QuicListener.IsSupported)
+        {
+            return;
+        }
+
+        using X509Certificate2 certificate = TestCertificates.CreateSelfSigned();
+        var listener = new QuicTransportListener(
+            new IPEndPoint(IPAddress.Loopback, 0),
+            new SslServerAuthenticationOptions { ServerCertificate = certificate });
+
+        try
+        {
+            using var released = new SemaphoreSlim(0, 2);
+
+            Task<Exception?> Start() => Task.Run<Exception?>(async () =>
+            {
+                await released.WaitAsync().ConfigureAwait(false);
+                return await Record.ExceptionAsync(() => listener.StartAsync()).ConfigureAwait(false);
+            });
+
+            Task<Exception?> firstStart = Start();
+            Task<Exception?> secondStart = Start();
+
+            released.Release(2);
+
+            Exception?[] results = await Task.WhenAll(firstStart, secondStart).ConfigureAwait(false);
+
+            // Exactly one call succeeded (null) and the other was refused.
+            int succeeded = results.Count(e => e is null);
+            int refused = results.Count(e => e is InvalidOperationException);
+            Assert.Equal(1, succeeded);
+            Assert.Equal(1, refused);
+
+            // The listener is genuinely usable — the winner's state was actually published, not lost.
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var connectTask = QuicTransport.ConnectAsync(
+                "127.0.0.1",
+                ((IPEndPoint)listener.LocalEndPoint!).Port,
+                new SslClientAuthenticationOptions
+                {
+                    RemoteCertificateValidationCallback = TestCertificates.PinnedTo(certificate),
+                },
+                deadline.Token);
+
+            await using QuicTransport clientTransport = await connectTask.ConfigureAwait(false);
+            await clientTransport.SendAsync(new byte[] { 1 }, deadline.Token).ConfigureAwait(false);
+
+            await using var serverTransport = await listener.AcceptAsync(deadline.Token).ConfigureAwait(false);
+            Assert.Equal(new byte[] { 1 }, await serverTransport.ReceiveAsync(deadline.Token).ConfigureAwait(false));
+        }
+        finally
+        {
+            await listener.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
     /// When AcceptAsync is called before the listener has been started, an InvalidOperationException is thrown.
     /// </summary>
     [Fact(Timeout = 1000)]
