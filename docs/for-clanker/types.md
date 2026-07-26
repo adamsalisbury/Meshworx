@@ -10,8 +10,8 @@ hunt for them. `namespace AdamSalisbury.Meshworx.Messages` unless noted otherwis
 
 | Type | Members | Raised by | Source |
 |---|---|---|---|
-| `MessageReceivedEventArgs` | `required Guid SenderId`, `required ReadOnlyMemory<byte> Data` | `IMeshClient.MessageReceived` (direct **and** broadcast) | `Messages/MessageReceivedEventArgs.cs` |
-| `GroupMessageReceivedEventArgs` | `required Guid SenderId`, `required string GroupName`, `required ReadOnlyMemory<byte> Data` | `IMeshClient.GroupMessageReceived` | `Messages/GroupMessageReceivedEventArgs.cs` |
+| `MessageReceivedEventArgs` | `required Guid SenderId`, `required ReadOnlyMemory<byte> Data`, `MessageHeaders Headers = MessageHeaders.Empty` | `IMeshClient.MessageReceived` (direct **and** broadcast) | `Messages/MessageReceivedEventArgs.cs` |
+| `GroupMessageReceivedEventArgs` | `required Guid SenderId`, `required string GroupName`, `required ReadOnlyMemory<byte> Data`, `MessageHeaders Headers = MessageHeaders.Empty` | `IMeshClient.GroupMessageReceived` | `Messages/GroupMessageReceivedEventArgs.cs` |
 | `GroupJoinRefusedEventArgs` | `required string GroupName` | `IMeshClient.GroupJoinRefused` | `Messages/GroupJoinRefusedEventArgs.cs:6` |
 | `DisconnectedEventArgs` | `required DisconnectReason Reason` | `IMeshClient.Disconnected` | `Messages/DisconnectedEventArgs.cs` |
 | `ClientConnectionEventArgs` | `required Guid ClientId`, `required string ClientName` | `IMeshHub.ClientConnected` / `ClientDisconnected` (namespace `AdamSalisbury.Meshworx`) | `ClientConnectionEventArgs.cs` |
@@ -22,6 +22,26 @@ All use `required` init-only properties (C# 11) — construct with object initia
 > (see [transport.md](transport.md)), so retaining it is safe today; the robust idiom is to copy
 > (`e.Data.ToArray()` / `e.Data.Span.CopyTo(...)`) if you keep it past the handler. `Span` is the usual
 > access, e.g. `Encoding.UTF8.GetString(e.Data.Span)`.
+
+## Message content types
+
+`MessageHeaders` (`sealed class`, `Messages/MessageHeaders.cs`, added by PR #74, issue #32) —
+`IReadOnlyDictionary<string, string>`, `StringComparer.Ordinal` (case-sensitive keys). A small,
+immutable bag of metadata that travels alongside a message body without the hub ever interpreting it —
+see [protocol.md](protocol.md#message-headers) for the wire format and
+[client.md](client.md#sending-headers) for how to send/receive it.
+
+- `MessageHeaders.Empty` — the shared, zero-entry instance used as the default on
+  `MessageReceivedEventArgs`/`GroupMessageReceivedEventArgs.Headers` and accepted by `SendAsync`/
+  `SendToGroupAsync` to mean "no headers" (produces the plain, header-less frame).
+- **Public constructor copies its input** into a fresh `Dictionary<string, string>` — mutating the
+  source afterwards does not affect the `MessageHeaders`. **Throws `ArgumentException` if the input
+  contains a duplicate key**, the same as calling `Dictionary<TKey,TValue>.Add` twice for the same key —
+  this differs from an object initializer or indexer assignment, which would silently keep the last
+  value. See [known-issues.md](known-issues.md) KI-34.
+- An `internal` `FromOwnedDictionary` factory (not part of the public surface) wraps a dictionary without
+  copying — used only by `HeaderEnvelope.Read`, which builds a fresh one for this purpose and never
+  touches it again.
 
 ## Enums
 
@@ -77,14 +97,14 @@ public sealed record RegistrationContext
 ```
 
 A `sealed record` with `required` init-only properties — construct with an object initialiser (the hub
-does, at `MeshHub.cs:1324`). Trivially constructible in tests.
+does, at `MeshHub.cs:1365`). Trivially constructible in tests.
 
 - `ClientName` — the name being registered under. Already validated for length, **not** yet checked for
   uniqueness, so two concurrent registrations for the same name can both reach your authenticator.
 - `Credential` — exactly the bytes the client sent after its name, empty if it sent none. The library
   assigns no meaning to them.
 - **Only guaranteed valid for the duration of the call** — copy it if it must outlive the invocation.
-  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:1323`, so
+  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:1364`, so
   it does not alias a larger buffer — but the documented contract is the one to code against.)
 
 <a id="authorisation-types"></a>
@@ -114,7 +134,7 @@ A **delegate, not an interface**, matching `ClientAuthenticator`. Return `true` 
 the group; `false` refuses the join and the hub sends the client a `GroupJoinRefused` frame.
 
 Contract, from the delegate's own XML docs and the hub's call site (`AuthoriseGroupJoinAsync`,
-`MeshHub.cs:1667`):
+`MeshHub.cs:1787`):
 
 - Invoked **once per join request**, including every re-join a client issues after reconnecting, so a
   decision is never carried across a connection and a reconnector's membership restore cannot bypass it.
@@ -124,7 +144,7 @@ Contract, from the delegate's own XML docs and the hub's call site (`AuthoriseGr
 - **Fails closed.** Returning `false`, throwing, cancelling from inside the callback, or exceeding
   `groupAuthorisationTimeout` all refuse the join.
 - `ValueTask<bool>` — a synchronous decision (`ValueTask.FromResult(...)`) takes an explicitly
-  allocation-free fast path in the hub (`MeshHub.cs:1697-1702`) and is the common case; anything else,
+  allocation-free fast path in the hub (`MeshHub.cs:1817-1822`) and is the common case; anything else,
   including an already-faulted result, goes through the bounded `WaitAsync`.
 - **It runs on input from an already-admitted client**, driven from that client's own receive loop, which
   reads nothing else from that client until it returns. So a slow callback stalls only the client that
@@ -143,7 +163,7 @@ public sealed record GroupJoinContext
 ```
 
 A `sealed record` with `required` init-only properties — construct with an object initialiser (the hub
-does, at `MeshHub.cs:1670`). Trivially constructible in tests.
+does, at `MeshHub.cs:1790`). Trivially constructible in tests.
 
 - `ClientId` — the hub-assigned id. Fresh per connection, so it is **not** stable across a reconnect;
   authorise on the name plus your own state if you need continuity.
@@ -172,11 +192,16 @@ catch (RegistrationRefusedException ex) { /* ex.ErrorCode tells you why */ }
 ## Internal types (not visible outside the assembly, listed for orientation)
 
 - `enum MessageType : byte` (`Messages/MessageType.cs`) — the opcodes; see [protocol.md](protocol.md).
-- `static class Protocol` (`Messages/Protocol.cs`) — `MinSupportedVersion = 4`, `MaxSupportedVersion = 4`
-  (replaced the single `Version = 3` constant in PR #73; see [protocol.md](protocol.md#versioning)),
-  `MaxClientNameLength = 256`.
-- `MeshHub.ClientConnection`, `MeshHub.Group`, `MeshClient.ConnectionState`, `MeshClient.PendingLookup`
-  — nested private helpers documented in [hub.md](hub.md) / [client.md](client.md).
+- `static class Protocol` (`Messages/Protocol.cs`) — `MinSupportedVersion = 4`, `MaxSupportedVersion = 5`
+  (raised from `4` by PR #74, issue #32, to admit the header envelope; replaced the single `Version = 3`
+  constant in PR #73; see [protocol.md](protocol.md#versioning)), `HeaderEnvelopeMinVersion = 5` (added by
+  PR #74 — the lowest negotiated version at which `MessageHeaders` may be used), `MaxClientNameLength = 256`.
+- `static class HeaderEnvelope` (`Messages/HeaderEnvelope.cs`, added by PR #74) — encodes/decodes the
+  header-block wire format for the four header-bearing opcodes; see
+  [protocol.md](protocol.md#message-headers).
+- `MeshHub.ClientConnection` (now also carries `NegotiatedProtocolVersion`, PR #74), `MeshHub.Group`,
+  `MeshClient.ConnectionState`, `MeshClient.PendingLookup` — nested private helpers documented in
+  [hub.md](hub.md) / [client.md](client.md).
 
 Tests reach internals via `<InternalsVisibleTo Include="AdamSalisbury.Meshworx.UnitTests" />`
 (`AdamSalisbury.Meshworx.csproj:726`).
