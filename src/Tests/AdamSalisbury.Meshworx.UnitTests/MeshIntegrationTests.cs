@@ -402,6 +402,64 @@ public sealed class MeshIntegrationTests
     }
 
     /// <summary>
+    /// A direct message sent with structured headers is delivered over the real wire protocol with
+    /// both the headers and the body intact, and a group message carrying headers reaches every other
+    /// member the same way — proving the header envelope round-trips end to end rather than only
+    /// within the unit-level frame-building and frame-parsing tests.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_HeadersRoundTripForDirectAndGroupMessages()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        await bob.ConnectAsync(listener.Connect(), "Bob");
+        await alice.ConnectAsync(listener.Connect(), "Alice");
+
+        var directReceivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        bob.MessageReceived += (_, e) => directReceivedTcs.TrySetResult(e);
+
+        Guid? bobId = await alice.GetClientIdByNameAsync("Bob");
+        Assert.Equal(bob.Id, bobId);
+
+        byte[] directPayload = Encoding.UTF8.GetBytes("with headers");
+        var directHeaders = new MessageHeaders([new("correlationId", "abc-123")]);
+        await alice.SendAsync(bobId!.Value, directPayload, directHeaders);
+
+        MessageReceivedEventArgs directReceived = await directReceivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(alice.Id, directReceived.SenderId);
+        Assert.Equal(directPayload, directReceived.Data.ToArray());
+        Assert.Equal("abc-123", directReceived.Headers["correlationId"]);
+
+        var groupReceivedTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        bob.GroupMessageReceived += (_, e) => groupReceivedTcs.TrySetResult(e);
+
+        await bob.JoinGroupAsync("team");
+        await alice.JoinGroupAsync("team");
+
+        // Give the hub's own group-join processing (on Bob's connection) a moment to land before Alice
+        // sends, since JoinGroupAsync returns as soon as the request is sent rather than once applied.
+        Guid? aliceId = await bob.GetClientIdByNameAsync("Alice");
+        Assert.Equal(alice.Id, aliceId);
+
+        byte[] groupPayload = Encoding.UTF8.GetBytes("team update");
+        var groupHeaders = new MessageHeaders([new("priority", "high")]);
+        await alice.SendToGroupAsync("team", groupPayload, groupHeaders);
+
+        GroupMessageReceivedEventArgs groupReceived = await groupReceivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(alice.Id, groupReceived.SenderId);
+        Assert.Equal("team", groupReceived.GroupName);
+        Assert.Equal(groupPayload, groupReceived.Data.ToArray());
+        Assert.Equal("high", groupReceived.Headers["priority"]);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
     /// When the hub stops, connected clients receive the disconnect notification and raise
     /// Disconnected with the RemoteDisconnect reason.
     /// </summary>

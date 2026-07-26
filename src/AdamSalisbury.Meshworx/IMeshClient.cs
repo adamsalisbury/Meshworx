@@ -96,10 +96,36 @@ public interface IMeshClient : IAsyncDisposable
     Task SendAsync(Guid recipientId, ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends a message to another client via the hub, carrying structured headers alongside the
+    /// opaque message body.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget, mirroring <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, CancellationToken)"/>.
+    /// Headers are metadata the hub can route and observe without ever decoding <paramref name="message"/>
+    /// itself. Passing <see cref="MessageHeaders.Empty"/> is equivalent to calling the overload without
+    /// headers — no header block is written to the wire, so it costs nothing extra.
+    /// </remarks>
+    /// <param name="recipientId">The unique identifier of the target client.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="headers">The structured headers to attach to the message.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="headers"/> is non-empty but the hub negotiated a protocol version that predates
+    /// the header envelope.
+    /// </exception>
+    Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Broadcasts a message to every other client currently registered with the hub.
     /// </summary>
     /// <remarks>
-    /// Delivery is best-effort and fire-and-forget, mirroring <see cref="SendAsync"/>. The message is
+    /// Delivery is best-effort and fire-and-forget, mirroring
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, CancellationToken)"/>. The message is
     /// not echoed back to the sender. Recipients receive it through <see cref="MessageReceived"/> and
     /// cannot distinguish it from a directly addressed message.
     /// </remarks>
@@ -157,6 +183,31 @@ public interface IMeshClient : IAsyncDisposable
     /// <param name="cancellationToken">A token to cancel the operation.</param>
     /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
     Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a message to every other member of the named group, carrying structured headers
+    /// alongside the opaque message body.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget, mirroring
+    /// <see cref="SendToGroupAsync(string, ReadOnlyMemory{byte}, CancellationToken)"/>. Passing
+    /// <see cref="MessageHeaders.Empty"/> is equivalent to calling the overload without headers — no
+    /// header block is written to the wire, so it costs nothing extra.
+    /// </remarks>
+    /// <param name="groupName">The name of the group to send to.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="headers">The structured headers to attach to the message.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="headers"/> is non-empty but the hub negotiated a protocol version that predates
+    /// the header envelope.
+    /// </exception>
+    Task SendToGroupAsync(
+        string groupName,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Queries the hub for a client's Id based on its name

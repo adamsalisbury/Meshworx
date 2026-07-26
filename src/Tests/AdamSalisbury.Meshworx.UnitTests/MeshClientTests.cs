@@ -403,6 +403,98 @@ public sealed class MeshClientTests
         Assert.Equal(message, sentData[17..]);
     }
 
+    /// <summary>
+    /// Calling the headers overload with <see cref="MessageHeaders.Empty"/> writes exactly the same
+    /// frame as the plain overload — no header block, byte-for-byte identical — so a message sent
+    /// without headers costs nothing extra over today's frame.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_EmptyHeadersOverload_ProducesByteIdenticalPayloadToPlainOverload()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        var recipientId = Guid.NewGuid();
+        var message = new byte[] { 1, 2, 3 };
+
+        byte[]? plainPayload = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => plainPayload = data.ToArray())
+            .Returns(Task.CompletedTask);
+        await fixture.Client.SendAsync(recipientId, message);
+
+        byte[]? headersPayload = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => headersPayload = data.ToArray())
+            .Returns(Task.CompletedTask);
+        await fixture.Client.SendAsync(recipientId, message, MessageHeaders.Empty);
+
+        Assert.Equal(plainPayload, headersPayload);
+    }
+
+    /// <summary>
+    /// When SendAsync is called with a non-empty MessageHeaders, the payload uses the
+    /// SendMessageWithHeaders type, followed by the recipient Guid, the header-block length, the
+    /// encoded header block, then the message bytes.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_WithHeaders_SendsSendMessageWithHeadersFrame()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        var recipientId = Guid.NewGuid();
+        var message = new byte[] { 1, 2, 3 };
+        var headers = new MessageHeaders([new("correlationId", "abc-123")]);
+        await fixture.Client.SendAsync(recipientId, message, headers);
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x11, sentData[0]); // SendMessageWithHeaders
+        Assert.Equal(recipientId, new Guid(sentData.AsSpan(1, 16)));
+
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(17, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(sentData.AsSpan(19), headerLength);
+        Assert.Equal("abc-123", decoded["correlationId"]);
+        Assert.Equal(message, sentData[(19 + headerLength)..]);
+    }
+
+    /// <summary>
+    /// When the hub negotiated a protocol version that predates the header envelope, attaching headers
+    /// throws rather than silently sending them without a body the hub understands, or silently
+    /// dropping them.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_WithHeadersOnOldNegotiatedVersion_ThrowsNotSupportedException()
+    {
+        var fixture = new MeshClientFixture();
+        fixture.SetupSuccessfulRegistrationWithNegotiatedVersion(4);
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        var headers = new MessageHeaders([new("correlationId", "abc-123")]);
+
+        await Assert.ThrowsAsync<NotSupportedException>(
+            () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, headers));
+    }
+
+    /// <summary>
+    /// Passing a null MessageHeaders throws rather than being treated as empty, so a caller cannot
+    /// mistake a missing argument for an explicit "no headers" choice.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_NullHeaders_ThrowsArgumentNullException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, null!));
+    }
+
     // Send policy (timeout and retry)
 
     /// <summary>
@@ -630,6 +722,82 @@ public sealed class MeshClientTests
     }
 
     /// <summary>
+    /// Calling the headers overload with <see cref="MessageHeaders.Empty"/> writes exactly the same
+    /// frame as the plain overload, so a group message sent without headers costs nothing extra.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendToGroupAsync_EmptyHeadersOverload_ProducesByteIdenticalPayloadToPlainOverload()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        var message = new byte[] { 5, 6 };
+
+        byte[]? plainPayload = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => plainPayload = data.ToArray())
+            .Returns(Task.CompletedTask);
+        await fixture.Client.SendToGroupAsync("team", message);
+
+        byte[]? headersPayload = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => headersPayload = data.ToArray())
+            .Returns(Task.CompletedTask);
+        await fixture.Client.SendToGroupAsync("team", message, MessageHeaders.Empty);
+
+        Assert.Equal(plainPayload, headersPayload);
+    }
+
+    /// <summary>
+    /// When SendToGroupAsync is called with a non-empty MessageHeaders, the payload uses the
+    /// GroupMessageWithHeaders type, the group name, the header-block length, the encoded header
+    /// block, then the message bytes.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendToGroupAsync_WithHeaders_SendsGroupMessageWithHeadersFrame()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        var message = new byte[] { 5, 6 };
+        var headers = new MessageHeaders([new("priority", "high")]);
+        await fixture.Client.SendToGroupAsync("team", message, headers);
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x13, sentData[0]); // GroupMessageWithHeaders
+        int nameLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(1, 2));
+        Assert.Equal("team", Encoding.UTF8.GetString(sentData.AsSpan(3, nameLength)));
+
+        int headerLengthOffset = 3 + nameLength;
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(headerLengthOffset, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(sentData.AsSpan(headerLengthOffset + 2), headerLength);
+        Assert.Equal("high", decoded["priority"]);
+        Assert.Equal(message, sentData[(headerLengthOffset + 2 + headerLength)..]);
+    }
+
+    /// <summary>
+    /// As with the direct-send overload, attaching headers on a connection negotiated below the
+    /// header-envelope minimum version throws rather than silently sending or dropping them.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendToGroupAsync_WithHeadersOnOldNegotiatedVersion_ThrowsNotSupportedException()
+    {
+        var fixture = new MeshClientFixture();
+        fixture.SetupSuccessfulRegistrationWithNegotiatedVersion(4);
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        var headers = new MessageHeaders([new("priority", "high")]);
+
+        await Assert.ThrowsAsync<NotSupportedException>(
+            () => fixture.Client.SendToGroupAsync("team", new byte[] { 1 }, headers));
+    }
+
+    /// <summary>
     /// When a group operation is invoked on a disconnected client, an InvalidOperationException is thrown.
     /// </summary>
     [Fact(Timeout = 1000)]
@@ -683,6 +851,60 @@ public sealed class MeshClientTests
         Assert.Equal(senderId, args.SenderId);
         Assert.Equal("team", args.GroupName);
         Assert.Equal(message, args.Data.ToArray());
+        Assert.Empty(args.Headers);
+    }
+
+    /// <summary>
+    /// When the receive loop processes a DeliverMessageWithHeaders frame, the MessageReceived event is
+    /// raised with the sender id, the decoded headers, and the message data.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_DeliverMessageWithHeaders_RaisesMessageReceivedWithHeaders()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+        var message = new byte[] { 1, 2, 3 };
+        var headers = new MessageHeaders([new("correlationId", "abc-123")]);
+        byte[] frame = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(senderId, headers, message);
+        fixture.SetupSuccessfulRegistration(frame);
+
+        MessageReceivedEventArgs? args = null;
+        fixture.Client.MessageReceived += (_, e) => args = e;
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        Assert.NotNull(args);
+        Assert.Equal(senderId, args.SenderId);
+        Assert.Equal(message, args.Data.ToArray());
+        Assert.Equal("abc-123", args.Headers["correlationId"]);
+    }
+
+    /// <summary>
+    /// When the receive loop processes a DeliverGroupMessageWithHeaders frame, the
+    /// GroupMessageReceived event is raised with the sender id, the group name, the decoded headers,
+    /// and the message data.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_DeliverGroupMessageWithHeaders_RaisesGroupMessageReceivedWithHeaders()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+        var message = new byte[] { 1, 2, 3 };
+        var headers = new MessageHeaders([new("priority", "high")]);
+        byte[] frame = MeshClientFixture.CreateDeliverGroupMessageWithHeadersPayload(
+            senderId, "team", headers, message);
+        fixture.SetupSuccessfulRegistration(frame);
+
+        GroupMessageReceivedEventArgs? args = null;
+        fixture.Client.GroupMessageReceived += (_, e) => args = e;
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        Assert.NotNull(args);
+        Assert.Equal(senderId, args.SenderId);
+        Assert.Equal("team", args.GroupName);
+        Assert.Equal(message, args.Data.ToArray());
+        Assert.Equal("high", args.Headers["priority"]);
     }
 
     // Connection state and group membership
