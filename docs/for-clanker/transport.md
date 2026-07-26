@@ -51,7 +51,7 @@ implementation:**
 
 The exception *type* is load-bearing. `MeshHub.AcceptLoopAsync` uses it to tell **"this listener is
 finished"** (break the loop) from **"that one connection failed"** (log and `continue`), and the retry
-has no delay (`MeshHub.cs:604-612`) — so a listener that is never coming back but reports anything else
+has no delay (`MeshHub.cs:691-699`) — so a listener that is never coming back but reports anything else
 spins the hub's accept loop hot. Both shipped listeners translate accordingly; see
 [known-issues.md](known-issues.md) KI-22.
 
@@ -62,7 +62,7 @@ Task SendAsync(IReadOnlyList<ReadOnlyMemory<byte>> messages, CancellationToken =
 ```
 
 An **optional capability**. The hub's send loop coalesces a burst of queued frames into one underlying
-write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:1277-1279`);
+write when the connection's transport implements it (`MeshHub.SendLoopAsync`, `MeshHub.cs:1391-1393`);
 transports that don't implement it just receive frames one at a time. It is deliberately **`internal`**:
 only the bundled `TcpTransport` benefits and only the in-assembly hub consumes it, so it stays off the
 public `ITransport` surface. Each element is delivered as its own message. **External transports cannot
@@ -78,7 +78,7 @@ Added by PR #68 (issue #16). Another **optional capability**, following the same
 `IBatchSendTransport` above but **public** rather than internal, since a custom network transport
 outside this assembly needs to be able to implement it too. `MeshHub.AcceptLoopAsync` uses it,
 immediately after `AcceptAsync` and before any handshake, to cap how many connections it admits from a
-single remote address at once (`ExtractRemoteAddress`, `MeshHub.cs:656-661`) — see
+single remote address at once (`ExtractRemoteAddress`, `MeshHub.cs:743-748`) — see
 [hub.md](hub.md#per-remote-endpoint-connection-cap) and [known-issues.md](known-issues.md) KI-29.
 - Return `null` if the transport has no meaningful network address (e.g. it isn't network-backed at
   all, or the address isn't known yet). A transport that doesn't implement this interface, or that

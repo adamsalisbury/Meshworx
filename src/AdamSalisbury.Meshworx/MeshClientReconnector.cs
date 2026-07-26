@@ -1,4 +1,6 @@
+using System.Diagnostics.Metrics;
 using System.Threading.Channels;
+using AdamSalisbury.Meshworx.Diagnostics;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
@@ -54,6 +56,11 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     private readonly Lock _restoreLock = new();
     private readonly HashSet<string> _pendingGroupRestore = new(StringComparer.Ordinal);
 
+    // Own Meter, disposed with this reconnector, rather than a static one shared process-wide — see the
+    // matching field on MeshHub for why.
+    private readonly Meter _meter = new(MeshworxMeterName.Value);
+    private readonly Counter<long> _reconnectsCounter;
+
     private Task? _reconnectLoopTask;
     private int _started;
     private int _disposed;
@@ -108,6 +115,11 @@ public sealed class MeshClientReconnector : IAsyncDisposable
         _connectTimeout = connectTimeout ?? DefaultConnectTimeout;
         _restoreGroupMembership = restoreGroupMembership;
         _logger = logger ?? NullLogger<MeshClientReconnector>.Instance;
+
+        _reconnectsCounter = _meter.CreateCounter<long>(
+            "meshworx.client.reconnects",
+            unit: "{reconnect}",
+            description: "The number of times this reconnector has re-established a dropped connection.");
     }
 
     /// <summary>
@@ -129,6 +141,20 @@ public sealed class MeshClientReconnector : IAsyncDisposable
     /// drop</b> — make the work they do idempotent rather than assuming it happens exactly once.
     /// </remarks>
     public event EventHandler? Reconnected;
+
+    /// <summary>
+    /// Gets the <see cref="Meter"/> this reconnector publishes its instruments to.
+    /// </summary>
+    /// <remarks>
+    /// Internal rather than private so a test can filter a
+    /// <see cref="System.Diagnostics.Metrics.MeterListener"/> down to exactly this reconnector's
+    /// instruments by reference, rather than by meter name alone — several reconnectors across a test
+    /// run can share the name, but never this object.
+    /// </remarks>
+    internal Meter GetMeterForTesting()
+    {
+        return _meter;
+    }
 
     /// <summary>
     /// Establishes the initial connection and begins monitoring it for unexpected disconnects.
@@ -269,6 +295,10 @@ public sealed class MeshClientReconnector : IAsyncDisposable
                     throw;
                 }
 
+                // Only reached once this method has itself re-established the connection — the early
+                // return above, for a drop signal that turned out to be stale, never gets here, so a
+                // no-op reconnect pass is never counted as a reconnect.
+                _reconnectsCounter.Add(1);
                 return;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -349,5 +379,6 @@ public sealed class MeshClientReconnector : IAsyncDisposable
 
         await Client.DisconnectAsync().ConfigureAwait(false);
         _stopCts.Dispose();
+        _meter.Dispose();
     }
 }
