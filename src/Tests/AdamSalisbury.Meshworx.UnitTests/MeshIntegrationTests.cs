@@ -339,14 +339,15 @@ public sealed class MeshIntegrationTests
         await hub.StartAsync();
 
         // A raw endpoint that completes registration by hand, then goes silent (never replies to pings).
-        // Frame: [type][version][name length (2, big-endian)][name][credential].
+        // Frame: [type][versionMin][versionMax][name length (2, big-endian)][name][credential].
         var raw = listener.Connect();
         byte[] nameBytes = Encoding.UTF8.GetBytes("Silent");
-        var registration = new byte[4 + nameBytes.Length];
+        var registration = new byte[5 + nameBytes.Length];
         registration[0] = 0x04; // RegistrationRequest
-        registration[1] = 0x03; // protocol version
-        BinaryPrimitives.WriteUInt16BigEndian(registration.AsSpan(2, 2), (ushort)nameBytes.Length);
-        nameBytes.CopyTo(registration, 4);
+        registration[1] = Protocol.MinSupportedVersion;
+        registration[2] = Protocol.MaxSupportedVersion;
+        BinaryPrimitives.WriteUInt16BigEndian(registration.AsSpan(3, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(registration, 5);
         await raw.SendAsync(registration);
 
         byte[]? response = await raw.ReceiveAsync().WaitAsync(WaitTimeout);

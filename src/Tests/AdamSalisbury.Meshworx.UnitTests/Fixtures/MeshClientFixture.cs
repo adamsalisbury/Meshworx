@@ -18,11 +18,13 @@ internal sealed class MeshClientFixture
         Transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
     }
 
-    public byte[] CreateRegistrationResponse()
+    public byte[] CreateRegistrationResponse(byte negotiatedVersion = 0x04)
     {
-        var response = new byte[17];
+        // RegistrationComplete frame: [type][clientId (16)][negotiated version].
+        var response = new byte[18];
         response[0] = 0x01; // RegistrationComplete
-        AssignedId.TryWriteBytes(response.AsSpan(1));
+        AssignedId.TryWriteBytes(response.AsSpan(1, 16));
+        response[17] = negotiatedVersion;
         return response;
     }
 
@@ -37,6 +39,16 @@ internal sealed class MeshClientFixture
 
     public void SetupSuccessfulRegistration(params byte[][] receiveLoopMessages)
     {
+        SetupSuccessfulRegistrationWithNegotiatedVersion(0x04, receiveLoopMessages);
+    }
+
+    /// <summary>
+    /// As <see cref="SetupSuccessfulRegistration"/>, but lets the test control the protocol version the
+    /// hub echoes back, so a negotiated-down version can be modelled.
+    /// </summary>
+    public void SetupSuccessfulRegistrationWithNegotiatedVersion(
+        byte negotiatedVersion, params byte[][] receiveLoopMessages)
+    {
         Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
@@ -47,7 +59,7 @@ internal sealed class MeshClientFixture
         // uncompleted deliberately: returning null would now be interpreted as a lost
         // connection and trigger teardown.
         var channel = Channel.CreateUnbounded<byte[]?>();
-        channel.Writer.TryWrite(CreateRegistrationResponse());
+        channel.Writer.TryWrite(CreateRegistrationResponse(negotiatedVersion));
 
         foreach (byte[] message in receiveLoopMessages)
         {

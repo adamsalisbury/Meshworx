@@ -77,14 +77,14 @@ public sealed record RegistrationContext
 ```
 
 A `sealed record` with `required` init-only properties — construct with an object initialiser (the hub
-does, at `MeshHub.cs:1285`). Trivially constructible in tests.
+does, at `MeshHub.cs:1324`). Trivially constructible in tests.
 
 - `ClientName` — the name being registered under. Already validated for length, **not** yet checked for
   uniqueness, so two concurrent registrations for the same name can both reach your authenticator.
 - `Credential` — exactly the bytes the client sent after its name, empty if it sent none. The library
   assigns no meaning to them.
 - **Only guaranteed valid for the duration of the call** — copy it if it must outlive the invocation.
-  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:1284`, so
+  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:1323`, so
   it does not alias a larger buffer — but the documented contract is the one to code against.)
 
 <a id="authorisation-types"></a>
@@ -114,7 +114,7 @@ A **delegate, not an interface**, matching `ClientAuthenticator`. Return `true` 
 the group; `false` refuses the join and the hub sends the client a `GroupJoinRefused` frame.
 
 Contract, from the delegate's own XML docs and the hub's call site (`AuthoriseGroupJoinAsync`,
-`MeshHub.cs:1628`):
+`MeshHub.cs:1667`):
 
 - Invoked **once per join request**, including every re-join a client issues after reconnecting, so a
   decision is never carried across a connection and a reconnector's membership restore cannot bypass it.
@@ -124,7 +124,7 @@ Contract, from the delegate's own XML docs and the hub's call site (`AuthoriseGr
 - **Fails closed.** Returning `false`, throwing, cancelling from inside the callback, or exceeding
   `groupAuthorisationTimeout` all refuse the join.
 - `ValueTask<bool>` — a synchronous decision (`ValueTask.FromResult(...)`) takes an explicitly
-  allocation-free fast path in the hub (`MeshHub.cs:1658-1663`) and is the common case; anything else,
+  allocation-free fast path in the hub (`MeshHub.cs:1697-1702`) and is the common case; anything else,
   including an already-faulted result, goes through the bounded `WaitAsync`.
 - **It runs on input from an already-admitted client**, driven from that client's own receive loop, which
   reads nothing else from that client until it returns. So a slow callback stalls only the client that
@@ -143,7 +143,7 @@ public sealed record GroupJoinContext
 ```
 
 A `sealed record` with `required` init-only properties — construct with an object initialiser (the hub
-does, at `MeshHub.cs:1631`). Trivially constructible in tests.
+does, at `MeshHub.cs:1670`). Trivially constructible in tests.
 
 - `ClientId` — the hub-assigned id. Fresh per connection, so it is **not** stable across a reconnect;
   authorise on the name plus your own state if you need continuity.
@@ -172,7 +172,9 @@ catch (RegistrationRefusedException ex) { /* ex.ErrorCode tells you why */ }
 ## Internal types (not visible outside the assembly, listed for orientation)
 
 - `enum MessageType : byte` (`Messages/MessageType.cs`) — the opcodes; see [protocol.md](protocol.md).
-- `static class Protocol` (`Messages/Protocol.cs`) — `Version = 3`, `MaxClientNameLength = 256`.
+- `static class Protocol` (`Messages/Protocol.cs`) — `MinSupportedVersion = 4`, `MaxSupportedVersion = 4`
+  (replaced the single `Version = 3` constant in PR #73; see [protocol.md](protocol.md#versioning)),
+  `MaxClientNameLength = 256`.
 - `MeshHub.ClientConnection`, `MeshHub.Group`, `MeshClient.ConnectionState`, `MeshClient.PendingLookup`
   — nested private helpers documented in [hub.md](hub.md) / [client.md](client.md).
 

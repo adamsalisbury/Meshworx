@@ -119,6 +119,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public string Name { get; private set; } = string.Empty;
 
     /// <inheritdoc/>
+    public byte NegotiatedProtocolVersion { get; private set; }
+
+    /// <inheritdoc/>
     public bool IsConnected
     {
         get
@@ -190,14 +193,15 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         try
         {
-            // Registration frame: [type][version][name length (2, big-endian)][name][credential].
+            // Registration frame: [type][versionMin][versionMax][name length (2, big-endian)][name][credential].
             byte[] nameBytes = Encoding.UTF8.GetBytes(clientName);
-            var requestPayload = new byte[2 + 2 + nameBytes.Length + credential.Length];
+            var requestPayload = new byte[3 + 2 + nameBytes.Length + credential.Length];
             requestPayload[0] = (byte)MessageType.RegistrationRequest;
-            requestPayload[1] = Protocol.Version;
-            BinaryPrimitives.WriteUInt16BigEndian(requestPayload.AsSpan(2, 2), (ushort)nameBytes.Length);
-            nameBytes.CopyTo(requestPayload, 4);
-            credential.Span.CopyTo(requestPayload.AsSpan(4 + nameBytes.Length));
+            requestPayload[1] = Protocol.MinSupportedVersion;
+            requestPayload[2] = Protocol.MaxSupportedVersion;
+            BinaryPrimitives.WriteUInt16BigEndian(requestPayload.AsSpan(3, 2), (ushort)nameBytes.Length);
+            nameBytes.CopyTo(requestPayload, 5);
+            credential.Span.CopyTo(requestPayload.AsSpan(5 + nameBytes.Length));
             await _transport.SendAsync(requestPayload, cancellationToken).ConfigureAwait(false);
 
             byte[]? responseData = await _transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
@@ -210,7 +214,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             }
 
             if (responseData is null
-                || responseData.Length != 17
+                || responseData.Length != 18
                 || (MessageType)responseData[0] != MessageType.RegistrationComplete)
             {
                 throw new InvalidOperationException("Failed to register with the hub.");
@@ -218,7 +222,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
             Id = new Guid(responseData.AsSpan(1, 16));
             Name = clientName;
-            _logger.LogInformation("Connected to hub with id {ClientId}", Id);
+            NegotiatedProtocolVersion = responseData[17];
+            _logger.LogInformation(
+                "Connected to hub with id {ClientId} on protocol version {ProtocolVersion}",
+                Id,
+                NegotiatedProtocolVersion);
 
             var cts = new CancellationTokenSource();
             _cts = cts;
@@ -336,6 +344,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             Id = Guid.Empty;
             Name = string.Empty;
+            NegotiatedProtocolVersion = 0;
             _state = ConnectionState.Disconnected;
         }
     }
@@ -914,6 +923,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             Id = Guid.Empty;
             Name = string.Empty;
+            NegotiatedProtocolVersion = 0;
             _state = ConnectionState.Disconnected;
 
             // Take the decision to raise under the same lock that publishes the disconnected state,

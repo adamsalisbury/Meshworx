@@ -115,17 +115,19 @@ internal sealed class MeshHubFixture
         _acceptFailures.Enqueue(exception);
     }
 
-    public static byte[] CreateRegistrationRequest(string name = "TestClient", byte[]? credential = null)
+    public static byte[] CreateRegistrationRequest(
+        string name = "TestClient", byte[]? credential = null, byte versionMin = 0x04, byte versionMax = 0x04)
     {
-        // Registration frame: [type][version][name length (2, big-endian)][name][credential].
+        // Registration frame: [type][versionMin][versionMax][name length (2, big-endian)][name][credential].
         credential ??= [];
         byte[] nameBytes = Encoding.UTF8.GetBytes(name);
-        var payload = new byte[2 + 2 + nameBytes.Length + credential.Length];
+        var payload = new byte[3 + 2 + nameBytes.Length + credential.Length];
         payload[0] = 0x04; // RegistrationRequest
-        payload[1] = 0x03; // Protocol version
-        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(2, 2), (ushort)nameBytes.Length);
-        nameBytes.CopyTo(payload, 4);
-        credential.CopyTo(payload, 4 + nameBytes.Length);
+        payload[1] = versionMin;
+        payload[2] = versionMax;
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(3, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(payload, 5);
+        credential.CopyTo(payload, 5 + nameBytes.Length);
         return payload;
     }
 
