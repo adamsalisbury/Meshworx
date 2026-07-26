@@ -1237,8 +1237,8 @@ public sealed class MeshHubTests
     // HandleClient — unsupported protocol version
 
     /// <summary>
-    /// When a client sends a registration request with an unsupported protocol version, the hub sends
-    /// an Error response containing the UnsupportedProtocolVersion error code.
+    /// When a client's advertised protocol version range does not overlap the hub's supported range, the
+    /// hub sends an Error response containing the UnsupportedProtocolVersion error code.
     /// </summary>
     [Fact(Timeout = 1000)]
     public async Task HandleClient_UnsupportedProtocolVersion_SendsErrorResponse()
@@ -1248,7 +1248,8 @@ public sealed class MeshHubTests
         var sentDataTcs = new TaskCompletionSource<byte[]>();
         var disposedTcs = new TaskCompletionSource();
 
-        byte[] badVersion = [0x04, 0xFF, 0x41]; // RegistrationRequest + bad version + 'A'
+        // RegistrationRequest advertising versions 1-2, which do not overlap the hub's version 4.
+        byte[] badVersion = [0x04, 0x01, 0x02];
         transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(badVersion);
         transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
@@ -1266,6 +1267,80 @@ public sealed class MeshHubTests
         Assert.Equal(0x05, sentData[0]); // Error
         Assert.Equal(0x02, sentData[1]); // UnsupportedProtocolVersion
 
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When a client sends a registration request whose advertised minimum version is greater than its
+    /// advertised maximum, the range is malformed and the hub refuses it as an unsupported version rather
+    /// than attempting to interpret it.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_InvertedProtocolVersionRange_SendsErrorResponse()
+    {
+        var fixture = new MeshHubFixture();
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+        var disposedTcs = new TaskCompletionSource();
+
+        // RegistrationRequest advertising min=5, max=4: an inverted, malformed range.
+        byte[] invertedRange = [0x04, 0x05, 0x04];
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(invertedRange);
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+        transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x02, sentData[1]); // UnsupportedProtocolVersion
+
+        await fixture.Hub.StopAsync();
+    }
+
+    // HandleClient — protocol version negotiation
+
+    /// <summary>
+    /// When a client advertises a version range wider than the hub's own supported range, the hub picks
+    /// the highest version common to both — not merely an exact match — and echoes it in the
+    /// RegistrationComplete response.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_ProtocolVersionRangeOverlapsHub_NegotiatesHighestSharedVersion()
+    {
+        var fixture = new MeshHubFixture();
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+        var blockingReceive = new TaskCompletionSource<byte[]?>();
+
+        // A client that supports versions 3 through 6; the hub only supports version 4, so 4 is the
+        // highest shared version. The receive loop's next call parks rather than spinning on the same
+        // registration frame once the client is admitted.
+        byte[] wideRange = MeshHubFixture.CreateRegistrationRequest("Alpha", versionMin: 3, versionMax: 6);
+        transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(wideRange)
+            .Returns(blockingReceive.Task);
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x01, sentData[0]); // RegistrationComplete
+        Assert.Equal(18, sentData.Length);
+        Assert.Equal(0x04, sentData[17]); // negotiated version
+
+        blockingReceive.TrySetResult(null);
         await fixture.Hub.StopAsync();
     }
 

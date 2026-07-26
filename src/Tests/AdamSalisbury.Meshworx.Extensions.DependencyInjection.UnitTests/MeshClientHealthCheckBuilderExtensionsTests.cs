@@ -16,9 +16,10 @@ public sealed class MeshClientHealthCheckBuilderExtensionsTests
         transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
-        var registrationResponse = new byte[17];
+        var registrationResponse = new byte[18];
         registrationResponse[0] = 0x01; // RegistrationComplete
-        assignedId.TryWriteBytes(registrationResponse.AsSpan(1));
+        assignedId.TryWriteBytes(registrationResponse.AsSpan(1, 16));
+        registrationResponse[17] = 0x04; // negotiated protocol version
 
         // Yield the registration response then block, exactly as a live connection would, so the
         // client's receive loop stays alive until DisconnectAsync cancels it.

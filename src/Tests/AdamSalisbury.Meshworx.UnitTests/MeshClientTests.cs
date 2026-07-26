@@ -101,11 +101,12 @@ public sealed class MeshClientTests
 
         Assert.NotNull(sentData);
         Assert.Equal(0x04, sentData[0]);
-        Assert.Equal(0x03, sentData[1]);
-        int nameLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(2, 2));
-        Assert.Equal("TestClient", Encoding.UTF8.GetString(sentData.AsSpan(4, nameLength)));
+        Assert.Equal(Protocol.MinSupportedVersion, sentData[1]);
+        Assert.Equal(Protocol.MaxSupportedVersion, sentData[2]);
+        int nameLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(3, 2));
+        Assert.Equal("TestClient", Encoding.UTF8.GetString(sentData.AsSpan(5, nameLength)));
         // No credential supplied, so the name is the whole remaining payload.
-        Assert.Equal(4 + nameLength, sentData.Length);
+        Assert.Equal(5 + nameLength, sentData.Length);
     }
 
     /// <summary>
@@ -130,6 +131,37 @@ public sealed class MeshClientTests
         await fixture.ConnectAsync("MyClient");
 
         Assert.Equal("MyClient", fixture.Client.Name);
+    }
+
+    /// <summary>
+    /// When ConnectAsync completes successfully, the client's NegotiatedProtocolVersion property is set
+    /// to the version the hub echoed in its RegistrationComplete response.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ConnectAsync_ValidRegistration_SetsNegotiatedProtocolVersion()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        Assert.Equal(Protocol.MaxSupportedVersion, fixture.Client.NegotiatedProtocolVersion);
+    }
+
+    /// <summary>
+    /// When the hub echoes a version lower than the client's own maximum — as an older hub negotiating
+    /// down would — the client accepts the handshake and records the negotiated version rather than the
+    /// version it originally advertised.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ConnectAsync_HubNegotiatesDownToOlderVersion_RecordsNegotiatedVersion()
+    {
+        var fixture = new MeshClientFixture();
+        const byte olderHubVersion = 2;
+
+        fixture.SetupSuccessfulRegistrationWithNegotiatedVersion(olderHubVersion);
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        Assert.Equal(olderHubVersion, fixture.Client.NegotiatedProtocolVersion);
+        Assert.Equal(fixture.AssignedId, fixture.Client.Id);
     }
 
     // ConnectAsync — registration failure
@@ -172,7 +204,7 @@ public sealed class MeshClientTests
     }
 
     /// <summary>
-    /// When the hub returns a response whose payload length does not match the expected 17 bytes, an InvalidOperationException is thrown.
+    /// When the hub returns a response whose payload length does not match the expected 18 bytes, an InvalidOperationException is thrown.
     /// </summary>
     [Fact(Timeout = 1000)]
     public async Task ConnectAsync_HubReturnsWrongPayloadLength_ThrowsInvalidOperationException()
@@ -384,9 +416,10 @@ public sealed class MeshClientTests
         Func<int, CancellationToken, Task> onSend)
     {
         var assignedId = Guid.NewGuid();
-        var registrationResponse = new byte[17];
+        var registrationResponse = new byte[18];
         registrationResponse[0] = 0x01; // RegistrationComplete
-        assignedId.TryWriteBytes(registrationResponse.AsSpan(1));
+        assignedId.TryWriteBytes(registrationResponse.AsSpan(1, 16));
+        registrationResponse[17] = Protocol.MaxSupportedVersion;
 
         var channel = Channel.CreateUnbounded<byte[]?>();
         channel.Writer.TryWrite(registrationResponse);
@@ -1594,9 +1627,10 @@ public sealed class MeshClientTests
 
     private static byte[] RegistrationComplete(Guid id)
     {
-        var response = new byte[17];
+        var response = new byte[18];
         response[0] = 0x01; // RegistrationComplete
-        id.TryWriteBytes(response.AsSpan(1));
+        id.TryWriteBytes(response.AsSpan(1, 16));
+        response[17] = Protocol.MaxSupportedVersion;
         return response;
     }
 }

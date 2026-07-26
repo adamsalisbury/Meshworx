@@ -16,6 +16,18 @@ public interface IMeshClient : IAsyncDisposable
     string Name { get; }
 
     /// <summary>
+    /// Gets the wire-protocol version negotiated with the hub during the last successful
+    /// <see cref="ConnectAsync"/>, or <c>0</c> if the client is not connected.
+    /// </summary>
+    /// <remarks>
+    /// The hub selects the highest version common to its own supported range and the range this
+    /// client advertised, so a newer client connecting to an older hub negotiates down to whatever
+    /// that hub supports rather than being refused outright. Only the shared feature set of the
+    /// negotiated version is guaranteed to work.
+    /// </remarks>
+    byte NegotiatedProtocolVersion { get; }
+
+    /// <summary>
     /// Gets a value indicating whether the client is currently connected to a hub.
     /// </summary>
     bool IsConnected { get; }

@@ -886,15 +886,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 }
             }
 
-            // Registration frame: [type][version][name length (2, big-endian)][name][credential].
+            // Registration frame: [type][versionMin][versionMax][name length (2, big-endian)][name][credential].
             if (registrationData is null
-                || registrationData.Length < 2
+                || registrationData.Length < 3
                 || (MessageType)registrationData[0] != MessageType.RegistrationRequest)
             {
                 return;
             }
 
-            if (registrationData[1] != Protocol.Version)
+            if (!TryNegotiateProtocolVersion(registrationData[1], registrationData[2], out byte negotiatedVersion))
             {
                 byte[] versionError =
                     [(byte)MessageType.Error, (byte)RegistrationErrorCode.UnsupportedProtocolVersion];
@@ -902,14 +902,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 return;
             }
 
-            if (registrationData.Length < 4)
+            if (registrationData.Length < 5)
             {
                 // Too short to carry the 2-byte name length; malformed.
                 return;
             }
 
-            int registrationNameLength = BinaryPrimitives.ReadUInt16BigEndian(registrationData.AsSpan(2, 2));
-            if (registrationNameLength == 0 || registrationData.Length < 4 + registrationNameLength)
+            int registrationNameLength = BinaryPrimitives.ReadUInt16BigEndian(registrationData.AsSpan(3, 2));
+            if (registrationNameLength == 0 || registrationData.Length < 5 + registrationNameLength)
             {
                 // Malformed frame: the name is empty, or the declared name runs past the payload. An
                 // empty name is refused here rather than admitted, because it would otherwise reserve
@@ -917,7 +917,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 return;
             }
 
-            string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(4, registrationNameLength));
+            string clientName = Encoding.UTF8.GetString(registrationData.AsSpan(5, registrationNameLength));
 
             if (clientName.Length > Protocol.MaxClientNameLength)
             {
@@ -974,9 +974,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             _clients.TryAdd(clientId, connection);
             _connectedClientsCounter.Add(1);
 
-            var responsePayload = new byte[17];
+            var responsePayload = new byte[18];
             responsePayload[0] = (byte)MessageType.RegistrationComplete;
-            clientId.TryWriteBytes(responsePayload.AsSpan(1));
+            clientId.TryWriteBytes(responsePayload.AsSpan(1, 16));
+            responsePayload[17] = negotiatedVersion;
             await transport.SendAsync(responsePayload, cancellationToken).ConfigureAwait(false);
 
             _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
@@ -1255,6 +1256,44 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             "Refusing client {ClientId}: hub at capacity ({MaxClients} clients)", clientId, MaxClients);
     }
 
+    /// <summary>
+    /// Selects the highest protocol version supported by both this hub and the connecting client.
+    /// </summary>
+    /// <param name="clientMinVersion">The lowest protocol version the client is willing to speak.</param>
+    /// <param name="clientMaxVersion">The highest protocol version the client is willing to speak.</param>
+    /// <param name="negotiatedVersion">
+    /// The highest version common to the hub's supported range (<see cref="Protocol.MinSupportedVersion"/>
+    /// to <see cref="Protocol.MaxSupportedVersion"/>) and the client's advertised range, when negotiation
+    /// succeeds; otherwise <c>0</c>.
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> if the client's advertised range is well-formed and overlaps the hub's
+    /// supported range; otherwise <see langword="false"/>.
+    /// </returns>
+    private static bool TryNegotiateProtocolVersion(
+        byte clientMinVersion, byte clientMaxVersion, out byte negotiatedVersion)
+    {
+        if (clientMinVersion > clientMaxVersion)
+        {
+            negotiatedVersion = 0;
+            return false;
+        }
+
+        int overlapMin = Math.Max(clientMinVersion, Protocol.MinSupportedVersion);
+        int overlapMax = Math.Min(clientMaxVersion, Protocol.MaxSupportedVersion);
+
+        if (overlapMin > overlapMax)
+        {
+            negotiatedVersion = 0;
+            return false;
+        }
+
+        // Highest mutually supported version wins, so both peers speak as much of the shared
+        // feature set as they can.
+        negotiatedVersion = (byte)overlapMax;
+        return true;
+    }
+
     private async Task<bool> AuthenticateAsync(
         Guid clientId,
         string clientName,
@@ -1281,7 +1320,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             // Copy the credential out of the registration frame so the context does not alias the larger
             // inbound buffer, which is safer if a caller retains it beyond the call.
-            byte[] credential = registrationData.AsSpan(4 + nameLength).ToArray();
+            byte[] credential = registrationData.AsSpan(5 + nameLength).ToArray();
             var context = new RegistrationContext { ClientName = clientName, Credential = credential };
 
             bool authenticated;
