@@ -1,8 +1,8 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 4c7a2ce (branch fix/unbounded-resource-consumption-defaults, PR #68, draft) + uncommitted working-tree changes on that branch (IPv6 /64 normalisation for the connection cap)
-reconciled-to-date: 2026-07-25
+reconciled-to-commit: 7962961 (branch feature/di-generic-host-integration, PR #70, open) — based on main at 76f9c89, clean working tree
+reconciled-to-date: 2026-07-26
 mode: update
 -->
 
@@ -12,34 +12,33 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `fix/unbounded-resource-consumption-defaults` (**draft PR #68**, closing
-> issue #16), currently checked out — plus uncommitted working-tree changes on top of that branch's pushed
-> commit `4c7a2ce` (an IPv6 `/64` normalisation step for the new connection cap, with its own test
-> coverage). **Unlike PR #67 below, this branch changes library code substantially**: `MeshHub`'s
-> constructor defaults, the accept loop, and a new public transport capability. It has **not merged to
-> `main`** — `main` is still `908a000`. Every `MeshHub.cs` coordinate in this file and in
-> [hub.md](for-clanker/hub.md), [known-issues.md](for-clanker/known-issues.md) and
-> [transport.md](for-clanker/transport.md) has been re-pointed against **this branch's tree**, not
-> against `main` — treat that as the current source of truth for `MeshHub.cs` line numbers until #68
-> merges. Concretely:
-> - `maxClients` now defaults to **1000** (was `int.MaxValue`/unlimited); `heartbeatInterval` now
->   defaults to **30 s** (was `null`/disabled), with `Timeout.InfiniteTimeSpan` as the new explicit
->   opt-out sentinel — distinct from omitting the parameter, which now takes the default rather than
->   disabling eviction. See [§5](#5-configuration--environment).
-> - A new `maxConnectionsPerRemoteEndpoint` constructor parameter (default **100**) caps connections from
->   a single remote address, enforced in `AcceptLoopAsync` before any registration handshake, backed by a
->   new public `IRemoteEndPointTransport` capability that `TcpTransport` implements. See
->   [hub.md](for-clanker/hub.md#per-remote-endpoint-connection-cap) and
->   [transport.md](for-clanker/transport.md#iremoteendpointtransport-public--transportiremoteendpointtransportcs16).
-> - A new internal `GetHeartbeatIntervalForTesting()` accessor lets tests assert the resolved interval
->   directly, mirroring the existing `TryReserveClientSlot`/`ReleaseClientSlot` internal-for-testing
->   pattern. See [testing.md](for-clanker/testing.md).
-> - The two existing constructor warnings (`maxMissedHeartbeats == 1` with heartbeats;
->   `groupAuthorisationTimeout` too close to the eviction budget) now check the **resolved**
->   `_heartbeatInterval` field rather than the raw constructor parameter, since idle eviction now runs by
->   default even when the parameter is left unset.
-> - See [known-issues.md](for-clanker/known-issues.md) KI-29 for the full write-up, including why this is
->   a breaking behavioural change for any existing hub that relied on the old defaults.
+> **Documented tree:** branch `feature/di-generic-host-integration` (open **PR #70**), currently checked
+> out on top of `main` at `76f9c89` (clean working tree, no divergence). **This branch is purely
+> additive**: it adds a second library project, `AdamSalisbury.Meshworx.Extensions.DependencyInjection`
+> (`AddMeshHub` / `AddMeshClient`, registering a hub or client with `Microsoft.Extensions.DependencyInjection`
+> and running it alongside a generic host), plus its own test project, and updates both `.slnx` files,
+> `src/Directory.Packages.props` and `README.md`. **`MeshHub`, `MeshClient`, `MeshClientReconnector` and
+> every transport type are untouched** — confirmed by an empty `git diff main HEAD` on each of those
+> files — so **no `path:line` coordinate anywhere else in this file or in** [hub.md](for-clanker/hub.md),
+> [client.md](for-clanker/client.md), [transport.md](for-clanker/transport.md),
+> [protocol.md](for-clanker/protocol.md), [types.md](for-clanker/types.md) or
+> [known-issues.md](for-clanker/known-issues.md) **needed re-pointing this pass.** The new package is
+> documented in full in [dependency-injection.md](for-clanker/dependency-injection.md); a hosted-service
+> registration bug found during this documentation pass was fixed before merge — see
+> [known-issues.md](for-clanker/known-issues.md) KI-30.
+>
+> The unbounded-resource-consumption-defaults fix (PR #68, closing issue #16) — draft at the time of the
+> previous pass — **has since merged as `76f9c89`**, which is the `main` commit this branch is built on.
+> The `MeshHub.cs`/`MeshHubTests.cs`/`TcpTransport.cs` coordinates below were already re-pointed against
+> that branch's own tree in the previous pass, and a diff against the merged commit confirms they are
+> unchanged, so nothing needed correcting. In summary: `maxClients` defaults to **1000** (was
+> `int.MaxValue`/unlimited); `heartbeatInterval` defaults to **30 s** (was `null`/disabled), with
+> `Timeout.InfiniteTimeSpan` as the explicit opt-out sentinel; a new `maxConnectionsPerRemoteEndpoint`
+> constructor parameter (default **100**) caps connections from a single remote address, backed by a new
+> public `IRemoteEndPointTransport` capability that `TcpTransport` implements. See
+> [§5](#5-configuration--environment), [hub.md](for-clanker/hub.md#per-remote-endpoint-connection-cap) and
+> [known-issues.md](for-clanker/known-issues.md) KI-29 for the full write-up, including why this was a
+> breaking behavioural change for any existing hub that relied on the old defaults.
 >
 > **Documented tree (PR #67):** branch `docs/reconnected-handler-async-void` (PR #67, closing issue #15),
 > which is `main` plus a README **Event handlers** subsection and one guard test in
@@ -117,8 +116,8 @@ rather than read directly, it says so.
 >
 > Every `MeshHub.cs`, `MeshHubTests.cs`, `TcpTransport.cs`, `ITransportListener.cs`,
 > `TcpTransportListener.cs` and `InMemoryTransportListener.cs` coordinate is current. The `MeshHub.cs`
-> and `MeshHubTests.cs` sets were most recently re-pointed in full for **PR #68** (draft, issue #16,
-> the branch this file documents — see above): `MeshHub.cs` gained ~270 lines across new constructor
+> and `MeshHubTests.cs` sets were most recently re-pointed in full for **PR #68** (issue #16, merged as
+> `76f9c89` — see above): `MeshHub.cs` gained ~270 lines across new constructor
 > defaults, validation, an `internal` testing accessor and the whole per-remote-endpoint cap (new
 > constants, a new field, `AcceptLoopAsync`'s cap check, and five new private helpers inserted before
 > `HandleClientAsync`), which shifted every coordinate below the new `DefaultMaxClients` constant by
@@ -142,6 +141,12 @@ Meshworx is a **.NET class library** (`AdamSalisbury.Meshworx`, target `net10.0`
 `0.1.0`) that provides **named message routing through a central hub**. It is not an application or a
 service — it is a library you embed. Two test/console apps ship alongside it purely to exercise it.
 
+A second, optional library — `AdamSalisbury.Meshworx.Extensions.DependencyInjection` (PR #70) — wraps the
+core types for `Microsoft.Extensions.DependencyInjection` and the generic host: `AddMeshHub` and
+`AddMeshClient` register a hub or client and run its start/stop alongside the host's own lifecycle, in
+place of the constructor-and-`StartAsync` calls shown directly below. It is a thin composition layer —
+nothing in the core library changed to support it. See [dependency-injection.md](for-clanker/dependency-injection.md).
+
 The model in one paragraph: a **hub** (`MeshHub`) listens on a pluggable transport and accepts
 **clients** (`MeshClient`). Each client registers under a **unique name** and is assigned a `Guid` id.
 Clients then exchange **opaque byte payloads** — addressed directly by recipient id, broadcast to
@@ -164,7 +169,7 @@ direct-send to any id it holds. Treat the transport boundary as the trust bounda
 
 | Fact | Value | Source |
 |---|---|---|
-| Kind | Library (+ two console test apps) | `src/AdamSalisbury.Meshworx/AdamSalisbury.Meshworx.csproj` |
+| Kind | Library, + an optional DI/hosting library, + two console test apps | `src/AdamSalisbury.Meshworx/AdamSalisbury.Meshworx.csproj`, `src/AdamSalisbury.Meshworx.Extensions.DependencyInjection/…csproj` |
 | Target framework | `net10.0` | `AdamSalisbury.Meshworx.csproj:4` |
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
@@ -256,6 +261,12 @@ handle events) → `DisconnectAsync` / dispose**. Runnable examples live in
 `src/AdamSalisbury.Meshworx.TestApps/{HubApp,ClientApp}/Program.cs` — read `ClientApp/Program.cs` for a
 complete, idiomatic client that uses every capability.
 
+**In a generic host or ASP.NET Core app, `AddMeshHub`/`AddMeshClient` replace this construct-and-start
+sequence** with `IServiceCollection` registration plus a hosted service that calls
+`StartAsync`/`ConnectAsync` and `StopAsync`/`DisconnectAsync` for you — see
+[dependency-injection.md](for-clanker/dependency-injection.md). The two console test apps above still
+use the manual sequence directly; they do not go through the DI package.
+
 **Capabilities at a glance** (all on `IMeshClient`, `src/AdamSalisbury.Meshworx/IMeshClient.cs`):
 
 | Task | Call | Notes |
@@ -318,6 +329,7 @@ receive loops never block on a slow recipient's socket; they just enqueue. See
 | Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `IRemoteEndPointTransport`, `TcpTransport(Listener)`, `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
 | Wire protocol & framing | `MessageType`, `Protocol`, handshake, opcode payloads | [protocol.md](for-clanker/protocol.md) |
 | Public value types | event args, `DisconnectReason`, `RegistrationErrorCode`, `ClientAuthenticator`, `RegistrationContext`, `GroupAuthoriser`, `GroupJoinContext`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
+| DI & generic-host integration | `AddMeshHub`, `AddMeshClient`, `MeshHubOptions`, `MeshClientOptions` | [dependency-injection.md](for-clanker/dependency-injection.md) |
 | Tests, fixtures, build/CI | xUnit + Moq suite, `MeshHubFixture`, `MeshClientFixture` | [testing.md](for-clanker/testing.md) |
 | **Known issues register** | consolidated foot-guns and limitations | [known-issues.md](for-clanker/known-issues.md) |
 
@@ -518,9 +530,9 @@ dotnet run --project src/AdamSalisbury.Meshworx.TestApps/HubApp
 dotnet run --project src/AdamSalisbury.Meshworx.TestApps/ClientApp
 ```
 
-> **Two solution files exist:** root `Meshworx.slnx` (library + test apps + tests — this is what CI
-> uses) and `src/Meshworx.slnx`. Use the **root** one. The README's per-project `dotnet build/test`
-> commands also work but only cover one project each.
+> **Two solution files exist:** root `Meshworx.slnx` (both libraries + test apps + both test projects —
+> this is what CI uses) and `src/Meshworx.slnx`. Use the **root** one. The README's per-project
+> `dotnet build/test` commands also work but only cover one project each.
 
 Package metadata (NuGet) is configured in the library `.csproj` (`Version 0.1.0`, MIT, symbols on) but
 there is no publish step in CI — CI only builds and tests.
@@ -580,6 +592,13 @@ there is no publish step in CI — CI only builds and tests.
   handler. A custom pooling transport could invalidate that assumption.
 - **Malformed/short frames are silently ignored** by both dispatch loops (length-guarded branches with
   no `else`). A bug in your framing will manifest as "nothing happens", not an exception.
+- **`AddMeshClient` guards against being called twice with the same name with a keyed marker type,
+  because its hosted-service registration otherwise cannot deduplicate itself the way `AddMeshHub`'s
+  does.** The hub's hosted-service registration is deduplicated for free by the framework
+  (`AddHostedService<T>()`); the client's uses a factory overload that is not, so `AddMeshClient` adds
+  its own guard rather than relying on one. Do not remove it. See
+  [dependency-injection.md](for-clanker/dependency-injection.md) and
+  [known-issues.md](for-clanker/known-issues.md) KI-30.
 - **Every `MeshHub` default is now finite (PR #68), which is a behavioural change, not just a value
   change.** A hub built with no arguments used to admit unlimited clients and never evict an idle one;
   it now caps at 1000 clients and 100 connections per remote address, and evicts a silent client after
