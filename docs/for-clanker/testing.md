@@ -7,6 +7,22 @@ The test suite is the best source of **intended usage** and the required place t
 wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test names), `CA2007`, and
 `xUnit1030`.
 
+**A second, separate suite** covers the DI/hosting package (PR #70):
+`src/Tests/AdamSalisbury.Meshworx.Extensions.DependencyInjection.UnitTests`, same stack and
+`NoWarn` set, three files —
+`MeshHubServiceCollectionExtensionsTests.cs` (202 lines), `MeshClientServiceCollectionExtensionsTests.cs`
+(276 lines) and `MeshHubHostedServiceTests.cs` (30 lines). Most tests build a
+`ServiceCollection`/`ServiceProvider` or a real `HostBuilder`/`IHost` directly, mocking only
+`ITransportListener`/`IMeshHub`/`ILogger`; the hosted-service **lifecycle** tests (host start/stop
+connecting and disconnecting a client) run against a real `MeshHub` over `InMemoryTransport` rather than
+a mock, because `ConnectAsync` performs a genuine registration handshake a bare transport mock cannot
+answer (`MeshClientServiceCollectionExtensionsTests.cs:214-274`) — no real sockets are used anywhere in
+this suite. `MeshClientServiceCollectionExtensionsTests.AddMeshClient_CalledTwiceForTheSameName_RegistersOnlyOneHostedService`
+covers the double-registration guard described in [known-issues.md](known-issues.md) KI-30; an
+`AddMeshHub`-called-twice scenario is not separately covered, since that path is deduplicated by the
+framework itself (`AddHostedService<T>()`) rather than by anything this repo wrote. See
+[dependency-injection.md](dependency-injection.md) for what the package does.
+
 ## Layout
 
 | File | Lines | Covers |

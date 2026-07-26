@@ -4,7 +4,9 @@
     <Project Path="AdamSalisbury.Meshworx.TestApps/HubApp/HubApp.csproj" />
   </Folder>
   <Folder Name="/Tests/">
+    <Project Path="Tests/AdamSalisbury.Meshworx.Extensions.DependencyInjection.UnitTests/AdamSalisbury.Meshworx.Extensions.DependencyInjection.UnitTests.csproj" />
     <Project Path="Tests/AdamSalisbury.Meshworx.UnitTests/AdamSalisbury.Meshworx.UnitTests.csproj" />
   </Folder>
   <Project Path="AdamSalisbury.Meshworx/AdamSalisbury.Meshworx.csproj" />
+  <Project Path="AdamSalisbury.Meshworx.Extensions.DependencyInjection/AdamSalisbury.Meshworx.Extensions.DependencyInjection.csproj" />
 </Solution>

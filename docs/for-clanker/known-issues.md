@@ -37,7 +37,8 @@ the risk to a change, not a claim that the code is defective.
 | KI-26 | `maxClients` was a soft cap — non-atomic check-then-act let a burst overshoot it | `MeshHub.cs:75`, `:833-837`, `:854-860`, `:1043-1046`, `:1081`, `:1110` | high (correctness) | **fixed** — PR #65 (issue #13); the atomic claim, its position *after* authentication, and the claim/release pairing are **load-bearing**, do not remove |
 | KI-27 | `GroupJoinRefused` carries no correlation identifier | `MeshHub.cs:1567-1569`, `MeshClient.cs:768-780` | low (correctness) | open — **accepted**, fail-safe by construction |
 | KI-28 | The group authoriser has no concurrency cap, and the timeout does not stop the callback | `MeshHub.cs:1482-1512` | medium (perf / availability) | open — **deliberate**; bounding it is the integrator's job |
-| KI-29 | `MeshHub` had unbounded resource-consumption defaults | `MeshHub.cs:24-38`, `:181-262`, `:602-753` | high (availability / security) | **fixed** — PR #68 (issue #16, draft); the new defaults are a **breaking behavioural change** for any hub relying on the old unlimited/disabled ones |
+| KI-29 | `MeshHub` had unbounded resource-consumption defaults | `MeshHub.cs:24-38`, `:181-262`, `:602-753` | high (availability / security) | **fixed** — PR #68 (issue #16, merged as `76f9c89`); the new defaults are a **breaking behavioural change** for any hub relying on the old unlimited/disabled ones |
+| KI-30 | `AddMeshClient` was not idempotent for its hosted service, unlike `AddMeshHub` | `MeshClientServiceCollectionExtensions.cs` | medium (correctness / availability) | **fixed** — caught in review and corrected before merge in PR #70; the keyed registration-marker guard is **load-bearing**, do not remove |
 
 ---
 
@@ -744,6 +745,37 @@ the risk to a change, not a claim that the code is defective.
   the four per-remote-endpoint tests. Do not remove the IPv6 `/64` masking on the reasoning that "IPv6
   isn't used in tests" — it is the load-bearing part of the cap for any deployment that is reachable over
   IPv6 at all.
+
+### KI-30 — `AddMeshClient` was not idempotent for its hosted service, unlike `AddMeshHub`
+- **Where:** `MeshClientServiceCollectionExtensions.AddMeshClientCore`, the hosted-service registration
+  guard immediately before `services.AddHostedService(serviceProvider => new MeshClientHostedService(...))`.
+  Contrast `MeshHubServiceCollectionExtensions.cs`, `services.AddHostedService<MeshHubHostedService>();`,
+  whose equivalent idempotency remark was already accurate.
+- **Status:** **fixed** before merge, in the same PR (#70) that introduced it — caught by documentation
+  review rather than by the analyser passes, then confirmed against the code and corrected.
+- **What the defect was:** `Microsoft.Extensions.Hosting`'s `AddHostedService<THostedService>()` (the
+  type-parameter overload, used by `AddMeshHub`) registers via `TryAddEnumerable`, so calling it twice for
+  the same closed type is a no-op the second time. `AddMeshClient` uses
+  `AddHostedService(Func<IServiceProvider, THostedService>)` — the **factory** overload — which is a
+  plain, undeduplicated `AddSingleton` under the hood, because a factory delegate carries no identity the
+  framework can compare. `AddMeshClient("Alice", ...)` called twice would therefore register **two**
+  `MeshClientHostedService` instances, both keyed to `"Alice"`, both resolving the *same* keyed
+  `IMeshClient`/`MeshClientReconnector` singleton. At host start the generic host runs each
+  `IHostedService.StartAsync` in registration order; the first call connects the client (or starts the
+  reconnector) successfully, and the second would throw `InvalidOperationException` from the same
+  singleton (`MeshClient.ConnectAsync` refuses a second connect; `MeshClientReconnector.StartAsync` refuses
+  a second start), which the host propagates as a fatal startup failure.
+- **The fix:** a private `MeshClientHostedServiceRegistrationMarker` type is registered as a keyed
+  singleton per `clientName` the first time `AddMeshClient` runs for that name; a later call for the same
+  name finds the marker already present and skips re-registering the hosted service (the options/keyed-
+  client registrations above it still run and still layer, unchanged). This is the moral equivalent, per
+  client name, of what `TryAddEnumerable` already gives `AddMeshHub` for free — **load-bearing**, do not
+  remove. Covered by
+  `MeshClientServiceCollectionExtensionsTests.AddMeshClient_CalledTwiceForTheSameName_RegistersOnlyOneHostedService`.
+- **What not to do:** do not "fix" a regression here by switching to the type-parameter
+  `AddHostedService<T>()` overload for `MeshClientHostedService` — it takes no constructor arguments
+  beyond what DI can supply, but `MeshClientHostedService` needs `clientName` captured per call, which
+  that overload has no way to thread through.
 
 ---
 
