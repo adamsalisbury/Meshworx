@@ -62,6 +62,13 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
 | `Transport/WebSocket/WebSocketTransportListenerTests.cs` | 207 | **New in PR #78 (issue #18).** Constructor guards, start/accept/dispose lifecycle, and the same raced-accept-vs-dispose and concurrent-dispose shapes as `TcpTransportListenerTests.cs` |
 | `Transport/WebSocket/WebSocketTransportLoopbackTests.cs` | 485 | **New in PR #78.** Round-trip send/receive over a real loopback socket, multi-frame reassembly, batch send (incl. deliver-then-fault), oversize payload on both send and receive, graceful close, wrong-path rejection, TLS variants (cert trust, silent-peer flood against negotiation slots, cert rejection, handshake-failure recovery, cleartext-against-TLS-only rejection) |
 | `Transport/WebSocket/WebSocketMeshIntegrationTests.cs` | 117 | **New in PR #78.** One end-to-end test: register/lookup/direct-send/broadcast/group-message over a real `wss://` connection, using the actual `MeshHub` and `MeshClient` — proves the WebSocket transport is a drop-in replacement for TCP with no protocol-level difference |
+| `Transport/Unix/TempSocketPath.cs` | 13 | **New in PR #81 (issue #20, not yet merged to `main`).** Helper only: generates a short `{Guid:N}.sock` path under the temp directory, kept short deliberately to stay under the platform's `sun_path` length limit |
+| `Transport/Unix/UnixSocketTransportTests.cs` | 87 | **New in PR #81.** Framing-level tests driven directly against a `MemoryStream` via the internal `UnixSocketTransport(Stream)` constructor — negative/oversize/truncated length-prefix handling and a round-trip — mirroring `TcpTransportTests.cs`'s malformed-frame coverage of the shared `StreamFramer` code, since both transports frame identically and each needs the same coverage rather than trusting the TCP tests alone to prove the shared path |
+| `Transport/Unix/UnixSocketTransportListenerTests.cs` | 258 | **New in PR #81.** Constructor guards, start/accept/dispose lifecycle, raced-accept-vs-dispose and concurrent-dispose (mirroring `TcpTransportListenerTests.cs`'s shapes), stale-socket-file deletion before bind, and the socket-file **permission-hardening** tests (owner-only default, custom `socketFileMode`) added during the security-review pass |
+| `Transport/Unix/UnixSocketTransportLoopbackTests.cs` | 147 | **New in PR #81.** Round-trip send/receive over a real Unix domain socket, oversize-payload rejection, remote-dispose-returns-null, batch send (`IBatchSendTransport`), and connect-with-nothing-listening |
+| `Transport/Unix/UnixSocketMeshIntegrationTests.cs` | 97 | **New in PR #81.** One end-to-end test: register/lookup/direct-send/broadcast/group-message over a real Unix domain socket, using the actual `MeshHub` and `MeshClient` — the same shape as `MeshIntegrationTests.cs`/`WebSocketMeshIntegrationTests.cs`, proving interoperability is identical for this transport too |
+| `Transport/NamedPipes/NamedPipeTransportTests.cs` | 39 | **New in PR #81.** Constructor/argument guard (`ArgumentException` on an empty pipe name) plus the `PlatformNotSupportedException` guard on `ConnectAsync` for non-Windows — **the happy path itself is untested on this repo's CI**, see the platform-guard note below |
+| `Transport/NamedPipes/NamedPipeTransportListenerTests.cs` | 93 | **New in PR #81.** Constructor guards (`maxServerInstances`), start-after-dispose/dispose-never-started/accept-not-started lifecycle checks, and the `PlatformNotSupportedException` guard on `StartAsync` for non-Windows — same platform-guard-only caveat as the transport's own tests |
 
 ## Testing conventions (follow these)
 
@@ -102,6 +109,46 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
     `TcpTransport` — the point of the test is that the interoperability surface is identical, so copying
     the existing integration test's shape rather than inventing a new one is itself part of what the test
     demonstrates.
+- **The Unix domain socket transport's tests (PR #81, issue #20, not yet merged to `main`) follow the
+  same "copy the TCP conventions first" rule the WebSocket transport's did.**
+  `UnixSocketTransportListenerTests.cs`'s raced-accept-vs-dispose
+  (`AcceptAsync_RacedAgainstDispose_OnlyEverReportsDisposal`) and concurrent-dispose
+  (`DisposeAsync_CalledConcurrently_DoesNotThrowAndLeavesListenerDisposed`) tests are the same
+  release-together-on-separate-`Task.Run`s shapes as `TcpTransportListenerTests.cs`'s, applied to the
+  socket-file-backed listener instead of the TLS-mode one. Two conventions specific to this transport:
+  - **`UnixSocketTransportTests.cs` proves the shared `StreamFramer` code directly, against a
+    `MemoryStream`, rather than only through a real loopback socket.** It drives the internal
+    `UnixSocketTransport(Stream)` constructor with a hand-built `MemoryStream` to exercise the same
+    negative-length/oversize-length/truncated-payload/round-trip cases `TcpTransportTests.cs` covers for
+    `TcpTransport` — deliberately, since both transports now share one framing implementation and a
+    regression in it should fail on **both** transports' test suites, not rely on one of them to catch it
+    for the other. `UnixSocketTransportLoopbackTests.cs` then separately proves the same behaviour holds
+    over a genuine socket, the way `TcpTransportLoopbackTests.cs` does for TCP.
+  - **The socket-file permission-hardening tests skip themselves on Windows with a plain runtime check**
+    (`if (OperatingSystem.IsWindows()) { return; }`), not a `[SkipOnPlatform]`-style attribute — POSIX
+    mode bits (`UnixFileMode`) are meaningless on Windows' `AF_UNIX` implementation, which uses NTFS ACLs
+    instead, so `StartAsync_Default_HardensSocketFileToOwnerOnly` and
+    `StartAsync_CustomSocketFileMode_AppliesIt` both early-return there rather than asserting anything.
+    Since this repo's CI runs `ubuntu-latest` only (`.github/workflows/ci.yml`), these two tests always
+    run for real in CI; the early-return exists for anyone running the suite locally on Windows.
+- **The named-pipe transport's tests (PR #81) are, by necessity, platform-guard tests only on this
+  repo's CI.** Named pipes are Windows-only, and `.github/workflows/ci.yml` runs `ubuntu-latest`
+  exclusively, so **the only behaviour `NamedPipeTransportTests.cs`/`NamedPipeTransportListenerTests.cs`
+  can actually exercise here is that `ConnectAsync`/`StartAsync` throw
+  `PlatformNotSupportedException` promptly rather than hanging or failing with a confusing lower-level
+  error** — every test that would drive a real accept/round-trip is written to check
+  `OperatingSystem.IsWindows()` first and either return early (documented as "nothing to assert here") or
+  branch into a genuine start-and-dispose call that only ever runs if this suite is one day executed on a
+  Windows agent. Constructor-argument guards (`Constructor_EmptyPipeName_ThrowsArgumentException`,
+  `Constructor_NonPositiveMaxServerInstances_ThrowsArgumentOutOfRangeException`) run on every platform
+  regardless, since they throw before the platform check is reached. Do not read a green run of these two
+  files on this repo's CI as proof the happy path works — it proves only that the guard does.
+- **Neither new local-IPC transport has a test proving `maxConnectionsPerRemoteEndpoint` caps it** —
+  correctly, because it doesn't: [known-issues.md](known-issues.md) KI-38 records that gap as a
+  deliberate scope decision, not a regression to catch. Do not add a test asserting the cap works over
+  `UnixSocketTransport`/`NamedPipeTransport` without first reading that entry; it would either fail
+  honestly or need to assert the *absence* of the cap, which is a strange thing for a test suite to lock
+  in without a comment explaining why.
 - **Assert the negative directly when testing a denial-of-service property.** The silent-peer tests
   (`TcpTransportTlsTests.cs:207`, `:263`) make the point that a surviving-client assertion alone is not
   proof: one test asserts the abandoned peer's socket actually reaches end of stream (a zero-byte read),

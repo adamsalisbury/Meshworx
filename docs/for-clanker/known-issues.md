@@ -46,6 +46,8 @@ the risk to a change, not a claim that the code is defective.
 | KI-35 | `WebSocketTransportListener` negotiates every connection off the accept path, including cleartext ones | `Transport/WebSocket/WebSocketTransportListener.cs:180-211`, `:317-373` | low (maintainability) | open — **by design**, but a real behavioural difference from `TcpTransportListener` |
 | KI-36 | Constructor's `path` doc claimed `404` for a wrong upgrade path; the code always sends `400` | `Transport/WebSocket/WebSocketTransportListener.cs:80-83`, `:420-428`, `:505-555` | low (maintainability / doc accuracy) | **fixed** — PR #78; the XML doc now says `400 Bad Request` and notes the two causes are indistinguishable |
 | KI-37 | A pipelined first WebSocket frame ahead of the `101` response has a dedicated regression test | `Transport/WebSocket/WebSocketTransportListener.cs:432-439`, `:575-613`, `:658-739` | low (test coverage) | **fixed** — PR #78; `WebSocketTransportLoopbackTests.ConnectAndAccept_ClientPipelinesFirstFrameAheadOfUpgradeResponse_LeftoverBytesAreNotLost` drives the `LeftoverPrefixedStream` path directly |
+| KI-38 | `UnixSocketTransport`/`NamedPipeTransport` bypass the per-remote-endpoint connection cap entirely | `MeshHub.cs:706-716`, `:743-748`; `Transport/Unix/UnixSocketTransport.cs:22`; `Transport/NamedPipes/NamedPipeTransport.cs:23` | high (availability / security) | open — **deliberately deferred**, out of scope for PR #81 (issue #20) by the issue's own design; see full reasoning below |
+| KI-39 | `UnixSocketTransportListener`'s `deleteExistingSocketFile` parameter silently also disables cleanup-on-dispose | `Transport/Unix/UnixSocketTransportListener.cs:59-67`, `:84-87`, `:167-170` | low (usability / test coverage) | open — **by design, correctly documented on the constructor, but untested for the `false` case** |
 
 ---
 
@@ -106,7 +108,7 @@ the risk to a change, not a claim that the code is defective.
      without `tlsOptions`, or a client using the three-argument `TcpTransport.ConnectAsync(host, port,
      ct)`, is **cleartext**: client names, assigned ids, group names and every message payload cross the
      wire in the clear and can be modified in flight. There is no log line, no property check and no
-     handshake failure to tell you — only `TcpTransport.IsEncrypted` (`TcpTransport.cs:61`), which you
+     handshake failure to tell you — only `TcpTransport.IsEncrypted` (`TcpTransport.cs:58`), which you
      have to assert yourself.
   5. **Even with TLS, sender identity is not end to end.** TLS secures each client–hub hop separately;
      a delivered message's sender id is still asserted by the hub rather than signed by the sending
@@ -165,7 +167,7 @@ the risk to a change, not a claim that the code is defective.
 - **Where:** `MeshHub.cs:499-509` (in `StopCoreAsync` since PR #64) — iterates `_clients` and calls
   `client.Transport.SendAsync` directly, concurrently with each connection's still-running send loop.
 - **Why it bites:** two writers hit the same transport at once. This is **safe for `TcpTransport`**
-  (internal `SemaphoreSlim` write lock, `TcpTransport.cs:32`) and any transport that honours the
+  (internal `SemaphoreSlim` write lock, `TcpTransport.cs:29`) and any transport that honours the
   "`SendAsync` must be concurrency-safe" contract — but a custom transport that serialises incorrectly
   will interleave/corrupt framing during shutdown.
 - **What to do:** if you write a custom transport, make `SendAsync` genuinely concurrency-safe. Don't
@@ -441,7 +443,7 @@ the risk to a change, not a claim that the code is defective.
      contract but says **nothing** about idempotent disposal (`Transport/ITransport.cs:3-15`). Both
      in-tree implementations happen to satisfy it — `InMemoryTransport` guards explicitly
      (`InMemoryTransport.cs:68-77`), `TcpTransport` inherits it from `Stream`/`TcpClient`/`SemaphoreSlim`
-     (`TcpTransport.cs:377-382`) — but a custom transport that throws on second disposal will fail here.
+     (`TcpTransport.cs:253-258`) — but a custom transport that throws on second disposal will fail here.
      **This gap is still open.** PR #63 closed only the *listener* half: `ITransportListener` now states
      the idempotent-and-concurrency-safe disposal contract explicitly (KI-22). `ITransport` was not
      touched, so the requirement the reconnector depends on remains undocumented on the interface that
@@ -539,7 +541,9 @@ the risk to a change, not a claim that the code is defective.
      only once teardown is complete.
 - **What to do:** if you write an `ITransportListener`, satisfy all of it — pending accept ends in
   `ObjectDisposedException`, later accepts throw the same, disposal is idempotent, concurrency-safe and
-  complete on return. Use the two shipped listeners as worked examples.
+  complete on return. Use the shipped listeners as worked examples — by the time of PR #81 (issue #20)
+  there are four socket/pipe-backed ones (`Tcp`, `WebSocket`, `Unix`, `NamedPipe`) plus
+  `InMemoryTransportListener`, all satisfying the same contract.
 - **What not to do:** do not "simplify" `AcceptAsync` back to reading the fields directly; do not remove
   the `_disposed` conjunct from the cleartext filter; do not widen `IsStoppedListenerFailure`; do not
   make it `private` — it is `internal` so a test can assert against the framework directly that what a
@@ -726,7 +730,10 @@ the risk to a change, not a claim that the code is defective.
   per-remote-endpoint cap machinery in `AcceptLoopAsync` and five new private helpers `:706-857`
   (`ExtractRemoteAddress`, `NormaliseForEndpointCap`, `DisposeRefusedTransportAsync`,
   `TryReserveEndpointSlot`, `ReleaseEndpointSlot`); the new `IRemoteEndPointTransport` interface
-  (`Transport/IRemoteEndPointTransport.cs`) and its `TcpTransport` implementation (`TcpTransport.cs:70`).
+  (`Transport/IRemoteEndPointTransport.cs`) and its `TcpTransport` implementation (`TcpTransport.cs:66`).
+  `WebSocketTransport` implements it too (added by PR #78). **`UnixSocketTransport` and
+  `NamedPipeTransport` (PR #81, issue #20) do not implement it at all** — see KI-38 below for what that
+  costs a hub reached only over one of those transports.
 - **Severity:** high (availability / security). Reachable from ordinary load, not just an adversary: any
   hub constructed with the defaults — which is to say, most integration code before this PR — had no
   ceiling on registered clients and never evicted an idle one.
@@ -990,6 +997,81 @@ the risk to a change, not a claim that the code is defective.
   is a test that opens a raw `TcpClient` against the listener, writes the upgrade request **and** the
   first WebSocket frame's bytes back-to-back in one `Send` before reading the response, and asserts the
   frame is still received correctly.
+
+### KI-38 — `UnixSocketTransport`/`NamedPipeTransport` bypass the per-remote-endpoint connection cap entirely
+- **Where:** `MeshHub.AcceptLoopAsync`'s cap check (`MeshHub.cs:706-716`) and the predicate it runs,
+  `ExtractRemoteAddress` (`MeshHub.cs:743-748`), which only recognises a transport implementing
+  `IRemoteEndPointTransport` **and** reporting an `IPEndPoint`. Neither `UnixSocketTransport`
+  (`Transport/Unix/UnixSocketTransport.cs:22`) nor `NamedPipeTransport`
+  (`Transport/NamedPipes/NamedPipeTransport.cs:23`) implements `IRemoteEndPointTransport` at all — added
+  by PR #81 (issue #20), **not yet merged to `main`** at the time this was written.
+- **Severity:** high (availability / security). Not hypothetical: it is reachable from ordinary use of
+  either new transport, not just an adversary.
+- **Why it bites:** `maxConnectionsPerRemoteEndpoint` (KI-29) exists specifically to cap the
+  pre-registration connection flood `maxClients` cannot see — but it is enforced only when
+  `ExtractRemoteAddress` gets back a non-null `IPAddress`, which requires the accepted transport to
+  implement `IRemoteEndPointTransport` and report an `IPEndPoint`. `UnixSocketTransport` and
+  `NamedPipeTransport` report neither (there is no interface to query), so `ExtractRemoteAddress` returns
+  `null` for every connection accepted over either transport, the cap check is skipped entirely
+  (`MeshHub.cs:707`, `remoteAddress is not null && !TryReserveEndpointSlot(remoteAddress)` — the
+  short-circuit means `TryReserveEndpointSlot` is never even called), and `TcpTransport`/
+  `WebSocketTransport`'s per-source ceiling simply does not exist for these two transports. **A single
+  local process (or, on a shared host, a single local account) with filesystem access to the Unix socket
+  path or the named pipe can open connections up to the hub's full `MaxClients` budget** — the *only*
+  remaining ceiling — rather than the intended `maxConnectionsPerRemoteEndpoint` (default 100) per
+  source. On a hub also reachable over TCP/WebSocket, this can also be used to exhaust the client budget
+  those remote peers would otherwise share, since `MaxClients` is one pool across every listener/transport
+  a given `MeshHub` accepts from.
+- **Why this was left unfixed rather than closed before merge (read before "fixing" it unilaterally):**
+  closing this gap properly means changing `MeshHub.cs` itself — either widening
+  `_connectionsByRemoteAddress`'s key type beyond `IPAddress` to admit some transport-agnostic notion of
+  "connection identity" (a socket path, a pipe name, a process id — none of which `MeshHub` currently has
+  a concept for), or inventing a parallel cap keyed some other way for non-`IPEndPoint` transports. Issue
+  #20's own accepted design explicitly scopes the work as **"new transport only; hub/client
+  untouched"** — extending `MeshHub.cs` was a deliberate non-goal of this PR, not an oversight the author
+  missed. The gap was surfaced during review (a `pr-analyser-performance` pass) and recorded here rather
+  than patched in a hurry inside an otherwise-scoped PR.
+- **What to do:** if you deploy either new transport on a host where more than one untrusted local
+  principal can reach the socket path/pipe name, **do not rely on `maxConnectionsPerRemoteEndpoint` for
+  protection** — it does nothing for you. Either restrict filesystem/ACL access to the path so only a
+  single trusted principal can reach it at all (which both listeners already hint at strongly — see
+  their permission-hardening defaults in [transport.md](transport.md)), or lower `maxClients` to a value
+  you are comfortable with a single untrusted local source claiming in full. A hub reachable over a mix
+  of TCP/WebSocket and one of the new local transports still shares one `maxClients` pool, so a flood
+  over the local transport can starve remote peers of capacity too.
+- **What not to do:** do not add an ad hoc, transport-specific cap bolted onto `AcceptLoopAsync` as a
+  quick fix without first deciding the general shape `MeshHub.cs` should take for a non-`IPEndPoint`
+  connection identity — that is exactly the design question issue #20 deferred, and a narrow special case
+  for these two transports would likely need redoing again for the next non-network transport.
+
+### KI-39 — `UnixSocketTransportListener`'s `deleteExistingSocketFile` parameter silently also disables cleanup-on-dispose
+- **Where:** the single `_deleteExistingSocketFile` field, set once from the constructor parameter of the
+  same name (`Transport/Unix/UnixSocketTransportListener.cs:59-67`) and read in two places:
+  `StartAsync`'s stale-file deletion before bind (`:84-87`) and `DisposeAsync`'s cleanup after teardown
+  (`:167-170`, via `TryDeleteSocketFile`). Added by PR #81 (issue #20).
+- **Severity:** low (usability / test coverage). Not a defect — the constructor's own XML doc states
+  plainly that "the same file is also deleted on `DisposeAsync`" — but the parameter name and its
+  placement (documented primarily as a *startup* concern: "the usual cause is a previous instance that
+  exited without cleaning up") make the dispose-time effect easy to miss on a skim.
+- **Why it bites:** a caller who passes `deleteExistingSocketFile: false` because they specifically do
+  not want *pre-existing* files touched — for instance, wanting to fail loudly on "address already in
+  use" rather than silently clobbering a file that might belong to something else — also, as a side
+  effect, opts their **own** instance out of deleting its **own** socket file on a clean shutdown. That
+  combination (fail-fast on collision, but still clean up after yourself) is not expressible with this
+  constructor as it stands; the two behaviours share one flag.
+- **Test coverage gap:** *(inference, confirmed by reading the test file)*
+  `UnixSocketTransportListenerTests.cs` has no test constructing a listener with
+  `deleteExistingSocketFile: false` at all — both the stale-file and the dispose-cleanup tests
+  (`StartAsync_StaleSocketFileExists_DeletesItAndBindsSuccessfully`, `DisposeAsync_DeletesTheSocketFile`)
+  exercise only the default (`true`) path. The `false` path's behaviour is exactly as the code implies,
+  but nothing regression-tests it.
+- **What to do:** if you need "leave a stale file alone at startup" and "delete my own file at shutdown"
+  as independent choices, this constructor cannot express that today — you would need to add a second
+  parameter rather than reusing this one, and should add the missing test coverage for whichever
+  combination you rely on at the same time.
+- **What not to do:** do not assume `deleteExistingSocketFile: false` only affects startup behaviour
+  when reading or reviewing code that passes it — check both call sites in the source, since the
+  constructor's own doc is the only place both effects are stated together.
 
 ---
 
