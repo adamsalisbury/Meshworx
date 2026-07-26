@@ -79,7 +79,8 @@ public sealed class WebSocketTransportListener : ITransportListener
     /// <param name="endPoint">The endpoint to bind to.</param>
     /// <param name="path">
     /// The HTTP request path a client must upgrade on. Defaults to <c>"/"</c>. A request for any other
-    /// path is refused with <c>404 Not Found</c> and the connection is closed.
+    /// path — or one that is not a well-formed WebSocket upgrade at all — is refused with
+    /// <c>400 Bad Request</c> and the connection is closed.
     /// </param>
     /// <param name="tlsOptions">
     /// TLS options to authenticate each accepted connection as the server, or <see langword="null"/>

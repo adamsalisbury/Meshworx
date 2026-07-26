@@ -1,8 +1,10 @@
 using System.Net;
 using System.Net.Security;
+using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.Transport.WebSocket;
 using AdamSalisbury.Meshworx.UnitTests.Transport.Tcp;
@@ -45,6 +47,85 @@ public sealed class WebSocketTransportLoopbackTests
         {
             await listener.DisposeAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// A client is not required by RFC 6455 to wait for the <c>101 Switching Protocols</c> response
+    /// before sending its first WebSocket frame. When the buffered header reader's single read happens
+    /// to capture the start of that frame along with the terminating blank line, those bytes must reach
+    /// the accepted transport rather than being silently dropped.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task ConnectAndAccept_ClientPipelinesFirstFrameAheadOfUpgradeResponse_LeftoverBytesAreNotLost()
+    {
+        var listener = new WebSocketTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await listener.StartAsync().ConfigureAwait(false);
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        try
+        {
+            using var rawClient = new TcpClient();
+            await rawClient.ConnectAsync(IPAddress.Loopback, port).ConfigureAwait(false);
+            NetworkStream rawStream = rawClient.GetStream();
+
+            var payload = new byte[] { 1, 2, 3, 4, 5 };
+
+            // Write the upgrade request and a masked WebSocket binary frame (RFC 6455 requires every
+            // client-to-server frame to be masked) back to back in a single write, so both are available
+            // to the listener's buffered header read in one go — exactly the pipelined case the
+            // LeftoverPrefixedStream wrapper exists to handle.
+            byte[] request = Encoding.ASCII.GetBytes(
+                "GET / HTTP/1.1\r\n"
+                    + "Host: localhost\r\n"
+                    + "Upgrade: websocket\r\n"
+                    + "Connection: Upgrade\r\n"
+                    + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                    + "Sec-WebSocket-Version: 13\r\n"
+                    + "\r\n");
+            byte[] frame = BuildMaskedBinaryFrame(payload);
+
+            var pipelined = new byte[request.Length + frame.Length];
+            request.CopyTo(pipelined, 0);
+            frame.CopyTo(pipelined, request.Length);
+
+            await rawStream.WriteAsync(pipelined).ConfigureAwait(false);
+            await rawStream.FlushAsync().ConfigureAwait(false);
+
+            await using var serverTransport = await listener.AcceptAsync().ConfigureAwait(false);
+
+            byte[]? received = await serverTransport.ReceiveAsync().ConfigureAwait(false);
+            Assert.Equal(payload, received);
+        }
+        finally
+        {
+            await listener.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Builds a single-frame, masked WebSocket binary frame carrying the given payload, as a
+    /// conforming client is required to send.
+    /// </summary>
+    private static byte[] BuildMaskedBinaryFrame(byte[] payload)
+    {
+        if (payload.Length > 125)
+        {
+            throw new ArgumentException("This helper only supports the short-length frame encoding.", nameof(payload));
+        }
+
+        byte[] mask = [0x12, 0x34, 0x56, 0x78];
+        var frame = new byte[2 + mask.Length + payload.Length];
+
+        frame[0] = 0x82; // FIN + opcode 0x2 (binary).
+        frame[1] = (byte)(0x80 | payload.Length); // MASK bit set + payload length.
+        mask.CopyTo(frame, 2);
+
+        for (int i = 0; i < payload.Length; i++)
+        {
+            frame[2 + mask.Length + i] = (byte)(payload[i] ^ mask[i % mask.Length]);
+        }
+
+        return frame;
     }
 
     /// <summary>
