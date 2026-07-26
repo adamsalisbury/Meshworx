@@ -20,7 +20,7 @@ namespace AdamSalisbury.Meshworx.Transport.WebSocket;
 /// <see cref="SendAsync(ReadOnlyMemory{byte}, CancellationToken)"/> from multiple threads are safe.
 /// </para>
 /// </remarks>
-public sealed class WebSocketTransport : ITransport, IRemoteEndPointTransport
+public sealed class WebSocketTransport : ITransport, IBatchSendTransport, IRemoteEndPointTransport
 {
     private const int MaxPayloadSize = 1024 * 1024;
     private const int ReceiveChunkSize = 8 * 1024;
@@ -120,38 +120,102 @@ public sealed class WebSocketTransport : ITransport, IRemoteEndPointTransport
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Each message is still sent as its own WebSocket message — unlike the TCP transport's
+    /// length-prefixed stream, the WebSocket protocol has no way to coalesce several logical messages
+    /// into a single wire write. What this still saves is the lock: acquiring the write lock once for
+    /// the whole batch, rather than once per message, means a fan-out burst (a broadcast or group send)
+    /// no longer pays one acquisition and release per queued frame.
+    /// </remarks>
+    public async Task SendAsync(
+        IReadOnlyList<ReadOnlyMemory<byte>> messages,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+
+        if (messages.Count == 0)
+        {
+            return;
+        }
+
+        if (messages.Count == 1)
+        {
+            await SendAsync(messages[0], cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // Mirror the single-send path's deliver-then-fault behaviour: messages ahead of the first
+        // oversize one are still sent before the batch throws, rather than discarding the whole batch
+        // because a later message in it is invalid.
+        int validCount = messages.Count;
+        for (int i = 0; i < messages.Count; i++)
+        {
+            if (messages[i].Length > MaxPayloadSize)
+            {
+                validCount = i;
+                break;
+            }
+        }
+
+        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            for (int i = 0; i < validCount; i++)
+            {
+                await _webSocket.SendAsync(
+                    messages[i], WebSocketMessageType.Binary, endOfMessage: true, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+
+        if (validCount < messages.Count)
+        {
+            int length = messages[validCount].Length;
+            throw new ArgumentException(
+                $"Payload size {length} exceeds the maximum frame payload of {MaxPayloadSize} bytes.",
+                nameof(messages));
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// The common case — a message that arrives in a single WebSocket frame, which is every message up
+    /// to <see cref="ReceiveChunkSize"/> — copies the payload exactly once, matching the TCP transport's
+    /// single exact-size read. Only a message spanning several frames falls back to accumulating in a
+    /// <see cref="MemoryStream"/>, which costs a second copy on the final <c>ToArray()</c>.
+    /// </remarks>
     public async Task<byte[]?> ReceiveAsync(CancellationToken cancellationToken = default)
     {
         byte[] chunk = ArrayPool<byte>.Shared.Rent(ReceiveChunkSize);
         try
         {
-            using var message = new MemoryStream();
-            ValueWebSocketReceiveResult result;
-            do
+            ValueWebSocketReceiveResult result = await ReceiveChunkAsync(chunk, cancellationToken).ConfigureAwait(false);
+            if (result.MessageType == WebSocketMessageType.Close)
             {
-                try
-                {
-                    result = await _webSocket.ReceiveAsync(chunk.AsMemory(), cancellationToken).ConfigureAwait(false);
-                }
-                catch (WebSocketException ex) when (ex.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely)
-                {
-                    // The peer dropped the connection without completing the close handshake. Treat it
-                    // the same as TCP's peer-closed-mid-frame case: end of stream, not a transport fault.
-                    return null;
-                }
+                await CloseOutputBestEffortAsync(cancellationToken).ConfigureAwait(false);
+                return null;
+            }
 
+            if (result.EndOfMessage)
+            {
+                // Fast path: the whole message fit in the first frame. One copy, no MemoryStream.
+                return chunk.AsSpan(0, result.Count).ToArray();
+            }
+
+            using var message = new MemoryStream();
+            message.Write(chunk, 0, result.Count);
+
+            while (!result.EndOfMessage)
+            {
+                result = await ReceiveChunkAsync(chunk, cancellationToken).ConfigureAwait(false);
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
                     await CloseOutputBestEffortAsync(cancellationToken).ConfigureAwait(false);
                     return null;
-                }
-
-                if (result.MessageType != WebSocketMessageType.Binary)
-                {
-                    // Meshworx only ever sends binary frames. A text frame from a non-conformant or
-                    // hostile peer means the framing can no longer be trusted; surface it the same way
-                    // TCP surfaces a corrupt length prefix — as an I/O error that ends the connection.
-                    throw new IOException($"Unexpected WebSocket message type: {result.MessageType}");
                 }
 
                 if (message.Length + result.Count > MaxPayloadSize)
@@ -162,7 +226,6 @@ public sealed class WebSocketTransport : ITransport, IRemoteEndPointTransport
 
                 message.Write(chunk, 0, result.Count);
             }
-            while (!result.EndOfMessage);
 
             return message.ToArray();
         }
@@ -170,6 +233,42 @@ public sealed class WebSocketTransport : ITransport, IRemoteEndPointTransport
         {
             ArrayPool<byte>.Shared.Return(chunk);
         }
+    }
+
+    /// <summary>
+    /// Receives a single WebSocket frame into <paramref name="chunk"/>, translating a premature
+    /// disconnect into a synthetic close result and validating the frame is binary and within the
+    /// payload cap.
+    /// </summary>
+    private async Task<ValueWebSocketReceiveResult> ReceiveChunkAsync(byte[] chunk, CancellationToken cancellationToken)
+    {
+        ValueWebSocketReceiveResult result;
+        try
+        {
+            result = await _webSocket.ReceiveAsync(chunk.AsMemory(), cancellationToken).ConfigureAwait(false);
+        }
+        catch (WebSocketException ex) when (ex.WebSocketErrorCode == WebSocketError.ConnectionClosedPrematurely)
+        {
+            // The peer dropped the connection without completing the close handshake. Treat it the same
+            // as TCP's peer-closed-mid-frame case: end of stream, not a transport fault. Reported as a
+            // synthetic Close result so both call sites in ReceiveAsync handle it identically.
+            return new ValueWebSocketReceiveResult(0, WebSocketMessageType.Close, endOfMessage: true);
+        }
+
+        if (result.MessageType == WebSocketMessageType.Close)
+        {
+            return result;
+        }
+
+        if (result.MessageType != WebSocketMessageType.Binary)
+        {
+            // Meshworx only ever sends binary frames. A text frame from a non-conformant or hostile peer
+            // means the framing can no longer be trusted; surface it the same way TCP surfaces a corrupt
+            // length prefix — as an I/O error that ends the connection.
+            throw new IOException($"Unexpected WebSocket message type: {result.MessageType}");
+        }
+
+        return result;
     }
 
     /// <inheritdoc/>

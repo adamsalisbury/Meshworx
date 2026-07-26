@@ -380,6 +380,14 @@ public sealed class WebSocketTransportListener : ITransportListener
         CancellationToken cancellationToken)
     {
         WebSocketTransport? transport = null;
+
+        // Tracks whichever stream is currently negotiating — the plain NetworkStream, or the SslStream
+        // wrapping it once TLS is configured — so the catch block below can dispose it if negotiation
+        // fails at any point. Assigning this the instant the SslStream is constructed, rather than only
+        // once AuthenticateAsServerAsync has succeeded, is what stops a handshake failure from leaking
+        // it: TcpTransportListener.HandshakeAsync avoids the same leak by constructing its owning
+        // transport before authenticating, for the identical reason.
+        Stream? stream = null;
         try
         {
             tcpClient.NoDelay = true;
@@ -389,18 +397,28 @@ public sealed class WebSocketTransportListener : ITransportListener
 
             NetworkStream networkStream = tcpClient.GetStream();
 
+            // Wait for the peer to actually send something before spending a negotiation slot on it. A
+            // zero-byte read consumes nothing and completes only once data has arrived — whether that is
+            // a TLS ClientHello or a plaintext HTTP request line — so a peer that connects and then stays
+            // silent waits out its own timeout without ever occupying one of the slots that bound
+            // negotiation concurrency. Mirrors TcpTransportListener.HandshakeAsync, which does the same
+            // zero-byte read before its own handshake-slot semaphore for the identical reason: without
+            // it, a flood of connect-then-idle peers could hold every slot and starve genuine clients.
+            await networkStream.ReadAsync(Memory<byte>.Empty, negotiationCts.Token).ConfigureAwait(false);
+
             await negotiationSlots.WaitAsync(negotiationCts.Token).ConfigureAwait(false);
             try
             {
-                Stream stream = networkStream;
+                stream = networkStream;
                 if (_tlsOptions is not null)
                 {
                     var sslStream = new SslStream(networkStream, leaveInnerStreamOpen: false);
-                    await sslStream.AuthenticateAsServerAsync(_tlsOptions, negotiationCts.Token).ConfigureAwait(false);
                     stream = sslStream;
+                    await sslStream.AuthenticateAsServerAsync(_tlsOptions, negotiationCts.Token).ConfigureAwait(false);
                 }
 
-                string? webSocketKey = await ReadUpgradeRequestAsync(stream, negotiationCts.Token).ConfigureAwait(false);
+                (string? webSocketKey, byte[] leftover) =
+                    await ReadUpgradeRequestAsync(stream, negotiationCts.Token).ConfigureAwait(false);
                 if (webSocketKey is null)
                 {
                     await WriteResponseAsync(stream, "400 Bad Request", negotiationCts.Token).ConfigureAwait(false);
@@ -410,6 +428,15 @@ public sealed class WebSocketTransportListener : ITransportListener
                 }
 
                 await WriteUpgradeResponseAsync(stream, webSocketKey, negotiationCts.Token).ConfigureAwait(false);
+
+                // A peer is not required to wait for this 101 response before sending its first
+                // WebSocket frame, and the buffered header read above may have already consumed the
+                // start of it along with the terminating blank line. Prepending it back is what stops
+                // that data from being silently lost.
+                if (leftover.Length > 0)
+                {
+                    stream = new LeftoverPrefixedStream(stream, leftover);
+                }
 
                 SystemWebSocket webSocket = SystemWebSocket.CreateFromStream(
                     stream, isServer: true, subProtocol: null, keepAliveInterval: TimeSpan.Zero);
@@ -429,10 +456,19 @@ public sealed class WebSocketTransportListener : ITransportListener
         {
             // A failed negotiation — a TLS handshake failure, a malformed or missing upgrade request, a
             // timeout, a peer that reset — concerns only this connection. Drop it quietly and keep the
-            // listener serving; anything else would let one bad peer stop the hub.
+            // listener serving; anything else would let one bad peer stop the hub. Disposing whichever
+            // stream was negotiating (the SslStream, once one exists, rather than the plain
+            // NetworkStream underneath it) is what releases a partially or fully negotiated TLS session
+            // rather than leaking it — the socket itself closes as part of that, so tcpClient.Dispose()
+            // is only needed when negotiation failed before any stream was even selected.
             if (transport is not null)
             {
                 await transport.DisposeAsync().ConfigureAwait(false);
+            }
+            else if (stream is not null)
+            {
+                await stream.DisposeAsync().ConfigureAwait(false);
+                tcpClient.Dispose();
             }
             else
             {
@@ -452,14 +488,18 @@ public sealed class WebSocketTransportListener : ITransportListener
     /// </summary>
     /// <returns>
     /// The client's <c>Sec-WebSocket-Key</c> header value if the request is a well-formed upgrade for
-    /// the configured path, or <see langword="null"/> if it is not.
+    /// the configured path, or <see langword="null"/> if it is not, together with any bytes read past
+    /// the header block's terminating blank line — a peer is not required to wait for the <c>101</c>
+    /// response before sending its first WebSocket frame, so a buffered read can legitimately capture
+    /// the start of one.
     /// </returns>
-    private async Task<string?> ReadUpgradeRequestAsync(Stream stream, CancellationToken cancellationToken)
+    private async Task<(string? Key, byte[] Leftover)> ReadUpgradeRequestAsync(
+        Stream stream, CancellationToken cancellationToken)
     {
-        List<string> lines = await ReadHeaderLinesAsync(stream, cancellationToken).ConfigureAwait(false);
+        (List<string> lines, byte[] leftover) = await ReadHeaderLinesAsync(stream, cancellationToken).ConfigureAwait(false);
         if (lines.Count == 0)
         {
-            return null;
+            return (null, leftover);
         }
 
         string[] requestLine = lines[0].Split(' ', StringSplitOptions.RemoveEmptyEntries);
@@ -467,7 +507,7 @@ public sealed class WebSocketTransportListener : ITransportListener
             || !string.Equals(requestLine[0], "GET", StringComparison.OrdinalIgnoreCase)
             || !string.Equals(requestLine[1], _path, StringComparison.Ordinal))
         {
-            return null;
+            return (null, leftover);
         }
 
         string? upgrade = null;
@@ -512,60 +552,63 @@ public sealed class WebSocketTransportListener : ITransportListener
             && connection.Split(',', StringSplitOptions.TrimEntries)
                 .Any(token => string.Equals(token, "Upgrade", StringComparison.OrdinalIgnoreCase));
 
-        return isValid ? webSocketKey : null;
+        return (isValid ? webSocketKey : null, leftover);
     }
 
+    private static readonly byte[] HeaderTerminator = "\r\n\r\n"u8.ToArray();
+
     /// <summary>
-    /// Reads raw ASCII lines from the stream, one byte at a time, until the blank line that terminates
-    /// an HTTP header block, bounded by <see cref="MaxRequestHeaderBytes"/> so a peer that never sends
-    /// one cannot hold the buffer open indefinitely.
+    /// Reads raw ASCII lines from the stream in bounded chunks until the blank line that terminates an
+    /// HTTP header block, bounded overall by <see cref="MaxRequestHeaderBytes"/> so a peer that never
+    /// sends one cannot hold the buffer open indefinitely.
     /// </summary>
-    private static async Task<List<string>> ReadHeaderLinesAsync(Stream stream, CancellationToken cancellationToken)
+    /// <remarks>
+    /// Reads in chunks rather than one byte at a time — a single connection's handshake would otherwise
+    /// cost roughly one <see cref="Stream.ReadAsync(Memory{byte}, CancellationToken)"/> call per header
+    /// byte, which is significant overhead multiplied across every negotiating connection, and
+    /// particularly under a reconnect storm where many clients renegotiate at once. Because the terminator
+    /// can be read past in the same chunk that contains it, any bytes after it are not header bytes at
+    /// all — they are the start of the first WebSocket frame, which a peer is not required to wait for
+    /// the <c>101</c> response before sending. Those bytes are returned as leftover input rather than
+    /// discarded, so the caller can hand them to the WebSocket layer instead of silently dropping them.
+    /// </remarks>
+    private static async Task<(List<string> Lines, byte[] Leftover)> ReadHeaderLinesAsync(
+        Stream stream, CancellationToken cancellationToken)
     {
-        var lines = new List<string>();
-        var currentLine = new StringBuilder();
-        byte[] singleByte = new byte[1];
-        int totalBytesRead = 0;
-        bool previousWasCarriageReturn = false;
+        var buffer = new byte[MaxRequestHeaderBytes];
+        int filled = 0;
 
         while (true)
         {
-            int bytesRead = await stream.ReadAsync(singleByte.AsMemory(0, 1), cancellationToken).ConfigureAwait(false);
+            int terminatorIndex = buffer.AsSpan(0, filled).IndexOf(HeaderTerminator);
+            if (terminatorIndex >= 0)
+            {
+                // Everything up to and including the last header line's own "\r\n" — the blank line's
+                // second "\r\n" is the terminator itself and carries no line of its own.
+                string headerText = Encoding.ASCII.GetString(buffer, 0, terminatorIndex + 2);
+                string[] lines = headerText.Split(
+                    "\r\n", StringSplitOptions.RemoveEmptyEntries);
+
+                int consumed = terminatorIndex + HeaderTerminator.Length;
+                byte[] leftover = buffer[consumed..filled];
+                return ([.. lines], leftover);
+            }
+
+            if (filled >= buffer.Length)
+            {
+                // Exceeded the bound without ever finding the terminating blank line.
+                return ([], []);
+            }
+
+            int bytesRead = await stream.ReadAsync(
+                buffer.AsMemory(filled, buffer.Length - filled), cancellationToken).ConfigureAwait(false);
             if (bytesRead == 0)
             {
                 // The peer closed the connection before finishing the request.
-                return [];
+                return ([], []);
             }
 
-            totalBytesRead++;
-            if (totalBytesRead > MaxRequestHeaderBytes)
-            {
-                return [];
-            }
-
-            char c = (char)singleByte[0];
-            if (c == '\n')
-            {
-                string line = currentLine.ToString();
-                if (previousWasCarriageReturn && line.Length > 0 && line[^1] == '\r')
-                {
-                    line = line[..^1];
-                }
-
-                if (line.Length == 0)
-                {
-                    return lines;
-                }
-
-                lines.Add(line);
-                currentLine.Clear();
-                previousWasCarriageReturn = false;
-            }
-            else
-            {
-                currentLine.Append(c);
-                previousWasCarriageReturn = c == '\r';
-            }
+            filled += bytesRead;
         }
     }
 
@@ -600,5 +643,98 @@ public sealed class WebSocketTransportListener : ITransportListener
         byte[] bytes = Encoding.ASCII.GetBytes(response);
         await stream.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
         await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Wraps a stream so a handful of already-read bytes are served back before reads continue against
+    /// the underlying stream, and writes pass straight through.
+    /// </summary>
+    /// <remarks>
+    /// Used only to hand the buffered header reader's leftover bytes — the start of the first WebSocket
+    /// frame, read incidentally while looking for the header block's terminating blank line — back to
+    /// <see cref="SystemWebSocket.CreateFromStream(Stream, bool, string?, TimeSpan)"/>, so they are not
+    /// silently dropped.
+    /// </remarks>
+    private sealed class LeftoverPrefixedStream(Stream inner, byte[] leftover) : Stream
+    {
+        private int _leftoverOffset;
+
+        public override bool CanRead => true;
+
+        public override bool CanWrite => inner.CanWrite;
+
+        public override bool CanSeek => false;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (_leftoverOffset < leftover.Length)
+            {
+                int available = leftover.Length - _leftoverOffset;
+                int toCopy = Math.Min(available, buffer.Length);
+                leftover.AsSpan(_leftoverOffset, toCopy).CopyTo(buffer.Span);
+                _leftoverOffset += toCopy;
+                return toCopy;
+            }
+
+            return await inner.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            return ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+        }
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            return inner.WriteAsync(buffer, cancellationToken);
+        }
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        {
+            return inner.WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            inner.Write(buffer, offset, count);
+        }
+
+        public override Task FlushAsync(CancellationToken cancellationToken)
+        {
+            return inner.FlushAsync(cancellationToken);
+        }
+
+        public override void Flush()
+        {
+            inner.Flush();
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                inner.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+
+        public override async ValueTask DisposeAsync()
+        {
+            await inner.DisposeAsync().ConfigureAwait(false);
+            await base.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }
