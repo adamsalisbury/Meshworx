@@ -1,9 +1,11 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics.Metrics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
+using AdamSalisbury.Meshworx.Diagnostics;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
@@ -61,6 +63,29 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly ConcurrentDictionary<Guid, ClientConnection> _clients = new();
     private readonly ConcurrentDictionary<string, Guid> _clientNames = new();
     private readonly ConcurrentDictionary<Task, byte> _handlerTasks = new();
+
+    // One Meter per hub instance, disposed with it — rather than a single static Meter shared by every
+    // hub in the process — so a hub's instruments stop reporting the moment it is torn down instead of
+    // going on publishing zeros (or nothing at all) for a resource that no longer exists. Multiple hubs
+    // in one process still publish under the same meter name, which is exactly what an exporter expects:
+    // OpenTelemetry aggregates every Meter with a matching name regardless of how many instances created
+    // one.
+    private readonly Meter _meter;
+    private readonly UpDownCounter<int> _connectedClientsCounter;
+    private readonly Counter<long> _messagesRoutedCounter;
+    private readonly Counter<long> _bytesRoutedCounter;
+    private readonly Counter<long> _messagesDroppedCounter;
+    private readonly ObservableGauge<int> _outboundQueueDepthGauge;
+
+    // Single-tag KeyValuePairs, reused across every call site rather than built inline. Counter<T>.Add has
+    // an allocation-free overload that takes exactly one KeyValuePair<string, object?>, which every
+    // instrument below uses with exactly one tag — allocating a fresh pair (or array) per routed or
+    // dropped message would put a heap allocation on the hub's hottest paths for no benefit.
+    private static readonly KeyValuePair<string, object?> DirectDirectionTag = new("direction", "direct");
+    private static readonly KeyValuePair<string, object?> BroadcastDirectionTag = new("direction", "broadcast");
+    private static readonly KeyValuePair<string, object?> GroupDirectionTag = new("direction", "group");
+    private static readonly KeyValuePair<string, object?> UnknownRecipientDropTag = new("reason", "unknown-recipient");
+    private static readonly KeyValuePair<string, object?> QueueFullDropTag = new("reason", "queue-full");
 
     // How many client slots are currently claimed. This, rather than _clients.Count, is what maxClients
     // is enforced against: a slot is claimed by a single atomic operation before the client is put into
@@ -303,6 +328,54 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 configuredInterval,
                 maxMissedHeartbeats);
         }
+
+        _meter = new Meter(MeshworxMeterName.Value);
+        _connectedClientsCounter = _meter.CreateUpDownCounter<int>(
+            "meshworx.hub.clients.connected",
+            unit: "{client}",
+            description: "The number of clients currently registered with the hub.");
+        _messagesRoutedCounter = _meter.CreateCounter<long>(
+            "meshworx.hub.messages.routed",
+            unit: "{message}",
+            description: "The number of messages the hub has routed, tagged by direction "
+                + "(direct, broadcast or group).");
+        _bytesRoutedCounter = _meter.CreateCounter<long>(
+            "meshworx.hub.bytes.routed",
+            unit: "By",
+            description: "The number of message payload bytes the hub has routed, tagged by direction "
+                + "(direct, broadcast or group).");
+        _messagesDroppedCounter = _meter.CreateCounter<long>(
+            "meshworx.hub.messages.dropped",
+            unit: "{message}",
+            description: "The number of messages the hub has dropped, tagged by reason "
+                + "(unknown-recipient or queue-full).");
+        _outboundQueueDepthGauge = _meter.CreateObservableGauge(
+            "meshworx.hub.outbound_queue.depth",
+            ObserveOutboundQueueDepth,
+            unit: "{message}",
+            description: "The total number of messages currently queued for delivery, summed across "
+                + "every connected client's outbound queue.");
+    }
+
+    /// <summary>
+    /// Reports the total number of frames currently sitting in every connected client's outbound queue.
+    /// </summary>
+    /// <remarks>
+    /// A single aggregate value rather than one measurement per client: tagging by client id would give
+    /// an observable gauge series whose cardinality grows with every client the hub has ever seen
+    /// connect, which is exactly the kind of unbounded tag value OpenTelemetry's own guidance warns
+    /// against. The aggregate is enough to see a hub-wide backlog forming; per-client depth is available
+    /// on <see cref="ClientConnection.OutboundQueue"/> to anything already holding a reference to one.
+    /// </remarks>
+    private IEnumerable<Measurement<int>> ObserveOutboundQueueDepth()
+    {
+        int depth = 0;
+        foreach (ClientConnection connection in _clients.Values)
+        {
+            depth += connection.OutboundQueue.Reader.Count;
+        }
+
+        yield return new Measurement<int>(depth);
     }
 
     /// <inheritdoc/>
@@ -548,6 +621,19 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         return _heartbeatInterval;
     }
 
+    /// <summary>
+    /// Gets the <see cref="Meter"/> this hub publishes its instruments to.
+    /// </summary>
+    /// <remarks>
+    /// Internal rather than private so a test can filter a <see cref="System.Diagnostics.Metrics.MeterListener"/>
+    /// down to exactly this hub's instruments by reference, rather than by meter name alone — several
+    /// hubs across a test run can share the name, but never this object.
+    /// </remarks>
+    internal Meter GetMeterForTesting()
+    {
+        return _meter;
+    }
+
     /// <inheritdoc/>
     /// <remarks>
     /// Safe to call more than once, and from more than one thread at a time. The first call performs the
@@ -582,6 +668,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         await StopAsync().ConfigureAwait(false);
         await _listener.DisposeAsync().ConfigureAwait(false);
         _authenticationSlots?.Dispose();
+        _meter.Dispose();
     }
 
     private async Task AcceptLoopAsync(CancellationToken cancellationToken)
@@ -885,6 +972,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
             connection = new ClientConnection(clientId, clientName, transport);
             _clients.TryAdd(clientId, connection);
+            _connectedClientsCounter.Add(1);
 
             var responsePayload = new byte[17];
             responsePayload[0] = (byte)MessageType.RegistrationComplete;
@@ -1049,6 +1137,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 RemoveFromAllGroups(connection);
                 _clientNames.TryRemove(connection.Name, out _);
                 _clients.TryRemove(clientId, out _);
+                _connectedClientsCounter.Add(-1);
             }
 
             // Give the slot back on every path that claimed one — a client that was admitted and has now
@@ -1128,6 +1217,31 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     {
         Interlocked.Decrement(ref _reservedClientSlots);
     }
+
+    /// <summary>
+    /// Writes a raw frame directly onto a registered client's outbound queue, bypassing routing entirely.
+    /// </summary>
+    /// <remarks>
+    /// Internal so a test can drive a client's outbound queue to capacity deterministically. Filling it
+    /// by racing a real producer against the real consumer — sending enough messages through the wire
+    /// protocol and hoping the consumer is slower — depends on thread-pool scheduling that is not
+    /// reliably reproducible from a test.
+    /// </remarks>
+    /// <returns>
+    /// <see langword="true"/> if the frame was queued; <see langword="false"/> if the client is not
+    /// registered or its queue was already full.
+    /// </returns>
+    internal bool TryQueueRawFrameForTesting(Guid clientId, byte[] frame)
+    {
+        return _clients.TryGetValue(clientId, out ClientConnection? connection)
+            && connection.OutboundQueue.Writer.TryWrite(frame);
+    }
+
+    /// <summary>
+    /// The capacity of a client's outbound queue, exposed for a test driving one to that capacity via
+    /// <see cref="TryQueueRawFrameForTesting"/>.
+    /// </summary>
+    internal const int OutboundQueueCapacityForTesting = ClientConnection.OutboundQueueCapacity;
 
     /// <summary>
     /// Tells a registering client the hub is full and records why it was refused.
@@ -1366,6 +1480,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 "Message from {SenderId} dropped: recipient {RecipientId} not found",
                 senderId,
                 recipientId);
+            _messagesDroppedCounter.Add(1, UnknownRecipientDropTag);
             return;
         }
 
@@ -1380,7 +1495,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 "Outbound queue for {RecipientId} is full, message from {SenderId} dropped",
                 recipientId,
                 senderId);
+            _messagesDroppedCounter.Add(1, QueueFullDropTag);
+            return;
         }
+
+        // A direct send has exactly one recipient, so "routed" only counts once the frame has actually
+        // been queued for delivery — unlike the fan-out sends below, there is no partial-success case to
+        // reconcile.
+        _messagesRoutedCounter.Add(1, DirectDirectionTag);
+        _bytesRoutedCounter.Add(messageData.Length, DirectDirectionTag);
     }
 
     private void BroadcastMessage(Guid senderId, ReadOnlyMemory<byte> messageData)
@@ -1391,6 +1514,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         deliveryPayload[0] = (byte)MessageType.DeliverMessage;
         senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
         messageData.CopyTo(deliveryPayload.AsMemory(17));
+
+        // Recorded once per broadcast rather than once per recipient: this counts the message the hub
+        // routed, not the number of deliveries it fanned out to. Each recipient whose queue is full is
+        // still counted separately below as its own dropped message.
+        _messagesRoutedCounter.Add(1, BroadcastDirectionTag);
+        _bytesRoutedCounter.Add(messageData.Length, BroadcastDirectionTag);
 
         foreach (KeyValuePair<Guid, ClientConnection> entry in _clients)
         {
@@ -1406,6 +1535,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     "Outbound queue for {RecipientId} is full, broadcast from {SenderId} dropped",
                     entry.Key,
                     senderId);
+                _messagesDroppedCounter.Add(1, QueueFullDropTag);
             }
         }
     }
@@ -1716,6 +1846,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         groupNameBytes.Span.CopyTo(deliveryPayload.AsSpan(19));
         messageData.CopyTo(deliveryPayload.AsMemory(19 + nameLength));
 
+        // Recorded once per group send rather than once per member, mirroring BroadcastMessage: this
+        // counts the message the hub routed, not the number of deliveries it fanned out to. Each member
+        // whose queue is full is still counted separately below as its own dropped message.
+        _messagesRoutedCounter.Add(1, GroupDirectionTag);
+        _bytesRoutedCounter.Add(messageData.Length, GroupDirectionTag);
+
         foreach (Guid recipientId in recipients)
         {
             if (recipientId == senderId)
@@ -1731,6 +1867,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     "Outbound queue for {RecipientId} is full, group message from {SenderId} dropped",
                     recipientId,
                     senderId);
+                _messagesDroppedCounter.Add(1, QueueFullDropTag);
             }
         }
     }
@@ -1747,7 +1884,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
     private sealed class ClientConnection(Guid id, string name, ITransport transport) : IAsyncDisposable
     {
-        private const int OutboundQueueCapacity = 1024;
+        // Internal rather than private so MeshHub.OutboundQueueCapacityForTesting can expose it to a
+        // test — a private member of a nested type is not accessible from its enclosing type in C#.
+        internal const int OutboundQueueCapacity = 1024;
         private int _disposed;
         private long _activitySequence;
 
