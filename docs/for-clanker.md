@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 8950893 (branch feat/issue-24-metrics-instrumentation, PR #72, open draft) — based on main at e2892c1, clean working tree
+reconciled-to-commit: 50bbe42 (branch feat/issue-47-protocol-version-negotiation, PR #73, open) — one commit on top of main at f6d7fd1, clean working tree
 reconciled-to-date: 2026-07-26
 mode: update
 -->
@@ -12,49 +12,63 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree:** branch `feat/issue-24-metrics-instrumentation` (open **PR #72**, closing issue #24),
-> currently checked out on top of `main` at `e2892c1` (clean working tree, two commits ahead: `c1cc9b1`
-> then `8950893`). **This branch adds first-class metrics instrumentation to `MeshHub` and
-> `MeshClientReconnector`**, published through a `System.Diagnostics.Metrics.Meter` both share by name
-> (`"AdamSalisbury.Meshworx"`, the constant lives in the new, internal `Diagnostics/MeshworxMeterName.cs`).
-> **No protocol, payload, public constructor or DI-package change accompanies it** — the new instruments
-> only observe routing and connection-lifecycle events that already happen. `MeshHub` owns one `Meter` per
-> instance (constructed in the constructor, disposed in `DisposeCoreAsync`), publishing five instruments:
-> `meshworx.hub.clients.connected` (up/down counter); `meshworx.hub.messages.routed` /
-> `meshworx.hub.bytes.routed` (counters tagged `direction`: `direct`/`broadcast`/`group` — a fan-out send
-> counts once per call that reaches at least one candidate recipient, not once per recipient, and not at
-> all when nobody was there to receive it); `meshworx.hub.messages.dropped` (counter tagged `reason`:
-> `unknown-recipient`/`queue-full`); and `meshworx.hub.outbound_queue.depth` (an observable gauge, a single
-> aggregate across every connected client's queue, deliberately not tagged per client to avoid unbounded
-> cardinality). `MeshClientReconnector` owns its own `Meter` the same way, publishing
-> `meshworx.client.reconnects` (a counter incremented only when `ConnectWithRetryAsync` itself
-> re-establishes a dropped connection — never on `StartAsync`'s initial connect, and never on a stale
-> reconnect signal that turns out to be a no-op). Three internal test-only members were added to support
-> this: `MeshHub.TryQueueRawFrameForTesting`, `MeshHub.OutboundQueueCapacityForTesting` and a
-> `GetMeterForTesting()` on each type; the nested `MeshHub.ClientConnection.OutboundQueueCapacity` field
-> moved from `private` to `internal` to back the second of those. Full write-up in
-> [hub.md](for-clanker/hub.md#metrics) and [client.md](for-clanker/client.md#metrics); a
-> documentation-only nuance about how the routed and dropped counters can both fire for the same
-> broadcast/group call is recorded as [known-issues.md](for-clanker/known-issues.md) KI-32.
+> **Documented tree:** branch `feat/issue-47-protocol-version-negotiation` (open **PR #73**, closing
+> issue #47), currently checked out on top of `main` at `f6d7fd1` (clean working tree, one commit ahead:
+> `50bbe42`). **This branch replaces the fixed `Protocol.Version` equality check at registration with
+> min/max range negotiation.** `Messages/Protocol.cs` drops the single `Version = 3` constant for two new
+> ones, `MinSupportedVersion` and `MaxSupportedVersion` (both `4` today). `RegistrationRequest`'s frame
+> gains a second version byte — `[type][versionMin][versionMax][nameLen(2)][name][credential]` — so every
+> offset from the name length onward shifts by one byte. `MeshHub.HandleClientAsync` negotiates via a new
+> private static `TryNegotiateProtocolVersion` (`MeshHub.cs:1273-1295`): it picks the **highest** version
+> common to the client's advertised range and the hub's own, refusing with the existing
+> `Error(UnsupportedProtocolVersion)` on an inverted or non-overlapping range — the same wire outcome as
+> before for a mismatch, but now able to negotiate *down* instead of refusing outright once the ranges
+> genuinely differ. `RegistrationComplete` grows from 17 to 18 bytes to carry the negotiated version as a
+> trailing byte; `MeshClient`/`IMeshClient` gain a new `NegotiatedProtocolVersion` byte property, reset to
+> `0` on both disconnect paths. **Nothing yet reads that property, or the client's advertised range,
+> anywhere except the handshake** — see [known-issues.md](for-clanker/known-issues.md) KI-14, narrowed
+> this pass from "hard break" to "negotiation exists but nothing downstream branches on it yet". Full
+> write-up in [protocol.md](for-clanker/protocol.md#versioning),
+> [hub.md](for-clanker/hub.md#registration-handshake-hub-side) and [client.md](for-clanker/client.md).
 >
-> **`MeshHub.cs` gained 152 net lines across many separate insertion points** (the constructor's
-> meter/instrument setup, the `ObserveOutboundQueueDepth` gauge callback, `GetMeterForTesting`, the two
-> testing-only members, and one counter call each in `RouteMessage`, `BroadcastMessage` and `SendToGroup`),
-> so every coordinate below `MeshHub.cs:15` has moved again, by an amount that climbs in discrete steps
-> depending on position. **`MeshClientReconnector.cs` gained 31 net lines** the same way (its own
-> `Meter`/`Counter` fields, the counter setup in the constructor, `GetMeterForTesting`, the counter
-> increment in `ConnectWithRetryAsync`, and `_meter.Dispose()` in `DisposeAsync`), so every coordinate below
-> its constructor has moved too. Both shifts were derived from the diff's hunk boundaries and verified by
-> comparing cited-line content before and after re-pointing — this pass touched every `MeshHub.cs:` and
-> `MeshClientReconnector.cs:` coordinate in the set, in [hub.md](for-clanker/hub.md),
-> [client.md](for-clanker/client.md), [known-issues.md](for-clanker/known-issues.md),
-> [protocol.md](for-clanker/protocol.md), [types.md](for-clanker/types.md),
-> [transport.md](for-clanker/transport.md) and [testing.md](for-clanker/testing.md), even where the
-> surrounding prose describes unrelated, untouched behaviour. **While re-pointing `client.md`'s
-> `MeshClientReconnector` section, the pre-#52 coordinate drift flagged as a standing gap by every pass
-> since PR #63 was also corrected** — see the "Known documentation gap" note below, now narrowed to
-> `MeshClient.cs` only. `IMeshClient.cs`, `MeshClient.cs` and every transport type are otherwise untouched
-> by this branch.
+> **`MeshHub.cs` gained 38 net lines in one place** (the new `TryNegotiateProtocolVersion` method,
+> inserted between `RefuseAtCapacityAsync` and `AuthenticateAsync`) plus one more at the
+> `RegistrationComplete` response-payload construction, so every coordinate at old line 980 or below is
+> unchanged, everything from 980 to 1257 shifted **+1**, and everything from 1258 onward shifted **+39**.
+> This pass re-pointed every `MeshHub.cs:` coordinate in [hub.md](for-clanker/hub.md),
+> [known-issues.md](for-clanker/known-issues.md), [protocol.md](for-clanker/protocol.md),
+> [types.md](for-clanker/types.md) and [transport.md](for-clanker/transport.md), verified by comparing
+> cited-line content before and after re-pointing, not computed from a single blanket offset.
+> `MeshClient.cs` shifted too (+3 up to +10, in six discrete steps through `ConnectAsync`'s frame-building
+> and response-parsing code and the two `NegotiatedProtocolVersion = 0;` reset sites) and `IMeshClient.cs`
+> by +12 (the new property, inserted after `Name`). **This pass went further than the registration path
+> alone and closed the standing `client.md`/`known-issues.md` `MeshClient.cs` gap flagged by every prior
+> pass** (see the "Known documentation gap" note below, now narrowed further): every citation that was
+> verified accurate against `main` before this branch — `ConnectAsync` and its internals, the disconnect
+> claim protocol, the receive-loop dispatch ladder and its termination gates, `JoinGroupAsync`/
+> `LeaveGroupAsync`/`GroupJoinRefused` (both the Surface Table rows and the group-membership section), and
+> the correlated-lookup mechanics — was re-derived from the current source and re-pointed in
+> [client.md](for-clanker/client.md) and [known-issues.md](for-clanker/known-issues.md) (KI-3, KI-8, KI-9,
+> KI-10, KI-12, KI-13, KI-14, KI-20, KI-21, KI-27), plus the two `IMeshClient.cs` XML-doc citations for
+> `DisconnectAsync`/`Disconnected`. **What remains out of scope is a distinct, older gap**: the handful of
+> `MeshClient.cs` citations that were *already wrong before this branch* (KI-3's clientName check was
+> mislabelled, KI-8's group-length check, and similar) were corrected to their true *current* location as
+> part of this same pass rather than left pointing at stale numbers — see each entry's citation for the
+> fix. The one thing this pass did **not** attempt is a line-by-line audit of every remaining
+> `MeshClient.cs` mention outside these two files; treat citations elsewhere as unverified against this
+> branch's shift until checked.
+>
+> The metrics-instrumentation work (PR #72, closing issue #24) has since merged as `f6d7fd1`, which is the
+> `main` commit this branch is built on. In summary: `MeshHub` and `MeshClientReconnector` each own a
+> `System.Diagnostics.Metrics.Meter` (name `"AdamSalisbury.Meshworx"`,
+> `Diagnostics/MeshworxMeterName.cs`), publishing `meshworx.hub.clients.connected`,
+> `meshworx.hub.messages.routed`/`bytes.routed` (tagged `direction`), `meshworx.hub.messages.dropped`
+> (tagged `reason`), `meshworx.hub.outbound_queue.depth` (an aggregate gauge) and
+> `meshworx.client.reconnects`. No protocol, payload, public constructor or DI-package change accompanied
+> it. Full write-up in [hub.md](for-clanker/hub.md#metrics) and [client.md](for-clanker/client.md#metrics);
+> KI-32 records the routed/dropped-counter nuance for `broadcast`/`group` sends. Every `MeshHub.cs` and
+> `MeshClientReconnector.cs` coordinate it touched has since been re-pointed again by this pass's own
+> PR #73 shift, above, where affected.
 >
 > The `IsRunning`/`MaxClients`/`ClaimedClientSlots` and health-check work (PR #71, closing issue #23) — open
 > at the time of the previous pass — **has since merged as `e2892c1`**, which is the `main` commit this
@@ -138,16 +152,28 @@ rather than read directly, it says so.
 > is documented in [transport.md](for-clanker/transport.md); the registration-authentication work of
 > PR #56 and protocol version 3 are on `main`.
 >
-> **Known documentation gap — narrowed by this pass to `MeshClient.cs` only:** the coordinates
-> (`path:line`) for `MeshClient.cs` outside the registration and group-membership paths were written
-> against an older tree and have since drifted — PR #55 (client send timeout and retry) landed on `main`
-> after this documentation set was first written and has **still** not been reconciled. None of PRs #59
-> through #71 touched that backlog: each reconciliation is scoped to its own branch, so each corrected only
-> the coordinates its own diff moved. Several `MeshClient.cs` coordinates cited from
-> [known-issues.md](for-clanker/known-issues.md) (e.g. `:102`, `:345`, `:551`) and the receive-loop
-> coordinates in [client.md](for-clanker/client.md) and
-> [protocol.md](for-clanker/protocol.md) (e.g. the empty-frame guard at `:546`, true value `:714`) resolve
-> to unrelated lines. Names and behaviour are accurate throughout; jump by symbol, not by line.
+> **Known documentation gap — closed for `client.md` and `known-issues.md` as of this pass; the rest of
+> the tree is untouched and unverified.** For several passes, `MeshClient.cs` coordinates outside the
+> registration and group-membership paths were written against an older tree and had drifted — PR #55
+> (client send timeout and retry) landed on `main` after this documentation set was first written and
+> went unreconciled through PRs #59–#72, each of which was scoped to its own branch and so only corrected
+> the coordinates its own diff moved. **PR #73 forced `client.md` open for its own registration-path
+> shift (`ConnectAsync` gained lines, +3 up to +10 depending on position; see the top of this document),
+> and rather than reconcile only that narrow slice, this pass used the opportunity to re-derive every
+> `MeshClient.cs`/`IMeshClient.cs` citation in `client.md` and `known-issues.md` from the current source**
+> — the Surface Table in full, the claim protocol, the receive-loop dispatch ladder and termination
+> gates, the correlated lookup, and the group-membership section — rather than trust old numbers or
+> apply a blanket arithmetic shift. This also corrected several citations that were wrong *before* PR #73
+> too (not just shifted): KI-3's clientName-length check, KI-8's group-name-length check, KI-12's
+> `_pendingLookup`/`GetClientIdByNameAsync`, and KI-13's `Data`-view sites all cited unrelated lines for
+> several passes and now cite the actual checks. The one citation still resolving to the wrong line by
+> design is [types.md](for-clanker/types.md)'s `AdamSalisbury.Meshworx.csproj:726` (see the note further
+> down) — untouched because `.csproj` files were out of scope for this pass's re-derivation. **Nothing
+> outside `client.md` and `known-issues.md` was audited this pass** — a `MeshClient.cs` mention in
+> [protocol.md](for-clanker/protocol.md), [hub.md](for-clanker/hub.md), [testing.md](for-clanker/testing.md)
+> or elsewhere was only touched where this pass's own edits already required it (the empty-frame guard and
+> `GroupJoinRefused` branch in `protocol.md`, both verified and re-pointed); treat any other `MeshClient.cs`
+> coordinate outside the two reconciled files as unconfirmed.
 >
 > **The matching gap in `MeshClientReconnector.cs` — open since PR #52 and reported by every pass from
 > PR #63 onward — is fixed as of this pass.** While re-pointing `client.md`'s `MeshClientReconnector`
@@ -162,14 +188,21 @@ rather than read directly, it says so.
 >
 > Every `MeshHub.cs`, `MeshClientReconnector.cs`, `MeshHubTests.cs`, `TcpTransport.cs`,
 > `ITransportListener.cs`, `TcpTransportListener.cs` and `InMemoryTransportListener.cs` coordinate is
-> current. `MeshHub.cs` and `MeshClientReconnector.cs` were most recently re-pointed in full for
-> **PR #72** (issue #24, this pass — see the top of this document): `MeshHub.cs` gained 152 net lines
+> current. `MeshHub.cs` was most recently re-pointed in full for **PR #73** (issue #47, this pass — see
+> the top of this document): 38 net lines gained in one place (`TryNegotiateProtocolVersion`) plus one
+> more at the `RegistrationComplete` payload, so every coordinate at old line 980 or below is unchanged,
+> 980–1257 shifted **+1**, and 1258 onward shifted **+39** — derived from the diff's hunk boundaries and
+> verified by comparing cited-line content before and after, not computed from a single offset. PR #73
+> touches no other file this note tracks: `MeshClientReconnector.cs`, `MeshHubTests.cs`,
+> `TcpTransport.cs` and the listener files remain exactly as the PR #72 pass below left them.
+> Before PR #73, `MeshHub.cs` and `MeshClientReconnector.cs` were most recently re-pointed in full for
+> **PR #72** (issue #24): `MeshHub.cs` gained 152 net lines
 > across many separate insertion points and `MeshClientReconnector.cs` gained 31, so every coordinate in
-> either file has moved again by an amount that climbs in discrete steps depending on position — derived
+> either file had moved by an amount that climbs in discrete steps depending on position — derived
 > from the diff's hunk boundaries and verified by comparing cited-line content before and after, not
 > computed from a single offset. `MeshHubTests.cs` is **untouched by PR #72** (no test file besides two new
 > ones — `MeshHubMetricsTests.cs`, `MeshClientReconnectorMetricsTests.cs` — and a new `MetricsCapture.cs`
-> fixture were added by this branch; see [testing.md](for-clanker/testing.md)), so its coordinates remain
+> fixture were added by that branch; see [testing.md](for-clanker/testing.md)), so its coordinates remain
 > exactly as the PR #71 pass below left them. Before PR #72, the `MeshHub.cs` and `MeshHubTests.cs` sets
 > were most recently re-pointed in full for **PR #71** (issue #23): `MeshHub.cs` lost one field
 > (`_maxClients`, folded into the new `MaxClients` auto-property) and gained 18 net new lines (`IsRunning`,
@@ -239,10 +272,10 @@ direct-send to any id it holds. Treat the transport boundary as the trust bounda
 | Target framework | `net10.0` | `AdamSalisbury.Meshworx.csproj:4` |
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
-| Wire protocol version | `3` | `Messages/Protocol.cs:5` |
+| Wire protocol version | Negotiated range, currently `4`–`4` (was a fixed `3`; PR #73) | `Messages/Protocol.cs:8`, `:14` |
 | Max frame payload (TCP) | 1 MiB (`1024*1024`) | `Transport/Tcp/TcpTransport.cs:29` |
 | TCP transport encryption | Optional TLS, **off by default** | `Transport/Tcp/TcpTransport.cs:146`, `TcpTransportListener.cs:110` |
-| Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:6` |
+| Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:16` |
 | Warnings as errors | Yes (`Directory.Build.props`) | `src/Directory.Build.props:3` |
 
 ---
@@ -431,8 +464,8 @@ deadlocks or dropped messages that tests may not catch.
   [known-issues.md](for-clanker/known-issues.md) KI-23.
 - **Client admission is an atomic claim, not a count check.** `maxClients` is enforced against
   `_reservedClientSlots` (`MeshHub.cs:99`), which a registration takes with a single compare-and-swap
-  (`TryReserveClientSlot`, `MeshHub.cs:1187`) and gives back in its handler's `finally`
-  (`MeshHub.cs:1149-1152`). The claim sits **after** the authenticator so an unauthenticated peer cannot
+  (`TryReserveClientSlot`, `MeshHub.cs:1188`) and gives back in its handler's `finally`
+  (`MeshHub.cs:1150-1153`). The claim sits **after** the authenticator so an unauthenticated peer cannot
   hold capacity, with a cheap at-capacity early-out **before** it so a full hub still never runs the
   callback. Consequence for any code you write here: `ConnectedClientCount` can transiently read *below*
   the number of claimed slots, so never gate admission on it. See
@@ -449,9 +482,9 @@ deadlocks or dropped messages that tests may not catch.
   [known-issues.md](for-clanker/known-issues.md) KI-29.
 - **Group membership is the hub's only enforceable boundary, and the join gate is an awaited callback.**
   A group send is dropped unless the sender is in the group — tested **inside** the group's lock
-  (`MeshHub.cs:1824`) so a sender removed concurrently cannot slip through. A join, when a
+  (`MeshHub.cs:1863`) so a sender removed concurrently cannot slip through. A join, when a
   `GroupAuthoriser` is configured, awaits that callback **from the calling client's own receive loop**
-  (`MeshHub.cs:1031-1032`), which therefore reads nothing else from that client until it returns. Two
+  (`MeshHub.cs:1032-1033`), which therefore reads nothing else from that client until it returns. Two
   consequences: a slow authoriser stalls only its own client, and a client parked on a decision looks
   idle to the heartbeat monitor and can be evicted mid-decision. Keep integrator awaits out of
   `Group.Lock`. See [hub.md](for-clanker/hub.md#group-authorisation) and
@@ -557,7 +590,7 @@ full house style; the points below are the ones the code actually enforces and d
   explicit range checks. Every public entry point does this.
 - **Catch specific exceptions.** Broad `catch (Exception)` appears **only** at loop/callback boundaries
   and is always logged with a comment explaining why it is intentional (e.g. `MeshHub.cs:691-699`,
-  `:1353`, and the three catches in `AuthenticateAsync` `:1298-1322`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
+  `:1392`, and the three catches in `AuthenticateAsync` `:1337-1361`). `CA1031` is a suggestion, not an error, but the convention is strict — match it.
 - **No blocking, no `.Result`.** `CA2007` (ConfigureAwait) is a build error in the library.
 - **Binary wire work uses `System.Buffers.Binary.BinaryPrimitives`** (big-endian) and
   `Guid.TryWriteBytes` / `new Guid(span)` for the 16-byte ids. Frame buffers on hot paths are rented
@@ -566,11 +599,15 @@ full house style; the points below are the ones the code actually enforces and d
 
 **Adding a new message type / capability** (the shape to follow):
 1. Add the opcode to `internal enum MessageType` (`Messages/MessageType.cs`) — pick the next free byte.
-2. Bump `Protocol.Version` (`Messages/Protocol.cs`) if the change is not backward-compatible; the hub
-   rejects mismatched versions at registration. A **hub → client** opcode that an older client can safely
-   ignore does **not** need a bump — that is the `GroupJoinRefused` precedent, and the exact conditions
-   are in [protocol.md](for-clanker/protocol.md#additive-opcodes-within-a-version). A client → hub
-   opcode, or any change to an existing frame's layout, always does.
+2. Raise `Protocol.MaxSupportedVersion` (`Messages/Protocol.cs`) if the change is not backward-compatible
+   — the hub negotiates the highest version common to its range and the connecting client's, and refuses
+   with `UnsupportedProtocolVersion` only if the ranges don't overlap. **A version bump alone does not
+   make a change safe**: nothing downstream reads `NegotiatedProtocolVersion` today, so if the change
+   needs old and new peers to behave differently, you must add that gating yourself — see
+   [known-issues.md](for-clanker/known-issues.md) KI-14. A **hub → client** opcode that an older client
+   can safely ignore does **not** need a bump — that is the `GroupJoinRefused` precedent, and the exact
+   conditions are in [protocol.md](for-clanker/protocol.md#additive-opcodes-within-a-version). A
+   client → hub opcode, or any change to an existing frame's layout, always does.
 3. Client: add the framing/send method to `MeshClient` and the interface method + XML doc to
    `IMeshClient`; add the inbound branch to `ReceiveLoopAsync`.
 4. Hub: add the inbound branch to `HandleClientAsync`'s dispatch chain and any routing helper.
@@ -618,9 +655,11 @@ there is no publish step in CI — CI only builds and tests.
   authoriser, and it shipped **without** a protocol version bump. A client that used to publish to a
   group without joining it still connects and still sends — it is simply never delivered. There is no
   send-only capability: joining to publish also means receiving. KI-2, KI-4.
-- **Protocol v3 broke both wire and source compatibility.** v2 and v3 peers cannot interoperate — there
-  is no negotiation — and `ConnectAsync` gained a `credential` parameter **before** the
-  `CancellationToken`, so positional call sites no longer compile. KI-14.
+- **Version negotiation exists, but nothing yet uses it beyond the handshake.** The hub picks the
+  highest wire-protocol version common to its own range and the connecting client's, so a range mismatch
+  fails gracefully instead of the old hard refuse-on-mismatch. But `NegotiatedProtocolVersion` is not
+  read anywhere else — bumping `Protocol.MaxSupportedVersion` for a real capability difference does not,
+  by itself, make old and new peers behave correctly together. KI-14.
 - **`new TcpTransportListener(port)` binds loopback**, not every interface. Remote clients cannot reach
   a hub created that way; pass an explicit `IPEndPoint` to expose it deliberately.
 - **The TCP transport is cleartext unless you pass TLS options** to both the listener and

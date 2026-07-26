@@ -40,15 +40,15 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
 
 | File | Lines | Covers |
 |---|---|---|
-| `Fixtures/MeshHubFixture.cs` | 304 | Hub test harness (mock listener/transport, register helpers, **authenticator and group-authoriser pass-throughs**, group/lookup/direct frame builders, `FrameRecorder`) |
-| `Fixtures/MeshClientFixture.cs` | 118 | Client test harness (mock transport, scripted receive, **`CreateGroupJoinRefusal`**) |
+| `Fixtures/MeshHubFixture.cs` | 321 | Hub test harness (mock listener/transport, register helpers, **authenticator and group-authoriser pass-throughs**, group/lookup/direct frame builders, `FrameRecorder`, **`CreateRegistrationRequest`'s `versionMin`/`versionMax` parameters, PR #73**) |
+| `Fixtures/MeshClientFixture.cs` | 130 | Client test harness (mock transport, scripted receive, **`CreateGroupJoinRefusal`**, **an 18-byte `RegistrationComplete` builder taking a negotiated-version byte, PR #73**) |
 | `Fixtures/MetricsCapture.cs` | 88 | **Metrics test harness (PR #72):** a `MeterListener` filtered to one `Meter` reference plus one instrument name, capturing every measurement and its tags in recording order |
-| `MeshHubTests.cs` | 2774 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, **capacity claim/release under a concurrent registration**, **groups as an authorisation boundary**, lifecycle, **concurrent stop/dispose and start-vs-stop races**, **`IsRunning`/`MaxClients` accessors (PR #71)** |
+| `MeshHubTests.cs` | 2849 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, **capacity claim/release under a concurrent registration**, **groups as an authorisation boundary**, lifecycle, **concurrent stop/dispose and start-vs-stop races**, **`IsRunning`/`MaxClients` accessors (PR #71)**, **inverted/non-overlapping version-range refusal and highest-shared-version negotiation (PR #73)** |
 | `MeshHubMetricsTests.cs` | 422 | **All five `MeshHub` instruments (PR #72):** connected-clients up/down counter, routed/dropped counters per direction/reason, the zero-recipient exclusion for broadcast, the outbound-queue-depth gauge |
-| `MeshClientTests.cs` | 1602 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race**, **group-join refusal handling** |
+| `MeshClientTests.cs` | 1636 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race**, **group-join refusal handling**, **`NegotiatedProtocolVersion` recorded on connect and reset on disconnect (PR #73)** |
 | `MeshClientReconnectorTests.cs` | 944 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal**, **restored membership re-authorised by the hub**, **the documented `Reconnected` handler idiom containing a post-suspension failure** |
 | `MeshClientReconnectorMetricsTests.cs` | 73 | **The `meshworx.client.reconnects` counter (PR #72):** excluded on the initial `StartAsync` connect, incremented exactly once on a genuine reconnect |
-| `MeshIntegrationTests.cs` | 481 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** and **non-member/unauthorised group paths** |
+| `MeshIntegrationTests.cs` | 482 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** and **non-member/unauthorised group paths** |
 | `Transport/InMemory/InMemoryTransportTests.cs` | 173 | Pair semantics, copy-on-send, close signalling |
 | `Transport/InMemory/InMemoryTransportListenerTests.cs` | 90 | **Listener disposal contract in memory (4 tests):** accept after dispose, dispose-without-ever-starting, a queued connection closed rather than served, repeated/concurrent dispose |
 | `Transport/Tcp/TcpTransportTests.cs` | 342 | Framing, oversize rejection, invalid length, batch send |
@@ -301,9 +301,12 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
 - **Fixture helpers build wire frames by hand** (`CreateRegistrationRequest`, `CreateDeliverMessagePayload`,
   `CreateLookupFound/NotFoundResponse`) with the raw opcodes — a useful cross-check of
   [protocol.md](protocol.md). If you change a frame layout, these helpers must change too.
-  `CreateRegistrationRequest(name, credential)` builds a **version 3** frame
-  (`[0x04][0x03][nameLen u16 BE][name][credential]`) and hard-codes the version byte, so a
-  `Protocol.Version` bump requires editing it (`Fixtures/MeshHubFixture.cs:118-130`).
+  `CreateRegistrationRequest(name, credential, versionMin=0x04, versionMax=0x04)` builds a
+  `[0x04][versionMin][versionMax][nameLen u16 BE][name][credential]` frame, defaulting both version
+  bytes to the current `Protocol.MinSupportedVersion`/`MaxSupportedVersion` (`Fixtures/MeshHubFixture.cs:118-131`,
+  updated for the min/max negotiation in PR #73). Most call sites take the defaults; pass explicit
+  `versionMin`/`versionMax` to exercise `TryNegotiateProtocolVersion`'s refusal paths (inverted or
+  non-overlapping range) without touching `Protocol.cs` itself.
 - **Test the authenticator through the hub, not in isolation.** `MeshHubFixture` takes `authenticator`
   and `maxConcurrentAuthentications` pass-throughs, so the seam is exercised over the real registration
   path. The `HandleClient_Authenticator*` tests in `MeshHubTests.cs` cover the outcomes worth copying:
