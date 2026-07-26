@@ -465,6 +465,52 @@ public sealed class MeshHubTests
         Assert.Equal(0, fixture.Hub.ConnectedClientCount);
     }
 
+    // IsRunning
+
+    /// <summary>
+    /// IsRunning reflects the hub's lifecycle: false before StartAsync, true once it has started, and
+    /// false again once StopAsync has completed.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task IsRunning_TracksHubLifecycle()
+    {
+        var fixture = new MeshHubFixture();
+
+        Assert.False(fixture.Hub.IsRunning);
+
+        await fixture.Hub.StartAsync();
+        Assert.True(fixture.Hub.IsRunning);
+
+        await fixture.Hub.StopAsync();
+        Assert.False(fixture.Hub.IsRunning);
+    }
+
+    // MaxClients
+
+    /// <summary>
+    /// MaxClients reflects the value passed to the constructor.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task MaxClients_ConstructedWithExplicitValue_ReflectsThatValue()
+    {
+        await Task.CompletedTask;
+        var fixture = new MeshHubFixture(maxClients: 5);
+
+        Assert.Equal(5, fixture.Hub.MaxClients);
+    }
+
+    /// <summary>
+    /// MaxClients defaults to one thousand when the constructor is not given an explicit value.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task MaxClients_NotSpecified_DefaultsToOneThousand()
+    {
+        await Task.CompletedTask;
+        var fixture = new MeshHubFixture();
+
+        Assert.Equal(1000, fixture.Hub.MaxClients);
+    }
+
     // IsClientRegistered
 
     /// <summary>

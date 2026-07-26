@@ -2,13 +2,16 @@
 
 [← back to index](../for-clanker.md) · related: [hub.md](hub.md) · [client.md](client.md) · [testing.md](testing.md) · [known-issues.md](known-issues.md)
 
-A second library, `AdamSalisbury.Meshworx.Extensions.DependencyInjection` (added by PR #70, currently
-open), that registers a `MeshHub` or `MeshClient` with `Microsoft.Extensions.DependencyInjection` and
+A second library, `AdamSalisbury.Meshworx.Extensions.DependencyInjection` (added by PR #70, merged as
+`0d0c6ff`), that registers a `MeshHub` or `MeshClient` with `Microsoft.Extensions.DependencyInjection` and
 runs it alongside a generic host or ASP.NET Core application — the composition-root equivalent of the
 constructor calls documented in [for-clanker.md §2](../for-clanker.md#2-how-it-is-meant-to-be-used). It
-is **purely additive**: nothing in `AdamSalisbury.Meshworx` itself changed to support it, and it depends
-on the core library the same way any consumer would (`ProjectReference` only, no `InternalsVisibleTo`
-into the core assembly).
+is **purely additive**: registering and hosting a hub or client changed nothing in `AdamSalisbury.Meshworx`
+itself, and it depends on the core library the same way any consumer would (`ProjectReference` only, no
+`InternalsVisibleTo` into the core assembly). PR #71 (issue #23) added a **health-check integration** to
+this same package — see [Health checks](#health-checks) below — which did need three new `IMeshHub`
+members (`IsRunning`, `MaxClients`, `ClaimedClientSlots`, all implemented on `MeshHub`); those are
+documented on [hub.md](hub.md), not here.
 
 - **Extension methods** live in namespace `Microsoft.Extensions.DependencyInjection` (so they appear on
   `IServiceCollection` without an extra `using`), following the convention every `Add*` method in that
@@ -216,7 +219,74 @@ services.TryAddKeyedSingleton<IMeshClient>(clientName, (serviceProvider, key) =>
 
 ---
 
-## Both extensions, in common
+## Health checks
+
+Added by PR #71 (issue #23), in the same package, against
+`Microsoft.Extensions.Diagnostics.HealthChecks` (`PackageReference` added to both the package `.csproj`
+and `Directory.Packages.props`). Two `IHealthChecksBuilder` extension methods, in the same
+`Microsoft.Extensions.DependencyInjection` namespace and following the same "no extra `using`" convention
+as `AddMeshHub`/`AddMeshClient` above — this matches the real ecosystem convention, since the framework's
+own `AddHealthChecks()` lives there too, not in `Microsoft.Extensions.Diagnostics.HealthChecks`.
+
+| Member | Signature | Source |
+|---|---|---|
+| `AddMeshHub` | `IHealthChecksBuilder AddMeshHub(this IHealthChecksBuilder, string name = "meshhub", HealthStatus? failureStatus = null, IEnumerable<string>? tags = null)` | `MeshHubHealthCheckBuilderExtensions.cs:29` |
+| `AddMeshClient` | `IHealthChecksBuilder AddMeshClient(this IHealthChecksBuilder, string clientName, string? name = null, HealthStatus? failureStatus = null, IEnumerable<string>? tags = null)` | `MeshClientHealthCheckBuilderExtensions.cs:30` |
+
+```csharp
+builder.Services.AddHealthChecks()
+    .AddMeshHub()
+    .AddMeshClient("Alice");
+```
+
+Both require the hub or the named client to already be registered — call `AddMeshHub`/`AddMeshClient`
+(the `IServiceCollection` extensions documented above) first. `AddMeshClient`'s `name` defaults to
+`"meshclient:{clientName}"`; `AddMeshHub`'s to `"meshhub"`. Both back onto `internal sealed` `IHealthCheck`
+implementations you never construct directly: `MeshHubHealthCheck` (`MeshHubHealthCheck.cs:21`) and
+`MeshClientHealthCheck` (`MeshClientHealthCheck.cs:21`).
+
+### Using it efficiently
+
+- **`MeshHubHealthCheck`** (`CheckHealthAsync`, `MeshHubHealthCheck.cs:24-55`): `Unhealthy` while
+  `!hub.IsRunning`; `Degraded` once `hub.ClaimedClientSlots >= hub.MaxClients` — the hub is still serving
+  existing clients but refusing new ones; `Healthy` otherwise. **Capacity is judged against
+  `ClaimedClientSlots`, not `ConnectedClientCount`** — a slot is claimed as soon as a connection is
+  accepted and released only once its handler has fully finished, so `ClaimedClientSlots` is what the
+  hub's own admission check enforces `MaxClients` against and it stays ahead of `ConnectedClientCount`
+  while a client is mid-handshake or mid-teardown. Comparing `ConnectedClientCount` instead would let this
+  check report `Healthy` while the hub was already refusing connections — see [hub.md](hub.md) and
+  [known-issues.md](known-issues.md) KI-26. The result's `data` dictionary carries
+  `connectedClientCount`, `claimedClientSlots` and `maxClients` — see the exposure caveat below before
+  wiring this to an unauthenticated endpoint.
+- **`MeshClientHealthCheck`** (`CheckHealthAsync`, `MeshClientHealthCheck.cs:24-32`): `Healthy` while
+  `client.IsConnected`, `Unhealthy` otherwise — including while a `MeshClientReconnector` is still
+  retrying, since the managed client reports disconnected until it reconnects (see
+  [client.md](client.md)).
+- **Both resolve their target from an injected `IServiceProvider` inside `CheckHealthAsync`, not as a
+  constructor dependency captured by the `HealthCheckRegistration` factory delegate.** This is deliberate:
+  `MeshHubHealthCheck` resolves `IMeshHub` with `GetRequiredService` and `MeshClientHealthCheck` resolves
+  the keyed `IMeshClient` with `GetRequiredKeyedService` (both inside `CheckHealthAsync`), so a hub or
+  named client that was never registered surfaces as a resolution failure **caught by the health check
+  service** and mapped to the registration's configured `failureStatus` — not as an unhandled exception
+  thrown before that service's own try/catch runs. `AddMeshHub_HubNotRegistered_ReportsUnhealthyRatherThanThrowing`
+  and `AddMeshClient_ClientNotRegistered_ReportsUnhealthyRatherThanThrowing` are the regression tests for
+  this; keep resolving inside `CheckHealthAsync` if you touch either check.
+
+### Contracts and gotchas
+
+- **Exposing either check over an unauthenticated HTTP endpoint leaks operational detail.** Neither check
+  does any endpoint-mapping itself — that is entirely the integrator's call, typically via ASP.NET Core's
+  `MapHealthChecks` — but if you do map one without authentication, the response's `data` (connected and
+  claimed client counts, `MaxClients`, and the client name embedded in `AddMeshClient`'s default check
+  name) is visible to any caller who can reach the endpoint. See [known-issues.md](known-issues.md) KI-31.
+- **A health check added without its matching `AddMeshHub`/`AddMeshClient` call reports the registration's
+  failure status, not a 500 from an unhandled exception** — see "Using it efficiently" above. This means a
+  typo'd `clientName` in `AddMeshClient(...)` (health check) that does not match the one passed to the
+  `IServiceCollection` `AddMeshClient(...)` call fails quietly as `Unhealthy` (or whatever `failureStatus`
+  you configured) rather than crashing health-check evaluation — check the reported exception in the
+  `HealthReport` entry if a check you expect to pass never does.
+
+
 
 - Neither extension throws if called with a `null` `IServiceCollection` silently — both guard with
   `ArgumentNullException.ThrowIfNull(services)` at the top of every public overload, consistent with the
@@ -235,5 +305,7 @@ services.TryAddKeyedSingleton<IMeshClient>(clientName, (serviceProvider, key) =>
 ## Known issues
 
 See [known-issues.md](known-issues.md) KI-30 for the `AddMeshClient` hosted-service duplication described
-above — found and fixed before merge, in the same PR that introduced it. Nothing else here is registered
-in the known-issues table; the design otherwise matches the core library's documented defaults exactly.
+above — found and fixed before merge, in the same PR that introduced it — and KI-31 for the
+health-check-endpoint-exposure caveat described under [Health checks](#health-checks). Nothing else here
+is registered in the known-issues table; the design otherwise matches the core library's documented
+defaults exactly.
