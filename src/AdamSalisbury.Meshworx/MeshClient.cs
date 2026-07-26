@@ -57,8 +57,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// <param name="sendTimeout">
     /// The maximum time a single message send may take before it is cancelled and fails with a
     /// <see cref="TimeoutException"/>. Cancelling releases the transport so a stalled send does not block
-    /// the connection. Applies to <see cref="SendAsync"/>, <see cref="BroadcastAsync"/> and
-    /// <see cref="SendToGroupAsync"/>. A timed-out send is not retried. Defaults to <see langword="null"/>
+    /// the connection. Applies to <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, CancellationToken)"/>,
+    /// <see cref="BroadcastAsync"/> and
+    /// <see cref="SendToGroupAsync(string, ReadOnlyMemory{byte}, CancellationToken)"/>.
+    /// A timed-out send is not retried. Defaults to <see langword="null"/>
     /// (no timeout).
     /// </param>
     /// <param name="maxSendAttempts">
@@ -350,11 +352,23 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
-    public async Task SendAsync(
+    public Task SendAsync(
         Guid recipientId,
         ReadOnlyMemory<byte> message,
         CancellationToken cancellationToken = default)
     {
+        return SendAsync(recipientId, message, MessageHeaders.Empty, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public async Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(headers);
+
         ITransport transport;
 
         lock (_stateLock)
@@ -367,10 +381,28 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             transport = _transport!;
         }
 
-        var payload = new byte[1 + 16 + message.Length];
-        payload[0] = (byte)MessageType.SendMessage;
-        recipientId.TryWriteBytes(payload.AsSpan(1));
-        message.CopyTo(payload.AsMemory(17));
+        byte[] payload;
+        if (headers.Count == 0)
+        {
+            // No header block is written at all when there is nothing to carry, so this remains
+            // byte-for-byte identical to the frame a header-unaware peer already understands.
+            payload = new byte[1 + 16 + message.Length];
+            payload[0] = (byte)MessageType.SendMessage;
+            recipientId.TryWriteBytes(payload.AsSpan(1));
+            message.CopyTo(payload.AsMemory(17));
+        }
+        else
+        {
+            RequireHeaderEnvelopeSupport(NegotiatedProtocolVersion);
+
+            int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+            payload = new byte[1 + 16 + 2 + headerLength + message.Length];
+            payload[0] = (byte)MessageType.SendMessageWithHeaders;
+            recipientId.TryWriteBytes(payload.AsSpan(1));
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(17, 2), (ushort)headerLength);
+            HeaderEnvelope.Write(headers, payload.AsSpan(19, headerLength));
+            message.CopyTo(payload.AsMemory(19 + headerLength));
+        }
 
         await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
     }
@@ -455,12 +487,23 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
-    public async Task SendToGroupAsync(
+    public Task SendToGroupAsync(
         string groupName,
         ReadOnlyMemory<byte> message,
         CancellationToken cancellationToken = default)
     {
+        return SendToGroupAsync(groupName, message, MessageHeaders.Empty, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public async Task SendToGroupAsync(
+        string groupName,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default)
+    {
         ArgumentException.ThrowIfNullOrEmpty(groupName);
+        ArgumentNullException.ThrowIfNull(headers);
 
         ITransport transport = GetConnectedTransport();
 
@@ -470,13 +513,48 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             throw new ArgumentException("The group name is too long.", nameof(groupName));
         }
 
-        var payload = new byte[1 + 2 + nameBytes.Length + message.Length];
-        payload[0] = (byte)MessageType.GroupMessage;
-        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)nameBytes.Length);
-        nameBytes.CopyTo(payload, 3);
-        message.CopyTo(payload.AsMemory(3 + nameBytes.Length));
+        byte[] payload;
+        if (headers.Count == 0)
+        {
+            // No header block is written at all when there is nothing to carry, so this remains
+            // byte-for-byte identical to the frame a header-unaware peer already understands.
+            payload = new byte[1 + 2 + nameBytes.Length + message.Length];
+            payload[0] = (byte)MessageType.GroupMessage;
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)nameBytes.Length);
+            nameBytes.CopyTo(payload, 3);
+            message.CopyTo(payload.AsMemory(3 + nameBytes.Length));
+        }
+        else
+        {
+            RequireHeaderEnvelopeSupport(NegotiatedProtocolVersion);
+
+            int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+            int headerLengthOffset = 3 + nameBytes.Length;
+            payload = new byte[headerLengthOffset + 2 + headerLength + message.Length];
+            payload[0] = (byte)MessageType.GroupMessageWithHeaders;
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)nameBytes.Length);
+            nameBytes.CopyTo(payload, 3);
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(headerLengthOffset, 2), (ushort)headerLength);
+            HeaderEnvelope.Write(headers, payload.AsSpan(headerLengthOffset + 2, headerLength));
+            message.CopyTo(payload.AsMemory(headerLengthOffset + 2 + headerLength));
+        }
 
         await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Guards a header-bearing send against a connection that negotiated a protocol version predating
+    /// the header envelope, so headers the caller supplied are never silently dropped on the wire.
+    /// </summary>
+    private static void RequireHeaderEnvelopeSupport(byte negotiatedProtocolVersion)
+    {
+        if (negotiatedProtocolVersion < Protocol.HeaderEnvelopeMinVersion)
+        {
+            throw new NotSupportedException(
+                $"Message headers require a negotiated protocol version of at least "
+                + $"{Protocol.HeaderEnvelopeMinVersion}; this connection negotiated version "
+                + $"{negotiatedProtocolVersion}.");
+        }
     }
 
     /// <summary>
@@ -774,6 +852,79 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         }
                     }
                 }
+                else if (data.Length >= 19
+                    && (MessageType)data[0] == MessageType.DeliverMessageWithHeaders)
+                {
+                    var senderId = new Guid(data.AsSpan(1, 16));
+                    int headerBlockLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(17, 2));
+
+                    if (data.Length >= 19 + headerBlockLength)
+                    {
+                        MessageHeaders? headers = TryReadHeaderBlock(data.AsSpan(19), headerBlockLength, senderId);
+                        if (headers is not null)
+                        {
+                            ReadOnlyMemory<byte> messageData = data.AsMemory(19 + headerBlockLength);
+
+                            try
+                            {
+                                MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                                {
+                                    SenderId = senderId,
+                                    Data = messageData,
+                                    Headers = headers,
+                                });
+                            }
+                            catch (Exception ex)
+                            {
+                                // A throwing subscriber must not tear down the receive loop and
+                                // silently halt all further delivery. This is a callback boundary.
+                                _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                            }
+                        }
+                    }
+                }
+                else if (data.Length >= 21
+                    && (MessageType)data[0] == MessageType.DeliverGroupMessageWithHeaders)
+                {
+                    var senderId = new Guid(data.AsSpan(1, 16));
+                    int nameLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(17, 2));
+                    int headerLengthOffset = 19 + nameLength;
+
+                    if (data.Length >= headerLengthOffset + 2)
+                    {
+                        int headerBlockLength = BinaryPrimitives.ReadUInt16BigEndian(
+                            data.AsSpan(headerLengthOffset, 2));
+                        int bodyOffset = headerLengthOffset + 2 + headerBlockLength;
+
+                        if (data.Length >= bodyOffset)
+                        {
+                            string groupName = Encoding.UTF8.GetString(data.AsSpan(19, nameLength));
+                            MessageHeaders? headers = TryReadHeaderBlock(
+                                data.AsSpan(headerLengthOffset + 2), headerBlockLength, senderId);
+
+                            if (headers is not null)
+                            {
+                                ReadOnlyMemory<byte> messageData = data.AsMemory(bodyOffset);
+
+                                try
+                                {
+                                    GroupMessageReceived?.Invoke(this, new GroupMessageReceivedEventArgs
+                                    {
+                                        SenderId = senderId,
+                                        GroupName = groupName,
+                                        Data = messageData,
+                                        Headers = headers,
+                                    });
+                                }
+                                catch (Exception ex)
+                                {
+                                    // Callback boundary — a throwing subscriber must not halt the loop.
+                                    _logger.LogError(ex, "A GroupMessageReceived handler threw an exception");
+                                }
+                            }
+                        }
+                    }
+                }
                 else if (data.Length > 1
                     && (MessageType)data[0] == MessageType.GroupJoinRefused)
                 {
@@ -947,6 +1098,31 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             // A throwing subscriber must not fault the receive loop task. Callback boundary.
             _logger.LogError(ex, "A Disconnected handler threw an exception");
+        }
+    }
+
+    /// <summary>
+    /// Decodes a header block, returning <see langword="null"/> instead of throwing if it is internally
+    /// malformed.
+    /// </summary>
+    /// <remarks>
+    /// The hub relays a header block byte-for-byte without decoding it, so a peer sending a
+    /// well-formed outer frame with an internally corrupt header block reaches this decoder unfiltered.
+    /// A single bad frame must not tear down the receive loop and disconnect an otherwise healthy
+    /// connection — the same reasoning already applied to a throwing event handler at every call site
+    /// below applies here too, just one step earlier.
+    /// </remarks>
+    private MessageHeaders? TryReadHeaderBlock(ReadOnlySpan<byte> source, int blockLength, Guid senderId)
+    {
+        try
+        {
+            return HeaderEnvelope.Read(source, blockLength);
+        }
+        catch (FormatException ex)
+        {
+            _logger.LogWarning(
+                ex, "Discarding a message from {SenderId} with a malformed header block", senderId);
+            return null;
         }
     }
 

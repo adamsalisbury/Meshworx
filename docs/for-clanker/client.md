@@ -18,57 +18,62 @@ up peers, manages group membership, and raises events for inbound traffic and di
 
 | Member | Signature / notes | Source |
 |---|---|---|
-| ctor | `MeshClient(ILogger<MeshClient>, TimeSpan? idleTimeout=null, TimeSpan? sendTimeout=null, int maxSendAttempts=1, TimeSpan? sendRetryDelay=null)` | `MeshClient.cs:75` |
-| `Id` | `Guid` — assigned by hub; `Guid.Empty` when disconnected | `MeshClient.cs:116` |
-| `Name` | `string` — set on connect, cleared on disconnect | `MeshClient.cs:119` |
-| `IsConnected` | `bool` — true only in `Connected` state | `MeshClient.cs:125` |
-| `JoinedGroups` | `IReadOnlyCollection<string>` — **snapshot** of client-side membership | `MeshClient.cs:137` |
-| `ConnectAsync` | `Task ConnectAsync(ITransport, string clientName, ReadOnlyMemory<byte> credential=default, CancellationToken=default)` | `MeshClient.cs:161` |
-| `NegotiatedProtocolVersion` | `byte` — the wire-protocol version agreed with the hub during the last successful `ConnectAsync`; `0` when not connected | `MeshClient.cs:122` |
-| `DisconnectAsync` | `Task DisconnectAsync(CancellationToken=default)` — graceful; no `Disconnected` event | `MeshClient.cs:279` |
-| `SendAsync` | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, CancellationToken=default)` | `MeshClient.cs:353` |
-| `BroadcastAsync` | `Task BroadcastAsync(ReadOnlyMemory<byte>, CancellationToken=default)` | `MeshClient.cs:379` |
-| `JoinGroupAsync` / `LeaveGroupAsync` | `Task ...(string groupName, CancellationToken=default)` — **optimistic**: `JoinGroupAsync` records membership *before* sending and the hub may still refuse, see [Group membership](#group-membership) | `MeshClient.cs:401` / `:442` |
-| `SendToGroupAsync` | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, CancellationToken=default)` | `MeshClient.cs:458` |
-| `GetClientIdByNameAsync` | `Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken=default)` | `MeshClient.cs:573` |
-| `MessageReceived` | `event EventHandler<MessageReceivedEventArgs>` — direct **and** broadcast | `MeshClient.cs:149` |
-| `GroupMessageReceived` | `event EventHandler<GroupMessageReceivedEventArgs>` — carries group name | `MeshClient.cs:152` |
-| `GroupJoinRefused` | `event EventHandler<GroupJoinRefusedEventArgs>` — the hub refused a join; the group has **already** been removed from `JoinedGroups` when this fires | `MeshClient.cs:155` |
-| `Disconnected` | `event EventHandler<DisconnectedEventArgs>` — **unexpected** endings only | `MeshClient.cs:158` |
-| `DisposeAsync` | `ValueTask` — `DisconnectAsync` then disposes the lookup semaphore | `MeshClient.cs:622` |
+| ctor | `MeshClient(ILogger<MeshClient>, TimeSpan? idleTimeout=null, TimeSpan? sendTimeout=null, int maxSendAttempts=1, TimeSpan? sendRetryDelay=null)` | `MeshClient.cs:77` |
+| `Id` | `Guid` — assigned by hub; `Guid.Empty` when disconnected | `MeshClient.cs:118` |
+| `Name` | `string` — set on connect, cleared on disconnect | `MeshClient.cs:121` |
+| `IsConnected` | `bool` — true only in `Connected` state | `MeshClient.cs:127` |
+| `JoinedGroups` | `IReadOnlyCollection<string>` — **snapshot** of client-side membership | `MeshClient.cs:139` |
+| `ConnectAsync` | `Task ConnectAsync(ITransport, string clientName, ReadOnlyMemory<byte> credential=default, CancellationToken=default)` | `MeshClient.cs:163` |
+| `NegotiatedProtocolVersion` | `byte` — the wire-protocol version agreed with the hub during the last successful `ConnectAsync`; `0` when not connected | `MeshClient.cs:124` |
+| `DisconnectAsync` | `Task DisconnectAsync(CancellationToken=default)` — graceful; no `Disconnected` event | `MeshClient.cs:281` |
+| `SendAsync` | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, CancellationToken=default)` — compatibility overload, forwards to the headers overload with `MessageHeaders.Empty` | `MeshClient.cs:355` |
+| `SendAsync` (headers) | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); see [Sending headers](#sending-headers) | `MeshClient.cs:364` |
+| `BroadcastAsync` | `Task BroadcastAsync(ReadOnlyMemory<byte>, CancellationToken=default)` | `MeshClient.cs:411` |
+| `JoinGroupAsync` / `LeaveGroupAsync` | `Task ...(string groupName, CancellationToken=default)` — **optimistic**: `JoinGroupAsync` records membership *before* sending and the hub may still refuse, see [Group membership](#group-membership) | `MeshClient.cs:433` / `:474` |
+| `SendToGroupAsync` | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, CancellationToken=default)` — compatibility overload, forwards to the headers overload with `MessageHeaders.Empty` | `MeshClient.cs:490` |
+| `SendToGroupAsync` (headers) | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); see [Sending headers](#sending-headers) | `MeshClient.cs:499` |
+| `GetClientIdByNameAsync` | `Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken=default)` | `MeshClient.cs:651` |
+| `MessageReceived` | `event EventHandler<MessageReceivedEventArgs>` — direct **and** broadcast; `Headers` populated when the sender attached any (PR #74) | `MeshClient.cs:151` |
+| `GroupMessageReceived` | `event EventHandler<GroupMessageReceivedEventArgs>` — carries group name; `Headers` populated when the sender attached any (PR #74) | `MeshClient.cs:154` |
+| `GroupJoinRefused` | `event EventHandler<GroupJoinRefusedEventArgs>` — the hub refused a join; the group has **already** been removed from `JoinedGroups` when this fires | `MeshClient.cs:157` |
+| `Disconnected` | `event EventHandler<DisconnectedEventArgs>` — **unexpected** endings only | `MeshClient.cs:160` |
+| `DisposeAsync` | `ValueTask` — `DisconnectAsync` then disposes the lookup semaphore | `MeshClient.cs:700` |
 
-> **Coordinate caveat — resolved as of this pass (PR #73).** Every row in this table, and every
-> `MeshClient.cs`/`IMeshClient.cs` citation in the rest of this file, was re-derived from the current
-> source this pass, closing a gap that had stood since the docs were first written (only
-> `JoinGroupAsync`/`LeaveGroupAsync`/`GroupJoinRefused` had ever been corrected, in the PR #66 pass). See
-> the note in [the index](../for-clanker.md) for what this pass did and did not verify elsewhere in the
-> tree. Names and behaviour throughout this file were already accurate; only the line numbers were wrong.
+> **Coordinate caveat — resolved for PR #73, re-pointed again for PR #74.** Every row in this table, and
+> every `MeshClient.cs`/`IMeshClient.cs` citation in the rest of this file, was re-derived from the
+> current source as of PR #74 (issue #32), which shifted every coordinate below `ConnectAsync` by +2 and
+> everything from the header-bearing `SendAsync`/`SendToGroupAsync` overloads onward by a larger, growing
+> amount (see the [index](../for-clanker.md) for the full shift map). Names and behaviour were already
+> accurate as of the PR #73 pass; only the line numbers moved.
 
 ### Lifecycle & state machine
 
 Internal `enum ConnectionState { Disconnected, Connecting, Connected, Disconnecting }`
-(`MeshClient.cs:953`), guarded by `_stateLock` (`System.Threading.Lock`). Send/lookup/group methods
+(`MeshClient.cs:1129`), guarded by `_stateLock` (`System.Threading.Lock`). Send/lookup/group methods
 throw `InvalidOperationException("Not connected to a hub.")` unless `Connected`.
 
-**`ConnectAsync`** (`MeshClient.cs:161`):
+**`ConnectAsync`** (`MeshClient.cs:163`):
 1. Validates `transport`/`clientName`, rejects names longer than 256 chars, and refuses to connect
    unless currently `Disconnected` (state-specific message otherwise).
 2. Sends `RegistrationRequest` (`[0x04][versionMin][versionMax][nameLen u16 BE][utf8 name][credential]`,
-   `MeshClient.cs:196-204`), always advertising `Protocol.MinSupportedVersion`/`MaxSupportedVersion`
-   (both `4`), then awaits one frame.
+   `MeshClient.cs:198-206`), always advertising `Protocol.MinSupportedVersion`/`MaxSupportedVersion`
+   (`4`/`5` as of PR #74), then awaits one frame.
 3. If the reply is `Error`, throws `RegistrationRefusedException` carrying the
    `RegistrationErrorCode` — which now includes `AuthenticationFailed` if the hub's authenticator
    rejected the credential, and (unchanged) `UnsupportedProtocolVersion` if the hub could not negotiate a
    version in this client's range. If the reply is not a well-formed `RegistrationComplete` (exactly
    18 bytes as of PR #73, was 17), throws `InvalidOperationException`.
-4. Records `Id` and `NegotiatedProtocolVersion` (the hub's reply's trailing byte, `MeshClient.cs:223-225`
+4. Records `Id` and `NegotiatedProtocolVersion` (the hub's reply's trailing byte, `MeshClient.cs:225-227`
    — `0` until a successful connect), sets `Connected`, and starts `ReceiveLoopAsync`.
 5. On **any** failure it cleans up (disposes the transport), resets to `Disconnected` (and
    `NegotiatedProtocolVersion` to `0`), logs, and rethrows.
 
-> **Nothing reads `NegotiatedProtocolVersion` besides the logger.** It is recorded for the caller's
-> information and exposed on `IMeshClient`, but no send/receive path branches on it — see
-> [known-issues.md](known-issues.md) KI-14.
+> **`NegotiatedProtocolVersion` is read by the send path since PR #74 (issue #32), not just logged.**
+> `SendAsync`/`SendToGroupAsync`'s headers overload calls `RequireHeaderEnvelopeSupport`
+> (`MeshClient.cs:549-558`), which throws `NotSupportedException` if this connection's negotiated
+> version is below `Protocol.HeaderEnvelopeMinVersion` — see [Sending headers](#sending-headers). This
+> resolves [known-issues.md](known-issues.md) KI-14 for the header envelope specifically; a future
+> capability gated the same way would need its own check.
 
 > **The client takes ownership of the transport** (`IMeshClient.cs` doc, `MeshClient.cs` cleanup paths):
 > it is disposed on disconnect or if the handshake fails. **The caller must not use or dispose the
@@ -101,7 +106,7 @@ is **also** what you get if the hub's authenticator threw, hung or was starved o
 client cannot tell those apart, so do not treat it as proof the credential itself was wrong. Retrying is
 reasonable; retrying in a tight loop is not.
 
-There is a subtle **synchronous-completion guard** (`MeshClient.cs:226-246`): if the hub has already
+There is a subtle **synchronous-completion guard** (`MeshClient.cs:228-248`): if the hub has already
 buffered a `Disconnect`, `ReceiveLoopAsync` can run to completion synchronously and a `Disconnected`
 handler may reconnect from within it, replacing `_cts`. The code only records `_receiveLoopTask` if
 `_cts` is still the one it created, so a stale synchronous loop never clobbers a newer connection.
@@ -109,34 +114,37 @@ Preserve this reference-equality check if you refactor connect.
 
 ### The receive loop
 
-`ReceiveLoopAsync` (`MeshClient.cs:655`) is the single reader. It:
+`ReceiveLoopAsync` (`MeshClient.cs:733`) is the single reader. It:
 - Sets `AsyncLocal<bool> _inReceiveLoop = true` so a `DisconnectAsync` invoked **from a handler** skips
   awaiting the loop (would deadlock) — see below.
-- Runs an optional **idle monitor** (`MonitorIdleAsync`, `MeshClient.cs:680`) on a `PeriodicTimer`,
+- Runs an optional **idle monitor** (`MonitorIdleAsync`, `MeshClient.cs:758`) on a `PeriodicTimer`,
   comparing an `activitySequence` counter between ticks; on a fully idle interval it cancels the loop's
   linked CTS, ending the connection as `ConnectionLost`.
 - Dispatches inbound frames: `DeliverMessage` → `MessageReceived`; `DeliverGroupMessage` →
-  `GroupMessageReceived`; `GroupJoinRefused` → removes the group from `_joinedGroups`, logs a `Warning`,
-  then raises `GroupJoinRefused` (`MeshClient.cs:777-802`); `ClientLookupResponse` → completes the
-  pending lookup (if correlation matches, `:803-824`); `Ping` → replies `Pong` (best-effort); `Disconnect`
-  → sets reason `RemoteDisconnect` and breaks.
+  `GroupMessageReceived`; `DeliverMessageWithHeaders`/`DeliverGroupMessageWithHeaders` (PR #74, issue #32)
+  → the same two events with `Headers` populated from a decoded `MessageHeaders`, via `TryReadHeaderBlock`
+  (`:1115-1127`, see [protocol.md](protocol.md#message-headers)); `GroupJoinRefused` → removes the group
+  from `_joinedGroups`, logs a `Warning`, then raises `GroupJoinRefused` (`MeshClient.cs:928-953`);
+  `ClientLookupResponse` → completes the pending lookup (if correlation matches, `:954-975`); `Ping` →
+  replies `Pong` (best-effort); `Disconnect` → sets reason `RemoteDisconnect` and breaks.
 - Wraps each handler invocation in `try/catch` and logs a throwing subscriber (callback boundary) so it
-  cannot halt delivery (`MeshClient.cs:735-748`, `:761-774`).
-- On termination (`finally`, `MeshClient.cs:859-883`): stops the idle monitor, **faults any pending
+  cannot halt delivery (`MeshClient.cs:813-826`, `:839-852`, and identically around each of the two new
+  header-bearing branches).
+- On termination (`finally`, `MeshClient.cs:1010-1034`): stops the idle monitor, **faults any pending
   lookup** with `InvalidOperationException` so a caller on a non-cancellable token is not left hanging
   and `_lookupLock` is released, then calls `HandleReceiveLoopTerminationAsync`.
 
-`HandleReceiveLoopTerminationAsync` (`MeshClient.cs:895`) decides whether the ending raises
+`HandleReceiveLoopTerminationAsync` (`MeshClient.cs:1046`) decides whether the ending raises
 `Disconnected`. There are **two** gates and both must pass:
 
-1. **The entry gate** (`MeshClient.cs:897-908`). Under `_stateLock`, the teardown claims the connection
+1. **The entry gate** (`MeshClient.cs:1048-1059`). Under `_stateLock`, the teardown claims the connection
    by moving `Connected` → `Disconnecting`. If the state was anything other than `Connected`, a local
    `DisconnectAsync` already owns the teardown, so the loop returns immediately and stays silent.
-2. **The claim gate** (`MeshClient.cs:920-940`). After `CleanUpAsync`, the loop reads
+2. **The claim gate** (`MeshClient.cs:1071-1091`). After `CleanUpAsync`, the loop reads
    `_localDisconnectRequested` into a local `raiseDisconnected` **in the same locked block that
-   publishes `_state = ConnectionState.Disconnected`** (`MeshClient.cs:922-933`). If a `DisconnectAsync`
+   publishes `_state = ConnectionState.Disconnected`** (`MeshClient.cs:1073-1084`). If a `DisconnectAsync`
    claimed the teardown while it was in flight, the loop logs at Debug and returns without raising
-   (`MeshClient.cs:935-940`).
+   (`MeshClient.cs:1086-1091`).
 
 Gate 1 alone used to be the whole mechanism, and it was **not sufficient**. If the receive loop won the
 race out of `Connected`, a concurrent `DisconnectAsync` found the client already `Disconnecting`,
@@ -168,7 +176,7 @@ deliberately left open — see [known-issues.md](known-issues.md) KI-21.
 - **Does not fire for a local `DisconnectAsync`** — including one that races a remote drop. Whichever
   side tears the connection down, an application-requested disconnect stays silent: `DisconnectAsync`
   either performs the teardown itself or claims the one already in flight (see the claim protocol
-  above). The interface XML docs state this contract (`IMeshClient.cs:70-83`, `:198-208`).
+  above). The interface XML docs state this contract (`IMeshClient.cs:70-83`, `:249-259`).
   - **The one exception** is a narrow residual window: a `DisconnectAsync` arriving *after* the teardown
     has published the disconnected state has nothing left to claim, and the event fires. Read
     [known-issues.md](known-issues.md) KI-21 before you rely on the suppression being absolute.
@@ -184,22 +192,22 @@ deliberately left open — see [known-issues.md](known-issues.md) KI-21.
 
 ### Group membership — optimistic, and revocable by the hub
 
-`JoinGroupAsync` (`MeshClient.cs:401`) is **fire-and-forget with an optimistic local record**. The order
+`JoinGroupAsync` (`MeshClient.cs:433`) is **fire-and-forget with an optimistic local record**. The order
 of operations changed in PR #66 and the new order is load-bearing:
 
-1. Validate the name and grab the connected transport (`MeshClient.cs:403-405`) — both *before* anything
+1. Validate the name and grab the connected transport (`MeshClient.cs:435-437`) — both *before* anything
    is recorded, so a rejected call leaves no trace.
-2. **Record the membership in `_joinedGroups`, then send the frame** (`:411-415`). Not the other way
+2. **Record the membership in `_joinedGroups`, then send the frame** (`:443-447`). Not the other way
    round: the hub may refuse, and its `GroupJoinRefused` can arrive and be handled by the receive loop
    **before this method resumes**. Recording afterwards would reinstate the very group the refusal had
    just removed.
 3. If the send throws, take the record back — **but only if this call is what added it** (`recorded`,
-   `:414`, rollback at `:429-435`). A join of a group already joined, or one racing a concurrent join of
+   `:446`, rollback at `:461-467`). A join of a group already joined, or one racing a concurrent join of
    the same name, must not roll back a record its predecessor owns; the group would then be missing from
    `JoinedGroups` while the client is still in it on the hub, and `MeshClientReconnector` — which
    restores from that snapshot — would silently not restore it.
 
-`LeaveGroupAsync` (`:442`) keeps the opposite order: send first, then remove locally (`:448-454`).
+`LeaveGroupAsync` (`:474`) keeps the opposite order: send first, then remove locally (`:480-486`).
 
 **What the return value means.** `JoinGroupAsync` returning means *the request was sent*, not that you
 are a member. A hub with a `GroupAuthoriser` may refuse. Applications that depend on membership must
@@ -214,7 +222,7 @@ await client.JoinGroupAsync("engineering");
 ```
 
 On a refusal the receive loop removes the group from `_joinedGroups` **first**, then logs, then raises
-the event (`MeshClient.cs:777-802`) — so `JoinedGroups` never claims a membership the hub has denied,
+the event (`MeshClient.cs:928-953`) — so `JoinedGroups` never claims a membership the hub has denied,
 and a later disconnect does not hand the group to the reconnector to restore. The refusal is **not**
 retried by anything in the library; a handler that wants to try again must ask again itself.
 
@@ -222,19 +230,56 @@ retried by anything in the library; a handler that wants to try again must ask a
 > later join legitimately obtained. The divergence is fail-safe — the client under-reports while the hub
 > keeps the member — but it is real. [known-issues.md](known-issues.md) KI-27.
 
-Note the client logs the refused group name **unclipped** (`MeshClient.cs:791`), unlike the hub, which
+Note the client logs the refused group name **unclipped** (`MeshClient.cs:942`), unlike the hub, which
 clips to 64 characters. The name came from your own hub, so this is not the same exposure, but it is
 worth knowing if you parse client logs.
 
+<a id="sending-headers"></a>
+
+### Sending headers
+
+PR #74 (issue #32) added a `MessageHeaders` overload to both `SendAsync` and `SendToGroupAsync` — a
+small, string-keyed, immutable bag of metadata (correlation id, content-type hint, trace context, and
+the like) that travels alongside the payload without the hub ever decoding it. Full wire-format
+write-up: [protocol.md](protocol.md#message-headers).
+
+```csharp
+var headers = new MessageHeaders(new Dictionary<string, string> { ["correlationId"] = "abc123" });
+await client.SendAsync(recipientId, payload, headers);
+```
+
+- **The plain `SendAsync(recipientId, message, cancellationToken)` overload still exists** and is now a
+  one-line forward to the headers overload with `MessageHeaders.Empty` (`MeshClient.cs:355-361`) — existing
+  call sites need no change, and an empty `MessageHeaders` produces the exact same bytes on the wire as
+  before (no header block is written at all when `headers.Count == 0`).
+- **A non-empty `MessageHeaders` requires a connection negotiated at `Protocol.HeaderEnvelopeMinVersion`
+  (`5`) or above.** Below that, both `SendAsync` and `SendToGroupAsync` throw `NotSupportedException`
+  (`RequireHeaderEnvelopeSupport`, `MeshClient.cs:549-558`) rather than silently sending the message
+  without its headers — a caller that assumes headers arrived when the hub actually stripped them (or
+  never received them) would be a much harder bug to find than an eagerly-thrown exception.
+- **`MessageHeaders`'s public constructor copies its input into a fresh `Dictionary<string, string>` using
+  `StringComparer.Ordinal`** — key lookups are case-sensitive, and passing an enumerable with a duplicate
+  key **throws `ArgumentException`** rather than silently keeping the last value, unlike an object
+  initializer or a plain `Dictionary` indexer assignment. See
+  [known-issues.md](known-issues.md) KI-34.
+- **`GetEncodedLength` throws `ArgumentException` for an oversized header set** (aggregate encoded length
+  over 65 535 bytes, or any single key over 255 UTF-8 bytes / value over 65 535 UTF-8 bytes) — this
+  surfaces synchronously from `SendAsync`/`SendToGroupAsync` itself, before anything is written to the
+  wire, so it is a caller bug to handle, not a delivery failure.
+- **On receipt**, `MessageReceivedEventArgs.Headers`/`GroupMessageReceivedEventArgs.Headers` default to
+  `MessageHeaders.Empty` — check `Headers.Count` or use `TryGetValue` rather than assuming a particular
+  key is present, since the sender controls what it attaches (or an older/degraded peer may have had its
+  header block stripped in transit by the hub — see [hub.md](hub.md#routing-helpers)).
+
 ### `GetClientIdByNameAsync` — the correlated lookup
 
-`MeshClient.cs:573`. Serialised by `_lookupLock` (`SemaphoreSlim(1,1)`): **one lookup in flight at a
+`MeshClient.cs:651`. Serialised by `_lookupLock` (`SemaphoreSlim(1,1)`): **one lookup in flight at a
 time per client**; concurrent callers queue. Each request carries a 4-byte correlation id (`unchecked`
-increment, `:38-39`, `:593`). A single-slot `_pendingLookup` (`PendingLookup(correlationId,
-TaskCompletionSource<Guid?>)`, declared at `:961`, assigned at `:595`) is completed by the receive loop
-**only when the ids match** (`:803-824`) — so a late response from a cancelled lookup cannot resolve a
+increment, `:38-39`, `:671`). A single-slot `_pendingLookup` (`PendingLookup(correlationId,
+TaskCompletionSource<Guid?>)`, declared at `:1137`, assigned at `:673`) is completed by the receive loop
+**only when the ids match** (`:954-975`) — so a late response from a cancelled lookup cannot resolve a
 subsequent one. Returns `null` when the hub reports "not found". Cancelling via the token abandons the
-wait; the `finally` clears `_pendingLookup` and releases the lock (`:606-618`).
+wait; the `finally` clears `_pendingLookup` and releases the lock (`:684-696`).
 
 ### Threading & idempotency
 
@@ -242,7 +287,7 @@ wait; the `finally` clears `_pendingLookup` and releases the lock (`:606-618`).
   `_groupMembershipLock` guards `_joinedGroups`. `_lookupLock` serialises lookups.
 - `DisconnectAsync` and `DisposeAsync` are safe to call when not connected (early return). Note that
   `DisconnectAsync`'s early return is not *quite* inert: in the `Disconnecting` state it claims the
-  in-flight teardown (`MeshClient.cs:297-300`). It is still idempotent and side-effect-free from the
+  in-flight teardown (`MeshClient.cs:299-302`). It is still idempotent and side-effect-free from the
   caller's point of view.
 - Send methods snapshot the transport under `_stateLock`, then release it before the `await SendAsync`
   — so a slow send does not hold the state lock.

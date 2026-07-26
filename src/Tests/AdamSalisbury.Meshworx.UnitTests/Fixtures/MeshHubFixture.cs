@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using System.Threading.Channels;
+using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -77,6 +78,41 @@ internal sealed class MeshHubFixture
         payload[0] = 0x02; // SendMessage
         recipientId.TryWriteBytes(payload.AsSpan(1));
         message.CopyTo(payload, 17);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a SendMessageWithHeaders frame:
+    /// [type][recipient id (16)][headerBlockLength(2)][headerBlock][message].
+    /// </summary>
+    public static byte[] CreateDirectMessageWithHeaders(Guid recipientId, MessageHeaders headers, byte[] message)
+    {
+        int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+        var payload = new byte[1 + 16 + 2 + headerLength + message.Length];
+        payload[0] = 0x11; // SendMessageWithHeaders
+        recipientId.TryWriteBytes(payload.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(17, 2), (ushort)headerLength);
+        HeaderEnvelope.Write(headers, payload.AsSpan(19, headerLength));
+        message.CopyTo(payload, 19 + headerLength);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a GroupMessageWithHeaders frame: [type][name length (2, big-endian)][UTF-8 group name]
+    /// [headerBlockLength(2)][headerBlock][message].
+    /// </summary>
+    public static byte[] CreateGroupMessageWithHeaders(string groupName, MessageHeaders headers, byte[] message)
+    {
+        byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
+        int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+        int headerLengthOffset = 3 + nameBytes.Length;
+        var payload = new byte[headerLengthOffset + 2 + headerLength + message.Length];
+        payload[0] = 0x13; // GroupMessageWithHeaders
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(payload, 3);
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(headerLengthOffset, 2), (ushort)headerLength);
+        HeaderEnvelope.Write(headers, payload.AsSpan(headerLengthOffset + 2, headerLength));
+        message.CopyTo(payload, headerLengthOffset + 2 + headerLength);
         return payload;
     }
 
@@ -157,14 +193,17 @@ internal sealed class MeshHubFixture
     }
 
     public async Task<RegisteredClient> RegisterClientAsync(
-        string name = "TestClient", IPEndPoint? remoteEndPoint = null)
+        string name = "TestClient",
+        IPEndPoint? remoteEndPoint = null,
+        byte versionMin = 0x04,
+        byte versionMax = 0x04)
     {
         var transport = CreateMockTransport(remoteEndPoint);
         var registrationCompleteTcs = new TaskCompletionSource<byte[]>();
         var disconnectTcs = new TaskCompletionSource<byte[]?>();
 
         transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
-            .ReturnsAsync(CreateRegistrationRequest(name))
+            .ReturnsAsync(CreateRegistrationRequest(name, versionMin: versionMin, versionMax: versionMax))
             .Returns(disconnectTcs.Task);
 
         transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
@@ -184,14 +223,16 @@ internal sealed class MeshHubFixture
         return new RegisteredClient(clientId, transport, disconnectTcs, responseData);
     }
 
-    public async Task<MultiMessageRegisteredClient> RegisterMultiMessageClientAsync(string name = "TestClient")
+    public async Task<MultiMessageRegisteredClient> RegisterMultiMessageClientAsync(
+        string name = "TestClient", byte versionMin = 0x04, byte versionMax = 0x04)
     {
         var transport = CreateMockTransport();
         var registrationCompleteTcs = new TaskCompletionSource<byte[]>();
         var messageChannel = Channel.CreateUnbounded<byte[]?>();
 
         // Queue the registration request as the first message.
-        await messageChannel.Writer.WriteAsync(CreateRegistrationRequest(name)).ConfigureAwait(false);
+        await messageChannel.Writer.WriteAsync(
+            CreateRegistrationRequest(name, versionMin: versionMin, versionMax: versionMax)).ConfigureAwait(false);
 
         transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
             .Returns<CancellationToken>(async ct => await messageChannel.Reader.ReadAsync(ct).ConfigureAwait(false));
@@ -300,6 +341,11 @@ internal sealed class RegisteredClient(
     public Mock<ITransport> Transport { get; } = transport;
     public TaskCompletionSource<byte[]?> DisconnectTcs { get; } = disconnectTcs;
     public byte[] RegistrationResponse { get; } = registrationResponse;
+
+    /// <summary>
+    /// The protocol version the hub echoed back in <see cref="RegistrationResponse"/>.
+    /// </summary>
+    public byte NegotiatedProtocolVersion => RegistrationResponse[17];
 
     public void Disconnect() => DisconnectTcs.TrySetResult(null);
 }

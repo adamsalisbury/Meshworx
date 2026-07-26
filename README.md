@@ -98,6 +98,14 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
   group requires membership of it**: the hub drops a group message from a client that has not joined.
   Who may join is the hub's decision — see [Security](#security) for the authorisation seam; without
   one, any client may join any group.
+- **Message headers.** `SendAsync(recipientId, payload, headers)` and
+  `SendToGroupAsync(name, payload, headers)` accept a `MessageHeaders` — a small, string-keyed bag of
+  metadata (a correlation id, a content-type hint, and the like) that travels alongside the payload
+  without the hub ever inspecting it. `MessageReceivedEventArgs.Headers` and
+  `GroupMessageReceivedEventArgs.Headers` expose what the sender attached, defaulting to
+  `MessageHeaders.Empty` when there were none. Requires both ends to have negotiated protocol version
+  5 or higher — see [Wire protocol](#wire-protocol) for the frame layout and the fallback behaviour
+  when a group has members on different negotiated versions.
 - **Disconnect.** Calling `DisconnectAsync` is graceful and does not raise `Disconnected`. The
   `Disconnected` event fires only for unexpected endings — the hub closing the connection
   (`RemoteDisconnect`) or the transport failing (`ConnectionLost`). After it fires the client
@@ -403,20 +411,29 @@ The TCP transport frames every message as a **4-byte big-endian length prefix** 
 payload (maximum 1 MiB). The first payload byte is the message type. Enabling TLS does not change
 any of this — the same frames simply travel inside the TLS record layer.
 
-Protocol version: **3**.
+Protocol version: negotiated between **4** (minimum) and **5** (maximum). Registration advertises a
+range rather than a single value — `[versionMin, versionMax]` — and the hub picks the highest version
+common to its own supported range and the client's, so a newer client connecting to an older hub (or
+vice versa) negotiates down instead of being refused outright. Only the shared feature set of the
+negotiated version is guaranteed to work; `IMeshClient.NegotiatedProtocolVersion` reports what was
+agreed for the current connection.
 
 | Type | Byte | Direction | Payload after the type byte |
 |---|---|---|---|
-| `RegistrationRequest` | `0x04` | client → hub | version (1 byte), name length (2 bytes, big-endian), UTF-8 name, opaque credential (remaining bytes) |
-| `RegistrationComplete` | `0x01` | hub → client | assigned client id (16 bytes) |
+| `RegistrationRequest` | `0x04` | client → hub | version min (1 byte), version max (1 byte), name length (2 bytes, big-endian), UTF-8 name, opaque credential (remaining bytes) |
+| `RegistrationComplete` | `0x01` | hub → client | assigned client id (16 bytes), negotiated version (1 byte) |
 | `Error` | `0x05` | hub → client | registration error code (1 byte) |
 | `SendMessage` | `0x02` | client → hub | recipient id (16 bytes), message bytes |
+| `SendMessageWithHeaders` | `0x11` | client → hub | recipient id (16 bytes), header-block length (2 bytes, big-endian), header block, message bytes |
 | `BroadcastMessage` | `0x0B` | client → hub | message bytes |
 | `JoinGroup` | `0x0C` | client → hub | UTF-8 group name |
 | `LeaveGroup` | `0x0D` | client → hub | UTF-8 group name |
 | `GroupMessage` | `0x0E` | client → hub | group-name length (2 bytes, big-endian), UTF-8 group name, message bytes |
+| `GroupMessageWithHeaders` | `0x13` | client → hub | group-name length (2 bytes, big-endian), UTF-8 group name, header-block length (2 bytes, big-endian), header block, message bytes |
 | `DeliverMessage` | `0x03` | hub → client | sender id (16 bytes), message bytes |
+| `DeliverMessageWithHeaders` | `0x12` | hub → client | sender id (16 bytes), header-block length (2 bytes, big-endian), header block, message bytes |
 | `DeliverGroupMessage` | `0x0F` | hub → client | sender id (16 bytes), group-name length (2 bytes, big-endian), UTF-8 group name, message bytes |
+| `DeliverGroupMessageWithHeaders` | `0x14` | hub → client | sender id (16 bytes), group-name length (2 bytes, big-endian), UTF-8 group name, header-block length (2 bytes, big-endian), header block, message bytes |
 | `GroupJoinRefused` | `0x10` | hub → client | UTF-8 group name |
 | `ClientLookupRequest` | `0x06` | client → hub | correlation id (4 bytes, big-endian), UTF-8 name |
 | `ClientLookupResponse` | `0x07` | hub → client | correlation id (4 bytes), found flag (1 byte), id (16 bytes if found) |
@@ -424,11 +441,35 @@ Protocol version: **3**.
 | `Ping` | `0x09` | hub → client | none |
 | `Pong` | `0x0A` | client → hub | none |
 
-`GroupJoinRefused` is an addition within version 3 rather than a new protocol version: it travels only
-from hub to client, and a client that does not recognise it ignores it, so it changes nothing for a peer
-that never sees one. A hub drops a `GroupMessage` from a client that is not a member of the target group,
-and does so silently — a correct client only sends to groups it has joined, and it learns of a refused
-join from `GroupJoinRefused`.
+`GroupJoinRefused` is an addition within an existing protocol version rather than a new one: it travels
+only from hub to client, and a client that does not recognise it ignores it, so it changes nothing for a
+peer that never sees one. A hub drops a `GroupMessage` from a client that is not a member of the target
+group, and does so silently — a correct client only sends to groups it has joined, and it learns of a
+refused join from `GroupJoinRefused`.
+
+### Header block format
+
+A header block (used by `SendMessageWithHeaders`, `DeliverMessageWithHeaders`,
+`GroupMessageWithHeaders` and `DeliverGroupMessageWithHeaders`) is a flat, back-to-back run of entries
+— `[keyLength(1 byte)][UTF-8 key][valueLength(2 bytes, big-endian)][UTF-8 value]` — read until exactly
+as many bytes as the preceding block-length field declared have been consumed. There is no entry count:
+the block's own length is the only thing bounding it. A key longer than 255 bytes once UTF-8 encoded,
+or a value longer than 65535 bytes, cannot be represented.
+
+Headers exist so cross-cutting metadata (a correlation id, a content-type hint, trace context, and the
+like) can travel with a message without the hub ever parsing the message body: the hub reads only the
+header block's length, never its contents, and forwards the body untouched. A message with no headers
+uses the plain frame (`SendMessage`/`DeliverMessage`/`GroupMessage`/`DeliverGroupMessage`) exactly as
+before, so it costs nothing extra on the wire — the header-bearing opcodes and their length-prefixed
+block are only ever used when there is at least one header to carry.
+
+Headers require both ends of a connection to have negotiated protocol version 5 or higher. On a
+connection negotiated below that, `MeshClient.SendAsync`/`SendToGroupAsync` throw
+`NotSupportedException` if called with a non-empty `MessageHeaders` rather than silently dropping them.
+For a group message, each member's own negotiated version decides what it receives: a member on version
+5 or higher gets the header-bearing frame with the header block intact, while a member still on an
+older version gets the plain frame with the header block stripped, since it would not recognise the
+header-bearing opcode.
 
 Registration error codes (`RegistrationErrorCode`): `DuplicateClientName` (`0x01`),
 `UnsupportedProtocolVersion` (`0x02`), `ClientNameTooLong` (`0x03`), `HubAtCapacity` (`0x04`),

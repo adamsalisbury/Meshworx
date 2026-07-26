@@ -970,7 +970,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 return;
             }
 
-            connection = new ClientConnection(clientId, clientName, transport);
+            connection = new ClientConnection(clientId, clientName, transport, negotiatedVersion);
             _clients.TryAdd(clientId, connection);
             _connectedClientsCounter.Add(1);
 
@@ -1020,6 +1020,20 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
                     RouteMessage(clientId, recipientId, messageData);
                 }
+                else if (data.Length >= 19
+                    && (MessageType)data[0] == MessageType.SendMessageWithHeaders)
+                {
+                    var recipientId = new Guid(data.AsSpan(1, 16));
+                    int headerBlockLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(17, 2));
+
+                    if (data.Length >= 19 + headerBlockLength)
+                    {
+                        ReadOnlyMemory<byte> headerBlock = data.AsMemory(19, headerBlockLength);
+                        ReadOnlyMemory<byte> body = data.AsMemory(19 + headerBlockLength);
+
+                        RouteMessageWithHeaders(clientId, recipientId, headerBlock, body);
+                    }
+                }
                 else if ((MessageType)data[0] == MessageType.BroadcastMessage)
                 {
                     BroadcastMessage(clientId, data.AsMemory(1));
@@ -1051,6 +1065,33 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                             groupName,
                             data.AsMemory(3, nameLength),
                             data.AsMemory(3 + nameLength));
+                    }
+                }
+                else if (data.Length >= 5
+                    && (MessageType)data[0] == MessageType.GroupMessageWithHeaders)
+                {
+                    int nameLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(1, 2));
+                    int headerLengthOffset = 3 + nameLength;
+
+                    if (data.Length >= headerLengthOffset + 2)
+                    {
+                        int headerBlockLength = BinaryPrimitives.ReadUInt16BigEndian(
+                            data.AsSpan(headerLengthOffset, 2));
+                        int bodyOffset = headerLengthOffset + 2 + headerBlockLength;
+
+                        if (data.Length >= bodyOffset)
+                        {
+                            string groupName = Encoding.UTF8.GetString(data.AsSpan(3, nameLength));
+                            ReadOnlyMemory<byte> headerBlock = data.AsMemory(headerLengthOffset + 2, headerBlockLength);
+                            ReadOnlyMemory<byte> body = data.AsMemory(bodyOffset);
+
+                            SendToGroupWithHeaders(
+                                clientId,
+                                groupName,
+                                data.AsMemory(3, nameLength),
+                                headerBlock,
+                                body);
+                        }
                     }
                 }
                 else if (data.Length >= 5
@@ -1447,8 +1488,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             // Expected during shutdown.
         }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or ArgumentException)
         {
+            // ArgumentException here means a transport (TcpTransport, notably) rejected a delivery
+            // frame as oversized — the routing methods above can grow a near-maximum-size inbound
+            // payload past the transport's cap by adding the sender id, group name and, for a
+            // header-bearing frame, the header block. Left uncaught, this would fault the task that
+            // HandleClientAsync's own cleanup awaits from inside its finally block, aborting that
+            // finally partway through and skipping the slot release, name removal, group removal and
+            // disposal that follow it — leaking the client's registration permanently rather than
+            // merely losing the one oversized message. Treating it exactly like a transport fault, by
+            // cancelling the client here instead of letting it propagate, keeps that cleanup intact.
             _logger.LogWarning(
                 ex,
                 "Send loop for client {ClientId} terminated due to transport error",
@@ -1543,6 +1593,76 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         // reconcile.
         _messagesRoutedCounter.Add(1, DirectDirectionTag);
         _bytesRoutedCounter.Add(messageData.Length, DirectDirectionTag);
+    }
+
+    /// <summary>
+    /// Routes a header-bearing direct message to its recipient, choosing the outgoing frame shape from
+    /// that recipient's own negotiated protocol version.
+    /// </summary>
+    /// <remarks>
+    /// The header block is never decoded here — the hub reads only its length so it can either forward
+    /// it unchanged to a recipient that understands <see cref="MessageType.DeliverMessageWithHeaders"/>,
+    /// or strip it entirely and fall back to the plain <see cref="MessageType.DeliverMessage"/> frame for
+    /// a recipient negotiated below <see cref="Protocol.HeaderEnvelopeMinVersion"/>, which could not parse
+    /// a header block it does not recognise the opcode for.
+    /// </remarks>
+    private void RouteMessageWithHeaders(
+        Guid senderId, Guid recipientId, ReadOnlyMemory<byte> headerBlock, ReadOnlyMemory<byte> body)
+    {
+        if (!_clients.TryGetValue(recipientId, out ClientConnection? recipient))
+        {
+            _logger.LogDebug(
+                "Message from {SenderId} dropped: recipient {RecipientId} not found",
+                senderId,
+                recipientId);
+            _messagesDroppedCounter.Add(1, UnknownRecipientDropTag);
+            return;
+        }
+
+        byte[] deliveryPayload = recipient.NegotiatedProtocolVersion >= Protocol.HeaderEnvelopeMinVersion
+            ? BuildDeliverMessageWithHeaders(senderId, headerBlock, body)
+            : BuildDeliverMessage(senderId, body);
+
+        if (!recipient.OutboundQueue.Writer.TryWrite(deliveryPayload))
+        {
+            _logger.LogWarning(
+                "Outbound queue for {RecipientId} is full, message from {SenderId} dropped",
+                recipientId,
+                senderId);
+            _messagesDroppedCounter.Add(1, QueueFullDropTag);
+            return;
+        }
+
+        _messagesRoutedCounter.Add(1, DirectDirectionTag);
+        _bytesRoutedCounter.Add(body.Length, DirectDirectionTag);
+    }
+
+    /// <summary>
+    /// Builds a plain <see cref="MessageType.DeliverMessage"/> frame: <c>[type][senderId(16)][body]</c>.
+    /// </summary>
+    private static byte[] BuildDeliverMessage(Guid senderId, ReadOnlyMemory<byte> body)
+    {
+        var frame = new byte[1 + 16 + body.Length];
+        frame[0] = (byte)MessageType.DeliverMessage;
+        senderId.TryWriteBytes(frame.AsSpan(1));
+        body.CopyTo(frame.AsMemory(17));
+        return frame;
+    }
+
+    /// <summary>
+    /// Builds a <see cref="MessageType.DeliverMessageWithHeaders"/> frame:
+    /// <c>[type][senderId(16)][headerBlockLength(2)][headerBlock][body]</c>.
+    /// </summary>
+    private static byte[] BuildDeliverMessageWithHeaders(
+        Guid senderId, ReadOnlyMemory<byte> headerBlock, ReadOnlyMemory<byte> body)
+    {
+        var frame = new byte[1 + 16 + 2 + headerBlock.Length + body.Length];
+        frame[0] = (byte)MessageType.DeliverMessageWithHeaders;
+        senderId.TryWriteBytes(frame.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(17, 2), (ushort)headerBlock.Length);
+        headerBlock.CopyTo(frame.AsMemory(19));
+        body.CopyTo(frame.AsMemory(19 + headerBlock.Length));
+        return frame;
     }
 
     private void BroadcastMessage(Guid senderId, ReadOnlyMemory<byte> messageData)
@@ -1922,6 +2042,128 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Fans a header-bearing group message out to every other member, mirroring <see cref="SendToGroup"/>.
+    /// </summary>
+    /// <remarks>
+    /// Two shared frames are built at most — one with the header block, one without — regardless of how
+    /// many members the group has, and each recipient's outbound queue is given whichever shape its own
+    /// negotiated protocol version can understand. A recipient negotiated below
+    /// <see cref="Protocol.HeaderEnvelopeMinVersion"/> gets the header-stripped frame rather than one
+    /// carrying an opcode it does not recognise. Neither frame is built at all if no member can use it.
+    /// </remarks>
+    private void SendToGroupWithHeaders(
+        Guid senderId,
+        string groupName,
+        ReadOnlyMemory<byte> groupNameBytes,
+        ReadOnlyMemory<byte> headerBlock,
+        ReadOnlyMemory<byte> body)
+    {
+        if (!_groups.TryGetValue(groupName, out Group? group))
+        {
+            return;
+        }
+
+        Guid[]? recipients = null;
+        lock (group.Lock)
+        {
+            if (group.Members.Contains(senderId))
+            {
+                recipients = new Guid[group.Members.Count];
+                group.Members.CopyTo(recipients);
+            }
+        }
+
+        if (recipients is null)
+        {
+            _logger.LogDebug(
+                "Group message from {SenderId} to group {GroupName} dropped: the sender is not a member",
+                senderId,
+                ForLog(groupName));
+            return;
+        }
+
+        if (recipients.Length == 1 && recipients[0] == senderId)
+        {
+            // The sender is the only member; nothing to deliver and no frame to build.
+            return;
+        }
+
+        _messagesRoutedCounter.Add(1, GroupDirectionTag);
+        _bytesRoutedCounter.Add(body.Length, GroupDirectionTag);
+
+        byte[]? withHeadersFrame = null;
+        byte[]? strippedFrame = null;
+
+        foreach (Guid recipientId in recipients)
+        {
+            if (recipientId == senderId)
+            {
+                // A group message is not echoed back to its sender.
+                continue;
+            }
+
+            if (!_clients.TryGetValue(recipientId, out ClientConnection? recipient))
+            {
+                continue;
+            }
+
+            byte[] deliveryPayload = recipient.NegotiatedProtocolVersion >= Protocol.HeaderEnvelopeMinVersion
+                ? withHeadersFrame ??= BuildDeliverGroupMessageWithHeaders(senderId, groupNameBytes, headerBlock, body)
+                : strippedFrame ??= BuildDeliverGroupMessage(senderId, groupNameBytes, body);
+
+            if (!recipient.OutboundQueue.Writer.TryWrite(deliveryPayload))
+            {
+                _logger.LogWarning(
+                    "Outbound queue for {RecipientId} is full, group message from {SenderId} dropped",
+                    recipientId,
+                    senderId);
+                _messagesDroppedCounter.Add(1, QueueFullDropTag);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds a plain <see cref="MessageType.DeliverGroupMessage"/> frame:
+    /// <c>[type][senderId(16)][groupNameLength(2)][groupName][body]</c>.
+    /// </summary>
+    private static byte[] BuildDeliverGroupMessage(
+        Guid senderId, ReadOnlyMemory<byte> groupNameBytes, ReadOnlyMemory<byte> body)
+    {
+        int nameLength = groupNameBytes.Length;
+        var frame = new byte[1 + 16 + 2 + nameLength + body.Length];
+        frame[0] = (byte)MessageType.DeliverGroupMessage;
+        senderId.TryWriteBytes(frame.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(17, 2), (ushort)nameLength);
+        groupNameBytes.Span.CopyTo(frame.AsSpan(19));
+        body.CopyTo(frame.AsMemory(19 + nameLength));
+        return frame;
+    }
+
+    /// <summary>
+    /// Builds a <see cref="MessageType.DeliverGroupMessageWithHeaders"/> frame:
+    /// <c>[type][senderId(16)][groupNameLength(2)][groupName][headerBlockLength(2)][headerBlock][body]</c>.
+    /// </summary>
+    private static byte[] BuildDeliverGroupMessageWithHeaders(
+        Guid senderId,
+        ReadOnlyMemory<byte> groupNameBytes,
+        ReadOnlyMemory<byte> headerBlock,
+        ReadOnlyMemory<byte> body)
+    {
+        int nameLength = groupNameBytes.Length;
+        var frame = new byte[1 + 16 + 2 + nameLength + 2 + headerBlock.Length + body.Length];
+        frame[0] = (byte)MessageType.DeliverGroupMessageWithHeaders;
+        senderId.TryWriteBytes(frame.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(17, 2), (ushort)nameLength);
+        groupNameBytes.Span.CopyTo(frame.AsSpan(19));
+
+        int headerLengthOffset = 19 + nameLength;
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(headerLengthOffset, 2), (ushort)headerBlock.Length);
+        headerBlock.CopyTo(frame.AsMemory(headerLengthOffset + 2));
+        body.CopyTo(frame.AsMemory(headerLengthOffset + 2 + headerBlock.Length));
+        return frame;
+    }
+
     // A single group's membership, guarded by its own lock. Removed is set true under Lock when the
     // group is taken out of _groups so a concurrent join that already fetched this instance retries
     // against a fresh one rather than resurrecting a dead group.
@@ -1932,7 +2174,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         public bool Removed { get; set; }
     }
 
-    private sealed class ClientConnection(Guid id, string name, ITransport transport) : IAsyncDisposable
+    private sealed class ClientConnection(Guid id, string name, ITransport transport, byte negotiatedProtocolVersion)
+        : IAsyncDisposable
     {
         // Internal rather than private so MeshHub.OutboundQueueCapacityForTesting can expose it to a
         // test — a private member of a nested type is not accessible from its enclosing type in C#.
@@ -1943,6 +2186,13 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         public Guid Id { get; } = id;
         public string Name { get; } = name;
         public ITransport Transport { get; } = transport;
+
+        /// <summary>
+        /// The protocol version negotiated with this client during registration. Used to decide whether
+        /// a header-bearing delivery frame can be forwarded to it unchanged, or must have its header
+        /// block stripped because this connection predates <see cref="Protocol.HeaderEnvelopeMinVersion"/>.
+        /// </summary>
+        public byte NegotiatedProtocolVersion { get; } = negotiatedProtocolVersion;
 
         /// <summary>
         /// A monotonically increasing counter bumped once for every frame received from the client.

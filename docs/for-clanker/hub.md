@@ -48,7 +48,7 @@ optional and applies with or without an authoriser: sending to a group requires 
 - **The hub owns the listener** — `DisposeAsync` disposes it. Do not dispose the listener yourself.
 - `ClientConnected` / `ClientDisconnected` fire **from the per-client handler task**, so they run
   **concurrently for different clients**. Handlers must be thread-safe. A throwing handler is caught and
-  logged (`RaiseClientEvent`, `MeshHub.cs:1377-1397`) — it will not fault the hub. That catch covers the
+  logged (`RaiseClientEvent`, `MeshHub.cs:1418-1438`) — it will not fault the hub. That catch covers the
   handler only up to its **first suspension**: an `async void` handler's later exception escapes to the
   thread pool unobserved, so keep handlers synchronous or contain the failure inside the task you start
   (see [for-clanker.md](../for-clanker.md#4-threading--async-model-read-before-changing-any-loop) and the
@@ -99,8 +99,8 @@ optional and applies with or without an authoriser: sending to a group requires 
   the atomic "claim this name" operation (`MeshHub.cs:966`).
 - `int _reservedClientSlots` (`MeshHub.cs:99`) — **the counter `maxClients` is actually enforced
   against**, not `_clients.Count`. A slot is claimed by one atomic compare-and-swap
-  (`TryReserveClientSlot`, `MeshHub.cs:1188`) during registration and given back by `ReleaseClientSlot`
-  (`:1217`) in the handler's `finally`. Read it with `Volatile.Read`; never write it directly. Shutdown
+  (`TryReserveClientSlot`, `MeshHub.cs:1229`) during registration and given back by `ReleaseClientSlot`
+  (`:1258`) in the handler's `finally`. Read it with `Volatile.Read`; never write it directly. Shutdown
   deliberately does **not** reset it — each still-running handler owns its own claim and returns it
   itself. See [Registration handshake](#registration-handshake-hub-side) and
   [known-issues.md](known-issues.md) KI-26.
@@ -120,9 +120,14 @@ optional and applies with or without an authoriser: sending to a group requires 
   seam. The semaphore is **only allocated when an authenticator was supplied** (`MeshHub.cs:288-292`),
   so an unauthenticated hub does no extra work and allocates nothing.
 
-`ClientConnection` (nested, `MeshHub.cs:1935`) holds the id, name, transport, a bounded outbound
+`ClientConnection` (nested, `MeshHub.cs:2177`) holds the id, name, transport, a bounded outbound
 `Channel<byte[]>` (capacity **1024**, single-reader/multi-writer), an `ActivitySequence` counter
-(`Interlocked`-incremented per received frame), and the `HashSet<string> Groups` it has joined.
+(`Interlocked`-incremented per received frame), the `HashSet<string> Groups` it has joined, and — since
+PR #74 (issue #32) — its own `NegotiatedProtocolVersion` (`byte`, captured once as a constructor
+parameter at registration, immutable thereafter). This is what closes the gap
+[known-issues.md](known-issues.md) KI-14 used to describe: `RouteMessageWithHeaders`/
+`SendToGroupWithHeaders` read it per-recipient to pick the outgoing frame shape — see
+[Routing helpers](#routing-helpers).
 
 <a id="lifecycle"></a>
 
@@ -204,32 +209,48 @@ handshake spins up:
 
 1. **Receive loop** — the body of `HandleClientAsync` itself: `transport.ReceiveAsync` → dispatch by
    opcode → route. Reads against one long-lived `clientCts` token (no per-frame CTS). Dispatch is
-   otherwise synchronous, with **two** branches that await: the lookup response write (`MeshHub.cs:1080`)
-   and, when a `groupAuthoriser` is configured, the group join (`MeshHub.cs:1032-1033`). While either is
-   in flight this client's loop reads **nothing else from this client** — which is what makes a slow
-   authoriser a per-client problem rather than a hub-wide one, and also why a slow authoriser can get
-   the client evicted by the heartbeat monitor (see the constructor warning above).
-2. **Send loop** — `SendLoopAsync` (`MeshHub.cs:1403`): drains the outbound `Channel`, **coalescing**
-   already-queued frames up to a 64 KiB byte budget (`SendCoalesceByteBudget`, `MeshHub.cs:1401`) into a
+   otherwise synchronous, with **two** branches that await: the lookup response write (`MeshHub.cs:1121`)
+   and, when a `groupAuthoriser` is configured, the group join (`MeshHub.cs:1046-1047`). The two
+   header-bearing branches added by PR #74 (`SendMessageWithHeaders` → `RouteMessageWithHeaders`,
+   `GroupMessageWithHeaders` → `SendToGroupWithHeaders`) are synchronous like their plain counterparts —
+   they do not add a third await site. While a lookup or group join is in flight this client's loop reads
+   **nothing else from this client** — which is what makes a slow authoriser a per-client problem rather
+   than a hub-wide one, and also why a slow authoriser can get the client evicted by the heartbeat monitor
+   (see the constructor warning above).
+2. **Send loop** — `SendLoopAsync` (`MeshHub.cs:1444`): drains the outbound `Channel`, **coalescing**
+   already-queued frames up to a 64 KiB byte budget (`SendCoalesceByteBudget`, `MeshHub.cs:1442`) into a
    single batched write when the transport implements `IBatchSendTransport`; otherwise sends them one at
-   a time. A lone frame is sent immediately (no latency added).
-3. **Heartbeat monitor** — `MonitorHeartbeatAsync` (`MeshHub.cs:1460`), **only if `heartbeatInterval`
+   a time. A lone frame is sent immediately (no latency added). Its `catch` also treats an
+   `ArgumentException` as a transport fault (`MeshHub.cs:1491`, alongside the pre-existing `IOException`/
+   `ObjectDisposedException`) — see the note below.
+3. **Heartbeat monitor** — `MonitorHeartbeatAsync` (`MeshHub.cs:1510`), **only if `heartbeatInterval`
    is set**. One `PeriodicTimer`. Compares `ActivitySequence` between ticks; an interval in which the
    sequence did not move is a **silent interval** and increments a miss counter. The counter is
    **checked before the probe**: on reaching `maxMissedHeartbeats` it cancels the client's CTS to evict
-   and returns (`MeshHub.cs:1490-1498`); otherwise it enqueues a `Ping` and loops
-   (`MeshHub.cs:1502`). Any frame from the client resets the counter to zero.
+   and returns (`MeshHub.cs:1540-1548`); otherwise it enqueues a `Ping` and loops
+   (`MeshHub.cs:1552`). Any frame from the client resets the counter to zero.
 
 All three share `clientCts` (linked to the hub's token). Teardown in the `finally` block
-(`MeshHub.cs:1101-1173`) completes the outbound queue, cancels the CTS, awaits the send + heartbeat tasks,
+(`MeshHub.cs:1142-1214`) completes the outbound queue, cancels the CTS, awaits the send + heartbeat tasks,
 removes the client from all groups and both dictionaries, disposes the connection (which disposes the
 transport), and raises `ClientDisconnected`.
+
+> **An oversized delivery frame is a transport fault, not a crash — fixed by PR #74 (issue #32).**
+> Combining a received frame's sender id / group name / header block with its body can produce an
+> outbound frame larger than a transport is willing to send (`TcpTransport`'s 1 MiB cap, notably) —
+> most reachable via a near-maximum body plus a large header block. Before this PR the transport's
+> resulting `ArgumentException` was uncaught inside `SendLoopAsync`, which faults the task that
+> `HandleClientAsync`'s own `finally` awaits — aborting that `finally` **partway through** and skipping
+> the slot release, name removal and group removal that follow, permanently leaking the client's
+> registration slot. `SendLoopAsync`'s `catch` now treats `ArgumentException` exactly like a transport
+> fault (`MeshHub.cs:1491-1507`), so cleanup runs to completion and only the one oversized message is
+> lost. See [known-issues.md](known-issues.md) KI-33.
 
 <a id="heartbeat-schedule"></a>
 
 > **Heartbeat schedule (know this before tuning):** eviction fires when `missedHeartbeats >=
-> _maxMissedHeartbeats` (`MeshHub.cs:1490`), and the check sits **above** the `TryWrite` of the `Ping`
-> (`MeshHub.cs:1502`). So "max missed = N" means exactly what it says — a client that sends nothing is
+> _maxMissedHeartbeats` (`MeshHub.cs:1540`), and the check sits **above** the `TryWrite` of the `Ping`
+> (`MeshHub.cs:1552`). So "max missed = N" means exactly what it says — a client that sends nothing is
 > **evicted on the Nth consecutive silent interval**, and is probed **N − 1 times** on its way there,
 > because no ping is sent on the interval that evicts.
 >
@@ -301,7 +322,7 @@ including the pre-registration window.
 - **A refusal disposes the transport immediately and reads nothing from it**
   (`DisposeRefusedTransportAsync`, `MeshHub.cs:787-798`) — no registration frame is ever received from a
   refused connection, so a flood cannot force any parsing work at all, not even a malformed-frame check.
-- **The slot is released in `HandleClientAsync`'s `finally`** (`MeshHub.cs:1155-1161`), unconditionally
+- **The slot is released in `HandleClientAsync`'s `finally`** (`MeshHub.cs:1196-1202`), unconditionally
   whenever a remote address was captured — regardless of whether registration ever completed. This is
   the same release-in-`finally` discipline as the client-slot claim; see
   [Registration handshake](#registration-handshake-hub-side) below.
@@ -374,12 +395,14 @@ The assigned id is a fresh `Guid.NewGuid()` generated at handler start (`MeshHub
 >   including on the duplicate-name path. A claim that escapes its release leaks capacity for the
 >   lifetime of the hub. See [known-issues.md](known-issues.md) KI-26.
 >
-> **Negotiation (step 3) picks a version; nothing after it branches on the result.** `negotiatedVersion`
-> only ever flows into the `RegistrationComplete` reply — every step from 4 onward reads the frame with
-> the same fixed offsets regardless of what was negotiated. That is fine while
-> `MinSupportedVersion == MaxSupportedVersion`, but the day that stops being true, whoever widens the
-> range must also decide what, if anything, changes behaviour for an older negotiated version. See
-> [known-issues.md](known-issues.md) KI-14.
+> **Negotiation (step 3) picks a version, and — since PR #74 (issue #32) — something does branch on the
+> result.** `negotiatedVersion` still flows into the `RegistrationComplete` reply exactly as before, but
+> it is also stored on the `ClientConnection` (`NegotiatedProtocolVersion`, `MeshHub.cs:2177`) and read
+> per-recipient by `RouteMessageWithHeaders`/`SendToGroupWithHeaders` to choose between the header-bearing
+> frame and the plain, stripped one — see [Routing helpers](#routing-helpers). This was the gap
+> [known-issues.md](known-issues.md) KI-14 used to describe; it is now resolved for the header envelope
+> specifically. The general lesson still holds for the *next* capability: widening the range again does
+> not by itself make anything conditional — whoever does it must add the branch, the way this PR did.
 
 ### Authentication
 
@@ -395,22 +418,22 @@ a **seam** and leaves the policy to the integrator.
 - The library never interprets the credential bytes. Format, comparison and rotation are entirely the
   integrator's problem.
 
-`AuthenticateAsync` (`MeshHub.cs:1297-1375`) wraps the callback with four protections, all of which exist
+`AuthenticateAsync` (`MeshHub.cs:1338-1416`) wraps the callback with four protections, all of which exist
 because **the callback runs on unauthenticated input, once per accepted connection**:
 
 | Protection | Mechanism | Source |
 |---|---|---|
-| Concurrency cap | `SemaphoreSlim` of `maxConcurrentAuthentications` (default **64**) permits; a connection that cannot get a slot within `registrationTimeout` is refused | `MeshHub.cs:1309-1317` |
-| Time bound | the callback's `ValueTask` is `WaitAsync(_registrationTimeout)`-ed, so a hanging callback cannot pin the handler task or its connection | `MeshHub.cs:1332-1344` |
-| Throw isolation | any exception is logged and becomes a refusal rather than faulting the handler (callback boundary) | `MeshHub.cs:1355-1361` |
-| Cancellation isolation | an `OperationCanceledException` raised *inside* the callback (e.g. an identity-provider call timing out) — as opposed to hub shutdown — becomes a logged refusal, not a silent drop | `MeshHub.cs:1345-1354` |
+| Concurrency cap | `SemaphoreSlim` of `maxConcurrentAuthentications` (default **64**) permits; a connection that cannot get a slot within `registrationTimeout` is refused | `MeshHub.cs:1350-1358` |
+| Time bound | the callback's `ValueTask` is `WaitAsync(_registrationTimeout)`-ed, so a hanging callback cannot pin the handler task or its connection | `MeshHub.cs:1373-1385` |
+| Throw isolation | any exception is logged and becomes a refusal rather than faulting the handler (callback boundary) | `MeshHub.cs:1396-1402` |
+| Cancellation isolation | an `OperationCanceledException` raised *inside* the callback (e.g. an identity-provider call timing out) — as opposed to hub shutdown — becomes a logged refusal, not a silent drop | `MeshHub.cs:1386-1395` |
 
 Every one of those paths results in the client receiving `Error(AuthenticationFailed)` and the connection
 being dropped. **The client cannot distinguish a bad credential from a slow, throwing or overloaded
 authenticator** — that is deliberate (it leaks nothing) but it makes hub-side logs the only diagnostic.
 
 The credential is **copied out** of the inbound registration buffer before the context is built
-(`MeshHub.cs:1323`), so `RegistrationContext.Credential` does not alias the larger frame. The XML doc on
+(`MeshHub.cs:1364`), so `RegistrationContext.Credential` does not alias the larger frame. The XML doc on
 the delegate still tells callers to copy it if it must outlive the call — treat that as the contract,
 not the current implementation.
 
@@ -440,42 +463,46 @@ Gotchas when writing an authenticator:
 
 | Method | Opcode in | Behaviour | Source |
 |---|---|---|---|
-| `RouteMessage` | `SendMessage` | Look up recipient; build `DeliverMessage`; `TryWrite` to its queue. Unknown recipient → logged `Debug`, **dropped**. Full queue → logged `Warning`, **dropped**. | `MeshHub.cs:1511` |
-| `BroadcastMessage` | `BroadcastMessage` | Build one shared `DeliverMessage` frame; `TryWrite` to every client **except the sender**. | `MeshHub.cs:1548` |
-| `JoinGroupAsync` | `JoinGroup` | **`async`, and awaited by the receive loop.** Empty name ignored. With a `groupAuthoriser`: copies the inbound name bytes, asks the authoriser, and on refusal calls `LeaveGroup` then `RefuseGroupJoin`. Otherwise, or on approval, calls `AddToGroup`. | `MeshHub.cs:1601` |
-| `AddToGroup` | — | The former `JoinGroup` body: `GetOrAdd` the `Group`, add member under its lock. Retries if the group was concurrently removed (`Removed` flag). | `MeshHub.cs:1777` |
-| `AuthoriseGroupJoinAsync` | — | Invokes the authoriser behind a `WaitAsync(_groupAuthorisationTimeout)`, with a sync fast path. Refuses on `false`, throw, self-cancellation or timeout. | `MeshHub.cs:1667` |
-| `RefuseGroupJoin` | — | Builds `[0x10][echoed name bytes]` and `TryWrite`s it to the client's own queue. Full queue → logged `Warning`, **dropped**. | `MeshHub.cs:1754` |
-| `LeaveGroup` | `LeaveGroup` | Remove member; if the group is now empty, mark `Removed` and drop it from `_groups`. Also called by `JoinGroupAsync` on refusal and by `RemoveFromAllGroups` (`:1813`) at teardown. | `MeshHub.cs:1800` |
-| `SendToGroup` | `GroupMessage` | **Requires the sender to be a member.** Tests `group.Members.Contains(senderId)` *inside* the group lock (`:1863`); a non-member is logged `Debug` and **dropped** (`:1873-1879`). A member snapshots the ids, then one shared `DeliverGroupMessage` frame is `TryWrite`n to each member **except the sender**. | `MeshHub.cs:1843` |
+| `RouteMessage` | `SendMessage` | Look up recipient; build `DeliverMessage`; `TryWrite` to its queue. Unknown recipient → logged `Debug`, **dropped**. Full queue → logged `Warning`, **dropped**. | `MeshHub.cs:1561` |
+| `RouteMessageWithHeaders` | `SendMessageWithHeaders` | As `RouteMessage`, but the outgoing frame shape is chosen from **the recipient's own** `NegotiatedProtocolVersion`: `DeliverMessageWithHeaders` (header block forwarded unchanged) if `>= Protocol.HeaderEnvelopeMinVersion`, else the plain `DeliverMessage` with the header block stripped. The header block is never decoded, only its length read. | `MeshHub.cs:1609` |
+| `BroadcastMessage` | `BroadcastMessage` | Build one shared `DeliverMessage` frame; `TryWrite` to every client **except the sender**. | `MeshHub.cs:1668` |
+| `JoinGroupAsync` | `JoinGroup` | **`async`, and awaited by the receive loop.** Empty name ignored. With a `groupAuthoriser`: copies the inbound name bytes, asks the authoriser, and on refusal calls `LeaveGroup` then `RefuseGroupJoin`. Otherwise, or on approval, calls `AddToGroup`. | `MeshHub.cs:1721` |
+| `AddToGroup` | — | The former `JoinGroup` body: `GetOrAdd` the `Group`, add member under its lock. Retries if the group was concurrently removed (`Removed` flag). | `MeshHub.cs:1897` |
+| `AuthoriseGroupJoinAsync` | — | Invokes the authoriser behind a `WaitAsync(_groupAuthorisationTimeout)`, with a sync fast path. Refuses on `false`, throw, self-cancellation or timeout. | `MeshHub.cs:1787` |
+| `RefuseGroupJoin` | — | Builds `[0x10][echoed name bytes]` and `TryWrite`s it to the client's own queue. Full queue → logged `Warning`, **dropped**. | `MeshHub.cs:1874` |
+| `LeaveGroup` | `LeaveGroup` | Remove member; if the group is now empty, mark `Removed` and drop it from `_groups`. Also called by `JoinGroupAsync` on refusal and by `RemoveFromAllGroups` (`:1933`) at teardown. | `MeshHub.cs:1920` |
+| `SendToGroup` | `GroupMessage` | **Requires the sender to be a member.** Tests `group.Members.Contains(senderId)` *inside* the group lock (`:1983`); a non-member is logged `Debug` and **dropped** (`:1993-1999`). A member snapshots the ids, then one shared `DeliverGroupMessage` frame is `TryWrite`n to each member **except the sender**. | `MeshHub.cs:1963` |
+| `SendToGroupWithHeaders` | `GroupMessageWithHeaders` | As `SendToGroup`, but each recipient's own `NegotiatedProtocolVersion` picks its frame shape, exactly like `RouteMessageWithHeaders`. At most **two** shared frames are built regardless of group size — one with the header block, one without — each lazily built (`??=`) only if some member actually needs that shape. | `MeshHub.cs:2055` |
 
-**Shared delivery frames:** broadcast and group sends allocate the delivery buffer **once** and hand the
-same `byte[]` to every recipient's queue. Send loops only read it, so concurrent reads of the
-never-mutated buffer are safe. Do not mutate a delivery frame after it is built.
+**Shared delivery frames:** broadcast and group sends allocate the delivery buffer **once** (or, for the
+two header-bearing group/direct paths, once per distinct frame shape actually needed) and hand the same
+`byte[]` to every recipient's queue that shape applies to. Send loops only read it, so concurrent reads
+of the never-mutated buffer are safe. Do not mutate a delivery frame after it is built.
 
-**The membership test is inside the lock, and that placement is deliberate.** `SendToGroup` sets
-`recipients` to `null` when the sender is not a member and takes the logging branch *after* releasing the
-lock (`MeshHub.cs:1860-1879`) — testing against the live `Members` set rather than scanning the snapshot
-afterwards means a sender removed from the group cannot slip a message through the gap between the test
-and the copy. Keep the test where it is; do not "simplify" it into a post-snapshot check.
+**The membership test is inside the lock, and that placement is deliberate.** `SendToGroup` (and
+`SendToGroupWithHeaders`, which shares the same snapshot logic) sets `recipients` to `null` when the
+sender is not a member and takes the logging branch *after* releasing the lock (`MeshHub.cs:1980-1999`)
+— testing against the live `Members` set rather than scanning the snapshot afterwards means a sender
+removed from the group cannot slip a message through the gap between the test and the copy. Keep the
+test where it is; do not "simplify" it into a post-snapshot check.
 
 Note the empty-group early return is **gone**: a group with no members can no longer be reached by a
 non-member send anyway, and a lone member sending to itself still short-circuits further down
-(`MeshHub.cs:1882-1886`). A send to a group that does not exist at all still returns at the
-`_groups.TryGetValue` miss (`MeshHub.cs:1849`).
+(`MeshHub.cs:2002-2006`). A send to a group that does not exist at all still returns at the
+`_groups.TryGetValue` miss (`MeshHub.cs:1969`).
 
 ### Group locking model
 
-Each `Group` (`MeshHub.cs:1928`) has its own `Lock`, a `HashSet<Guid> Members`, and a `bool Removed`.
+Each `Group` (`MeshHub.cs:2170`) has its own `Lock`, a `HashSet<Guid> Members`, and a `bool Removed`.
 Distinct groups route in parallel; only same-group mutation contends. The `Removed` flag closes a
 join/remove race: when the last member leaves, the group is marked removed **under its lock** and taken
 out of `_groups` only if that exact instance is still mapped (`TryRemove(KeyValuePair)`,
-`MeshHub.cs:1838`). A concurrent `AddToGroup` that fetched the dying instance sees `Removed` and retries
-against a fresh one (`MeshHub.cs:1781-1789`). A connection's own `Groups` set is only touched by its
+`MeshHub.cs:1958`). A concurrent `AddToGroup` that fetched the dying instance sees `Removed` and retries
+against a fresh one (`MeshHub.cs:1901-1909`). A connection's own `Groups` set is only touched by its
 receive loop and teardown, so it needs no lock.
 
 **The authoriser runs *outside* the group lock, and must.** `JoinGroupAsync` awaits the decision before
-it ever reaches `AddToGroup` (`MeshHub.cs:1628`), so no integrator callback is ever invoked while a
+it ever reaches `AddToGroup` (`MeshHub.cs:1748`), so no integrator callback is ever invoked while a
 `Group.Lock` is held. The send-side membership test, by contrast, is *inside* the lock — see
 [Routing helpers](#routing-helpers). If you add anything to this path, keep awaits out of the lock.
 
@@ -487,30 +514,30 @@ Groups are the hub's only **enforceable** boundary. Two separate rules, one unco
 
 | Rule | Applies | Enforced at |
 |---|---|---|
-| **A group send requires membership of that group** | always | `SendToGroup`, `MeshHub.cs:1863` |
-| **A join must be authorised** | only when a `GroupAuthoriser` is supplied | `JoinGroupAsync`, `MeshHub.cs:1612-1640` |
+| **A group send requires membership of that group** | always | `SendToGroup`/`SendToGroupWithHeaders`, `MeshHub.cs:1983` |
+| **A join must be authorised** | only when a `GroupAuthoriser` is supplied | `JoinGroupAsync`, `MeshHub.cs:1732-1760` |
 
 **With no `groupAuthoriser` (the default) the hub authorises no joins and any client may join any
 group** — groups are then a routing convenience, not isolation. The send-side rule still holds, so a
 client that never joined still cannot inject into a group. See
 [known-issues.md](known-issues.md) KI-2.
 
-`AuthoriseGroupJoinAsync` (`MeshHub.cs:1667-1748`) wraps the callback with three protections. Compare it
+`AuthoriseGroupJoinAsync` (`MeshHub.cs:1787-1868`) wraps the callback with three protections. Compare it
 with the four in [Authentication](#authentication) above — the **missing** one is the point:
 
 | Protection | Mechanism | Source |
 |---|---|---|
-| Time bound | `WaitAsync(_groupAuthorisationTimeout)` (default **10 s**), with a sync fast path that skips the `AsTask()` entirely | `MeshHub.cs:1691-1702` |
-| Throw isolation | any exception is logged at `Error` and becomes a refusal rather than faulting the receive loop (callback boundary) | `MeshHub.cs:1738-1747` |
-| Cancellation isolation | an `OperationCanceledException` raised *inside* the callback — as opposed to the client disconnecting or the hub shutting down — becomes a logged refusal, not a dropped connection | `MeshHub.cs:1725-1737` |
-| ~~Concurrency cap~~ | **deliberately absent.** The callback runs on input from an *already-admitted* client and is driven from that client's own receive loop, which reads nothing further from it until the callback returns — so one client cannot have two decisions in flight. The authentication semaphore exists because that callback runs on **un**authenticated input, where any peer reaching the port can drive it; this one is not in that position. | comment at `MeshHub.cs:1679-1690` |
+| Time bound | `WaitAsync(_groupAuthorisationTimeout)` (default **10 s**), with a sync fast path that skips the `AsTask()` entirely | `MeshHub.cs:1811-1822` |
+| Throw isolation | any exception is logged at `Error` and becomes a refusal rather than faulting the receive loop (callback boundary) | `MeshHub.cs:1858-1867` |
+| Cancellation isolation | an `OperationCanceledException` raised *inside* the callback — as opposed to the client disconnecting or the hub shutting down — becomes a logged refusal, not a dropped connection | `MeshHub.cs:1845-1857` |
+| ~~Concurrency cap~~ | **deliberately absent.** The callback runs on input from an *already-admitted* client and is driven from that client's own receive loop, which reads nothing further from it until the callback returns — so one client cannot have two decisions in flight. The authentication semaphore exists because that callback runs on **un**authenticated input, where any peer reaching the port can drive it; this one is not in that position. | comment at `MeshHub.cs:1799-1810` |
 
 Every refusal path results in a `GroupJoinRefused` frame to the client and **no** membership. The client
 cannot distinguish a policy `false` from a throwing, cancelling or slow authoriser — as with
 authentication, that is deliberate, and hub-side logs are the only diagnostic (`Warning` for refusal,
 timeout and cancellation; `Error` for a throw).
 
-**A refusal revokes.** Before replying, `JoinGroupAsync` calls `LeaveGroup` (`MeshHub.cs:1636`). This
+**A refusal revokes.** Before replying, `JoinGroupAsync` calls `LeaveGroup` (`MeshHub.cs:1756`). This
 matters because re-joining a group you are already in is legal and idempotent: if the authoriser has
 since changed its mind, leaving the existing membership in place would mean a deliberate "no" left the
 client still receiving that group's traffic and still entitled to send to it. Removing here also keeps
@@ -547,7 +574,7 @@ Gotchas when writing a group authoriser:
 - **Do not throw to signal refusal** — same reasoning as the authenticator: it works, but logs at
   `Error` and costs an exception per rejected join, and joins recur across a connection's life.
 - **Group names are clipped to 64 characters in the hub's log lines** (`MaxLoggedGroupNameLength` /
-  `ForLog`, `MeshHub.cs:1650`, `:1656-1661`). The refusal paths log at `Warning`/`Error` and are
+  `ForLog`, `MeshHub.cs:1770`, `:1776-1781`). The refusal paths log at `Warning`/`Error` and are
   reachable at will by any admitted client, so an unclipped name would let one client choose how much
   the hub writes. If you add a log line on this path, run the name through `ForLog`.
 
@@ -571,33 +598,39 @@ name). See `MetricsCapture<T>` in [testing.md](testing.md#metrics-tests).
 
 | Instrument | Kind | Tags | Source |
 |---|---|---|---|
-| `meshworx.hub.clients.connected` | `UpDownCounter<int>` | — | created `:333`; `+1` on registration (`:975`), `-1` on removal (`:1140`) |
-| `meshworx.hub.messages.routed` | `Counter<long>` | `direction`: `direct` / `broadcast` / `group` | created `:337`; recorded in `RouteMessage` (`:1505`), `BroadcastMessage` (`:1549`), `SendToGroup` (`:1863`) |
-| `meshworx.hub.bytes.routed` | `Counter<long>` | `direction`: `direct` / `broadcast` / `group` | created `:342`; recorded alongside each `messages.routed` add, with `messageData.Length` (`:1506`, `:1550`, `:1864`) |
-| `meshworx.hub.messages.dropped` | `Counter<long>` | `reason`: `unknown-recipient` / `queue-full` | created `:347`; recorded at every existing drop site — `RouteMessage` unknown-recipient (`:1483`) and queue-full (`:1498`), `BroadcastMessage` queue-full (`:1543`), `SendToGroup` queue-full (`:1881`) |
+| `meshworx.hub.clients.connected` | `UpDownCounter<int>` | — | created `:333`; `+1` on registration (`:975`), `-1` on removal (`:1182`) |
+| `meshworx.hub.messages.routed` | `Counter<long>` | `direction`: `direct` / `broadcast` / `group` | created `:337`; recorded in `RouteMessage` (`:1594`), `RouteMessageWithHeaders` (`:1636`), `BroadcastMessage` (`:1708`), `SendToGroup` (`:2022`), `SendToGroupWithHeaders` (`:2092`) |
+| `meshworx.hub.bytes.routed` | `Counter<long>` | `direction`: `direct` / `broadcast` / `group` | created `:342`; recorded alongside each `messages.routed` add, with the body's length |
+| `meshworx.hub.messages.dropped` | `Counter<long>` | `reason`: `unknown-recipient` / `queue-full` | created `:347`; recorded at every drop site — `RouteMessage` unknown-recipient (`:1572`) and queue-full (`:1587`), `RouteMessageWithHeaders` the same pair (`:1618`, `:1632`), `BroadcastMessage` queue-full (`:1702`), `SendToGroup` queue-full (`:2040`), `SendToGroupWithHeaders` queue-full (`:2121`) |
 | `meshworx.hub.outbound_queue.depth` | `ObservableGauge<int>` | — | created `:352`; callback `ObserveOutboundQueueDepth` (`:370-379`) sums `ClientConnection.OutboundQueue.Reader.Count` across every entry in `_clients` on each collection pass |
 
 **The routed counters are not "once per delivery" for every send kind, and the difference is deliberate:**
 
-- **`RouteMessage` (direct) only counts `messages.routed`/`bytes.routed` once the frame has actually been
-  written to the recipient's queue** (`:1505-1506`, after the `TryWrite` check at `:1492` returns
-  `true`). A direct send has exactly one candidate recipient, so "routed" and "successfully enqueued" are
-  the same event — there is no partial-success case to reconcile.
-- **`BroadcastMessage` and `SendToGroup` count `messages.routed`/`bytes.routed` once per call that reaches
-  at least one candidate recipient, not once per recipient, and not at all when there was nobody to
-  receive it.** `BroadcastMessage` tracks a local `hasRecipient` flag, set the first time the loop sees an
-  entry that is not the sender (`:1525`, set `:1535`), and only records routed/bytes after the loop if
-  that flag is set (`:1547-1550`) — a broadcast from a hub's only connected client therefore records
-  nothing. `SendToGroup` reaches the same effect with an early return: a `recipients` snapshot of exactly
-  `[senderId]` (the sender is the group's only member) returns before the frame is even built
-  (`:1843-1847`), so the routed/bytes add just after (`:1863-1864`) is only ever reached when at least one
-  other member exists.
-- **Consequence for anything consuming these metrics:** for a broadcast or group send, `messages.routed`
-  can be incremented for a call where every individual recipient's queue was full — `messages.dropped`
-  (`reason=queue-full`) is incremented once per failed recipient in the same call, independently of the
-  routed counter. `messages.routed − messages.dropped` is **not** a delivered-message count for
-  `broadcast`/`group`; it only holds that identity for `direct`. See
-  [known-issues.md](known-issues.md) KI-32 for the fuller write-up of this asymmetry.
+- **`RouteMessage`/`RouteMessageWithHeaders` (direct) only count `messages.routed`/`bytes.routed` once the
+  frame has actually been written to the recipient's queue** (`:1594`, after the `TryWrite` check at
+  `:1581` returns `true`; header variant identically at `:1636`, `TryWrite` check at `:1626`). A direct
+  send has exactly one
+  candidate recipient, so "routed" and "successfully enqueued" are the same event — there is no
+  partial-success case to reconcile. (Header variant's `TryWrite` check is at `:1626`.)
+- **`BroadcastMessage`, `SendToGroup` and `SendToGroupWithHeaders` count `messages.routed`/`bytes.routed`
+  once per call that reaches at least one candidate recipient, not once per recipient, and not at all when
+  there was nobody to receive it.** `BroadcastMessage` tracks a local `hasRecipient` flag, set the first
+  time the loop sees an entry that is not the sender (`:1688`, set `:1694`), and only records routed/bytes
+  after the loop if that flag is set (`:1708-1709`) — a broadcast from a hub's only connected client
+  therefore records nothing. `SendToGroup`/`SendToGroupWithHeaders` reach the same effect with an early
+  return: a `recipients` snapshot of exactly `[senderId]` (the sender is the group's only member) returns
+  before any frame is built (`:2002`), so the routed/bytes add just after (`:2022-2023`) is only ever
+  reached when at least one other member exists. `SendToGroupWithHeaders` additionally never builds the
+  frame shape a header-aware member would need if no member is negotiated at `HeaderEnvelopeMinVersion` or
+  above (and vice versa for the plain shape) — that lazy build does not change when `messages.routed` is
+  counted, only which of the (at most two) `byte[]` allocations actually happen.
+- **Consequence for anything consuming these metrics:** for a broadcast or group send (with or without
+  headers), `messages.routed` can be incremented for a call where every individual recipient's queue was
+  full — `messages.dropped` (`reason=queue-full`) is incremented once per failed recipient in the same
+  call, independently of the routed counter. `messages.routed − messages.dropped` is **not** a
+  delivered-message count for `broadcast`/`group`; it only holds that identity for `direct`. See
+  [known-issues.md](known-issues.md) KI-32 for the fuller write-up of this asymmetry — PR #74's two new
+  routing methods inherit it unchanged, they do not introduce a new variant of it.
 
 **Three internal, test-only members exist purely to make the metrics deterministically testable, and are
 not part of the public contract:**
@@ -640,19 +673,19 @@ not part of the public contract:**
   `SendToGroup` frames cap the name at `ushort.MaxValue`. Minor asymmetry — a name longer than 65 535
   bytes could be joined but never targeted by a group send. [known-issues.md](known-issues.md) KI-8.
 - **Lookup responses are handled inline in the receive loop** and awaited on `clientCts.Token`
-  (`MeshHub.cs:1080`) — a slow/blocked transport write here stalls that client's inbound processing.
+  (`MeshHub.cs:1121`) — a slow/blocked transport write here stalls that client's inbound processing.
 - **Malformed frames are silently ignored** — the dispatch chain is a series of length-guarded
   `else if`s with no terminal `else`. [known-issues.md](known-issues.md) KI-9. A malformed *registration*
   frame is dropped the same way, without an error reply.
 - **A hub with no authenticator admits anyone who can reach the listener.** The seam exists; using it is
   opt-in. [known-issues.md](known-issues.md) KI-2.
 - **A group send from a non-member is dropped, silently and unconditionally.** No error frame, a `Debug`
-  log only (`MeshHub.cs:1873-1879`). This holds with or without a `groupAuthoriser`, and it is a
+  log only (`MeshHub.cs:1993-1999`). This holds with or without a `groupAuthoriser`, and it is a
   behavioural break for any client that used to publish to a group without joining it — such a client
   must now join, and will then also start receiving that group's traffic. There is no send-only
   capability. [known-issues.md](known-issues.md) KI-2.
 - **A refused join revokes an existing membership.** `JoinGroupAsync` calls `LeaveGroup` before replying
-  (`MeshHub.cs:1636`), so re-joining a group you are already in is a live re-authorisation, not a no-op.
+  (`MeshHub.cs:1756`), so re-joining a group you are already in is a live re-authorisation, not a no-op.
   Do not "optimise" the re-join into an early return — that would make the first `true` permanent.
 - **The join path awaits an integrator callback inside the receive loop.** That parks the calling
   client's inbound processing and makes it look idle to the heartbeat monitor. See

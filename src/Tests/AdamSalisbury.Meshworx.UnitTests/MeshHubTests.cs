@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Net;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
@@ -1320,10 +1321,13 @@ public sealed class MeshHubTests
         var sentDataTcs = new TaskCompletionSource<byte[]>();
         var blockingReceive = new TaskCompletionSource<byte[]?>();
 
-        // A client that supports versions 3 through 6; the hub only supports version 4, so 4 is the
-        // highest shared version. The receive loop's next call parks rather than spinning on the same
-        // registration frame once the client is admitted.
-        byte[] wideRange = MeshHubFixture.CreateRegistrationRequest("Alpha", versionMin: 3, versionMax: 6);
+        // A client that supports every version from the hub's minimum up to one past its maximum, so
+        // the hub's own maximum is the highest shared version. The receive loop's next call parks
+        // rather than spinning on the same registration frame once the client is admitted.
+        byte[] wideRange = MeshHubFixture.CreateRegistrationRequest(
+            "Alpha",
+            versionMin: Protocol.MinSupportedVersion,
+            versionMax: (byte)(Protocol.MaxSupportedVersion + 1));
         transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(wideRange)
             .Returns(blockingReceive.Task);
@@ -1338,7 +1342,7 @@ public sealed class MeshHubTests
 
         Assert.Equal(0x01, sentData[0]); // RegistrationComplete
         Assert.Equal(18, sentData.Length);
-        Assert.Equal(0x04, sentData[17]); // negotiated version
+        Assert.Equal(Protocol.MaxSupportedVersion, sentData[17]); // negotiated version
 
         blockingReceive.TrySetResult(null);
         await fixture.Hub.StopAsync();
@@ -1822,6 +1826,110 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    // RouteMessage — header envelope
+
+    /// <summary>
+    /// A header-bearing direct message is forwarded to a recipient negotiated at the header-envelope's
+    /// minimum version as a DeliverMessageWithHeaders frame, carrying the header block through unchanged.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task RouteMessageWithHeaders_RecipientNegotiatedCurrentVersion_DeliversWithHeaders()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var clientA = await fixture.RegisterClientAsync("ClientA");
+        var clientB = await fixture.RegisterClientAsync("ClientB", versionMin: 5, versionMax: 5);
+
+        var deliveredTcs = new TaskCompletionSource<byte[]>();
+        clientB.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => deliveredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        var messageContent = new byte[] { 10, 20, 30 };
+        var headers = new MessageHeaders([new("correlationId", "abc-123")]);
+        byte[] sendPayload = MeshHubFixture.CreateDirectMessageWithHeaders(clientB.Id, headers, messageContent);
+
+        clientA.DisconnectTcs.SetResult(sendPayload);
+
+        byte[] deliveredData = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x12, deliveredData[0]); // DeliverMessageWithHeaders
+        Assert.Equal(clientA.Id, new Guid(deliveredData.AsSpan(1, 16)));
+
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(deliveredData.AsSpan(17, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(deliveredData.AsSpan(19), headerLength);
+        Assert.Equal("abc-123", decoded["correlationId"]);
+        Assert.Equal(messageContent, deliveredData[(19 + headerLength)..]);
+
+        clientB.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A header-bearing direct message routed to a recipient negotiated below the header-envelope's
+    /// minimum version has its header block stripped: the recipient gets the plain DeliverMessage frame
+    /// it already understands, rather than an opcode it would not recognise.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task RouteMessageWithHeaders_RecipientNegotiatedOldVersion_StripsHeadersAndDeliversPlainFrame()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var clientA = await fixture.RegisterClientAsync("ClientA");
+        var clientB = await fixture.RegisterClientAsync("ClientB"); // negotiates version 4 by default
+
+        var deliveredTcs = new TaskCompletionSource<byte[]>();
+        clientB.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => deliveredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        Assert.Equal(4, clientB.NegotiatedProtocolVersion);
+
+        var messageContent = new byte[] { 10, 20, 30 };
+        var headers = new MessageHeaders([new("correlationId", "abc-123")]);
+        byte[] sendPayload = MeshHubFixture.CreateDirectMessageWithHeaders(clientB.Id, headers, messageContent);
+
+        clientA.DisconnectTcs.SetResult(sendPayload);
+
+        byte[] deliveredData = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x03, deliveredData[0]); // DeliverMessage — the plain frame, headers stripped
+        Assert.Equal(clientA.Id, new Guid(deliveredData.AsSpan(1, 16)));
+        Assert.Equal(messageContent, deliveredData[17..]);
+
+        clientB.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A header-bearing direct message addressed to a Guid that does not match any registered client is
+    /// silently dropped, mirroring the plain SendMessage behaviour.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task RouteMessageWithHeaders_RecipientDoesNotExist_SilentlyDrops()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterClientAsync();
+
+        var disposedTcs = new TaskCompletionSource();
+        client.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        var headers = new MessageHeaders([new("correlationId", "abc-123")]);
+        byte[] sendPayload = MeshHubFixture.CreateDirectMessageWithHeaders(Guid.NewGuid(), headers, [1, 2, 3]);
+
+        client.DisconnectTcs.SetResult(sendPayload);
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        client.Transport.Verify(
+            t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()),
+            Times.Once); // only RegistrationComplete, no delivery bounce-back
+
+        await fixture.Hub.StopAsync();
+    }
+
     // BroadcastMessage
 
     /// <summary>
@@ -2106,6 +2214,58 @@ public sealed class MeshHubTests
 
         Assert.False(fixture.Hub.IsClientRegistered(recipient.Id));
         Assert.True(fixture.Hub.IsClientRegistered(sender.Id));
+
+        sender.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A transport's SendAsync can reject an oversized delivery frame with an ArgumentException — as
+    /// TcpTransport does when a near-maximum-size inbound payload grows past the frame cap once the
+    /// hub adds routing fields (and, for a header-bearing message, the header block). This must be
+    /// treated exactly like a transport fault: the recipient is evicted with its slot, name and group
+    /// memberships released, not left to fault the send loop's awaiting task and skip that cleanup.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task HandleClient_RecipientTransportRejectsOversizedDelivery_EvictsRecipientAndReleasesItsSlot()
+    {
+        var fixture = new MeshHubFixture(maxClients: 2);
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterMultiMessageClientAsync("Recipient");
+
+        var recipientDisposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => recipientDisposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ArgumentException("Payload size exceeds the maximum frame payload of 1048576 bytes."));
+
+        var sendPayload = new byte[1 + 16 + 3];
+        sendPayload[0] = 0x02; // SendMessage
+        recipient.Id.TryWriteBytes(sendPayload.AsSpan(1));
+        new byte[] { 1, 2, 3 }.CopyTo(sendPayload, 17);
+        sender.EnqueueMessage(sendPayload);
+
+        await recipientDisposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.False(fixture.Hub.IsClientRegistered(recipient.Id));
+        Assert.True(fixture.Hub.IsClientRegistered(sender.Id));
+
+        // The recipient's claimed slot must have been released too, not just its registry entry
+        // removed — otherwise a third client could never register against the 2-client cap.
+        var thirdClient = MeshHubFixture.CreateMockTransport();
+        var thirdRegisteredTcs = new TaskCompletionSource<byte[]>();
+        thirdClient.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Third"));
+        thirdClient.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => thirdRegisteredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+        fixture.EnqueueClient(thirdClient.Object);
+
+        byte[] thirdResponse = await thirdRegisteredTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(0x01, thirdResponse[0]); // RegistrationComplete, not HubAtCapacity
 
         sender.Disconnect();
         await fixture.Hub.StopAsync();
@@ -2472,6 +2632,65 @@ public sealed class MeshHubTests
 
         first.Disconnect();
         second.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A header-bearing group message fans out with the frame shape each member's own negotiated
+    /// protocol version can understand: a member negotiated at the header-envelope's minimum version
+    /// gets DeliverGroupMessageWithHeaders with the header block intact, while a member negotiated
+    /// below it gets the plain DeliverGroupMessage frame with the headers stripped — built once each,
+    /// not per recipient.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task SendToGroupWithHeaders_MixedNegotiatedVersionMembers_EachGetsItsOwnFrameShape()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var currentVersionMember = await fixture.RegisterMultiMessageClientAsync(
+            "CurrentVersionMember", versionMin: 5, versionMax: 5);
+        var oldVersionMember = await fixture.RegisterMultiMessageClientAsync(
+            "OldVersionMember", versionMin: 4, versionMax: 4);
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+
+        var currentVersionFrames = new FrameRecorder(currentVersionMember.Transport);
+        var oldVersionFrames = new FrameRecorder(oldVersionMember.Transport);
+
+        currentVersionMember.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        await ApplyPendingFramesAsync(currentVersionMember, currentVersionFrames, "Sender");
+
+        oldVersionMember.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        await ApplyPendingFramesAsync(oldVersionMember, oldVersionFrames, "Sender");
+
+        // The sender must itself be a member to send to the group at all; queued on its own connection,
+        // ahead of the group message, so it is guaranteed to have been applied first.
+        var headers = new MessageHeaders([new("priority", "high")]);
+        sender.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        sender.EnqueueMessage(MeshHubFixture.CreateGroupMessageWithHeaders("team", headers, [1, 2, 3]));
+
+        byte[] withHeadersFrame = await currentVersionFrames.WaitForAsync(f => f[0] == 0x14)
+            .WaitAsync(WaitTimeout); // DeliverGroupMessageWithHeaders
+        byte[] strippedFrame = await oldVersionFrames.WaitForAsync(f => f[0] == 0x0F)
+            .WaitAsync(WaitTimeout); // DeliverGroupMessage
+
+        Assert.Equal(sender.Id, new Guid(withHeadersFrame.AsSpan(1, 16)));
+        int withHeadersNameLength = BinaryPrimitives.ReadUInt16BigEndian(withHeadersFrame.AsSpan(17, 2));
+        Assert.Equal("team", Encoding.UTF8.GetString(withHeadersFrame.AsSpan(19, withHeadersNameLength)));
+        int headerLengthOffset = 19 + withHeadersNameLength;
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(withHeadersFrame.AsSpan(headerLengthOffset, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(withHeadersFrame.AsSpan(headerLengthOffset + 2), headerLength);
+        Assert.Equal("high", decoded["priority"]);
+        Assert.Equal(new byte[] { 1, 2, 3 }, withHeadersFrame[(headerLengthOffset + 2 + headerLength)..]);
+
+        Assert.Equal(sender.Id, new Guid(strippedFrame.AsSpan(1, 16)));
+        int strippedNameLength = BinaryPrimitives.ReadUInt16BigEndian(strippedFrame.AsSpan(17, 2));
+        Assert.Equal("team", Encoding.UTF8.GetString(strippedFrame.AsSpan(19, strippedNameLength)));
+        Assert.Equal(new byte[] { 1, 2, 3 }, strippedFrame[(19 + strippedNameLength)..]);
+
+        currentVersionMember.Disconnect();
+        oldVersionMember.Disconnect();
+        sender.Disconnect();
         await fixture.Hub.StopAsync();
     }
 

@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using System.Threading.Channels;
+using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -18,7 +20,7 @@ internal sealed class MeshClientFixture
         Transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
     }
 
-    public byte[] CreateRegistrationResponse(byte negotiatedVersion = 0x04)
+    public byte[] CreateRegistrationResponse(byte negotiatedVersion = Protocol.MaxSupportedVersion)
     {
         // RegistrationComplete frame: [type][clientId (16)][negotiated version].
         var response = new byte[18];
@@ -37,9 +39,47 @@ internal sealed class MeshClientFixture
         return payload;
     }
 
+    /// <summary>
+    /// Builds a DeliverMessageWithHeaders frame:
+    /// [type][senderId(16)][headerBlockLength(2)][headerBlock][message].
+    /// </summary>
+    public static byte[] CreateDeliverMessageWithHeadersPayload(
+        Guid senderId, MessageHeaders headers, byte[] messageContent)
+    {
+        int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+        var payload = new byte[1 + 16 + 2 + headerLength + messageContent.Length];
+        payload[0] = 0x12; // DeliverMessageWithHeaders
+        senderId.TryWriteBytes(payload.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(17, 2), (ushort)headerLength);
+        HeaderEnvelope.Write(headers, payload.AsSpan(19, headerLength));
+        messageContent.CopyTo(payload, 19 + headerLength);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a DeliverGroupMessageWithHeaders frame: [type][senderId(16)][groupNameLength(2)]
+    /// [groupName][headerBlockLength(2)][headerBlock][message].
+    /// </summary>
+    public static byte[] CreateDeliverGroupMessageWithHeadersPayload(
+        Guid senderId, string groupName, MessageHeaders headers, byte[] messageContent)
+    {
+        byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(groupName);
+        int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+        int headerLengthOffset = 19 + nameBytes.Length;
+        var payload = new byte[headerLengthOffset + 2 + headerLength + messageContent.Length];
+        payload[0] = 0x14; // DeliverGroupMessageWithHeaders
+        senderId.TryWriteBytes(payload.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(17, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(payload, 19);
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(headerLengthOffset, 2), (ushort)headerLength);
+        HeaderEnvelope.Write(headers, payload.AsSpan(headerLengthOffset + 2, headerLength));
+        messageContent.CopyTo(payload, headerLengthOffset + 2 + headerLength);
+        return payload;
+    }
+
     public void SetupSuccessfulRegistration(params byte[][] receiveLoopMessages)
     {
-        SetupSuccessfulRegistrationWithNegotiatedVersion(0x04, receiveLoopMessages);
+        SetupSuccessfulRegistrationWithNegotiatedVersion(Protocol.MaxSupportedVersion, receiveLoopMessages);
     }
 
     /// <summary>
