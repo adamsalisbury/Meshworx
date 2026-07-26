@@ -40,7 +40,6 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly ILogger<MeshHub> _logger;
     private readonly ITransportListener _listener;
     private readonly TimeSpan _registrationTimeout;
-    private readonly int _maxClients;
     private readonly TimeSpan? _heartbeatInterval;
     private readonly int _maxMissedHeartbeats;
     private readonly ClientAuthenticator? _authenticator;
@@ -247,7 +246,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _logger = logger;
         _listener = listener;
         _registrationTimeout = registrationTimeout ?? DefaultRegistrationTimeout;
-        _maxClients = maxClients ?? DefaultMaxClients;
+        MaxClients = maxClients ?? DefaultMaxClients;
 
         // Null now means "not configured" rather than "disabled": an unconfigured hub still gets idle
         // eviction, at the default interval, exactly like an unconfigured maxClients still gets a cap.
@@ -509,6 +508,21 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
     /// <inheritdoc/>
     public int ConnectedClientCount => _clients.Count;
+
+    /// <inheritdoc/>
+    public bool IsRunning
+    {
+        get
+        {
+            lock (_stateLock)
+            {
+                return _cts is not null;
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    public int MaxClients { get; }
 
     /// <inheritdoc/>
     public bool IsClientRegistered(Guid clientId)
@@ -830,7 +844,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 // authenticator — once there is nothing left to admit it to. This is only an early-out:
                 // the slot itself is claimed below, after authentication returns, so that a peer which
                 // never authenticates cannot hold capacity away from one that would.
-                if (Volatile.Read(ref _reservedClientSlots) >= _maxClients)
+                if (Volatile.Read(ref _reservedClientSlots) >= MaxClients)
                 {
                     await RefuseAtCapacityAsync(transport, clientId, cancellationToken).ConfigureAwait(false);
                     return;
@@ -1086,7 +1100,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         // ever made from a count that was still under the cap at the instant the claim was made.
         int claimed = Volatile.Read(ref _reservedClientSlots);
 
-        while (claimed < _maxClients)
+        while (claimed < MaxClients)
         {
             int observed = Interlocked.CompareExchange(ref _reservedClientSlots, claimed + 1, claimed);
             if (observed == claimed)
@@ -1121,7 +1135,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         byte[] capacityError = [(byte)MessageType.Error, (byte)RegistrationErrorCode.HubAtCapacity];
         await transport.SendAsync(capacityError, cancellationToken).ConfigureAwait(false);
         _logger.LogWarning(
-            "Refusing client {ClientId}: hub at capacity ({MaxClients} clients)", clientId, _maxClients);
+            "Refusing client {ClientId}: hub at capacity ({MaxClients} clients)", clientId, MaxClients);
     }
 
     private async Task<bool> AuthenticateAsync(

@@ -66,6 +66,21 @@ public interface IMeshHub : IAsyncDisposable
     int ConnectedClientCount { get; }
 
     /// <summary>
+    /// Gets a value indicating whether the hub is currently running and accepting connections.
+    /// </summary>
+    /// <remarks>
+    /// <see langword="true"/> from the moment <see cref="StartAsync"/> completes until
+    /// <see cref="StopAsync"/> begins tearing the hub down. The value is a point-in-time snapshot; the
+    /// hub's lifecycle may change concurrently.
+    /// </remarks>
+    bool IsRunning { get; }
+
+    /// <summary>
+    /// Gets the maximum number of clients the hub admits at once.
+    /// </summary>
+    int MaxClients { get; }
+
+    /// <summary>
     /// Determines whether a client with the specified identifier is currently registered.
     /// </summary>
     /// <param name="clientId">The unique identifier of the client to look up.</param>

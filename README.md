@@ -513,6 +513,25 @@ starts on host start and stops on host stop. By default the client connects over
 transport. As with the hub, an `IConfiguration` overload binds `MeshClientOptions` from a section,
 and options are validated the same way on host start.
 
+### Health checks
+
+The same package registers health checks against `Microsoft.Extensions.Diagnostics.HealthChecks`,
+so orchestrators and load balancers get a liveness/readiness signal without any glue code:
+
+```csharp
+builder.Services.AddHealthChecks()
+    .AddMeshHub()
+    .AddMeshClient("Alice");
+```
+
+`AddMeshHub` reports `Unhealthy` while the hub is not running, `Degraded` once it has reached
+`MeshHubOptions.MaxClients` — still serving existing clients but refusing new ones — and `Healthy`
+otherwise. `AddMeshClient` reports `Healthy` while the named client is connected and `Unhealthy`
+otherwise, including while a `MeshClientReconnector` is still retrying. Both require the
+corresponding `AddMeshHub`/`AddMeshClient` call to have registered the hub or client first, and
+both accept an optional `name` — `AddMeshHub` defaults to `"meshhub"`, `AddMeshClient` to
+`"meshclient:{clientName}"`.
+
 ## Building and testing
 
 ```sh
