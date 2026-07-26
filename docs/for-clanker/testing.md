@@ -69,6 +69,11 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
 | `Transport/Unix/UnixSocketMeshIntegrationTests.cs` | 97 | **New in PR #81.** One end-to-end test: register/lookup/direct-send/broadcast/group-message over a real Unix domain socket, using the actual `MeshHub` and `MeshClient` — the same shape as `MeshIntegrationTests.cs`/`WebSocketMeshIntegrationTests.cs`, proving interoperability is identical for this transport too |
 | `Transport/NamedPipes/NamedPipeTransportTests.cs` | 39 | **New in PR #81.** Constructor/argument guard (`ArgumentException` on an empty pipe name) plus the `PlatformNotSupportedException` guard on `ConnectAsync` for non-Windows — **the happy path itself is untested on this repo's CI**, see the platform-guard note below |
 | `Transport/NamedPipes/NamedPipeTransportListenerTests.cs` | 93 | **New in PR #81.** Constructor guards (`maxServerInstances`), start-after-dispose/dispose-never-started/accept-not-started lifecycle checks, and the `PlatformNotSupportedException` guard on `StartAsync` for non-Windows — same platform-guard-only caveat as the transport's own tests |
+| `Transport/Quic/QuicTransportTests.cs` | 100 | **New in PR #82 (issue #21, not yet merged to `main`).** Framing-level tests driven directly against a `MemoryStream` via the internal `QuicTransport(Stream)` constructor — negative/oversize/truncated length-prefix handling and a round-trip, mirroring `TcpTransportTests.cs`/`UnixSocketTransportTests.cs`'s coverage of the shared `StreamFramer` code — plus `RemoteEndPoint_ConstructedOverPlainStream_IsNull` |
+| `Transport/Quic/QuicTransportListenerTests.cs` | 402 | **New in PR #82.** Constructor guards, start/accept/dispose lifecycle, the sequential `StartAsync_AlreadyRunning_ThrowsInvalidOperationException` case, **and three race tests**: `AcceptAsync_RacedAgainstDispose_OnlyEverReportsDisposal` (the same release-together shape as `TcpTransportListenerTests.cs`'s), `DisposeAsync_RacedAgainstStartAsync_NeverLeavesAnUnpublishedListenerRunning`, and `StartAsync_CalledConcurrently_OnlyOneSucceeds` (added once KI-41 was found and fixed) — the latter two are **QUIC-specific**, since they only exist because `QuicListener.ListenAsync` is itself the asynchronous bind step, unlike every other listener's synchronous one (see [known-issues.md](known-issues.md) KI-41, now fixed) |
+| `Transport/Quic/QuicTransportListenerSourceAdmissionTests.cs` | 157 | **New in PR #82.** Deterministic, non-network tests for the per-source admission primitives (`TryAdmitSource`/`ReleaseSource`/`NormaliseForSourceCap`) called directly — admit-then-refuse at the cap, slot release and re-admission, independent caps for different sources, concurrent callers for the same source never exceeding the cap, and the IPv6 `/64` normalisation both within and across prefixes |
+| `Transport/Quic/QuicTransportLoopbackTests.cs` | 357 | **New in PR #82.** Round-trip over a real QUIC connection, remote-endpoint reporting, oversize-payload rejection, batch send, remote-dispose-returns-null, and `StreamOpenTimeout_SilentPeerAbandoned_SlotReclaimedForLaterClient` (proves a silent peer's negotiation slot is reclaimed after `streamOpenTimeout` by driving `maxConcurrentNegotiations: 1` and proving a later genuine client can only connect if the slot was freed) |
+| `Transport/Quic/QuicMeshIntegrationTests.cs` | 124 | **New in PR #82.** One end-to-end test, `EndToEnd_RegisterSendBroadcastAndGroupMessage_OverQuic` — register/direct-send/broadcast/group-message over a real QUIC connection using the actual `MeshHub`/`MeshClient`, the same shape as the Unix-socket/WebSocket integration tests |
 
 ## Testing conventions (follow these)
 
@@ -143,6 +148,44 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
   `Constructor_NonPositiveMaxServerInstances_ThrowsArgumentOutOfRangeException`) run on every platform
   regardless, since they throw before the platform check is reached. Do not read a green run of these two
   files on this repo's CI as proof the happy path works — it proves only that the guard does.
+- **The QUIC transport's tests (PR #82, issue #21, not yet merged to `main`) are documented no-ops
+  wherever `QuicListener.IsSupported`/`QuicConnection.IsSupported` is `false`.** Every test in
+  `Transport/Quic/*.cs` opens with `if (!IsQuicSupported) { return; }` (or the `QuicListener.IsSupported`
+  equivalent) rather than an attribute-driven skip, matching the pattern the named-pipe tests use for
+  their own platform gate — CI installs `libmsquic` explicitly (`.github/workflows/ci.yml`) precisely so
+  this repo's own CI run exercises the real thing rather than silently taking the no-op path. Do not read
+  a green run elsewhere (a machine without `libmsquic`) as proof the transport works — check whether the
+  support check actually passed.
+  - **`QuicTransportListenerSourceAdmissionTests.cs` tests the per-source admission primitives
+    (`TryAdmitSource`/`ReleaseSource`/`NormaliseForSourceCap`) directly and deterministically, not through
+    a real multi-source network flood.** A genuine test of "does the per-source cap actually cap a
+    distributed set of sources" is not reproducible from a single loopback test box — every connection a
+    test process opens shares one local address (or, at best, one narrow local range) — so the primitives
+    that implement the bookkeeping are unit-tested in isolation instead, calling the `internal static`
+    methods directly with hand-picked `IPAddress` values. This is the same "test what you can prove
+    deterministically, not what would need a distributed rig" reasoning that keeps
+    `MeshHubTests.cs`'s IPv6 per-remote-endpoint cap tests (see
+    [per-remote-endpoint-connection-cap](#per-remote-endpoint-connection-cap) above) hand-picking specific
+    addresses rather than generating a real flood — copy this shape for the equivalent reason if you add
+    another per-source primitive.
+  - **QUIC's test loopback shape is the reverse of every other transport's: send before you accept, not
+    after.** A QUIC stream is invisible to the peer until data actually arrives on it — opening one is a
+    purely local operation — so `QuicTransportListener.AcceptAsync` cannot complete until the connecting
+    client has called `SendAsync` at least once. Every test in `QuicTransportLoopbackTests.cs` and
+    `QuicMeshIntegrationTests.cs` therefore sends the first payload (or relies on `MeshClient.ConnectAsync`
+    sending the registration frame) **before** awaiting the listener's `AcceptAsync`, the opposite order
+    every TCP/WebSocket/Unix-socket loopback test uses. Copy the send-then-accept order if you add another
+    QUIC test directly against the transport rather than through a `MeshClient`/`MeshHub` pair — getting
+    the order backwards deadlocks the test rather than failing it cleanly, so give any such test an
+    explicit `[Fact(Timeout = …)]`.
+  - **`DisposeAsync_RacedAgainstStartAsync_NeverLeavesAnUnpublishedListenerRunning`
+    (`QuicTransportListenerTests.cs:286`) has no analogue on any other listener in this suite, because no
+    other listener has an asynchronous bind step to race against.** `QuicListener.ListenAsync` is itself
+    the async bind/listen call, unlike every socket-backed listener's synchronous one, so
+    `QuicTransportListener` is the only listener where `StartAsync` and `DisposeAsync` can genuinely
+    interleave mid-bind. **This file also covers the equivalent `StartAsync`-vs-`StartAsync` race**, via
+    `StartAsync_CalledConcurrently_OnlyOneSucceeds` — added once [known-issues.md](known-issues.md) KI-41
+    was found and fixed.
 - **Neither new local-IPC transport has a test proving `maxConnectionsPerRemoteEndpoint` caps it** —
   correctly, because it doesn't: [known-issues.md](known-issues.md) KI-38 records that gap as a
   deliberate scope decision, not a regression to catch. Do not add a test asserting the cap works over

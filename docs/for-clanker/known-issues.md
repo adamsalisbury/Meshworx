@@ -48,6 +48,8 @@ the risk to a change, not a claim that the code is defective.
 | KI-37 | A pipelined first WebSocket frame ahead of the `101` response has a dedicated regression test | `Transport/WebSocket/WebSocketTransportListener.cs:432-439`, `:575-613`, `:658-739` | low (test coverage) | **fixed** — PR #78; `WebSocketTransportLoopbackTests.ConnectAndAccept_ClientPipelinesFirstFrameAheadOfUpgradeResponse_LeftoverBytesAreNotLost` drives the `LeftoverPrefixedStream` path directly |
 | KI-38 | `UnixSocketTransport`/`NamedPipeTransport` bypass the per-remote-endpoint connection cap entirely | `MeshHub.cs:706-716`, `:743-748`; `Transport/Unix/UnixSocketTransport.cs:22`; `Transport/NamedPipes/NamedPipeTransport.cs:23` | high (availability / security) | open — **deliberately deferred**, out of scope for PR #81 (issue #20) by the issue's own design; see full reasoning below |
 | KI-39 | `UnixSocketTransportListener`'s `deleteExistingSocketFile` parameter silently also disables cleanup-on-dispose | `Transport/Unix/UnixSocketTransportListener.cs:59-67`, `:84-87`, `:167-170` | low (usability / test coverage) | open — **by design, correctly documented on the constructor, but untested for the `false` case** |
+| KI-40 | `QuicTransportListener`'s per-source negotiation cap mitigates, but does not eliminate, a many-source flood | `Transport/Quic/QuicTransportListener.cs:421-516` | medium (availability) | open — **by design, a documented limitation of the mitigation, not a defect in it**; see full reasoning below |
+| KI-41 | `QuicTransportListener.StartAsync` is not safe under concurrent invocation — unlike every other listener in this codebase | `Transport/Quic/QuicTransportListener.cs` | medium (correctness / resource leak) | **fixed** — same PR (#82), commit `d4de3b3`; a `_starting` flag now serialises concurrent `StartAsync` calls, mirroring `MeshHub.StartAsync`'s identical pattern; see `StartAsync_CalledConcurrently_OnlyOneSucceeds` |
 
 ---
 
@@ -1004,7 +1006,11 @@ the risk to a change, not a claim that the code is defective.
   `IRemoteEndPointTransport` **and** reporting an `IPEndPoint`. Neither `UnixSocketTransport`
   (`Transport/Unix/UnixSocketTransport.cs:22`) nor `NamedPipeTransport`
   (`Transport/NamedPipes/NamedPipeTransport.cs:23`) implements `IRemoteEndPointTransport` at all — added
-  by PR #81 (issue #20), **not yet merged to `main`** at the time this was written.
+  by PR #81 (issue #20). **`QuicTransport` (PR #82, issue #21, not yet merged to `main`) is *not* in this
+  bucket** — it implements `IRemoteEndPointTransport` and reports the real `QuicConnection.RemoteEndPoint`
+  on both sides, so it participates in `maxConnectionsPerRemoteEndpoint` exactly as `TcpTransport` does;
+  this was a deliberate correctness point confirmed during that PR's review specifically to avoid growing
+  this entry's affected-transport list further. See [transport.md](transport.md#quictransport--transportquicquictransportcs33).
 - **Severity:** high (availability / security). Not hypothetical: it is reachable from ordinary use of
   either new transport, not just an adversary.
 - **Why it bites:** `maxConnectionsPerRemoteEndpoint` (KI-29) exists specifically to cap the
@@ -1072,6 +1078,109 @@ the risk to a change, not a claim that the code is defective.
 - **What not to do:** do not assume `deleteExistingSocketFile: false` only affects startup behaviour
   when reading or reviewing code that passes it — check both call sites in the source, since the
   constructor's own doc is the only place both effects are stated together.
+
+### KI-40 — `QuicTransportListener`'s per-source negotiation cap mitigates, but does not eliminate, a many-source flood
+- **Where:** `NegotiationPumpAsync` (`Transport/Quic/QuicTransportListener.cs:421-516`) — the global
+  `negotiationSlots` semaphore (`maxConcurrentNegotiations`, default 64, `:428`) and the per-source cap
+  layered in front of it (`TryAdmitSource`/`ReleaseSource`/`NormaliseForSourceCap`,
+  `maxConcurrentNegotiationsPerSource`, default one eighth of `maxConcurrentNegotiations`, `:572-643`).
+  Added by PR #82 (issue #21), **not yet merged to `main`**.
+- **Severity:** medium (availability). Not hypothetical against a genuinely distributed source — it is
+  the residual half of a gap the per-source cap was added specifically to narrow, not close.
+- **Why it bites:** QUIC's `AcceptConnectionAsync` completes the full TLS 1.3 handshake internally
+  before ever returning a connection, so — unlike `TcpTransportListener`'s handshake pump or
+  `WebSocketTransportListener`'s negotiation pump, both of which gate admission on a cheap zero-byte-read
+  pre-check that costs nothing and needs no slot — there is no way to tell a QUIC peer that will
+  eventually open a stream apart from one that never will, before actually waiting for it. The per-source
+  cap bounds how much of the global `maxConcurrentNegotiations` pool **one** source can occupy; it does
+  **not** bound how much a flood spread across **many distinct sources** can occupy between them. A
+  distributed flood of genuine (not spoofed — a spoofed source cannot complete the handshake at all)
+  QUIC handshakes from `maxConcurrentNegotiations` or more distinct source addresses, each opening no
+  stream, can still exhaust the global pool for `streamOpenTimeout` at a time, exactly as it could before
+  the per-source cap existed. The cap changes the *shape* of the attack a single source can mount — from
+  "hold the whole pool alone" to "hold at most one eighth of it" — not the existence of the underlying
+  "no cheap pre-check" gap that makes the pool exhaustible at all.
+- **Why this is recorded as a known limitation rather than fixed here:** closing it fully would need
+  either a genuinely cheap admission signal QUIC does not offer (there is no equivalent of TCP's
+  zero-byte pre-connect-handshake read once msquic has already completed the crypto), or an
+  IP-reputation/rate-limiting layer outside what `QuicTransportListener` can reasonably own on its own —
+  a materially larger design than a transport-level listener. The per-source cap is the mitigation that
+  fits the transport's own scope; it was added specifically during a security-review pass on PR #82,
+  which is itself evidence this trade-off was made deliberately, not missed.
+- **What to do:** if you deploy `QuicTransportListener` on a network reachable by an adversary who can
+  mount a distributed flood, size `maxConcurrentNegotiations` and `streamOpenTimeout` for that threat
+  model specifically — a smaller `streamOpenTimeout` shortens how long a hostile connection can hold its
+  slot, at the cost of being less forgiving to a genuinely slow legitimate peer. Do not rely on
+  `maxConcurrentNegotiationsPerSource` alone as a defence against a distributed flood; it was never
+  designed to be one.
+- **What not to do:** do not read "the per-source cap was added during a security review" as "this gap is
+  now closed" — the cap's own constructor XML doc and the pump's `<remarks>` are explicit that it
+  addresses the single-source case only.
+
+### KI-41 — `QuicTransportListener.StartAsync` is not safe under concurrent invocation (fixed)
+- **Status: fixed, same PR (#82), commit `d4de3b3`.** Found by this documentation pass while reconciling
+  the disposal-race handling already present in `StartAsync`; fixed immediately afterwards rather than
+  shipped as an open item, since the fix pattern already exists in this same codebase
+  (`MeshHub.StartAsync`'s `_starting` flag) and the change was small and low-risk.
+- **Where it was:** `StartAsync` (`Transport/Quic/QuicTransportListener.cs`). The "already running" guard
+  was checked under the lock **before** the asynchronous bind (`QuicListener.ListenAsync`); the only
+  check made in the **second** lock block, after the bind completed, was `!_disposed` — there was no
+  re-check that another `StartAsync` call had since published state.
+- **Severity:** medium (correctness / resource leak). Not reachable through ordinary `MeshHub` usage —
+  `MeshHub.StartAsync` calls `listener.StartAsync()` exactly once, itself guarded by the hub's own
+  lifecycle lock (KI-23) — but reachable from any caller that invokes `QuicTransportListener.StartAsync`
+  more than once without awaiting the first call first, which nothing on this type prevents or documents
+  against.
+- **Why it bites:** every other listener in this codebase (`TcpTransportListener`,
+  `WebSocketTransportListener`, `UnixSocketTransportListener`, `NamedPipeTransportListener`) binds
+  synchronously, so its entire bind runs *inside* `_stateLock` and a second concurrent `StartAsync` call
+  simply cannot observe the "not yet running" state the first call already claimed — the lock serialises
+  them completely, and the second reliably throws `InvalidOperationException`. `QuicTransportListener`
+  cannot do this, because `QuicListener.ListenAsync` is itself the asynchronous bind — there is no
+  synchronous constructor step to lock around, as the type's own doc comments acknowledge (`:239-243`,
+  "a concurrent `DisposeAsync` is handled by rechecking the `_disposed` flag under lock once
+  `ListenAsync`'s await completes"). That handles the **`StartAsync`-vs-`DisposeAsync`** race — it is
+  exactly what `DisposeAsync_RacedAgainstStartAsync_NeverLeavesAnUnpublishedListenerRunning`
+  (`QuicTransportListenerTests.cs:286`) proves — but nothing handles the **`StartAsync`-vs-`StartAsync`**
+  race: two overlapping calls both pass the initial guard (neither has published `_negotiationCts` yet
+  when the other checks it), both genuinely call `QuicListener.ListenAsync` and successfully bind (two
+  real binds — if the endpoint uses an ephemeral port, `0`, both succeed on two different ports; if it
+  names a fixed port, one bind will fail with a `QuicException`/`SocketException` the caller sees
+  directly, which happens to mask the race on that path only), and both reach the second lock block.
+  Whichever finishes second **silently overwrites** `_listener`, `_negotiatedTransports`,
+  `_negotiationCts` and `_negotiationPumpTask` with its own instances — there is no check for "somebody
+  else already published". The loser's `QuicListener` is never disposed by anything: its background
+  `NegotiationPumpAsync` keeps running, keeps accepting real connections, and keeps writing negotiated
+  transports into a `Channel` that only the *orphaned* pump's own closure still references — nothing will
+  ever call `AcceptAsync` against it, because the listener's `_negotiatedTransports` field now points at
+  the winner's channel instead. The result is a leaked bound UDP socket and a background task that runs
+  forever (or until the channel fills and its writes start blocking), invisible to `DisposeAsync`, which
+  only ever tears down whatever the fields currently reference.
+- **What was tested and what wasn't:** `StartAsync_AlreadyRunning_ThrowsInvalidOperationException`
+  (`QuicTransportListenerTests.cs:82`) only exercises the **sequential** case — it fully `await`s the
+  first `StartAsync` before issuing the second, which the existing guard handles correctly. Nothing in
+  `QuicTransportListenerTests.cs` dispatches two `StartAsync` calls concurrently and releases them
+  together the way `AcceptAsync_RacedAgainstDispose_OnlyEverReportsDisposal`
+  (`QuicTransportListenerTests.cs:230`) does for the accept/dispose race — that shape exists in the file
+  for exactly this kind of race and was not applied to this one.
+- **Why this was missed by the PR's earlier hardening passes:** the security-review and performance-review
+  passes recorded in this branch's history (KI-40's per-source cap, the non-blocking shed) both targeted
+  the negotiation pump's handling of *many connections*, not the listener's own `StartAsync` entry point.
+  This gap sat one level up, in code the other hardening passes had no reason to look at.
+- **What was fixed:** a `_starting` flag, checked and claimed under `_stateLock` alongside the existing
+  "already running" check, exactly mirroring `MeshHub.StartAsync`'s pattern (`MeshHub.cs:401`, described
+  in [known-issues.md](known-issues.md) KI-23's fifth point). A second concurrent `StartAsync` now sees
+  `_starting` already `true` and throws `InvalidOperationException` immediately, before ever calling
+  `QuicListener.ListenAsync` — so the double-bind this entry describes can no longer happen. The flag is
+  released (in a `catch`) if `QuicListener.IsSupported` is `false` or `ListenAsync` itself throws, so a
+  listener that failed to start remains startable rather than permanently reporting itself as running.
+  `StartAsync_CalledConcurrently_OnlyOneSucceeds` (`QuicTransportListenerTests.cs`) dispatches two
+  `StartAsync` calls to separate threads, releases them together, asserts exactly one succeeds, and then
+  proves the winner's state was genuinely published by connecting and exchanging a payload through the
+  listener afterwards — closing the test gap this entry originally recorded.
+- **What not to do:** do not treat `StartAsync_AlreadyRunning_ThrowsInvalidOperationException` alone as
+  proof this is safe — it only ever exercised the sequential case; the race coverage above is what closes
+  the gap it left open.
 
 ---
 

@@ -31,17 +31,18 @@ sites in `MeshHub.cs` / `MeshClient.cs`.
 ## Two layers: framing vs message
 
 1. **Transport framing** (owned by the transport). For `TcpTransport`: `[4-byte big-endian length N][N
-   payload bytes]`, `N ≤ 1 MiB`. `UnixSocketTransport` and `NamedPipeTransport` (PR #81, issue #20, **not
-   yet merged to `main`**) frame **identically** — both are stream-oriented exactly as TCP is, and all
-   three now share one internal `StreamFramer` helper (`Transport/Framing/StreamFramer.cs`) rather than
-   each reimplementing the length prefix and its bounds checking. `WebSocketTransport` (PR #78, issue #18)
-   is the exception and needs no length prefix at all — one WebSocket binary message carries exactly one
-   frame, since the WebSocket protocol already delimits messages; it enforces the identical 1 MiB cap
-   independently, on both send and receive, via its own separate constant. `InMemoryTransport` likewise
-   uses channel boundaries — no length prefix. Whatever the transport, the hub/client never see its
-   framing; they receive one **message payload** per `ReceiveAsync`, and everything below this line is
-   that payload, unchanged by which transport carried it. See [transport.md](transport.md) for each
-   transport's framing in full.
+   payload bytes]`, `N ≤ 1 MiB`. `UnixSocketTransport`/`NamedPipeTransport` (PR #81, issue #20) and, since
+   PR #82 (issue #21, **not yet merged to `main`**), `QuicTransport` frame **identically** — all three
+   (plus TCP) wrap a stream-oriented channel (a socket stream, a pipe stream, or a single QUIC stream)
+   exactly the same way, and all four now share one internal `StreamFramer` helper
+   (`Transport/Framing/StreamFramer.cs`) rather than each reimplementing the length prefix and its bounds
+   checking. `WebSocketTransport` (PR #78, issue #18) is the exception and needs no length prefix at all —
+   one WebSocket binary message carries exactly one frame, since the WebSocket protocol already delimits
+   messages; it enforces the identical 1 MiB cap independently, on both send and receive, via its own
+   separate constant. `InMemoryTransport` likewise uses channel boundaries — no length prefix. Whatever
+   the transport, the hub/client never see its framing; they receive one **message payload** per
+   `ReceiveAsync`, and everything below this line is that payload, unchanged by which transport carried
+   it. See [transport.md](transport.md) for each transport's framing in full.
 2. **Message** (owned by hub/client). The **first payload byte is the opcode** (`MessageType`); the rest
    is opcode-specific. Empty frames (length 0) are ignored, not decoded (`MeshHub.cs:1009`,
    `MeshClient.cs:723`).
