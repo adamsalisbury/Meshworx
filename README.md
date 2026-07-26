@@ -10,7 +10,8 @@ substituted.
 
 - **Target framework:** .NET 10
 - **Namespaces:** `AdamSalisbury.Meshworx`, `AdamSalisbury.Meshworx.Messages`,
-  `AdamSalisbury.Meshworx.Transport`, `AdamSalisbury.Meshworx.Transport.Tcp`
+  `AdamSalisbury.Meshworx.Transport`, `AdamSalisbury.Meshworx.Transport.Tcp`,
+  `AdamSalisbury.Meshworx.Extensions.DependencyInjection`
 
 ## Architecture
 
@@ -22,6 +23,7 @@ substituted.
 | `ITransportListener` | Accepts inbound transport connections for the hub. |
 | `TcpTransport` / `TcpTransportListener` | TCP implementation using a 4-byte big-endian length prefix per frame. |
 | `InMemoryTransport` / `InMemoryTransportListener` | In-process implementation backed by channels, for hosting a hub and clients in one process and for fast, deterministic testing. |
+| `AddMeshHub` / `AddMeshClient` | `IServiceCollection` extension methods, in the `AdamSalisbury.Meshworx.Extensions.DependencyInjection` package, that register a hub or client for dependency injection and the generic host. |
 
 The hub never interprets message payloads — it only reads the routing header and forwards the
 body. Delivery is best-effort and fire-and-forget.
@@ -453,6 +455,63 @@ await hub.StartAsync();
 await using var client = new MeshClient(clientLogger);
 await client.ConnectAsync(listener.Connect(), "Alice");
 ```
+
+## Dependency injection and hosting
+
+The `AdamSalisbury.Meshworx.Extensions.DependencyInjection` package registers a hub or client
+with `Microsoft.Extensions.DependencyInjection` and runs it alongside a generic host or ASP.NET
+Core application, instead of the application managing `StartAsync`/`StopAsync` and disposal by
+hand.
+
+### Hosting a hub
+
+```csharp
+using AdamSalisbury.Meshworx;
+
+builder.Services.AddMeshHub(options =>
+{
+    options.Port = 22001;
+    options.MaxClients = 1000;
+});
+```
+
+`AddMeshHub` registers a singleton `IMeshHub` — built from a `TcpTransportListener` on
+`MeshHubOptions.Port` by default, or from `MeshHubOptions.Listener` when one is supplied — and a
+hosted service that calls `StartAsync` when the host starts and `StopAsync` when it begins a
+graceful shutdown, draining connected clients before the process exits. An overload binds
+`MeshHubOptions` from an `IConfiguration` section:
+
+```csharp
+builder.Services.AddMeshHub(builder.Configuration.GetSection("MeshHub"));
+```
+
+Every `MeshHubOptions` property mirrors a `MeshHub` constructor parameter and carries the same
+default — see [Configuration](#configuration) above. An out-of-range `Port` fails host start
+with an `OptionsValidationException` rather than surfacing later as a socket error.
+
+### Hosting a client
+
+```csharp
+using AdamSalisbury.Meshworx;
+
+builder.Services.AddMeshClient("Alice", options =>
+{
+    options.Host = "localhost";
+    options.Port = 22001;
+    options.UseReconnector = true;
+});
+```
+
+`AddMeshClient` registers the client as a keyed `IMeshClient`, resolved by the name it was added
+with (`serviceProvider.GetRequiredKeyedService<IMeshClient>("Alice")`), and a hosted service that
+connects it when the host starts and disconnects it on shutdown. Setting
+`MeshClientOptions.UseReconnector` wraps the client in a `MeshClientReconnector` instead — the
+keyed `IMeshClient` is then the reconnector's managed client, so callers use the same API either
+way, and the reconnector (also resolvable by the same key, as `MeshClientReconnector`) is what
+starts on host start and stops on host stop. By default the client connects over TCP to
+`MeshClientOptions.Host`/`Port`; set `MeshClientOptions.TransportFactory` to use TLS or another
+transport. As with the hub, an `IConfiguration` overload binds `MeshClientOptions` from a section,
+and options are validated the same way on host start.
 
 ## Building and testing
 

@@ -53,6 +53,7 @@ public sealed class MeshClientServiceCollectionExtensionsTests
         Assert.Equal("localhost", options.Host);
         Assert.Equal(22001, options.Port);
         Assert.Null(options.TransportFactory);
+        Assert.Null(options.Credential);
         Assert.Null(options.IdleTimeout);
         Assert.Null(options.SendTimeout);
         Assert.Equal(1, options.MaxSendAttempts);
@@ -82,6 +83,7 @@ public sealed class MeshClientServiceCollectionExtensionsTests
                 ["Host"] = "hub.internal",
                 ["Port"] = "23456",
                 ["UseReconnector"] = "true",
+                ["Credential"] = Convert.ToBase64String("secret"u8.ToArray()),
             })
             .Build();
 
@@ -95,6 +97,11 @@ public sealed class MeshClientServiceCollectionExtensionsTests
         Assert.Equal("hub.internal", options.Host);
         Assert.Equal(23456, options.Port);
         Assert.True(options.UseReconnector);
+
+        // Credential is deliberately typed byte[] rather than ReadOnlyMemory<byte> — the configuration
+        // binder has no converter for ReadOnlyMemory<byte> and would silently leave it empty rather than
+        // fail, so this proves a config-bound credential actually reaches the options.
+        Assert.Equal("secret"u8.ToArray(), options.Credential);
     }
 
     [Fact(Timeout = 1000)]
@@ -259,7 +266,10 @@ public sealed class MeshClientServiceCollectionExtensionsTests
         IMeshClient client = host.Services.GetRequiredKeyedService<IMeshClient>("Bob");
         Assert.True(client.IsConnected);
 
+        // host.StopAsync() alone must disconnect a reconnector-backed client too — it must not rely on the
+        // service provider being disposed afterwards, since a caller may stop a host without disposing it.
         await host.StopAsync();
+        Assert.False(client.IsConnected);
 
         await hub.StopAsync();
     }

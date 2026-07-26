@@ -17,9 +17,12 @@ namespace AdamSalisbury.Meshworx.Extensions.DependencyInjection;
 /// configuration and is not known until the options pipeline resolves it.
 /// <para>
 /// A reconnector-backed client is started via <see cref="MeshClientReconnector.StartAsync"/> so its
-/// disconnect monitoring is wired up correctly, and is left to the dependency-injection container's own
-/// disposal of the reconnector's singleton — which disconnects gracefully — rather than being disconnected
-/// again here on stop.
+/// disconnect monitoring is wired up correctly, and is disposed directly on stop rather than left to the
+/// dependency-injection container's own disposal of the reconnector's singleton: <see cref="IHost.StopAsync"/>
+/// completing does not itself dispose the root service provider — a caller that stops a host without also
+/// disposing it would otherwise leave the reconnector's background loop running and the connection open.
+/// <see cref="MeshClientReconnector.DisposeAsync"/> is idempotent, so the later container disposal of the
+/// same singleton is a safe no-op once this has already run.
 /// </para>
 /// </remarks>
 internal sealed class MeshClientHostedService(
@@ -44,7 +47,8 @@ internal sealed class MeshClientHostedService(
 
         if (options.UseReconnector)
         {
-            return Task.CompletedTask;
+            MeshClientReconnector reconnector = serviceProvider.GetRequiredKeyedService<MeshClientReconnector>(clientName);
+            return reconnector.DisposeAsync().AsTask();
         }
 
         IMeshClient client = serviceProvider.GetRequiredKeyedService<IMeshClient>(clientName);

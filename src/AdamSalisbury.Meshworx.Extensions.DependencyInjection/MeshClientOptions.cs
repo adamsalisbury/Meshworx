@@ -50,7 +50,14 @@ public sealed class MeshClientOptions
     /// <summary>
     /// Gets or sets the opaque credential presented to the hub's authenticator on every connection attempt.
     /// </summary>
-    public ReadOnlyMemory<byte> Credential { get; set; }
+    /// <remarks>
+    /// Declared as <see cref="byte"/>[] rather than <see cref="ReadOnlyMemory{T}"/> deliberately: the
+    /// configuration binder has no converter for <see cref="ReadOnlyMemory{T}"/> and would silently leave
+    /// it empty rather than fail, so a credential bound from a base64 configuration value (e.g. from a
+    /// mounted secret) would be dropped without error. <c>byte[]</c> is the type the binder actually
+    /// supports for that case. Left <see langword="null"/>, the client presents no credential.
+    /// </remarks>
+    public byte[]? Credential { get; set; }
 
     /// <summary>
     /// Gets or sets how long the client tolerates silence from the hub before treating the connection as lost.
