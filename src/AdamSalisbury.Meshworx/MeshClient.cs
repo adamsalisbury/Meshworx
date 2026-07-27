@@ -43,7 +43,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     // Concurrent, unlike the single-slot lookup above: multiple RequestAsync calls may be in flight
     // together, each tracked independently by its own correlation id until its reply arrives, it times
     // out, or the connection tears down.
-    private readonly ConcurrentDictionary<long, TaskCompletionSource<ReadOnlyMemory<byte>>> _pendingRequests = new();
+    private readonly ConcurrentDictionary<long, PendingRequest> _pendingRequests = new();
     private long _requestCorrelationId;
 
     private readonly Lock _groupMembershipLock = new();
@@ -376,7 +376,24 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(headers);
+        ThrowIfReservedHeaderKeyPresent(headers);
 
+        await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Builds and sends a direct message frame, with or without a header block. Shared by the public
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, MessageHeaders, CancellationToken)"/> and by
+    /// <see cref="RequestAsync"/>/<see cref="ReplyAsync"/>, which construct
+    /// <see cref="RequestReplyHeaderKeys"/> headers themselves and so must bypass the public overload's
+    /// <see cref="ThrowIfReservedHeaderKeyPresent"/> guard rather than trip over their own headers.
+    /// </summary>
+    private async Task SendCoreAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken)
+    {
         ITransport transport;
 
         lock (_stateLock)
@@ -413,6 +430,25 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
 
         await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Guards against an application header colliding with one of <see cref="RequestReplyHeaderKeys"/>.
+    /// Without this, a message that happened to carry a header literally named <c>mesh.reply</c> with
+    /// value <c>"1"</c> would be silently intercepted by the receive loop as if it were a reply to some
+    /// request and never raised through <see cref="MessageReceived"/> at all.
+    /// </summary>
+    private static void ThrowIfReservedHeaderKeyPresent(MessageHeaders headers)
+    {
+        if (headers.ContainsKey(RequestReplyHeaderKeys.CorrelationId)
+            || headers.ContainsKey(RequestReplyHeaderKeys.Reply))
+        {
+            throw new ArgumentException(
+                $"The header keys '{RequestReplyHeaderKeys.CorrelationId}' and '{RequestReplyHeaderKeys.Reply}' "
+                + "are reserved for the request/response helper (RequestAsync/ReplyAsync) and cannot be set "
+                + "directly.",
+                nameof(headers));
+        }
     }
 
     /// <inheritdoc/>
@@ -718,7 +754,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         long correlationId = Interlocked.Increment(ref _requestCorrelationId);
         var completion = new TaskCompletionSource<ReadOnlyMemory<byte>>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pendingRequests[correlationId] = completion;
+
+        // The expected responder is recorded alongside the completion source so a reply is only ever
+        // accepted from the client this request was actually addressed to. Without this, any other
+        // client connected to the same hub could forge a DeliverMessageWithHeaders frame guessing (or
+        // brute-forcing) this correlation id and resolve the request with attacker-controlled bytes.
+        _pendingRequests[correlationId] = new PendingRequest(recipientId, completion);
 
         try
         {
@@ -729,7 +770,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     correlationId.ToString(CultureInfo.InvariantCulture)),
             ]);
 
-            await SendAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+            await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
 
             // Bound the wait by cancelling it, matching the pattern SendOnceAsync uses for its own
             // timeout: cancelling releases the wait rather than abandoning it, so a request that never
@@ -777,7 +818,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             new KeyValuePair<string, string>(RequestReplyHeaderKeys.Reply, "1"),
         ]);
 
-        return SendAsync(request.SenderId, message, headers, cancellationToken);
+        return SendCoreAsync(request.SenderId, message, headers, cancellationToken);
     }
 
     /// <inheritdoc/>
@@ -949,7 +990,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         {
                             ReadOnlyMemory<byte> messageData = data.AsMemory(19 + headerBlockLength);
 
-                            if (!TryCompletePendingRequest(headers, messageData))
+                            if (!TryCompletePendingRequest(senderId, headers, messageData))
                             {
                                 try
                                 {
@@ -1121,9 +1162,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             // Likewise the only thing that completes a pending RequestAsync call: fault every
             // still-outstanding request so a caller awaiting with a non-cancellable token is not left
             // hanging, then clear the table so nothing here is mistaken for a match on the next connection.
-            foreach (KeyValuePair<long, TaskCompletionSource<ReadOnlyMemory<byte>>> pending in _pendingRequests)
+            foreach (KeyValuePair<long, PendingRequest> pending in _pendingRequests)
             {
-                pending.Value.TrySetException(
+                pending.Value.Completion.TrySetException(
                     new InvalidOperationException("The connection was closed before a reply arrived."));
             }
 
@@ -1229,11 +1270,18 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// Completes a pending <see cref="RequestAsync"/> call if <paramref name="headers"/> mark this frame
     /// as a reply, so it is resolved internally rather than surfaced through <see cref="MessageReceived"/>.
     /// </summary>
+    /// <param name="senderId">
+    /// The actual sender of the frame, as stamped by the hub. Checked against the pending request's
+    /// recorded <see cref="PendingRequest.ExpectedResponderId"/> before completion, so a reply cannot be
+    /// forged by a client other than the one the request was addressed to.
+    /// </param>
+    /// <param name="headers">The frame's decoded headers.</param>
+    /// <param name="messageData">The frame's body, used as the reply payload if this frame is a match.</param>
     /// <returns>
     /// <see langword="true"/> if the frame was a reply (whether or not it matched a still-pending
-    /// request), so the caller must not raise it as an ordinary message.
+    /// request from the expected responder), so the caller must not raise it as an ordinary message.
     /// </returns>
-    private bool TryCompletePendingRequest(MessageHeaders headers, ReadOnlyMemory<byte> messageData)
+    private bool TryCompletePendingRequest(Guid senderId, MessageHeaders headers, ReadOnlyMemory<byte> messageData)
     {
         if (!headers.TryGetValue(RequestReplyHeaderKeys.Reply, out string? replyFlag)
             || !string.Equals(replyFlag, "1", StringComparison.Ordinal))
@@ -1249,17 +1297,32 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             return true;
         }
 
-        if (_pendingRequests.TryRemove(correlationId, out TaskCompletionSource<ReadOnlyMemory<byte>>? completion))
-        {
-            completion.TrySetResult(messageData);
-        }
-        else
+        if (!_pendingRequests.TryGetValue(correlationId, out PendingRequest? pending))
         {
             // The request this reply answers has already timed out, been cancelled, or never existed
             // on this connection; discard rather than misrouting it to an unrelated later request.
             _logger.LogDebug(
                 "Discarding a reply with an unmatched or expired correlation id {CorrelationId}",
                 correlationId);
+        }
+        else if (pending.ExpectedResponderId != senderId)
+        {
+            // This frame claims to answer a request addressed elsewhere. Left in place rather than
+            // removed, so a forged reply cannot be used to strand the real request — the genuine
+            // responder's reply can still arrive and complete it.
+            _logger.LogWarning(
+                "Discarding a reply for correlation id {CorrelationId} from {SenderId}, which does not "
+                + "match the expected responder {ExpectedResponderId}",
+                correlationId,
+                senderId,
+                pending.ExpectedResponderId);
+        }
+        else if (_pendingRequests.TryRemove(new KeyValuePair<long, PendingRequest>(correlationId, pending)))
+        {
+            // The compare-remove above only succeeds against the exact instance just matched, so a
+            // concurrent RequestAsync that has already claimed this id for a new call (having removed
+            // and replaced the entry itself) cannot have its fresh request stolen by a stale reply.
+            pending.Completion.TrySetResult(messageData);
         }
 
         return true;
@@ -1290,4 +1353,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     private sealed record PendingLookup(int CorrelationId, TaskCompletionSource<Guid?> Completion);
+
+    /// <summary>
+    /// A <see cref="RequestAsync"/> call awaiting a reply. <see cref="ExpectedResponderId"/> is checked
+    /// against the actual sender of an incoming reply frame before <see cref="Completion"/> is resolved,
+    /// so a client other than the one this request was addressed to cannot forge a reply and resolve it.
+    /// </summary>
+    private sealed record PendingRequest(Guid ExpectedResponderId, TaskCompletionSource<ReadOnlyMemory<byte>> Completion);
 }
