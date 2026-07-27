@@ -19,7 +19,7 @@ namespace AdamSalisbury.Meshworx.UnitTests.Transport.Quic;
 /// </summary>
 public sealed class QuicMeshIntegrationTests
 {
-    private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WaitTimeout = TestTimeouts.Wait;
 
     private static MeshHub CreateHub(QuicTransportListener listener)
     {
@@ -36,7 +36,7 @@ public sealed class QuicMeshIntegrationTests
     /// entirely through QUIC — the interoperability surface is identical to the TCP transport because
     /// nothing about the wire protocol changes.
     /// </summary>
-    [Fact(Timeout = 20000)]
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
     public async Task EndToEnd_RegisterSendBroadcastAndGroupMessage_OverQuic()
     {
         if (!QuicListener.IsSupported || !QuicConnection.IsSupported)

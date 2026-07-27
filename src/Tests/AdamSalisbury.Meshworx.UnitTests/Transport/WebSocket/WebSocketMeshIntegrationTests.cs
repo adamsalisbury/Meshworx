@@ -17,7 +17,7 @@ namespace AdamSalisbury.Meshworx.UnitTests.Transport.WebSocket;
 /// </summary>
 public sealed class WebSocketMeshIntegrationTests
 {
-    private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WaitTimeout = TestTimeouts.Wait;
 
     private static MeshHub CreateHub(WebSocketTransportListener listener)
     {
@@ -34,7 +34,7 @@ public sealed class WebSocketMeshIntegrationTests
     /// entirely through <c>wss://</c> — the interoperability surface is identical to the TCP transport
     /// because nothing about the wire protocol changes.
     /// </summary>
-    [Fact(Timeout = 20000)]
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
     public async Task EndToEnd_RegisterSendBroadcastAndGroupMessage_OverSecureWebSocket()
     {
         using X509Certificate2 hubCertificate = TestCertificates.CreateSelfSigned("localhost");
