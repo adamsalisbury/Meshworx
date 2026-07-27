@@ -1022,7 +1022,7 @@ public sealed class MeshClientTests
     /// When the hub refuses a group join, the client stops claiming the membership and tells the
     /// application, so it does not go on believing it is in a group it will receive nothing from.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task GroupJoinRefused_RemovesTheGroupAndRaisesTheEvent()
     {
         var fixture = new MeshClientFixture();
@@ -1057,7 +1057,7 @@ public sealed class MeshClientTests
     /// already removed. The interleaving is pinned by holding the send open until the refusal has been
     /// handled, rather than raced for.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task GroupJoinRefused_ArrivingBeforeTheJoinReturns_LeavesTheClientOutOfTheGroup()
     {
         var fixture = new MeshClientFixture();
@@ -1522,7 +1522,7 @@ public sealed class MeshClientTests
     /// is raised through MessageReceived as normal, with its CorrelationId populated so a handler knows
     /// to answer it via ReplyAsync.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_MessageCarriesRequestCorrelationId_SetsCorrelationIdOnEventArgs()
     {
         var fixture = new MeshClientFixture();
@@ -1812,7 +1812,7 @@ public sealed class MeshClientTests
     /// acknowledgement is additive, not a replacement for the ordinary receive path), and the client
     /// sends back an acknowledgement frame addressed to the sender carrying the same correlation id.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_MessageRequestsAcknowledgement_RaisesMessageReceivedAndSendsAcknowledgement()
     {
         var fixture = new MeshClientFixture();
@@ -1930,7 +1930,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// A message that did not request an acknowledgement does not cause one to be sent.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_MessageWithoutAcknowledgementRequest_DoesNotSendAcknowledgement()
     {
         var fixture = new MeshClientFixture();
@@ -2284,7 +2284,7 @@ public sealed class MeshClientTests
     /// When the hub sends a Ping frame, the client replies with a Pong frame so the hub can
     /// confirm the client is alive.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_HubSendsPing_ClientRepliesWithPong()
     {
         var fixture = new MeshClientFixture();
@@ -2318,7 +2318,7 @@ public sealed class MeshClientTests
     /// When the hub sends a Disconnect frame, the Disconnected event is raised with the
     /// RemoteDisconnect reason.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_HubSendsDisconnect_RaisesDisconnectedWithRemoteReason()
     {
         var fixture = new MeshClientFixture();
@@ -2338,7 +2338,7 @@ public sealed class MeshClientTests
     /// When the underlying transport reports the connection closed (ReceiveAsync returns null),
     /// the Disconnected event is raised with the ConnectionLost reason.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_ConnectionClosed_RaisesDisconnectedWithConnectionLostReason()
     {
         var fixture = new MeshClientFixture();
@@ -2362,7 +2362,7 @@ public sealed class MeshClientTests
     /// When the connection ends, the Disconnected event carries the groups the client was a member of,
     /// captured before the client clears its membership as it resets.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_ConnectionClosed_DisconnectedCarriesJoinedGroups()
     {
         var fixture = new MeshClientFixture();
@@ -2395,7 +2395,7 @@ public sealed class MeshClientTests
     /// When the connection is lost remotely, the client resets to a disconnected state so its
     /// Id is cleared and further sends are rejected.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_ConnectionClosed_ResetsToDisconnectedState()
     {
         var fixture = new MeshClientFixture();

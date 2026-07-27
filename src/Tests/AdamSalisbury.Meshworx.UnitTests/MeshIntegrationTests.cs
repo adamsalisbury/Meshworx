@@ -19,7 +19,7 @@ namespace AdamSalisbury.Meshworx.UnitTests;
 /// </summary>
 public sealed class MeshIntegrationTests
 {
-    private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WaitTimeout = TestTimeouts.Wait;
 
     private static MeshHub CreateHub(TcpTransportListener listener)
     {
@@ -68,7 +68,7 @@ public sealed class MeshIntegrationTests
     /// <summary>
     /// A broadcast from one client is delivered to every other connected client over the real protocol.
     /// </summary>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task EndToEnd_BroadcastReachesAllOtherClients()
     {
         var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
@@ -187,7 +187,7 @@ public sealed class MeshIntegrationTests
     /// A hub with a group authoriser makes groups an access-control boundary over the real protocol: an
     /// unauthorised client is refused membership, told so, and receives none of the group's traffic.
     /// </summary>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task EndToEnd_UnauthorisedClientIsRefusedGroupMembership()
     {
         var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
@@ -372,7 +372,7 @@ public sealed class MeshIntegrationTests
     /// The full hub and client stack works over the in-memory transport, confirming the transport
     /// abstraction is pluggable: a message is routed between two clients without any sockets.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task EndToEnd_MessageRoutedOverInMemoryTransport()
     {
         var listener = new InMemoryTransportListener();
@@ -479,7 +479,7 @@ public sealed class MeshIntegrationTests
     /// member the same way — proving the header envelope round-trips end to end rather than only
     /// within the unit-level frame-building and frame-parsing tests.
     /// </summary>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task EndToEnd_HeadersRoundTripForDirectAndGroupMessages()
     {
         var listener = new InMemoryTransportListener();

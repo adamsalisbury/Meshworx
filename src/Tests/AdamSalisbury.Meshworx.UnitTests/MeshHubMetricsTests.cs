@@ -6,7 +6,7 @@ namespace AdamSalisbury.Meshworx.UnitTests;
 
 public sealed class MeshHubMetricsTests
 {
-    private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WaitTimeout = TestTimeouts.Wait;
 
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
     {
@@ -40,7 +40,7 @@ public sealed class MeshHubMetricsTests
     /// <summary>
     /// When a client completes registration, the hub's connected-clients up/down counter is incremented.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ClientsConnectedCounter_ClientRegisters_IsIncremented()
     {
         var fixture = new MeshHubFixture();
@@ -69,7 +69,7 @@ public sealed class MeshHubMetricsTests
     /// <summary>
     /// When a registered client disconnects, the hub's connected-clients up/down counter is decremented.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ClientsConnectedCounter_ClientDisconnects_IsDecremented()
     {
         var fixture = new MeshHubFixture();
@@ -98,7 +98,7 @@ public sealed class MeshHubMetricsTests
     /// When a message is routed directly to a registered recipient, the routed-messages and routed-bytes
     /// counters are both incremented, tagged with direction "direct".
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessage_RecipientExists_IncrementsRoutedCountersTaggedDirect()
     {
         var fixture = new MeshHubFixture();
@@ -137,7 +137,7 @@ public sealed class MeshHubMetricsTests
     /// When a message is sent to a Guid that does not match any registered client, the dropped-messages
     /// counter is incremented with reason "unknown-recipient".
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessage_RecipientDoesNotExist_IncrementsDroppedCounterTaggedUnknownRecipient()
     {
         var fixture = new MeshHubFixture();
@@ -166,7 +166,7 @@ public sealed class MeshHubMetricsTests
     /// When a recipient's outbound queue is already full, a further message routed to it increments the
     /// dropped-messages counter with reason "queue-full" instead of the routed counters.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
     public async Task RouteMessage_RecipientQueueFull_IncrementsDroppedCounterTaggedQueueFull()
     {
         var fixture = new MeshHubFixture();
@@ -234,7 +234,7 @@ public sealed class MeshHubMetricsTests
     /// not once per recipient — since it counts the message the hub routed rather than the deliveries it
     /// fanned out to.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task BroadcastMessage_MultipleRecipients_IncrementsRoutedCounterOnceTaggedBroadcast()
     {
         var fixture = new MeshHubFixture();
@@ -278,7 +278,7 @@ public sealed class MeshHubMetricsTests
     /// the routed-messages counter at all — mirroring SendToGroup, which likewise records nothing when
     /// the sender is the group's only member.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task BroadcastMessage_SenderIsOnlyClient_DoesNotIncrementRoutedCounter()
     {
         var fixture = new MeshHubFixture();
@@ -325,7 +325,7 @@ public sealed class MeshHubMetricsTests
     /// A message sent to a group increments the routed-messages and routed-bytes counters, tagged
     /// "group".
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task SendToGroup_MemberSends_IncrementsRoutedCountersTaggedGroup()
     {
         var fixture = new MeshHubFixture();
@@ -371,7 +371,7 @@ public sealed class MeshHubMetricsTests
     /// While a recipient's outbound queue holds undelivered frames, the observable outbound-queue-depth
     /// gauge reports a total no smaller than the number queued.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task OutboundQueueDepth_MessagesQueued_ReportsPositiveAggregateDepth()
     {
         var fixture = new MeshHubFixture();

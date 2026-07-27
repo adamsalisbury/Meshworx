@@ -13,7 +13,7 @@ namespace AdamSalisbury.Meshworx.UnitTests.Transport.Unix;
 /// </summary>
 public sealed class UnixSocketMeshIntegrationTests
 {
-    private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WaitTimeout = TestTimeouts.Wait;
 
     private static MeshHub CreateHub(UnixSocketTransportListener listener)
     {
@@ -30,7 +30,7 @@ public sealed class UnixSocketMeshIntegrationTests
     /// entirely through a Unix domain socket — the interoperability surface is identical to the TCP
     /// transport because nothing about the wire protocol changes.
     /// </summary>
-    [Fact(Timeout = 20000)]
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
     public async Task EndToEnd_RegisterSendBroadcastAndGroupMessage_OverUnixSocket()
     {
         string path = TempSocketPath.Create();
