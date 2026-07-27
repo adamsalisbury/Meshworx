@@ -517,6 +517,39 @@ public sealed class MeshClientTests
             () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, headers));
     }
 
+    /// <summary>
+    /// The request/response helper's correlation-id header key is reserved: a caller that happens to
+    /// set it directly is rejected loudly rather than having the receive loop silently swallow a
+    /// perfectly ordinary message on the recipient's side because it coincidentally looked like RPC
+    /// plumbing.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_HeadersContainReservedCorrelationIdKey_ThrowsArgumentException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        var headers = new MessageHeaders([new(RequestReplyHeaderKeys.CorrelationId, "1")]);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, headers));
+    }
+
+    /// <summary>
+    /// As above, for the reply-flag header key.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_HeadersContainReservedReplyKey_ThrowsArgumentException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        var headers = new MessageHeaders([new(RequestReplyHeaderKeys.Reply, "1")]);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, headers));
+    }
+
     // Send policy (timeout and retry)
 
     /// <summary>
@@ -1190,6 +1223,388 @@ public sealed class MeshClientTests
         Assert.NotNull(lookupPayload);
         Assert.Equal(0x06, lookupPayload[0]);
         Assert.Equal("Target", System.Text.Encoding.UTF8.GetString(lookupPayload.AsSpan(5)));
+    }
+
+    // RequestAsync / ReplyAsync
+
+    /// <summary>
+    /// When RequestAsync is called on a client that is not connected to a hub, an
+    /// InvalidOperationException is thrown, matching every other send-shaped method.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task RequestAsync_NotConnected_ThrowsInvalidOperationException()
+    {
+        var fixture = new MeshClientFixture();
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => fixture.Client.RequestAsync(Guid.NewGuid(), new byte[] { 1 }, TimeSpan.FromSeconds(1)));
+    }
+
+    /// <summary>
+    /// A zero or negative timeout is rejected before anything is sent, rather than resolving
+    /// immediately as a timeout would.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task RequestAsync_ZeroTimeout_ThrowsArgumentOutOfRangeException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => fixture.Client.RequestAsync(Guid.NewGuid(), new byte[] { 1 }, TimeSpan.Zero));
+    }
+
+    /// <summary>
+    /// When a matching reply frame (correlation id echoed back with the reply header set) arrives,
+    /// RequestAsync completes with the reply's payload rather than raising it through MessageReceived.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task RequestAsync_ReplyArrives_ReturnsReplyPayloadWithoutRaisingMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var channel = Channel.CreateUnbounded<byte[]?>();
+        channel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        var responderId = Guid.NewGuid();
+        byte[] replyBody = [9, 9, 9];
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                byte[] sent = data.ToArray();
+                if (sent[0] != 0x11)
+                {
+                    // Not the request frame (e.g. the registration handshake); nothing to reply to.
+                    return;
+                }
+
+                int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sent.AsSpan(17, 2));
+                MessageHeaders sentHeaders = HeaderEnvelope.Read(sent.AsSpan(19), headerLength);
+                string correlationId = sentHeaders[RequestReplyHeaderKeys.CorrelationId];
+
+                var replyHeaders = new MessageHeaders(
+                [
+                    new(RequestReplyHeaderKeys.CorrelationId, correlationId),
+                    new(RequestReplyHeaderKeys.Reply, "1"),
+                ]);
+                channel.Writer.TryWrite(
+                    MeshClientFixture.CreateDeliverMessageWithHeadersPayload(responderId, replyHeaders, replyBody));
+            })
+            .Returns(Task.CompletedTask);
+
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        bool messageReceivedRaised = false;
+        fixture.Client.MessageReceived += (_, _) => messageReceivedRaised = true;
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        ReadOnlyMemory<byte> reply = await fixture.Client.RequestAsync(
+            responderId, new byte[] { 1, 2, 3 }, TimeSpan.FromSeconds(1));
+
+        Assert.Equal(replyBody, reply.ToArray());
+        Assert.False(messageReceivedRaised);
+    }
+
+    /// <summary>
+    /// Concurrent requests are tracked independently by their own correlation id: each resolves with
+    /// the reply addressed to it, not a reply meant for the other.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task RequestAsync_ConcurrentRequests_AreIndependent()
+    {
+        var fixture = new MeshClientFixture();
+        var channel = Channel.CreateUnbounded<byte[]?>();
+        channel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        var responderId = Guid.NewGuid();
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                byte[] sent = data.ToArray();
+                if (sent[0] != 0x11)
+                {
+                    return;
+                }
+
+                int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sent.AsSpan(17, 2));
+                MessageHeaders sentHeaders = HeaderEnvelope.Read(sent.AsSpan(19), headerLength);
+                string correlationId = sentHeaders[RequestReplyHeaderKeys.CorrelationId];
+                byte[] requestBody = sent[(19 + headerLength)..];
+
+                // Echo the request body back behind a marker, so each reply is distinguishable and can
+                // be matched back to the request that produced it.
+                var replyBody = new byte[9 + requestBody.Length];
+                Encoding.UTF8.GetBytes("reply-to:").CopyTo(replyBody, 0);
+                requestBody.CopyTo(replyBody, 9);
+
+                var replyHeaders = new MessageHeaders(
+                [
+                    new(RequestReplyHeaderKeys.CorrelationId, correlationId),
+                    new(RequestReplyHeaderKeys.Reply, "1"),
+                ]);
+                channel.Writer.TryWrite(
+                    MeshClientFixture.CreateDeliverMessageWithHeadersPayload(responderId, replyHeaders, replyBody));
+            })
+            .Returns(Task.CompletedTask);
+
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        Task<ReadOnlyMemory<byte>> first = fixture.Client.RequestAsync(
+            responderId, new byte[] { 1 }, TimeSpan.FromSeconds(1));
+        Task<ReadOnlyMemory<byte>> second = fixture.Client.RequestAsync(
+            responderId, new byte[] { 2 }, TimeSpan.FromSeconds(1));
+
+        ReadOnlyMemory<byte>[] results = await Task.WhenAll(first, second);
+
+        Assert.Equal(Encoding.UTF8.GetBytes("reply-to:").Append((byte)1), results[0].ToArray());
+        Assert.Equal(Encoding.UTF8.GetBytes("reply-to:").Append((byte)2), results[1].ToArray());
+    }
+
+    /// <summary>
+    /// When no reply arrives within the given timeout, RequestAsync fails with a TimeoutException
+    /// rather than hanging indefinitely.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task RequestAsync_NoReplyWithinTimeout_ThrowsTimeoutException()
+    {
+        var fixture = new MeshClientFixture();
+        fixture.SetupSuccessfulRegistration();
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => fixture.Client.RequestAsync(Guid.NewGuid(), new byte[] { 1 }, TimeSpan.FromMilliseconds(50)));
+    }
+
+    /// <summary>
+    /// A reply that arrives after its request has already timed out is discarded rather than being
+    /// misrouted to a later, unrelated request that happens to reuse the same correlation id, and does
+    /// not surface through MessageReceived either.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task RequestAsync_LateReplyAfterTimeout_IsDiscardedNotMisrouted()
+    {
+        var fixture = new MeshClientFixture();
+        var channel = Channel.CreateUnbounded<byte[]?>();
+        channel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => fixture.Client.RequestAsync(Guid.NewGuid(), new byte[] { 1 }, TimeSpan.FromMilliseconds(20)));
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        fixture.Client.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        // A late reply for the now-expired correlation id ("1", the first and only request this fresh
+        // client has made).
+        var lateReplyHeaders = new MessageHeaders(
+        [
+            new(RequestReplyHeaderKeys.CorrelationId, "1"),
+            new(RequestReplyHeaderKeys.Reply, "1"),
+        ]);
+        channel.Writer.TryWrite(
+            MeshClientFixture.CreateDeliverMessageWithHeadersPayload(Guid.NewGuid(), lateReplyHeaders, [9]));
+
+        // A barrier message that follows it: once this is observed, the loop must already have
+        // processed (and silently dropped) the late reply immediately before it.
+        var barrierHeaders = new MessageHeaders([new("marker", "barrier")]);
+        channel.Writer.TryWrite(
+            MeshClientFixture.CreateDeliverMessageWithHeadersPayload(Guid.NewGuid(), barrierHeaders, [5]));
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(5, received.Data.Span[0]);
+    }
+
+    /// <summary>
+    /// A reply frame claiming the correct correlation id but arriving from a client other than the one
+    /// the request was addressed to is discarded rather than resolving the request — otherwise any
+    /// other client connected to the same hub could forge a reply for a request meant for someone else.
+    /// The genuinely addressed responder's reply, arriving afterwards, still completes the request: the
+    /// forged reply must not have consumed or stranded the pending slot.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task RequestAsync_ReplyFromWrongSender_IsDiscardedAndGenuineReplyStillCompletes()
+    {
+        var fixture = new MeshClientFixture();
+        var channel = Channel.CreateUnbounded<byte[]?>();
+        channel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        var intendedResponderId = Guid.NewGuid();
+        var attackerId = Guid.NewGuid();
+        byte[] genuineReplyBody = [7, 7, 7];
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                byte[] sent = data.ToArray();
+                if (sent[0] != 0x11)
+                {
+                    return;
+                }
+
+                int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sent.AsSpan(17, 2));
+                MessageHeaders sentHeaders = HeaderEnvelope.Read(sent.AsSpan(19), headerLength);
+                string correlationId = sentHeaders[RequestReplyHeaderKeys.CorrelationId];
+
+                var replyHeaders = new MessageHeaders(
+                [
+                    new(RequestReplyHeaderKeys.CorrelationId, correlationId),
+                    new(RequestReplyHeaderKeys.Reply, "1"),
+                ]);
+
+                // A forged reply from a client that was never the addressed recipient, immediately
+                // followed by the genuine responder's own reply — both racing to resolve the same
+                // pending request.
+                channel.Writer.TryWrite(
+                    MeshClientFixture.CreateDeliverMessageWithHeadersPayload(attackerId, replyHeaders, [9, 9, 9]));
+                channel.Writer.TryWrite(
+                    MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+                        intendedResponderId, replyHeaders, genuineReplyBody));
+            })
+            .Returns(Task.CompletedTask);
+
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        ReadOnlyMemory<byte> reply = await fixture.Client.RequestAsync(
+            intendedResponderId, new byte[] { 1 }, TimeSpan.FromSeconds(1));
+
+        Assert.Equal(genuineReplyBody, reply.ToArray());
+    }
+
+    /// <summary>
+    /// If the connection is torn down before a reply arrives, the pending RequestAsync call is faulted
+    /// rather than left hanging forever.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task RequestAsync_ConnectionClosedBeforeReplyArrives_ThrowsInvalidOperationException()
+    {
+        var fixture = new MeshClientFixture();
+        var channel = Channel.CreateUnbounded<byte[]?>();
+        channel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                if (data.Span[0] == 0x11)
+                {
+                    // Simulate the connection dropping immediately after the request is sent, before
+                    // any reply arrives — the receive loop's next read observes a closed connection.
+                    channel.Writer.TryWrite(null);
+                }
+            })
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => fixture.Client.RequestAsync(Guid.NewGuid(), new byte[] { 1 }, TimeSpan.FromSeconds(5)));
+    }
+
+    /// <summary>
+    /// A message carrying a request correlation id (but not the reply flag) is an incoming request: it
+    /// is raised through MessageReceived as normal, with its CorrelationId populated so a handler knows
+    /// to answer it via ReplyAsync.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_MessageCarriesRequestCorrelationId_SetsCorrelationIdOnEventArgs()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+        var headers = new MessageHeaders([new(RequestReplyHeaderKeys.CorrelationId, "7")]);
+        byte[] payload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, headers, new byte[] { 1 });
+        fixture.SetupSuccessfulRegistration(payload);
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        fixture.Client.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(7L, received.CorrelationId);
+    }
+
+    /// <summary>
+    /// Replying to a message that was not a request (no CorrelationId) throws, rather than sending a
+    /// reply frame nothing is waiting for.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReplyAsync_MessageWasNotARequest_ThrowsInvalidOperationException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        var request = new MessageReceivedEventArgs { SenderId = Guid.NewGuid(), Data = new byte[] { 1 } };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => fixture.Client.ReplyAsync(request, new byte[] { 2 }));
+    }
+
+    /// <summary>
+    /// A null request argument throws rather than being dereferenced.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReplyAsync_NullRequest_ThrowsArgumentNullException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        await Assert.ThrowsAsync<ArgumentNullException>(
+            () => fixture.Client.ReplyAsync(null!, new byte[] { 1 }));
+    }
+
+    /// <summary>
+    /// ReplyAsync addresses the reply back to the request's sender and carries both the correlation id
+    /// and the reply flag, so the original requester's RequestAsync call resolves rather than the reply
+    /// itself being mistaken for a fresh request.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReplyAsync_ValidRequest_SendsReplyFrameCarryingCorrelationIdAndReplyFlag()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        var requesterId = Guid.NewGuid();
+        var request = new MessageReceivedEventArgs
+        {
+            SenderId = requesterId,
+            Data = new byte[] { 1 },
+            CorrelationId = 42,
+        };
+
+        await fixture.Client.ReplyAsync(request, new byte[] { 9, 9 });
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x11, sentData[0]); // SendMessageWithHeaders
+        Assert.Equal(requesterId, new Guid(sentData.AsSpan(1, 16)));
+
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(17, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(sentData.AsSpan(19), headerLength);
+        Assert.Equal("42", decoded[RequestReplyHeaderKeys.CorrelationId]);
+        Assert.Equal("1", decoded[RequestReplyHeaderKeys.Reply]);
+        Assert.Equal(new byte[] { 9, 9 }, sentData[(19 + headerLength)..]);
     }
 
     // ReceiveLoop (tested indirectly via MessageReceived event)

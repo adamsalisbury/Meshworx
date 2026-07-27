@@ -219,6 +219,59 @@ public interface IMeshClient : IAsyncDisposable
     Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends a request to another client and awaits a correlated reply.
+    /// </summary>
+    /// <remarks>
+    /// The correlation id that ties the reply back to this call travels as a header, so this requires a
+    /// connection that negotiated a protocol version supporting the structured header envelope (see
+    /// <see cref="MessageHeaders"/>). The responder observes the request through
+    /// <see cref="MessageReceived"/> — a raised event whose
+    /// <see cref="MessageReceivedEventArgs.CorrelationId"/> is not <see langword="null"/> is a
+    /// request awaiting a reply — and answers it with <see cref="ReplyAsync"/>.
+    /// <para>
+    /// Concurrent requests from the same client are independent: each is tracked by its own correlation
+    /// id and resolved only by a reply carrying that same id. A reply that arrives after this call has
+    /// already timed out or been cancelled is discarded rather than misrouted to a later request that
+    /// happens to reuse the id.
+    /// </para>
+    /// </remarks>
+    /// <param name="recipientId">The unique identifier of the client to request a reply from.</param>
+    /// <param name="message">The request payload.</param>
+    /// <param name="timeout">The maximum time to wait for a reply before the call fails.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <returns>The reply payload sent back via <see cref="ReplyAsync"/>.</returns>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The hub negotiated a protocol version that predates the header envelope.
+    /// </exception>
+    /// <exception cref="TimeoutException">No reply arrived within <paramref name="timeout"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeout"/> is not positive.</exception>
+    Task<ReadOnlyMemory<byte>> RequestAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Replies to a request previously received via <see cref="MessageReceived"/>, completing the
+    /// sender's pending <see cref="RequestAsync"/> call.
+    /// </summary>
+    /// <param name="request">
+    /// The <see cref="MessageReceivedEventArgs"/> the request arrived on. Its
+    /// <see cref="MessageReceivedEventArgs.CorrelationId"/> must be set, i.e. it must have come
+    /// from a <see cref="RequestAsync"/> call rather than an ordinary send.
+    /// </param>
+    /// <param name="message">The reply payload.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">
+    /// The client is not connected to a hub, or <paramref name="request"/> was not a request.
+    /// </exception>
+    Task ReplyAsync(
+        MessageReceivedEventArgs request,
+        ReadOnlyMemory<byte> message,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Raised when a directly addressed or broadcast message is received from another client.
     /// </summary>
     event EventHandler<MessageReceivedEventArgs> MessageReceived;

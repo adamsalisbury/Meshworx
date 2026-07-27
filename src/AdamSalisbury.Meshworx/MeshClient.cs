@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net.Sockets;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
@@ -37,6 +39,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     // a subsequent lookup with a stale result.
     private PendingLookup? _pendingLookup;
     private int _lookupCorrelationId;
+
+    // Concurrent, unlike the single-slot lookup above: multiple RequestAsync calls may be in flight
+    // together, each tracked independently by its own correlation id until its reply arrives, it times
+    // out, or the connection tears down.
+    private readonly ConcurrentDictionary<long, PendingRequest> _pendingRequests = new();
+    private long _requestCorrelationId;
 
     private readonly Lock _groupMembershipLock = new();
     private readonly HashSet<string> _joinedGroups = new(StringComparer.Ordinal);
@@ -368,7 +376,24 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(headers);
+        ThrowIfReservedHeaderKeyPresent(headers);
 
+        await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Builds and sends a direct message frame, with or without a header block. Shared by the public
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, MessageHeaders, CancellationToken)"/> and by
+    /// <see cref="RequestAsync"/>/<see cref="ReplyAsync"/>, which construct
+    /// <see cref="RequestReplyHeaderKeys"/> headers themselves and so must bypass the public overload's
+    /// <see cref="ThrowIfReservedHeaderKeyPresent"/> guard rather than trip over their own headers.
+    /// </summary>
+    private async Task SendCoreAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken)
+    {
         ITransport transport;
 
         lock (_stateLock)
@@ -405,6 +430,25 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
 
         await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Guards against an application header colliding with one of <see cref="RequestReplyHeaderKeys"/>.
+    /// Without this, a message that happened to carry a header literally named <c>mesh.reply</c> with
+    /// value <c>"1"</c> would be silently intercepted by the receive loop as if it were a reply to some
+    /// request and never raised through <see cref="MessageReceived"/> at all.
+    /// </summary>
+    private static void ThrowIfReservedHeaderKeyPresent(MessageHeaders headers)
+    {
+        if (headers.ContainsKey(RequestReplyHeaderKeys.CorrelationId)
+            || headers.ContainsKey(RequestReplyHeaderKeys.Reply))
+        {
+            throw new ArgumentException(
+                $"The header keys '{RequestReplyHeaderKeys.CorrelationId}' and '{RequestReplyHeaderKeys.Reply}' "
+                + "are reserved for the request/response helper (RequestAsync/ReplyAsync) and cannot be set "
+                + "directly.",
+                nameof(headers));
+        }
     }
 
     /// <inheritdoc/>
@@ -697,6 +741,87 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public async Task<ReadOnlyMemory<byte>> RequestAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        if (timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout), "The request timeout must be positive.");
+        }
+
+        long correlationId = Interlocked.Increment(ref _requestCorrelationId);
+        var completion = new TaskCompletionSource<ReadOnlyMemory<byte>>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // The expected responder is recorded alongside the completion source so a reply is only ever
+        // accepted from the client this request was actually addressed to. Without this, any other
+        // client connected to the same hub could forge a DeliverMessageWithHeaders frame guessing (or
+        // brute-forcing) this correlation id and resolve the request with attacker-controlled bytes.
+        _pendingRequests[correlationId] = new PendingRequest(recipientId, completion);
+
+        try
+        {
+            var headers = new MessageHeaders(
+            [
+                new KeyValuePair<string, string>(
+                    RequestReplyHeaderKeys.CorrelationId,
+                    correlationId.ToString(CultureInfo.InvariantCulture)),
+            ]);
+
+            await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+
+            // Bound the wait by cancelling it, matching the pattern SendOnceAsync uses for its own
+            // timeout: cancelling releases the wait rather than abandoning it, so a request that never
+            // gets a reply does not leak a continuation waiting on the completion source forever.
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(timeout);
+
+            try
+            {
+                return await completion.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException($"The request did not receive a reply within {timeout}.");
+            }
+        }
+        finally
+        {
+            // Whether the reply arrived, the call timed out, or it was cancelled, this correlation id is
+            // no longer awaited — a late reply for it is discarded by TryCompletePendingRequest rather
+            // than resolving a future request that happens to reuse the id.
+            _pendingRequests.TryRemove(correlationId, out _);
+        }
+    }
+
+    /// <inheritdoc/>
+    public Task ReplyAsync(
+        MessageReceivedEventArgs request,
+        ReadOnlyMemory<byte> message,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        if (request.CorrelationId is not { } correlationId)
+        {
+            throw new InvalidOperationException(
+                "The supplied message was not a request and cannot be replied to.");
+        }
+
+        var headers = new MessageHeaders(
+        [
+            new KeyValuePair<string, string>(
+                RequestReplyHeaderKeys.CorrelationId, correlationId.ToString(CultureInfo.InvariantCulture)),
+            new KeyValuePair<string, string>(RequestReplyHeaderKeys.Reply, "1"),
+        ]);
+
+        return SendCoreAsync(request.SenderId, message, headers, cancellationToken);
+    }
+
+    /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
         await DisconnectAsync().ConfigureAwait(false);
@@ -865,20 +990,24 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         {
                             ReadOnlyMemory<byte> messageData = data.AsMemory(19 + headerBlockLength);
 
-                            try
+                            if (!TryCompletePendingRequest(senderId, headers, messageData))
                             {
-                                MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                                try
                                 {
-                                    SenderId = senderId,
-                                    Data = messageData,
-                                    Headers = headers,
-                                });
-                            }
-                            catch (Exception ex)
-                            {
-                                // A throwing subscriber must not tear down the receive loop and
-                                // silently halt all further delivery. This is a callback boundary.
-                                _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                                    MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                                    {
+                                        SenderId = senderId,
+                                        Data = messageData,
+                                        Headers = headers,
+                                        CorrelationId = TryGetRequestCorrelationId(headers),
+                                    });
+                                }
+                                catch (Exception ex)
+                                {
+                                    // A throwing subscriber must not tear down the receive loop and
+                                    // silently halt all further delivery. This is a callback boundary.
+                                    _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                                }
                             }
                         }
                     }
@@ -1030,6 +1159,17 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             _pendingLookup?.Completion.TrySetException(
                 new InvalidOperationException("The connection was closed before the lookup completed."));
 
+            // Likewise the only thing that completes a pending RequestAsync call: fault every
+            // still-outstanding request so a caller awaiting with a non-cancellable token is not left
+            // hanging, then clear the table so nothing here is mistaken for a match on the next connection.
+            foreach (KeyValuePair<long, PendingRequest> pending in _pendingRequests)
+            {
+                pending.Value.Completion.TrySetException(
+                    new InvalidOperationException("The connection was closed before a reply arrived."));
+            }
+
+            _pendingRequests.Clear();
+
             await HandleReceiveLoopTerminationAsync(reason).ConfigureAwait(false);
         }
     }
@@ -1126,6 +1266,84 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Completes a pending <see cref="RequestAsync"/> call if <paramref name="headers"/> mark this frame
+    /// as a reply, so it is resolved internally rather than surfaced through <see cref="MessageReceived"/>.
+    /// </summary>
+    /// <param name="senderId">
+    /// The actual sender of the frame, as stamped by the hub. Checked against the pending request's
+    /// recorded <see cref="PendingRequest.ExpectedResponderId"/> before completion, so a reply cannot be
+    /// forged by a client other than the one the request was addressed to.
+    /// </param>
+    /// <param name="headers">The frame's decoded headers.</param>
+    /// <param name="messageData">The frame's body, used as the reply payload if this frame is a match.</param>
+    /// <returns>
+    /// <see langword="true"/> if the frame was a reply (whether or not it matched a still-pending
+    /// request from the expected responder), so the caller must not raise it as an ordinary message.
+    /// </returns>
+    private bool TryCompletePendingRequest(Guid senderId, MessageHeaders headers, ReadOnlyMemory<byte> messageData)
+    {
+        if (!headers.TryGetValue(RequestReplyHeaderKeys.Reply, out string? replyFlag)
+            || !string.Equals(replyFlag, "1", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!headers.TryGetValue(RequestReplyHeaderKeys.CorrelationId, out string? correlationText)
+            || !long.TryParse(
+                correlationText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long correlationId))
+        {
+            _logger.LogWarning("Discarding a reply frame with a missing or malformed correlation id");
+            return true;
+        }
+
+        if (!_pendingRequests.TryGetValue(correlationId, out PendingRequest? pending))
+        {
+            // The request this reply answers has already timed out, been cancelled, or never existed
+            // on this connection; discard rather than misrouting it to an unrelated later request.
+            _logger.LogDebug(
+                "Discarding a reply with an unmatched or expired correlation id {CorrelationId}",
+                correlationId);
+        }
+        else if (pending.ExpectedResponderId != senderId)
+        {
+            // This frame claims to answer a request addressed elsewhere. Left in place rather than
+            // removed, so a forged reply cannot be used to strand the real request — the genuine
+            // responder's reply can still arrive and complete it.
+            _logger.LogWarning(
+                "Discarding a reply for correlation id {CorrelationId} from {SenderId}, which does not "
+                + "match the expected responder {ExpectedResponderId}",
+                correlationId,
+                senderId,
+                pending.ExpectedResponderId);
+        }
+        else if (_pendingRequests.TryRemove(new KeyValuePair<long, PendingRequest>(correlationId, pending)))
+        {
+            // The compare-remove above only succeeds against the exact instance just matched, so a
+            // concurrent RequestAsync that has already claimed this id for a new call (having removed
+            // and replaced the entry itself) cannot have its fresh request stolen by a stale reply.
+            pending.Completion.TrySetResult(messageData);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Reads the request correlation id from an incoming (non-reply) frame's headers, for exposure on
+    /// <see cref="MessageReceivedEventArgs.CorrelationId"/>.
+    /// </summary>
+    private static long? TryGetRequestCorrelationId(MessageHeaders headers)
+    {
+        if (headers.TryGetValue(RequestReplyHeaderKeys.CorrelationId, out string? correlationText)
+            && long.TryParse(
+                correlationText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long correlationId))
+        {
+            return correlationId;
+        }
+
+        return null;
+    }
+
     private enum ConnectionState
     {
         Disconnected,
@@ -1135,4 +1353,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     private sealed record PendingLookup(int CorrelationId, TaskCompletionSource<Guid?> Completion);
+
+    /// <summary>
+    /// A <see cref="RequestAsync"/> call awaiting a reply. <see cref="ExpectedResponderId"/> is checked
+    /// against the actual sender of an incoming reply frame before <see cref="Completion"/> is resolved,
+    /// so a client other than the one this request was addressed to cannot forge a reply and resolve it.
+    /// </summary>
+    private sealed record PendingRequest(Guid ExpectedResponderId, TaskCompletionSource<ReadOnlyMemory<byte>> Completion);
 }
