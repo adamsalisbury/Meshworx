@@ -45,7 +45,7 @@ sites in `MeshHub.cs` / `MeshClient.cs`.
    it. See [transport.md](transport.md) for each transport's framing in full.
 2. **Message** (owned by hub/client). The **first payload byte is the opcode** (`MessageType`); the rest
    is opcode-specific. Empty frames (length 0) are ignored, not decoded (`MeshHub.cs:1009`,
-   `MeshClient.cs:723`).
+   `MeshClient.cs:848`).
 
 Everything in the tables below is the **message payload** (i.e. after the transport's framing header).
 
@@ -82,6 +82,12 @@ Everything in the tables below is the **message payload** (i.e. after the transp
 message (recipient id / group name) and before the opaque message body — see
 [Message headers](#message-headers) below for why these needed a version bump rather than the
 additive-opcode route.
+
+**PR #83's request/response helper (`RequestAsync`/`ReplyAsync`) added no new opcode and no protocol
+version.** A request and its reply are both ordinary `SendMessageWithHeaders`/`DeliverMessageWithHeaders`
+(`0x11`/`0x12`) frames — the same two opcodes any `SendAsync(recipientId, message, headers)` call already
+produces — distinguished only by two new well-known keys inside the existing header block. See
+[Request/response headers](#request-response-headers) below.
 
 **`RegistrationErrorCode`** (`RegistrationErrorCode.cs`, sent as the byte after `Error`):
 `DuplicateClientName=0x01`, `UnsupportedProtocolVersion=0x02`, `ClientNameTooLong=0x03`,
@@ -140,9 +146,9 @@ cannot hold a slot away from one that would authenticate — and **before** the 
 client refused on either count never claims a name. The early-out in step 6 preserves the separate
 property that a full hub never runs the callback.
 
-Client-side (`MeshClient.cs:205-221`): an `Error` reply → `RegistrationRefusedException(errorCode)`; any
+Client-side (`MeshClient.cs:213-229`): an `Error` reply → `RegistrationRefusedException(errorCode)`; any
 reply that isn't exactly an 18-byte `RegistrationComplete` → `InvalidOperationException`. On success the
-trailing byte is read into `IMeshClient.NegotiatedProtocolVersion` (`MeshClient.cs:225`,
+trailing byte is read into `IMeshClient.NegotiatedProtocolVersion` (`MeshClient.cs:233`,
 `IMeshClient.cs:28`) — `0` whenever the client is not connected.
 
 A connection that never sends a valid registration within `registrationTimeout` (default 10 s) is
@@ -203,7 +209,7 @@ at encode time (`ArgumentException`), as is a header set whose total encoded len
 length against the block's own declared length and throws `FormatException` rather than letting a
 span-slice exception escape on a malformed block; the hub never calls it (it only reads the block's
 length to route/strip), but `MeshClient` does, on receipt of `DeliverMessageWithHeaders`/
-`DeliverGroupMessageWithHeaders`. There, `TryReadHeaderBlock` (`MeshClient.cs:1115-1127`) catches the
+`DeliverGroupMessageWithHeaders`. There, `TryReadHeaderBlock` (`MeshClient.cs:1255-1267`) catches the
 `FormatException`, logs a warning, and drops **only that one frame** rather than tearing down the
 connection — the same "one bad frame must not kill the loop" principle as the rest of the receive loop
 (see [Length-guard behaviour](#length-guard-behaviour-why-malformed-frames-do-nothing)).
@@ -244,6 +250,33 @@ client only sends to groups it has joined, and it learns that a join did *not* t
 `GroupJoinRefused`. See [hub.md](hub.md#group-authorisation) and
 [known-issues.md](known-issues.md) KI-2.
 
+<a id="request-response-headers"></a>
+
+### Request/response headers (PR #83)
+
+`RequestAsync`/`ReplyAsync` (`IMeshClient`, see [client.md](client.md#request-response)) are built
+entirely on the header block above — **no new opcode, no new frame shape, and no protocol version was
+added for this feature.** A request and its reply are both ordinary `SendMessageWithHeaders`/
+`DeliverMessageWithHeaders` (`0x11`/`0x12`) frames, gated by the same `HeaderEnvelopeMinVersion` (`5`)
+check every other non-empty `MessageHeaders` send already goes through. What distinguishes them from an
+application's own headers is two new well-known keys, `Messages/RequestReplyHeaderKeys.cs` (`internal`):
+
+| Key | Wire string | Present on |
+|---|---|---|
+| `RequestReplyHeaderKeys.CorrelationId` | `"mesh.request-id"` | both the request and its reply — an invariant-culture integer, the sender's own correlation id |
+| `RequestReplyHeaderKeys.Reply` | `"mesh.reply"` | the reply only, value `"1"` — its absence is what distinguishes an incoming request from an incoming reply that both carry `CorrelationId` |
+
+**The hub does not know these keys exist.** It never decodes header *content* on either the direct or
+group path (see above) — it only reads the header block's *length* to route or strip it. Request/response
+correlation, matching and the sender-identity check that prevents a hostile peer from forging a reply
+(see [client.md](client.md#request-response)) are entirely the two `MeshClient` instances' own
+responsibility. A consequence: `MessageHeaders`'s own constructor guard (below) only stops an
+*application* calling `SendAsync`/`RequestAsync` on **this** library's `MeshClient` from colliding with
+these keys — it cannot stop a differently-implemented peer, or a hand-built frame, from sending a
+`SendMessageWithHeaders` frame carrying `mesh.reply=1` to a real `MeshClient`, which will intercept and
+silently drop it before `MessageReceived` regardless of who sent it. See
+[known-issues.md](known-issues.md) KI-42 and KI-43.
+
 <a id="additive-opcodes-within-a-version"></a>
 
 ### Additive opcodes within a version
@@ -276,8 +309,9 @@ ClientLookupRequest : [0x06][correlationId i32 BE][utf8 name]    # client→hub,
 ClientLookupResponse: [0x07][correlationId i32 BE][found u8][id 16 if found==1]  # needs len ≥ 6
 ```
 `found == 0x01` **and** total length ≥ 22 → the 16-byte id follows; otherwise the client resolves the
-lookup to `null` (`MeshClient.cs:717-724`). The client only completes a lookup whose correlation id
-matches the pending request (see [client.md](client.md)).
+lookup to `null` (`MeshClient.cs:1096-1103` — corrected in this pass; the citation had pointed at
+unrelated cleanup code since at least the PR #74 reconciliation). The client only completes a lookup
+whose correlation id matches the pending request (see [client.md](client.md)).
 
 Control (no payload beyond the opcode):
 ```
@@ -286,7 +320,8 @@ Ping       : [0x09]     # hub→client liveness probe
 Pong       : [0x0A]     # client→hub reply
 ```
 `Ping`/`Pong` only exist when the hub is configured with a `heartbeatInterval`. The client replies to a
-`Ping` best-effort (`MeshClient.cs:726-737`); the hub treats **any** received frame (including `Pong`)
+`Ping` best-effort (`MeshClient.cs:1105-1118` — corrected in this pass, same pre-existing drift as the
+lookup-response citation above); the hub treats **any** received frame (including `Pong`)
 as proof of life via its activity counter, so a busy client is never pinged.
 
 ---
@@ -294,17 +329,20 @@ as proof of life via its activity counter, so a busy client is never pinged.
 ## Length-guard behaviour (why malformed frames "do nothing")
 
 Both dispatch chains are length-guarded `if / else if` ladders with **no terminal `else`**
-(`MeshHub.cs:1015-1132`, `MeshClient.cs:807-995`). A frame that is too short for its opcode, or carries an
+(`MeshHub.cs:1015-1132`, `MeshClient.cs:932-1124`). A frame that is too short for its opcode, or carries an
 unrecognised opcode, **falls through and is silently ignored** — no exception, no log at warning level.
 When debugging "my message never arrives", suspect a framing/offset error first; it will not surface as
 an error. If you add an opcode, add both the guard and the branch on the correct side, and mirror the
 exact offsets above. PR #74's four header-bearing opcodes each added one more `else if` to both ladders
 rather than changing an existing branch, growing the client's ladder by 188 lines (was 121) and the
 hub's by 118 (was 77) — the length-guard style scales additively, which is what makes it the right shape
-for a change like this one.
+for a change like this one. **PR #83 did not add a branch** to the client's ladder — it nested a new
+`if (!TryCompletePendingRequest(...))` check *inside* the existing `DeliverMessageWithHeaders` branch
+(`MeshClient.cs:993`, see [client.md](client.md#request-response)), so the ladder still has exactly the
+same number of `else if` branches; only that one branch's body grew.
 
 That fall-through is what makes a hub → client opcode addable without a version bump: the client's
-`GroupJoinRefused` branch (`MeshClient.cs:928-953`) guards on `data.Length > 1`, so a refusal carrying an
+`GroupJoinRefused` branch (`MeshClient.cs:1057-1082`) guards on `data.Length > 1`, so a refusal carrying an
 **empty** name — which a hub will never send, since `JoinGroupAsync` returns early on an empty name
 (`MeshHub.cs:1727`) — would itself fall through and be ignored.
 

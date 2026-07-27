@@ -10,7 +10,7 @@ hunt for them. `namespace AdamSalisbury.Meshworx.Messages` unless noted otherwis
 
 | Type | Members | Raised by | Source |
 |---|---|---|---|
-| `MessageReceivedEventArgs` | `required Guid SenderId`, `required ReadOnlyMemory<byte> Data`, `MessageHeaders Headers = MessageHeaders.Empty` | `IMeshClient.MessageReceived` (direct **and** broadcast) | `Messages/MessageReceivedEventArgs.cs` |
+| `MessageReceivedEventArgs` | `required Guid SenderId`, `required ReadOnlyMemory<byte> Data`, `MessageHeaders Headers = MessageHeaders.Empty`, `long? CorrelationId = null` (PR #83) | `IMeshClient.MessageReceived` (direct **and** broadcast) | `Messages/MessageReceivedEventArgs.cs` |
 | `GroupMessageReceivedEventArgs` | `required Guid SenderId`, `required string GroupName`, `required ReadOnlyMemory<byte> Data`, `MessageHeaders Headers = MessageHeaders.Empty` | `IMeshClient.GroupMessageReceived` | `Messages/GroupMessageReceivedEventArgs.cs` |
 | `GroupJoinRefusedEventArgs` | `required string GroupName` | `IMeshClient.GroupJoinRefused` | `Messages/GroupJoinRefusedEventArgs.cs:6` |
 | `DisconnectedEventArgs` | `required DisconnectReason Reason` | `IMeshClient.Disconnected` | `Messages/DisconnectedEventArgs.cs` |
@@ -22,6 +22,14 @@ All use `required` init-only properties (C# 11) — construct with object initia
 > (see [transport.md](transport.md)), so retaining it is safe today; the robust idiom is to copy
 > (`e.Data.ToArray()` / `e.Data.Span.CopyTo(...)`) if you keep it past the handler. `Span` is the usual
 > access, e.g. `Encoding.UTF8.GetString(e.Data.Span)`.
+
+> **`MessageReceivedEventArgs.CorrelationId` (PR #83)** is set only when this message is a request sent
+> via `IMeshClient.RequestAsync`, awaiting a reply — `null` for every ordinary message, including
+> broadcasts. A handler that finds it set should answer with `IMeshClient.ReplyAsync`, passing the same
+> event args back in. It is never set on `GroupMessageReceivedEventArgs` — group sends cannot be requests.
+> A *reply* frame is resolved internally by the receive loop before `MessageReceived` is ever raised for
+> it, so this property never distinguishes "is a reply" from "is an ordinary message" — only "is a
+> request". See [client.md](client.md#request-response).
 
 ## Message content types
 
@@ -42,6 +50,13 @@ see [protocol.md](protocol.md#message-headers) for the wire format and
 - An `internal` `FromOwnedDictionary` factory (not part of the public surface) wraps a dictionary without
   copying — used only by `HeaderEnvelope.Read`, which builds a fresh one for this purpose and never
   touches it again.
+
+`RequestReplyHeaderKeys` (`internal static class`, `Messages/RequestReplyHeaderKeys.cs`, added by PR #83)
+— not part of the public surface, listed here because its two `const string` values are effectively
+reserved vocabulary within any `MessageHeaders` an application constructs. `CorrelationId =
+"mesh.request-id"`, `Reply = "mesh.reply"`. `MeshClient.SendAsync`'s headers overload throws
+`ArgumentException` if a caller's own `MessageHeaders` contains either key — see
+[client.md](client.md#request-response) and [known-issues.md](known-issues.md) KI-42/KI-43.
 
 ## Enums
 
