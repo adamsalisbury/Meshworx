@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net.Sockets;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
@@ -37,6 +39,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     // a subsequent lookup with a stale result.
     private PendingLookup? _pendingLookup;
     private int _lookupCorrelationId;
+
+    // Concurrent, unlike the single-slot lookup above: multiple RequestAsync calls may be in flight
+    // together, each tracked independently by its own correlation id until its reply arrives, it times
+    // out, or the connection tears down.
+    private readonly ConcurrentDictionary<long, TaskCompletionSource<ReadOnlyMemory<byte>>> _pendingRequests = new();
+    private long _requestCorrelationId;
 
     private readonly Lock _groupMembershipLock = new();
     private readonly HashSet<string> _joinedGroups = new(StringComparer.Ordinal);
@@ -697,6 +705,82 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public async Task<ReadOnlyMemory<byte>> RequestAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        if (timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout), "The request timeout must be positive.");
+        }
+
+        long correlationId = Interlocked.Increment(ref _requestCorrelationId);
+        var completion = new TaskCompletionSource<ReadOnlyMemory<byte>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingRequests[correlationId] = completion;
+
+        try
+        {
+            var headers = new MessageHeaders(
+            [
+                new KeyValuePair<string, string>(
+                    RequestReplyHeaderKeys.CorrelationId,
+                    correlationId.ToString(CultureInfo.InvariantCulture)),
+            ]);
+
+            await SendAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+
+            // Bound the wait by cancelling it, matching the pattern SendOnceAsync uses for its own
+            // timeout: cancelling releases the wait rather than abandoning it, so a request that never
+            // gets a reply does not leak a continuation waiting on the completion source forever.
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(timeout);
+
+            try
+            {
+                return await completion.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException($"The request did not receive a reply within {timeout}.");
+            }
+        }
+        finally
+        {
+            // Whether the reply arrived, the call timed out, or it was cancelled, this correlation id is
+            // no longer awaited — a late reply for it is discarded by TryCompletePendingRequest rather
+            // than resolving a future request that happens to reuse the id.
+            _pendingRequests.TryRemove(correlationId, out _);
+        }
+    }
+
+    /// <inheritdoc/>
+    public Task ReplyAsync(
+        MessageReceivedEventArgs request,
+        ReadOnlyMemory<byte> message,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        if (request.CorrelationId is not { } correlationId)
+        {
+            throw new InvalidOperationException(
+                "The supplied message was not a request and cannot be replied to.");
+        }
+
+        var headers = new MessageHeaders(
+        [
+            new KeyValuePair<string, string>(
+                RequestReplyHeaderKeys.CorrelationId, correlationId.ToString(CultureInfo.InvariantCulture)),
+            new KeyValuePair<string, string>(RequestReplyHeaderKeys.Reply, "1"),
+        ]);
+
+        return SendAsync(request.SenderId, message, headers, cancellationToken);
+    }
+
+    /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
         await DisconnectAsync().ConfigureAwait(false);
@@ -865,20 +949,24 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         {
                             ReadOnlyMemory<byte> messageData = data.AsMemory(19 + headerBlockLength);
 
-                            try
+                            if (!TryCompletePendingRequest(headers, messageData))
                             {
-                                MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                                try
                                 {
-                                    SenderId = senderId,
-                                    Data = messageData,
-                                    Headers = headers,
-                                });
-                            }
-                            catch (Exception ex)
-                            {
-                                // A throwing subscriber must not tear down the receive loop and
-                                // silently halt all further delivery. This is a callback boundary.
-                                _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                                    MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                                    {
+                                        SenderId = senderId,
+                                        Data = messageData,
+                                        Headers = headers,
+                                        CorrelationId = TryGetRequestCorrelationId(headers),
+                                    });
+                                }
+                                catch (Exception ex)
+                                {
+                                    // A throwing subscriber must not tear down the receive loop and
+                                    // silently halt all further delivery. This is a callback boundary.
+                                    _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                                }
                             }
                         }
                     }
@@ -1030,6 +1118,17 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             _pendingLookup?.Completion.TrySetException(
                 new InvalidOperationException("The connection was closed before the lookup completed."));
 
+            // Likewise the only thing that completes a pending RequestAsync call: fault every
+            // still-outstanding request so a caller awaiting with a non-cancellable token is not left
+            // hanging, then clear the table so nothing here is mistaken for a match on the next connection.
+            foreach (KeyValuePair<long, TaskCompletionSource<ReadOnlyMemory<byte>>> pending in _pendingRequests)
+            {
+                pending.Value.TrySetException(
+                    new InvalidOperationException("The connection was closed before a reply arrived."));
+            }
+
+            _pendingRequests.Clear();
+
             await HandleReceiveLoopTerminationAsync(reason).ConfigureAwait(false);
         }
     }
@@ -1124,6 +1223,62 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 ex, "Discarding a message from {SenderId} with a malformed header block", senderId);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Completes a pending <see cref="RequestAsync"/> call if <paramref name="headers"/> mark this frame
+    /// as a reply, so it is resolved internally rather than surfaced through <see cref="MessageReceived"/>.
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> if the frame was a reply (whether or not it matched a still-pending
+    /// request), so the caller must not raise it as an ordinary message.
+    /// </returns>
+    private bool TryCompletePendingRequest(MessageHeaders headers, ReadOnlyMemory<byte> messageData)
+    {
+        if (!headers.TryGetValue(RequestReplyHeaderKeys.Reply, out string? replyFlag)
+            || !string.Equals(replyFlag, "1", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!headers.TryGetValue(RequestReplyHeaderKeys.CorrelationId, out string? correlationText)
+            || !long.TryParse(
+                correlationText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long correlationId))
+        {
+            _logger.LogWarning("Discarding a reply frame with a missing or malformed correlation id");
+            return true;
+        }
+
+        if (_pendingRequests.TryRemove(correlationId, out TaskCompletionSource<ReadOnlyMemory<byte>>? completion))
+        {
+            completion.TrySetResult(messageData);
+        }
+        else
+        {
+            // The request this reply answers has already timed out, been cancelled, or never existed
+            // on this connection; discard rather than misrouting it to an unrelated later request.
+            _logger.LogDebug(
+                "Discarding a reply with an unmatched or expired correlation id {CorrelationId}",
+                correlationId);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Reads the request correlation id from an incoming (non-reply) frame's headers, for exposure on
+    /// <see cref="MessageReceivedEventArgs.CorrelationId"/>.
+    /// </summary>
+    private static long? TryGetRequestCorrelationId(MessageHeaders headers)
+    {
+        if (headers.TryGetValue(RequestReplyHeaderKeys.CorrelationId, out string? correlationText)
+            && long.TryParse(
+                correlationText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long correlationId))
+        {
+            return correlationId;
+        }
+
+        return null;
     }
 
     private enum ConnectionState

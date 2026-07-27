@@ -402,6 +402,44 @@ public sealed class MeshIntegrationTests
     }
 
     /// <summary>
+    /// A full request/reply round trip over the real wire protocol and hub routing: the responder's
+    /// MessageReceived event carries the requester's correlation id, and answering it via ReplyAsync
+    /// resolves the requester's RequestAsync call with the reply payload — proving the two halves of
+    /// the RPC helper interoperate through the header envelope rather than only within isolated
+    /// unit-level tests of each half.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_RequestReplyRoundTripsOverInMemoryTransport()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        await bob.ConnectAsync(listener.Connect(), "Bob");
+        await alice.ConnectAsync(listener.Connect(), "Alice");
+
+        bob.MessageReceived += async (_, e) =>
+        {
+            Assert.NotNull(e.CorrelationId);
+            byte[] reply = Encoding.UTF8.GetBytes($"echo:{Encoding.UTF8.GetString(e.Data.Span)}");
+            await bob.ReplyAsync(e, reply);
+        };
+
+        Guid? bobId = await alice.GetClientIdByNameAsync("Bob");
+        Assert.Equal(bob.Id, bobId);
+
+        byte[] requestPayload = Encoding.UTF8.GetBytes("ping");
+        ReadOnlyMemory<byte> reply = await alice.RequestAsync(bobId!.Value, requestPayload, TimeSpan.FromSeconds(5));
+
+        Assert.Equal("echo:ping", Encoding.UTF8.GetString(reply.Span));
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
     /// A direct message sent with structured headers is delivered over the real wire protocol with
     /// both the headers and the body intact, and a group message carrying headers reaches every other
     /// member the same way — proving the header envelope round-trips end to end rather than only
