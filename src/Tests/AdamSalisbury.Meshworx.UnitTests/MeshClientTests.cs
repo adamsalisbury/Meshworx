@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Globalization;
 using System.Text;
 using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Messages;
@@ -1955,6 +1956,277 @@ public sealed class MeshClientTests
         // Only the registration request itself should have been sent; nothing else in reaction to a
         // plain message.
         Assert.Equal(1, sendCount);
+    }
+
+    // SendAsync(TimeSpan) / message expiry
+
+    /// <summary>
+    /// A zero or negative time-to-live is rejected before anything is sent.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_ZeroTimeToLive_ThrowsArgumentOutOfRangeException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, TimeSpan.Zero));
+    }
+
+    /// <summary>
+    /// A send with a time-to-live carries the expiry as an absolute Unix-millisecond instant computed
+    /// from now, in the header block, using the reserved expiry header key.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_WithTimeToLive_SendsExpiryHeader()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        DateTimeOffset before = DateTimeOffset.UtcNow;
+        await fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, TimeSpan.FromMinutes(5));
+        DateTimeOffset after = DateTimeOffset.UtcNow;
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x11, sentData[0]); // SendMessageWithHeaders
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(17, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(sentData.AsSpan(19), headerLength);
+
+        long expiresAt = long.Parse(
+            decoded[MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds], CultureInfo.InvariantCulture);
+        var expiry = DateTimeOffset.FromUnixTimeMilliseconds(expiresAt);
+
+        // ToUnixTimeMilliseconds truncates rather than rounds, so the encoded value can legitimately
+        // land up to a millisecond below "before" even though it was computed after it.
+        Assert.InRange(
+            expiry,
+            before.Add(TimeSpan.FromMinutes(5)).AddMilliseconds(-1),
+            after.Add(TimeSpan.FromMinutes(5)));
+    }
+
+    /// <summary>
+    /// The expiry header key is reserved, mirroring the request/response and acknowledgement keys.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_HeadersContainReservedExpiryKey_ThrowsArgumentException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        var headers = new MessageHeaders([new(MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, "1")]);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, headers));
+    }
+
+    /// <summary>
+    /// A message whose expiry has already passed by the time it is received is discarded rather than
+    /// raised through MessageReceived.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task ReceiveLoop_ExpiredMessage_DoesNotRaiseMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+
+        long alreadyExpired = DateTimeOffset.UtcNow.AddMinutes(-1).ToUnixTimeMilliseconds();
+        var expiredHeaders = new MessageHeaders(
+        [
+            new(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                alreadyExpired.ToString(CultureInfo.InvariantCulture)),
+        ]);
+        byte[] expiredPayload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, expiredHeaders, new byte[] { 1 });
+
+        // A non-expiring message that follows it, used as a barrier proving the loop processed (and
+        // silently dropped) the expired frame immediately before it.
+        var barrierHeaders = new MessageHeaders([new("marker", "barrier")]);
+        byte[] barrierPayload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, barrierHeaders, new byte[] { 2 });
+
+        fixture.SetupSuccessfulRegistration(expiredPayload, barrierPayload);
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        fixture.Client.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(2, received.Data.Span[0]);
+    }
+
+    /// <summary>
+    /// A message that has not yet expired is delivered exactly as an ordinary message would be.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task ReceiveLoop_NonExpiredMessage_RaisesMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+
+        long farInFuture = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds();
+        var headers = new MessageHeaders(
+        [
+            new(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                farInFuture.ToString(CultureInfo.InvariantCulture)),
+        ]);
+        byte[] payload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, headers, new byte[] { 3 });
+        fixture.SetupSuccessfulRegistration(payload);
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        fixture.Client.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(3, received.Data.Span[0]);
+    }
+
+    /// <summary>
+    /// A message with no expiry header at all behaves exactly as today: it is always delivered.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task ReceiveLoop_MessageWithoutExpiry_RaisesMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+        var headers = new MessageHeaders([new("marker", "no-expiry")]);
+        byte[] payload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, headers, new byte[] { 4 });
+        fixture.SetupSuccessfulRegistration(payload);
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        fixture.Client.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(4, received.Data.Span[0]);
+    }
+
+    /// <summary>
+    /// A malformed (non-numeric) expiry value is tolerated as "does not expire", the same as an absent
+    /// one, rather than being treated as a delivery failure.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task ReceiveLoop_MalformedExpiryValue_RaisesMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+        var headers = new MessageHeaders([new(MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, "not-a-number")]);
+        byte[] payload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, headers, new byte[] { 5 });
+        fixture.SetupSuccessfulRegistration(payload);
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        fixture.Client.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(5, received.Data.Span[0]);
+    }
+
+    /// <summary>
+    /// An expiry value that parses as a valid integer but falls outside the range DateTimeOffset can
+    /// represent (for example long.MaxValue) is tolerated exactly like a non-numeric one — the receive
+    /// loop must not crash over a hostile or malformed expiry header.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task ReceiveLoop_OutOfRangeExpiryValue_RaisesMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+        var headers = new MessageHeaders(
+        [
+            new(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                long.MaxValue.ToString(CultureInfo.InvariantCulture)),
+        ]);
+        byte[] payload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, headers, new byte[] { 6 });
+        fixture.SetupSuccessfulRegistration(payload);
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        fixture.Client.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(6, received.Data.Span[0]);
+    }
+
+    /// <summary>
+    /// The expiry check applies to group messages too: an already-expired group message is discarded
+    /// rather than raised through GroupMessageReceived, mirroring the direct-message case. Proved the
+    /// same way — a non-expiring group message queued immediately afterwards is what actually arrives.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task ReceiveLoop_ExpiredGroupMessage_DoesNotRaiseGroupMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+
+        long alreadyExpired = DateTimeOffset.UtcNow.AddMinutes(-1).ToUnixTimeMilliseconds();
+        var expiredHeaders = new MessageHeaders(
+        [
+            new(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                alreadyExpired.ToString(CultureInfo.InvariantCulture)),
+        ]);
+        byte[] expiredPayload = MeshClientFixture.CreateDeliverGroupMessageWithHeadersPayload(
+            senderId, "team", expiredHeaders, new byte[] { 1 });
+
+        var barrierHeaders = new MessageHeaders([new("marker", "barrier")]);
+        byte[] barrierPayload = MeshClientFixture.CreateDeliverGroupMessageWithHeadersPayload(
+            senderId, "team", barrierHeaders, new byte[] { 2 });
+
+        fixture.SetupSuccessfulRegistration(expiredPayload, barrierPayload);
+
+        var receivedTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        fixture.Client.GroupMessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        GroupMessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(2, received.Data.Span[0]);
+    }
+
+    /// <summary>
+    /// A group message that has not yet expired is delivered exactly as an ordinary group message would be.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task ReceiveLoop_NonExpiredGroupMessage_RaisesGroupMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+
+        long farInFuture = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds();
+        var headers = new MessageHeaders(
+        [
+            new(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                farInFuture.ToString(CultureInfo.InvariantCulture)),
+        ]);
+        byte[] payload = MeshClientFixture.CreateDeliverGroupMessageWithHeadersPayload(
+            senderId, "team", headers, new byte[] { 3 });
+        fixture.SetupSuccessfulRegistration(payload);
+
+        var receivedTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        fixture.Client.GroupMessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        GroupMessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(3, received.Data.Span[0]);
     }
 
     // ReceiveLoop (tested indirectly via MessageReceived event)

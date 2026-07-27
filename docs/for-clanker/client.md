@@ -27,58 +27,56 @@ up peers, manages group membership, and raises events for inbound traffic and di
 | `NegotiatedProtocolVersion` | `byte` — the wire-protocol version agreed with the hub during the last successful `ConnectAsync`; `0` when not connected | `MeshClient.cs:137` |
 | `DisconnectAsync` | `Task DisconnectAsync(CancellationToken=default)` — graceful; no `Disconnected` event | `MeshClient.cs:294` |
 | `SendAsync` | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, CancellationToken=default)` — compatibility overload, forwards to the headers overload with `MessageHeaders.Empty` | `MeshClient.cs:368` |
-| `SendAsync` (headers) | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); **throws `ArgumentException` if `headers` contains any of the five reserved request/reply/acknowledgement keys** (PR #83, extended by PR #84); see [Sending headers](#sending-headers) | `MeshClient.cs:377` |
+| `SendAsync` (headers) | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); **throws `ArgumentException` if `headers` contains any of the six reserved request/reply/acknowledgement/expiry keys** (PR #83, extended by PR #84, extended again by PR #85); see [Sending headers](#sending-headers) | `MeshClient.cs:377` |
 | `SendAsync` (delivery options) | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, DeliveryOptions options, CancellationToken=default)` — PR #84; with `DeliveryOptions.None` identical to the plain overload; with `DeliveryOptions.RequireAck(timeout)` awaits an end-to-end delivery acknowledgement or throws `TimeoutException`, see [Delivery acknowledgement](#delivery-acknowledgement) | `MeshClient.cs:390` |
-| `BroadcastAsync` | `Task BroadcastAsync(ReadOnlyMemory<byte>, CancellationToken=default)` | `MeshClient.cs:525` |
-| `JoinGroupAsync` / `LeaveGroupAsync` | `Task ...(string groupName, CancellationToken=default)` — **optimistic**: `JoinGroupAsync` records membership *before* sending and the hub may still refuse, see [Group membership](#group-membership) | `MeshClient.cs:547` / `:588` |
-| `SendToGroupAsync` | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, CancellationToken=default)` — compatibility overload, forwards to the headers overload with `MessageHeaders.Empty` | `MeshClient.cs:604` |
-| `SendToGroupAsync` (headers) | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); see [Sending headers](#sending-headers) | `MeshClient.cs:613` |
-| `GetClientIdByNameAsync` | `Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken=default)` | `MeshClient.cs:765` |
-| `RequestAsync` | `Task<ReadOnlyMemory<byte>> RequestAsync(Guid recipientId, ReadOnlyMemory<byte>, TimeSpan timeout, CancellationToken=default)` — PR #83; correlated request/reply over a direct message, see [Request/response (RPC)](#request-response) | `MeshClient.cs:814` |
-| `ReplyAsync` | `Task ReplyAsync(MessageReceivedEventArgs request, ReadOnlyMemory<byte>, CancellationToken=default)` — PR #83; answers a request received via `MessageReceived`, see [Request/response (RPC)](#request-response) | `MeshClient.cs:871` |
+| `SendAsync` (time-to-live) | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, TimeSpan timeToLive, CancellationToken=default)` — PR #85 (issue #29); throws `ArgumentOutOfRangeException` if `timeToLive` is not positive; the message is dropped, not delivered, once it expires, see [Message expiry (time-to-live)](#message-expiry-time-to-live) | `MeshClient.cs:446` |
+| `BroadcastAsync` | `Task BroadcastAsync(ReadOnlyMemory<byte>, CancellationToken=default)` | `MeshClient.cs:558` |
+| `JoinGroupAsync` / `LeaveGroupAsync` | `Task ...(string groupName, CancellationToken=default)` — **optimistic**: `JoinGroupAsync` records membership *before* sending and the hub may still refuse, see [Group membership](#group-membership) | `MeshClient.cs:580` / `:621` |
+| `SendToGroupAsync` | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, CancellationToken=default)` — compatibility overload, forwards to the headers overload with `MessageHeaders.Empty` | `MeshClient.cs:637` |
+| `SendToGroupAsync` (headers) | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); see [Sending headers](#sending-headers) | `MeshClient.cs:646` |
+| `GetClientIdByNameAsync` | `Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken=default)` | `MeshClient.cs:798` |
+| `RequestAsync` | `Task<ReadOnlyMemory<byte>> RequestAsync(Guid recipientId, ReadOnlyMemory<byte>, TimeSpan timeout, CancellationToken=default)` — PR #83; correlated request/reply over a direct message, see [Request/response (RPC)](#request-response) | `MeshClient.cs:847` |
+| `ReplyAsync` | `Task ReplyAsync(MessageReceivedEventArgs request, ReadOnlyMemory<byte>, CancellationToken=default)` — PR #83; answers a request received via `MessageReceived`, see [Request/response (RPC)](#request-response) | `MeshClient.cs:904` |
 | `MessageReceived` | `event EventHandler<MessageReceivedEventArgs>` — direct **and** broadcast; `Headers` populated when the sender attached any (PR #74); `CorrelationId` set when the message is a request awaiting a reply (PR #83) | `MeshClient.cs:164` |
 | `GroupMessageReceived` | `event EventHandler<GroupMessageReceivedEventArgs>` — carries group name; `Headers` populated when the sender attached any (PR #74) | `MeshClient.cs:167` |
 | `GroupJoinRefused` | `event EventHandler<GroupJoinRefusedEventArgs>` — the hub refused a join; the group has **already** been removed from `JoinedGroups` when this fires | `MeshClient.cs:170` |
 | `Disconnected` | `event EventHandler<DisconnectedEventArgs>` — **unexpected** endings only | `MeshClient.cs:173` |
-| `DisposeAsync` | `ValueTask` — `DisconnectAsync` then disposes the lookup semaphore | `MeshClient.cs:895` |
+| `DisposeAsync` | `ValueTask` — `DisconnectAsync` then disposes the lookup semaphore | `MeshClient.cs:928` |
 
-> **Coordinate caveat — resolved for PR #73, re-pointed for PR #74 and PR #83, re-pointed again for PR
-> #84.** Every row in this table, and every `MeshClient.cs`/`IMeshClient.cs` citation in the rest of this
-> file, was re-derived from the current source as of PR #84 (`feature/delivery-acknowledgements`, two
-> commits on top of `main`, the second of which — "stop the delivery-acknowledgement send blocking the
-> receive loop" — is a fix to the first, not a separate feature). **`main` has itself moved since the
-> previous documentation pass**: it now includes PR #83's `RequestAsync`/`ReplyAsync` work (merged as
-> `78e0264`, matching the branch tip the previous pass reconciled to, `12b2785`, byte-for-byte in content),
-> so this pass's "before" state already has all of PR #83's `MeshClient.cs`/`IMeshClient.cs` structure —
-> the shift below is PR #84's alone, not a re-measurement of PR #83's.
+> **Coordinate caveat — resolved for PR #73, re-pointed for PR #74, PR #83 and PR #84, re-pointed again
+> for PR #85.** Every row in this table, and every `MeshClient.cs`/`IMeshClient.cs` citation in the rest
+> of this file, was re-derived from the current source as of PR #85 (`feature/message-ttl-expiry`, three
+> commits on top of `main` at PR #84's merge, the last two of which are fixes to the first — "harden
+> expiry parsing against out-of-range values" and "apply the expiry check to group messages" — not
+> separate features).
 >
-> `MeshClient.cs` grew by a net **212** lines (1363 → 1575) across eight separate insertion points: the
-> `_pendingAcks`/`_ackCorrelationId` fields (+5), the new `SendAsync(..., DeliveryOptions, ...)` overload
-> (+59, immediately after the headers overload), the reserved-key guard's growth from two keys to five
-> (+6), a one-line-wider `if` in the `DeliverMessageWithHeaders` receive-loop branch nesting
-> `TryCompletePendingAck` ahead of the existing `TryCompletePendingRequest` check (+1), the acknowledgement
-> fire-and-forget dispatch immediately after (+11), the termination `finally`'s `_pendingAcks` fault-out,
-> mirroring the existing `_pendingRequests` one (+10), and — the largest single addition —
-> `TryCompletePendingAck`/`TrySendAcknowledgementAsync` plus the new `PendingAck` record, inserted after
-> the existing `TryCompletePendingRequest`/`TryGetRequestCorrelationId` pair (+112 across two hunks). Each
-> insertion point and its exact new coordinates were verified against the source individually (git diff
-> hunk headers plus content-equality spot checks), the same technique validated on every prior pass back
-> to #64. `IMeshClient.cs` grew by **32** lines in one place — the new `SendAsync(DeliveryOptions)`
-> interface member, inserted directly after the headers overload and before `BroadcastAsync` — which means
-> **every citation into `IMeshClient.cs` at or after old line 122 (everything from `BroadcastAsync`
-> onward, including `RequestAsync`/`ReplyAsync` and `Disconnected`) shifts by exactly +32**; nothing before
-> it moved.
+> `MeshClient.cs` grew by a net **63** lines (1575 → 1638) across four separate insertion points (a fifth
+> hunk, the `DeliverGroupMessageWithHeaders` expiry check, replaces one line for one — net zero, no shift
+> introduced), each individually verified against the source (content-equality spot checks at every
+> boundary, the same technique validated on every prior pass back to #64): the new
+> `SendAsync(..., TimeSpan, ...)` overload plus one extra `<see cref>` line in `SendCoreAsync`'s doc
+> comment (+24, immediately after the `DeliveryOptions` overload), the reserved-key guard's growth from
+> five keys to six and its refactor from a chain of `ContainsKey` checks into a `foreach` over a new
+> `ReservedHeaderKeys` array (+9, so **+33** cumulative from this point), the `DeliverMessageWithHeaders`
+> branch's check widening from two conditions to three (+1, so **+34** cumulative), and the new
+> `IsExpired` method itself, inserted after `TryReadHeaderBlock` (+29, so **+63** cumulative). Everything
+> before `SendAsync(..., TimeSpan, ...)` (old line ≤ 443, covering the whole
+> Lifecycle, `ConnectAsync`, receive-loop dispatch header, claim-protocol and group-membership sections)
+> is **unmoved** by this pass. `IMeshClient.cs` grew by **33** lines in one place — the new
+> `SendAsync(..., TimeSpan, ...)` interface member, inserted directly after the `DeliveryOptions` overload
+> and before `BroadcastAsync` (old line ≥ 154) — mirroring PR #84's own single-insertion-point shift for
+> the same interface.
 >
-> **One pre-existing citation was found wrong and corrected while this section was open anyway** (not
-> caused by PR #84, but free to fix per the standing rule): the "`Disconnected` semantics" section's cite
-> of `IMeshClient.cs:249-259` for the `Disconnected` event's `<remarks>` contract actually pointed at
-> `RequestAsync`'s declaration — the true pre-PR #84 location was `:302-312`, now `:334-344`. See
+> The prior pass's own note (PR #84, re-pointing `MeshClient.cs` by +212 and `IMeshClient.cs` by +32) is
+> folded into the coordinates above rather than repeated; it corrected one pre-existing wrong citation
+> (`IMeshClient.cs`'s `Disconnected` `<remarks>` contract, which had pointed at `RequestAsync`'s own
+> declaration) to `:334-344`, now re-pointed by this pass's own +33 shift to `:367-377`. See
 > [`Disconnected` semantics](#disconnected-semantics-important) below.
 
 ### Lifecycle & state machine
 
 Internal `enum ConnectionState { Disconnected, Connecting, Connected, Disconnecting }`
-(`MeshClient.cs:1551`), guarded by `_stateLock` (`System.Threading.Lock`). Send/lookup/group methods
+(`MeshClient.cs:1614`), guarded by `_stateLock` (`System.Threading.Lock`). Send/lookup/group methods
 throw `InvalidOperationException("Not connected to a hub.")` unless `Connected`.
 
 **`ConnectAsync`** (`MeshClient.cs:176`):
@@ -100,11 +98,11 @@ throw `InvalidOperationException("Not connected to a hub.")` unless `Connected`.
 > **`NegotiatedProtocolVersion` is read by the send path since PR #74 (issue #32), not just logged.**
 > `SendAsync`'s headers overload — and, since PR #83, `RequestAsync`/`ReplyAsync`, and since PR #84 the
 > `RequireAck` branch of `SendAsync(..., DeliveryOptions, ...)`, all of which share the same internal
-> `SendCoreAsync` (`MeshClient.cs:445-497`) — calls `RequireHeaderEnvelopeSupport` (call site `:485`,
-> definition `:663-672`), which throws `NotSupportedException` if this connection's negotiated version is
+> `SendCoreAsync` (`MeshClient.cs:468-521`) — calls `RequireHeaderEnvelopeSupport` (call site `:509`,
+> definition `:696-705`), which throws `NotSupportedException` if this connection's negotiated version is
 > below `Protocol.HeaderEnvelopeMinVersion` — see [Sending headers](#sending-headers),
 > [Request/response (RPC)](#request-response) and [Delivery acknowledgement](#delivery-acknowledgement).
-> `SendToGroupAsync`'s headers overload has its own separate call to the same check (`:643`); group sends
+> `SendToGroupAsync`'s headers overload has its own separate call to the same check (`:676`); group sends
 > do not go through `SendCoreAsync` and cannot participate in the request/response or acknowledgement
 > patterns (both only ever address a single `recipientId`). This resolves
 > [known-issues.md](known-issues.md) KI-14 for the header envelope specifically; a future capability gated
@@ -150,55 +148,60 @@ Preserve this reference-equality check if you refactor connect.
 
 ### The receive loop
 
-`ReceiveLoopAsync` (`MeshClient.cs:928`) is the single reader. It:
+`ReceiveLoopAsync` (`MeshClient.cs:961`) is the single reader. It:
 - Sets `AsyncLocal<bool> _inReceiveLoop = true` so a `DisconnectAsync` invoked **from a handler** skips
   awaiting the loop (would deadlock) — see below.
-- Runs an optional **idle monitor** (`MonitorIdleAsync`, `MeshClient.cs:953`) on a `PeriodicTimer`,
+- Runs an optional **idle monitor** (`MonitorIdleAsync`, `MeshClient.cs:986`) on a `PeriodicTimer`,
   comparing an `activitySequence` counter between ticks; on a fully idle interval it cancels the loop's
   linked CTS, ending the connection as `ConnectionLost`.
 - Dispatches inbound frames: `DeliverMessage` → `MessageReceived`; `DeliverGroupMessage` →
   `GroupMessageReceived`; `DeliverMessageWithHeaders`/`DeliverGroupMessageWithHeaders` (PR #74, issue #32)
   → the same two events with `Headers` populated from a decoded `MessageHeaders`, via `TryReadHeaderBlock`
-  (`:1347-1359`, see [protocol.md](protocol.md#message-headers)); `GroupJoinRefused` → removes the group
-  from `_joinedGroups`, logs a `Warning`, then raises `GroupJoinRefused` (`MeshClient.cs:1139-1164`);
-  `ClientLookupResponse` → completes the pending lookup (if correlation matches, `:1165-1186`); `Ping` →
+  (`:1381-1393`, see [protocol.md](protocol.md#message-headers)); `GroupJoinRefused` → removes the group
+  from `_joinedGroups`, logs a `Warning`, then raises `GroupJoinRefused` (`MeshClient.cs:1173-1198`);
+  `ClientLookupResponse` → completes the pending lookup (if correlation matches, `:1199-1220`); `Ping` →
   replies `Pong` (best-effort); `Disconnect` → sets reason `RemoteDisconnect` and breaks.
 - Wraps each handler invocation in `try/catch` and logs a throwing subscriber (callback boundary) so it
-  cannot halt delivery (`MeshClient.cs:1008-1021`, `:1034-1047`). **The two header-bearing branches are
-  no longer identical to each other since PR #83.** `DeliverGroupMessageWithHeaders` still just raises
-  `GroupMessageReceived` inside a plain `try/catch` — group sends cannot participate in request/response
-  or acknowledgement (`RequestAsync`/`SendAsync(..., DeliveryOptions, ...)` only ever address a single
-  `recipientId`). `DeliverMessageWithHeaders` (`MeshClient.cs:1050-1096`) is now gated by **two** nested
-  checks in sequence, `TryCompletePendingAck(senderId, headers)` **then**
-  `TryCompletePendingRequest(senderId, headers, messageData)` (`:1063-1064`; methods at `:1439-1484` and
-  `:1376-1421`) **before** it raises `MessageReceived` at all: a frame that is either a delivery
-  acknowledgement or a reply to one of this client's own calls is resolved internally and never surfaces
-  through the event. **Since PR #84**, once a genuine `MessageReceived` *is* raised for an incoming
-  message (`:1066-1081`, also setting `CorrelationId = TryGetRequestCorrelationId(headers)` at `:1073` so
-  a handler receiving a genuine incoming request knows to answer it with `ReplyAsync`), the branch fires a
-  delivery acknowledgement back to the sender — **fire-and-forget**, not awaited — if the sender requested
-  one (`:1083-1092`, dispatched via `TrySendAcknowledgementAsync`). See
-  [Request/response (RPC)](#request-response) and [Delivery acknowledgement](#delivery-acknowledgement)
-  for the full behaviour of each.
-- On termination (`finally`, `MeshClient.cs:1221-1267`): stops the idle monitor, **faults any pending
+  cannot halt delivery (`MeshClient.cs:1041-1054`, `:1067-1080`). **The two header-bearing branches are
+  no longer identical to each other since PR #83.** `DeliverGroupMessageWithHeaders`
+  (`MeshClient.cs:1131-1172`) raises `GroupMessageReceived` inside a plain `try/catch` — group sends
+  cannot participate in request/response or acknowledgement (`RequestAsync`/
+  `SendAsync(..., DeliveryOptions, ...)` only ever address a single `recipientId`) — but **since PR #85 it
+  is gated by one check first**: `!IsExpired(headers, senderId)` (`:1150`, method at `:1407-1422`) drops an
+  already-expired group message before the event is ever raised; see
+  [Message expiry (time-to-live)](#message-expiry-time-to-live) below. `DeliverMessageWithHeaders`
+  (`MeshClient.cs:1083-1130`) is now gated by **three** nested checks in sequence,
+  `TryCompletePendingAck(senderId, headers)`, `TryCompletePendingRequest(senderId, headers, messageData)`,
+  **then, since PR #85, `!IsExpired(headers, senderId)`** (`:1096-1098`; methods at `:1502-1547`,
+  `:1439-1484` and `:1407-1422` respectively) **before** it raises `MessageReceived` at all: a frame that
+  is either a delivery acknowledgement, a reply to one of this client's own calls, or already expired is
+  resolved (or dropped) internally and never surfaces through the event. **Since PR #84**, once a genuine
+  `MessageReceived` *is* raised for an incoming message (`:1100-1115`, also setting
+  `CorrelationId = TryGetRequestCorrelationId(headers)` at `:1107` so a handler receiving a genuine
+  incoming request knows to answer it with `ReplyAsync`), the branch fires a delivery acknowledgement back
+  to the sender — **fire-and-forget**, not awaited — if the sender requested one (`:1117-1126`, dispatched
+  via `TrySendAcknowledgementAsync`). See [Request/response (RPC)](#request-response),
+  [Delivery acknowledgement](#delivery-acknowledgement) and
+  [Message expiry (time-to-live)](#message-expiry-time-to-live) for the full behaviour of each.
+- On termination (`finally`, `MeshClient.cs:1255-1301`): stops the idle monitor, **faults any pending
   lookup** with `InvalidOperationException` so a caller on a non-cancellable token is not left hanging
-  and `_lookupLock` is released; faults every still-pending `RequestAsync` call the same way (`:1244-1253`,
+  and `_lookupLock` is released; faults every still-pending `RequestAsync` call the same way (`:1278-1287`,
   PR #83) and clears `_pendingRequests`; **since PR #84, does the same for every still-pending
-  `SendAsync(..., DeliveryOptions.RequireAck(...))` call** (`:1255-1263`) and clears `_pendingAcks` — so a
+  `SendAsync(..., DeliveryOptions.RequireAck(...))` call** (`:1289-1297`) and clears `_pendingAcks` — so a
   connection that drops mid-request or mid-acknowledgement does not leave a caller waiting forever; then
   calls `HandleReceiveLoopTerminationAsync`.
 
-`HandleReceiveLoopTerminationAsync` (`MeshClient.cs:1278`) decides whether the ending raises
+`HandleReceiveLoopTerminationAsync` (`MeshClient.cs:1312`) decides whether the ending raises
 `Disconnected`. There are **two** gates and both must pass:
 
-1. **The entry gate** (`MeshClient.cs:1280-1291`). Under `_stateLock`, the teardown claims the connection
+1. **The entry gate** (`MeshClient.cs:1314-1325`). Under `_stateLock`, the teardown claims the connection
    by moving `Connected` → `Disconnecting`. If the state was anything other than `Connected`, a local
    `DisconnectAsync` already owns the teardown, so the loop returns immediately and stays silent.
-2. **The claim gate** (`MeshClient.cs:1303-1323`). After `CleanUpAsync`, the loop reads
+2. **The claim gate** (`MeshClient.cs:1337-1357`). After `CleanUpAsync`, the loop reads
    `_localDisconnectRequested` into a local `raiseDisconnected` **in the same locked block that
-   publishes `_state = ConnectionState.Disconnected`** (`MeshClient.cs:1305-1316`). If a `DisconnectAsync`
+   publishes `_state = ConnectionState.Disconnected`** (`MeshClient.cs:1339-1350`). If a `DisconnectAsync`
    claimed the teardown while it was in flight, the loop logs at Debug and returns without raising
-   (`MeshClient.cs:1318-1323`).
+   (`MeshClient.cs:1352-1357`).
 
 Gate 1 alone used to be the whole mechanism, and it was **not sufficient**. If the receive loop won the
 race out of `Connected`, a concurrent `DisconnectAsync` found the client already `Disconnecting`,
@@ -231,7 +234,7 @@ deliberately left open — see [known-issues.md](known-issues.md) KI-21.
 - **Does not fire for a local `DisconnectAsync`** — including one that races a remote drop. Whichever
   side tears the connection down, an application-requested disconnect stays silent: `DisconnectAsync`
   either performs the teardown itself or claims the one already in flight (see the claim protocol
-  above). The interface XML docs state this contract (`IMeshClient.cs:70-83`, `:334-344` — this second
+  above). The interface XML docs state this contract (`IMeshClient.cs:70-83`, `:367-377` — this second
   citation was found pointing at `RequestAsync`'s declaration instead and corrected this pass, see the
   coordinate caveat above).
   - **The one exception** is a narrow residual window: a `DisconnectAsync` arriving *after* the teardown
@@ -250,22 +253,22 @@ deliberately left open — see [known-issues.md](known-issues.md) KI-21.
 
 ### Group membership — optimistic, and revocable by the hub
 
-`JoinGroupAsync` (`MeshClient.cs:547`) is **fire-and-forget with an optimistic local record**. The order
+`JoinGroupAsync` (`MeshClient.cs:580`) is **fire-and-forget with an optimistic local record**. The order
 of operations changed in PR #66 and the new order is load-bearing:
 
-1. Validate the name and grab the connected transport (`MeshClient.cs:549-551`) — both *before* anything
+1. Validate the name and grab the connected transport (`MeshClient.cs:582-584`) — both *before* anything
    is recorded, so a rejected call leaves no trace.
-2. **Record the membership in `_joinedGroups`, then send the frame** (`:557-561`). Not the other way
+2. **Record the membership in `_joinedGroups`, then send the frame** (`:590-594`). Not the other way
    round: the hub may refuse, and its `GroupJoinRefused` can arrive and be handled by the receive loop
    **before this method resumes**. Recording afterwards would reinstate the very group the refusal had
    just removed.
 3. If the send throws, take the record back — **but only if this call is what added it** (`recorded`,
-   `:560`, rollback at `:575-581`). A join of a group already joined, or one racing a concurrent join of
+   `:593`, rollback at `:608-614`). A join of a group already joined, or one racing a concurrent join of
    the same name, must not roll back a record its predecessor owns; the group would then be missing from
    `JoinedGroups` while the client is still in it on the hub, and `MeshClientReconnector` — which
    restores from that snapshot — would silently not restore it.
 
-`LeaveGroupAsync` (`:588`) keeps the opposite order: send first, then remove locally (`:594-600`).
+`LeaveGroupAsync` (`:621`) keeps the opposite order: send first, then remove locally (`:627-633`).
 
 **What the return value means.** `JoinGroupAsync` returning means *the request was sent*, not that you
 are a member. A hub with a `GroupAuthoriser` may refuse. Applications that depend on membership must
@@ -280,7 +283,7 @@ await client.JoinGroupAsync("engineering");
 ```
 
 On a refusal the receive loop removes the group from `_joinedGroups` **first**, then logs, then raises
-the event (`MeshClient.cs:1139-1164`) — so `JoinedGroups` never claims a membership the hub has denied,
+the event (`MeshClient.cs:1173-1198`) — so `JoinedGroups` never claims a membership the hub has denied,
 and a later disconnect does not hand the group to the reconnector to restore. The refusal is **not**
 retried by anything in the library; a handler that wants to try again must ask again itself.
 
@@ -288,7 +291,7 @@ retried by anything in the library; a handler that wants to try again must ask a
 > later join legitimately obtained. The divergence is fail-safe — the client under-reports while the hub
 > keeps the member — but it is real. [known-issues.md](known-issues.md) KI-27.
 
-Note the client logs the refused group name **unclipped** (`MeshClient.cs:1153`), unlike the hub, which
+Note the client logs the refused group name **unclipped** (`MeshClient.cs:1187`), unlike the hub, which
 clips to 64 characters. The name came from your own hub, so this is not the same exposure, but it is
 worth knowing if you parse client logs.
 
@@ -313,23 +316,30 @@ await client.SendAsync(recipientId, payload, headers);
   one-line forward to the headers overload with `MessageHeaders.Empty` (`MeshClient.cs:368-374`) — existing
   call sites need no change, and an empty `MessageHeaders` produces the exact same bytes on the wire as
   before (no header block is written at all when `headers.Count == 0`).
-- **The headers overload itself now guards five reserved keys — two from PR #83, three more from PR #84.**
-  `SendAsync(recipientId, message, headers, cancellationToken)` calls
-  `ThrowIfReservedHeaderKeyPresent(headers)` (`MeshClient.cs:384`, method at `:506-522`) before doing
+- **The headers overload itself now guards six reserved keys — two from PR #83, three more from PR #84,
+  one more from PR #85.** `SendAsync(recipientId, message, headers, cancellationToken)` calls
+  `ThrowIfReservedHeaderKeyPresent(headers)` (`MeshClient.cs:384`, method at `:543-555`) before doing
   anything else: if `headers` contains `"mesh.request-id"` or `"mesh.reply"` (`RequestReplyHeaderKeys`,
-  PR #83) **or** `"mesh.ack-id"`, `"mesh.ack-request"` or `"mesh.ack"`
-  (`DeliveryAcknowledgementHeaderKeys`, PR #84), it throws `ArgumentException` rather than letting the
-  message collide with the request/response or delivery-acknowledgement machinery. The body-build logic
-  and the actual frame-send all live in a shared private `SendCoreAsync` (`:445-497`) that
-  `RequestAsync`/`ReplyAsync`, the `RequireAck` branch of `SendAsync(..., DeliveryOptions, ...)`, and the
-  receive loop's automatic acknowledgement reply all call directly, **bypassing** this guard — they are
-  the legitimate producers of those five keys. `SendToGroupAsync`'s headers overload is untouched: it does
-  not share `SendCoreAsync` and does not guard these keys, because group sends cannot be a request, a
-  reply, or an acknowledgement in the first place. See [Request/response (RPC)](#request-response),
-  [Delivery acknowledgement](#delivery-acknowledgement) and [known-issues.md](known-issues.md) KI-42.
+  PR #83), `"mesh.ack-id"`, `"mesh.ack-request"` or `"mesh.ack"` (`DeliveryAcknowledgementHeaderKeys`,
+  PR #84), **or** `"mesh.expires-at"` (`MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds`, PR #85), it
+  throws `ArgumentException` rather than letting the message collide with the request/response, delivery-
+  acknowledgement or expiry machinery. **Since PR #85 the guard is a `foreach` over a single
+  `ReservedHeaderKeys` array (`:527-535`)** rather than a chain of individual `ContainsKey` checks, so
+  adding a seventh key in future needs only a new array entry, not a rewritten condition. The body-build
+  logic and the actual frame-send all live in a shared private `SendCoreAsync` (`:468-521`) that
+  `RequestAsync`/`ReplyAsync`, the `RequireAck` branch of `SendAsync(..., DeliveryOptions, ...)`, the
+  `SendAsync(..., TimeSpan, ...)` time-to-live overload (see
+  [Message expiry (time-to-live)](#message-expiry-time-to-live)), and the receive loop's automatic
+  acknowledgement reply all call directly, **bypassing** this guard — they are the legitimate producers of
+  those six keys. `SendToGroupAsync`'s headers overload is untouched: it does not share `SendCoreAsync` and
+  does not guard these keys, because group sends cannot be a request, a reply, an acknowledgement, or
+  carry a time-to-live in the first place — there is no `SendToGroupAsync(..., TimeSpan, ...)` overload.
+  See [Request/response (RPC)](#request-response), [Delivery acknowledgement](#delivery-acknowledgement),
+  [Message expiry (time-to-live)](#message-expiry-time-to-live) and
+  [known-issues.md](known-issues.md) KI-42.
 - **A non-empty `MessageHeaders` requires a connection negotiated at `Protocol.HeaderEnvelopeMinVersion`
   (`5`) or above.** Below that, both `SendAsync` and `SendToGroupAsync` throw `NotSupportedException`
-  (`RequireHeaderEnvelopeSupport`, `MeshClient.cs:663-672`) rather than silently sending the message
+  (`RequireHeaderEnvelopeSupport`, `MeshClient.cs:696-705`) rather than silently sending the message
   without its headers — a caller that assumes headers arrived when the hub actually stripped them (or
   never received them) would be a much harder bug to find than an eagerly-thrown exception.
 - **`MessageHeaders`'s public constructor copies its input into a fresh `Dictionary<string, string>` using
@@ -350,8 +360,8 @@ await client.SendAsync(recipientId, payload, headers);
 
 ### Request/response (RPC)
 
-PR #83 added a correlated request/reply helper — `RequestAsync`/`ReplyAsync` (`IMeshClient.cs:281-285` /
-`:301-304`, implemented `MeshClient.cs:814-868` / `:871-892`) — built entirely on the existing
+PR #83 added a correlated request/reply helper — `RequestAsync`/`ReplyAsync` (`IMeshClient.cs:314-318` /
+`:301-304`, implemented `MeshClient.cs:847-901` / `:904-925`) — built entirely on the existing
 [header envelope](protocol.md#message-headers) and the existing `SendMessageWithHeaders`/
 `DeliverMessageWithHeaders` opcodes (`0x11`/`0x12`). **No new opcode and no protocol version bump were
 needed**: a request and its reply are both just direct messages carrying two new well-known header keys,
@@ -384,40 +394,40 @@ ReadOnlyMemory<byte> reply = await alice.RequestAsync(
     bobId, Encoding.UTF8.GetBytes("ping"), TimeSpan.FromSeconds(5));
 ```
 
-**How `RequestAsync` works** (`MeshClient.cs:814-868`):
+**How `RequestAsync` works** (`MeshClient.cs:847-901`):
 1. Rejects a non-positive `timeout` with `ArgumentOutOfRangeException` before sending anything.
-2. Claims a fresh correlation id via `Interlocked.Increment(ref _requestCorrelationId)` (`:825`) and
-   records a `PendingRequest(recipientId, completion)` in `_pendingRequests[correlationId]` (`:832`) —
+2. Claims a fresh correlation id via `Interlocked.Increment(ref _requestCorrelationId)` (`:858`) and
+   records a `PendingRequest(recipientId, completion)` in `_pendingRequests[correlationId]` (`:865`) —
    **before** the send, so a reply racing back extremely fast still finds an entry.
-3. Sends the request as an ordinary direct message via the shared `SendCoreAsync` (`:445-497`), with a
+3. Sends the request as an ordinary direct message via the shared `SendCoreAsync` (`:468-521`), with a
    `MessageHeaders` carrying only `CorrelationId`.
 4. Awaits the completion source, bounded by a linked `CancellationTokenSource` cancelled after `timeout`
-   (`:848-859`) — a timeout is translated to `TimeoutException`, a genuine external cancellation still
+   (`:881-892`) — a timeout is translated to `TimeoutException`, a genuine external cancellation still
    surfaces as `OperationCanceledException`.
-5. **`finally` always removes the entry from `_pendingRequests`** (`:866`), whether the call succeeded,
+5. **`finally` always removes the entry from `_pendingRequests`** (`:899`), whether the call succeeded,
    timed out, or was cancelled — so a reply that arrives later for that id is discarded by
    `TryCompletePendingRequest` rather than resolving a *future* request that happens to reuse the id.
 
-**How `ReplyAsync` works** (`MeshClient.cs:871-892`): takes back the exact `MessageReceivedEventArgs` the
+**How `ReplyAsync` works** (`MeshClient.cs:904-925`): takes back the exact `MessageReceivedEventArgs` the
 request arrived on. If `request.CorrelationId` is `null` (an ordinary message, not a request), it throws
 `InvalidOperationException` rather than sending a reply frame nothing is waiting for. Otherwise it sends a
 direct message back to `request.SenderId` carrying both `CorrelationId` (echoed) and `Reply = "1"`, again
 via `SendCoreAsync`.
 
 **How an incoming reply is matched, and why a hostile peer cannot resolve someone else's request**
-(`TryCompletePendingRequest`, `MeshClient.cs:1376-1421`, called from the receive loop's
-`DeliverMessageWithHeaders` branch at `:1064`, **second** of the two nested checks — `:1063` is the
+(`TryCompletePendingRequest`, `MeshClient.cs:1439-1484`, called from the receive loop's
+`DeliverMessageWithHeaders` branch at `:1097`, **second** of the two nested checks — `:1096` is the
 delivery-acknowledgement check added by PR #84, see [Delivery acknowledgement](#delivery-acknowledgement)
 — **before** `MessageReceived` is ever raised for that frame):
 1. A frame without `Reply == "1"` is not a reply at all — returns `false`, so the caller raises
    `MessageReceived` as normal (this is how an incoming *request* is delivered — see below).
-2. A reply with a missing/malformed `CorrelationId` is logged and discarded (`:1388`) — still intercepted,
+2. A reply with a missing/malformed `CorrelationId` is logged and discarded (`:1451`) — still intercepted,
    never raised through `MessageReceived`.
 3. A reply whose correlation id is not currently in `_pendingRequests` is logged at `Debug` and discarded
-   (`:1392-1399`) — the request it answers has already timed out, been cancelled, or never existed on this
+   (`:1455-1462`) — the request it answers has already timed out, been cancelled, or never existed on this
    connection.
 4. **A reply is only accepted from the client the request was actually addressed to**
-   (`pending.ExpectedResponderId != senderId`, `:1400-1411`): a mismatch is logged at `Warning` and
+   (`pending.ExpectedResponderId != senderId`, `:1463-1474`): a mismatch is logged at `Warning` and
    discarded, **without removing the pending entry** — so a forged reply from any other client connected
    to the same hub cannot resolve, and cannot strand, a request meant for someone else. The genuine
    responder's reply, arriving afterwards, still completes it. This is the actual security property: the
@@ -425,7 +435,7 @@ delivery-acknowledgement check added by PR #84, see [Delivery acknowledgement](#
    `RequestAsync` cannot be tricked into accepting attacker-controlled bytes as long as the attacker is not
    the client the request was sent to.
 5. A genuine match resolves via a compare-and-remove (`TryRemove(new KeyValuePair<...>(correlationId,
-   pending))`, `:1412-1418`) against the *exact instance* just matched — so a reply racing a fresh
+   pending))`, `:1475-1481`) against the *exact instance* just matched — so a reply racing a fresh
    `RequestAsync` call that has already claimed the same id (having removed and replaced the entry itself)
    cannot steal that fresh call's slot.
 
@@ -438,7 +448,7 @@ both present on a frame this library produces; see
 
 **On the receiving side of a genuine incoming request** (not a reply), the same `DeliverMessageWithHeaders`
 branch sets `MessageReceivedEventArgs.CorrelationId = TryGetRequestCorrelationId(headers)`
-(`MeshClient.cs:1073`, method at `:1539-1549`) — `long?`, `null` for an ordinary message, set for a
+(`MeshClient.cs:1107`, method at `:1602-1612`) — `long?`, `null` for an ordinary message, set for a
 request. A handler that finds it set should call `ReplyAsync`, passing the same event args back in. **Since
 PR #84**, once that event has been raised (successfully or not), the same branch also fires an automatic
 delivery acknowledgement back to the sender if one was requested — see
@@ -480,7 +490,7 @@ applies only to `RequireAck`.
    collide on the same id space.
 2. Records `PendingAck(recipientId, completion)` in `_pendingAcks[ackId]` **before** the send (`:408`), for
    the same reason `RequestAsync` does — a fast-arriving acknowledgement must still find an entry.
-3. Sends the message via the shared `SendCoreAsync` (`:420`, definition `:445-497`), with a
+3. Sends the message via the shared `SendCoreAsync` (`:420`, definition `:468-521`), with a
    `MessageHeaders` carrying `DeliveryAcknowledgementHeaderKeys.CorrelationId` and `.Request = "1"`
    (`Messages/DeliveryAcknowledgementHeaderKeys.cs`, `internal`).
 4. Awaits the completion source, bounded by a linked `CancellationTokenSource` cancelled after
@@ -491,19 +501,19 @@ applies only to `RequireAck`.
    *future* send that happens to reuse it.
 
 **The recipient's client sends the acknowledgement automatically — this is not something the application
-calls.** In `ReceiveLoopAsync`'s `DeliverMessageWithHeaders` branch (`MeshClient.cs:1050-1096`), once
-`MessageReceived` has been raised for an incoming message (`:1066-1081`, whether or not a subscriber
+calls.** In `ReceiveLoopAsync`'s `DeliverMessageWithHeaders` branch (`MeshClient.cs:1083-1130`), once
+`MessageReceived` has been raised for an incoming message (`:1100-1115`, whether or not a subscriber
 threw), the branch fires `TrySendAcknowledgementAsync(senderId, headers, cancellationToken)`
-(`:1083-1092`, method at `:1486-1533`) if the sender attached `DeliveryAcknowledgementHeaderKeys.Request`.
+(`:1117-1126`, method at `:1549-1596`) if the sender attached `DeliveryAcknowledgementHeaderKeys.Request`.
 **This call is fire-and-forget (`_ = TrySendAcknowledgementAsync(...)`), not awaited** — the receive loop's
 own inbound frame processing (including the connection's `Ping`/`Pong` keepalive) must not be
 head-of-line-blocked behind a slow or stalled write back to the sender. `TrySendAcknowledgementAsync`
-swallows every exception internally (`:1521-1533`, a callback/detached-task boundary, the same reasoning
+swallows every exception internally (`:1584-1596`, a callback/detached-task boundary, the same reasoning
 already applied to a throwing `MessageReceived` subscriber) — there is nothing for the caller to observe,
 by design.
 
 **How an incoming acknowledgement is matched, and why a hostile peer cannot forge one** (`TryCompletePendingAck`,
-`MeshClient.cs:1439-1484`, called from the receive loop's `DeliverMessageWithHeaders` branch at `:1063`,
+`MeshClient.cs:1502-1547`, called from the receive loop's `DeliverMessageWithHeaders` branch at `:1096`,
 **before** `TryCompletePendingRequest` runs and **before** `MessageReceived` is ever raised for that
 frame) — the logic is the acknowledgement mirror of `TryCompletePendingRequest`, checked field-for-field:
 a frame without `Ack == "1"` is not an acknowledgement (returns `false`); a missing/malformed correlation
@@ -518,11 +528,11 @@ steal a slot a concurrent `RequireAck` send has already claimed for the same id.
 **Contract & gotchas:**
 - **A connection drop faults every outstanding `RequireAck` call** with `InvalidOperationException` ("The
   connection was closed before an acknowledgement arrived.") from the receive loop's termination `finally`
-  (`MeshClient.cs:1255-1263`) — the same treatment `RequestAsync` gets (`:1244-1253`). A caller on a
+  (`MeshClient.cs:1289-1297`) — the same treatment `RequestAsync` gets (`:1278-1287`). A caller on a
   non-cancellable token is not left hanging past the connection's own teardown.
 - **"Acknowledged" means "handed to the application", not "handled successfully".** The acknowledgement is
   sent once `MessageReceived?.Invoke(...)` has returned, *regardless of whether a subscriber threw*
-  (`MeshClient.cs:1066-1092`) — a throwing handler still results in the sender's `RequireAck` call
+  (`MeshClient.cs:1100-1126`) — a throwing handler still results in the sender's `RequireAck` call
   completing successfully. See [known-issues.md](known-issues.md) KI-44.
 - **A `TimeoutException` from `RequireAck` does not prove the message was not delivered.** The
   acknowledgement is an ordinary routed message, subject to the same silent-drop paths as any other send —
@@ -541,22 +551,22 @@ steal a slot a concurrent `RequireAck` send has already claimed for the same id.
   `SendAsync(..., DeliveryOptions, ...)` only ever take a single `recipientId`; `SendToGroupAsync`'s
   headers overload does not go through `SendCoreAsync` and is not gated by
   `ThrowIfReservedHeaderKeyPresent`. The `DeliverGroupMessageWithHeaders` receive-loop branch
-  (`MeshClient.cs:1097-1138`) is untouched by PR #83 and PR #84 alike — it still just raises
+  (`MeshClient.cs:1131-1172`) is untouched by PR #83 and PR #84 alike — it still just raises
   `GroupMessageReceived` inside a plain `try/catch`, with no `CorrelationId` or acknowledgement concept at
   all.
 - **A connection drop faults every outstanding `RequestAsync` call** with `InvalidOperationException`
   ("The connection was closed before a reply arrived.") from the receive loop's termination `finally`
-  (`MeshClient.cs:1244-1253`) — see [The receive loop](#the-receive-loop) above. **Since PR #84, the same
+  (`MeshClient.cs:1278-1287`) — see [The receive loop](#the-receive-loop) above. **Since PR #84, the same
   `finally` does the equivalent for every outstanding `SendAsync(..., DeliveryOptions.RequireAck(...))`
-  call** (`:1255-1263`, message "The connection was closed before an acknowledgement arrived."). A caller
+  call** (`:1289-1297`, message "The connection was closed before an acknowledgement arrived."). A caller
   on a non-cancellable token is not left hanging past the connection's own teardown, for either helper.
-- **The five reserved header keys cannot be set through the public `SendAsync(headers)` overload** —
-  `ThrowIfReservedHeaderKeyPresent` (`:506-522`) throws `ArgumentException` if the caller's own
+- **The six reserved header keys cannot be set through the public `SendAsync(headers)` overload** —
+  `ThrowIfReservedHeaderKeyPresent` (`:543-555`) throws `ArgumentException` if the caller's own
   `MessageHeaders` contains any of them. This is a genuine new constraint on a previously unrestricted
   parameter: an application already using one of the literal strings `"mesh.request-id"`/`"mesh.reply"`
-  (before PR #83) or `"mesh.ack-id"`/`"mesh.ack-request"`/`"mesh.ack"` (before PR #84) as one of its own
-  header keys will now see `SendAsync` throw where it previously succeeded. See
-  [known-issues.md](known-issues.md) KI-42.
+  (before PR #83), `"mesh.ack-id"`/`"mesh.ack-request"`/`"mesh.ack"` (before PR #84), or
+  `"mesh.expires-at"` (before PR #85) as one of its own header keys will now see `SendAsync` throw where
+  it previously succeeded. See [known-issues.md](known-issues.md) KI-42.
 - **The hub is completely unaware of request/response or delivery acknowledgement.** It never inspects
   `MessageHeaders` (headers ride opaque, same as always — see
   [protocol.md](protocol.md#message-headers)), so `RequestAsync`/`ReplyAsync` and
@@ -568,15 +578,100 @@ steal a slot a concurrent `RequireAck` send has already claimed for the same id.
   intercept and drop before `MessageReceived`, whether or not it matches a real pending request or
   acknowledgement. See [known-issues.md](known-issues.md) KI-43 and KI-46.
 
+<a id="message-expiry-time-to-live"></a>
+
+### Message expiry (time-to-live)
+
+PR #85 (issue #29) added `SendAsync(Guid recipientId, ReadOnlyMemory<byte> message, TimeSpan timeToLive,
+CancellationToken cancellationToken = default)` (`IMeshClient.cs:182-186`, implemented
+`MeshClient.cs:446-466`) — an opt-in, per-message time-to-live. Built the same "fourth route" way as
+PR #83's request/response and PR #84's delivery acknowledgement: entirely inside the existing
+[header envelope](protocol.md#message-headers), no new opcode, no protocol version bump. One new
+`internal` well-known key, `Messages/MessageExpiryHeaderKeys.cs`: `ExpiresAtUnixMilliseconds`, wire string
+`"mesh.expires-at"`.
+
+```csharp
+byte[] payload = Encoding.UTF8.GetBytes("only useful for the next five seconds");
+await alice.SendAsync(bobId, payload, TimeSpan.FromSeconds(5));
+// if this has not reached Bob's client within 5 seconds of the call, it is discarded rather than
+// delivered stale — Bob's MessageReceived never fires for it, and Alice's call does not learn this
+// happened (delivery is still fire-and-forget, exactly as the plain SendAsync overload is).
+```
+
+**How it works** (`MeshClient.cs:446-466`):
+1. Rejects a non-positive `timeToLive` with `ArgumentOutOfRangeException` before sending anything
+   (`:452-455`).
+2. Computes an **absolute** expiry instant, `DateTimeOffset.UtcNow.Add(timeToLive).ToUnixTimeMilliseconds()`
+   (`:457`), measured against **this client's own clock** at the moment of the call — there is no hub
+   clock authority; see the clock-skew caveat below.
+3. Attaches it as the sole entry of a `MessageHeaders` under `ExpiresAtUnixMilliseconds`, formatted as an
+   invariant-culture integer (`:458-463`), and sends via the shared `SendCoreAsync` (`:465`, definition
+   `:468-521`) — the same private helper `RequestAsync`, `ReplyAsync`, the `RequireAck` branch of
+   `SendAsync(..., DeliveryOptions, ...)` and the receive loop's automatic acknowledgement reply all use.
+   There is no pending-completion table and no correlation id: unlike request/response and delivery
+   acknowledgement, this overload's returned task completes once the hub has accepted the message — it
+   does not itself wait to learn whether the message was later dropped for having expired.
+
+**Parsing is shared and deliberately never throws.** `MessageExpiryHeaderKeys.TryParseExpiry`
+(`Messages/MessageExpiryHeaderKeys.cs:36-56`) is called by both this client's own receive loop and
+`MeshHub`'s send loop (see [hub.md](hub.md#dropping-expired-frames)), so the two never drift apart on how
+a bad value is treated. Absent, non-numeric, or numeric-but-out-of-range (e.g. `long.MaxValue`, which
+parses fine but is far outside what `DateTimeOffset.FromUnixTimeMilliseconds` can represent) all mean
+"does not expire" — identical to a message with no time-to-live at all. The value comes from the sender's
+own header block and is otherwise unvalidated, so this must never throw and crash whichever loop is
+checking it; a malformed *header block* itself (as opposed to a malformed expiry value inside a
+well-formed block) is a separate concern already handled by `TryReadHeaderBlock`/`HeaderEnvelope.Read`.
+
+**On receipt, an already-expired message is dropped before the application ever sees it — on both
+message shapes, not just direct.** `IsExpired(MessageHeaders headers, Guid senderId)`
+(`MeshClient.cs:1407-1422`) is the client-side check, called from **two** places in the receive loop:
+- `DeliverMessageWithHeaders`'s three-condition check (`:1096-1098`) — `!IsExpired(...)` is the **third**
+  condition, evaluated after the request/response and delivery-acknowledgement interceptions, so it only
+  ever applies to a message that was headed for `MessageReceived` in the first place. See
+  [The receive loop](#the-receive-loop) above.
+- `DeliverGroupMessageWithHeaders`'s single condition (`:1150`) — added by this pass's own second commit
+  ("apply the expiry check to group messages"), which was **not** present in the first commit: the
+  original change only guarded the direct-message branch, and an expired group message would still have
+  reached `GroupMessageReceived` until this fix landed within the same PR.
+
+An expired message is logged at `Debug` (`MeshClient.cs:1420`, `"Discarding an expired message from
+{SenderId}"`) and silently dropped — no event fires for it on either branch, and the sender is not
+notified (delivery remains fire-and-forget, exactly as an un-expired plain send is).
+
+**The hub also drops an expired frame, independently, while it is still queued** — see
+[hub.md](hub.md#dropping-expired-frames). A message can therefore be discarded at either end: by the hub
+before it ever reaches the recipient's transport, or by the recipient's own receive loop if it arrives
+just after expiring. Either way the effect on the application is identical — the message never surfaces.
+
+**Contract & gotchas:**
+- **There is no hub clock authority — this is a genuine, documented clock-skew caveat, not an edge case.**
+  The expiry is computed from the *sender's* clock and compared against the *hub's* and the *recipient's*
+  own clocks independently. If the sender's clock runs fast, a message may be discarded earlier than the
+  sender intended (relative to wall-clock time the sender thinks it is using); if it runs slow, a message
+  may survive longer than intended, or the receiving ends' comparisons may simply disagree with each
+  other. Meaningful use of a short time-to-live assumes the clocks involved are reasonably synchronised
+  (for example via NTP). See [known-issues.md](known-issues.md) KI-47.
+- **There is no `SendToGroupAsync(..., TimeSpan, ...)` overload.** Time-to-live is direct-message-only on
+  the sending side; only the *receiving* side of a group message is guarded (the `DeliverGroupMessageWithHeaders`
+  bullet above) — relevant only if some other sender (a hand-built frame, or a future overload) ever
+  attaches the header to a group send.
+- **A message can pass the hub's expiry check and still expire before the recipient's own check runs** —
+  the two checks are independent and use independent clock reads at different instants (queued-frame
+  dequeue time at the hub; frame-processing time at the recipient). This is expected, not a bug: both
+  checks exist to *reduce* stale delivery, not to guarantee an exact cutoff.
+- **`SendAsync(..., TimeSpan, ...)` bypasses `ThrowIfReservedHeaderKeyPresent`** the same way
+  `RequestAsync`, `ReplyAsync` and the `RequireAck` branch do — it is a legitimate producer of the
+  `"mesh.expires-at"` key via `SendCoreAsync` directly, not the public headers overload.
+
 ### `GetClientIdByNameAsync` — the correlated lookup
 
-`MeshClient.cs:765`. Serialised by `_lookupLock` (`SemaphoreSlim(1,1)`): **one lookup in flight at a
+`MeshClient.cs:798`. Serialised by `_lookupLock` (`SemaphoreSlim(1,1)`): **one lookup in flight at a
 time per client**; concurrent callers queue. Each request carries a 4-byte correlation id (`unchecked`
-increment, `:40-41`, `:785`). A single-slot `_pendingLookup` (`PendingLookup(correlationId,
-TaskCompletionSource<Guid?>)`, declared at `:1559`, assigned at `:787`) is completed by the receive loop
-**only when the ids match** (`:1165-1186`) — so a late response from a cancelled lookup cannot resolve a
+increment, `:40-41`, `:818`). A single-slot `_pendingLookup` (`PendingLookup(correlationId,
+TaskCompletionSource<Guid?>)`, declared at `:1622`, assigned at `:820`) is completed by the receive loop
+**only when the ids match** (`:1199-1220`) — so a late response from a cancelled lookup cannot resolve a
 subsequent one. Returns `null` when the hub reports "not found". Cancelling via the token abandons the
-wait; the `finally` clears `_pendingLookup` and releases the lock (`:798-810`).
+wait; the `finally` clears `_pendingLookup` and releases the lock (`:831-843`).
 
 This lookup's own single-slot `_pendingLookup`/correlation-id scheme is **not** what `RequestAsync` or
 `SendAsync(..., DeliveryOptions, ...)` use — both need to support multiple calls in flight at once, so
@@ -597,7 +692,7 @@ each has its own, separate `ConcurrentDictionary`-backed table: `_pendingRequest
 - **`_pendingRequests` (PR #83) needs no lock of its own** — it is a `ConcurrentDictionary<long,
   PendingRequest>` (`:46`), so concurrent `RequestAsync` calls and the single receive loop's
   `TryCompletePendingRequest` all touch it safely without going through `_stateLock`. Correlation ids come
-  from `Interlocked.Increment(ref _requestCorrelationId)` (`:47`, `:825`), so concurrent `RequestAsync`
+  from `Interlocked.Increment(ref _requestCorrelationId)` (`:47`, `:858`), so concurrent `RequestAsync`
   calls on the same client never collide on an id.
 - **`_pendingAcks` (PR #84) is the same shape and needs no lock of its own either** — a second, independent
   `ConcurrentDictionary<long, PendingAck>` (`:51`) with its own correlation counter,

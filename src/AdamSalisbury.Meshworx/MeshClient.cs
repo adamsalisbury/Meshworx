@@ -442,14 +442,38 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
     }
 
+    /// <inheritdoc/>
+    public async Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        TimeSpan timeToLive,
+        CancellationToken cancellationToken = default)
+    {
+        if (timeToLive <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeToLive), "The time-to-live must be positive.");
+        }
+
+        long expiresAtUnixMilliseconds = DateTimeOffset.UtcNow.Add(timeToLive).ToUnixTimeMilliseconds();
+        var headers = new MessageHeaders(
+        [
+            new KeyValuePair<string, string>(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                expiresAtUnixMilliseconds.ToString(CultureInfo.InvariantCulture)),
+        ]);
+
+        await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>
     /// Builds and sends a direct message frame, with or without a header block. Shared by the public
     /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, MessageHeaders, CancellationToken)"/> and by
     /// <see cref="RequestAsync"/>, <see cref="ReplyAsync"/>,
-    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, DeliveryOptions, CancellationToken)"/> and the
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, DeliveryOptions, CancellationToken)"/>,
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/> and the
     /// acknowledgement send in the receive loop, all of which construct
-    /// <see cref="RequestReplyHeaderKeys"/> or <see cref="DeliveryAcknowledgementHeaderKeys"/> headers
-    /// themselves and so must bypass the public overload's
+    /// <see cref="RequestReplyHeaderKeys"/>, <see cref="DeliveryAcknowledgementHeaderKeys"/> or
+    /// <see cref="MessageExpiryHeaderKeys"/> headers themselves and so must bypass the public overload's
     /// <see cref="ThrowIfReservedHeaderKeyPresent"/> guard rather than trip over their own headers.
     /// </summary>
     private async Task SendCoreAsync(
@@ -496,28 +520,37 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
     }
 
+    // Every header key a built-in helper (request/response, delivery acknowledgement, time-to-live, and
+    // any future one following the same pattern) reserves for its own use. Kept as a single list rather
+    // than a growing chain of ContainsKey checks, so ThrowIfReservedHeaderKeyPresent stays a fixed shape
+    // as more helpers are added.
+    private static readonly string[] ReservedHeaderKeys =
+    [
+        RequestReplyHeaderKeys.CorrelationId,
+        RequestReplyHeaderKeys.Reply,
+        DeliveryAcknowledgementHeaderKeys.CorrelationId,
+        DeliveryAcknowledgementHeaderKeys.Request,
+        DeliveryAcknowledgementHeaderKeys.Ack,
+        MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+    ];
+
     /// <summary>
-    /// Guards against an application header colliding with one of <see cref="RequestReplyHeaderKeys"/>
-    /// or <see cref="DeliveryAcknowledgementHeaderKeys"/>. Without this, a message that happened to
-    /// carry a header literally named <c>mesh.reply</c> or <c>mesh.ack</c> with value <c>"1"</c> would
-    /// be silently intercepted by the receive loop as if it were answering a request or an
-    /// acknowledgement request, and never raised through <see cref="MessageReceived"/> at all.
+    /// Guards against an application header colliding with one of <see cref="ReservedHeaderKeys"/>.
+    /// Without this, a message that happened to carry a header literally named, for example,
+    /// <c>mesh.reply</c> with value <c>"1"</c> would be silently intercepted by the receive loop as if
+    /// it were answering a request, and never raised through <see cref="MessageReceived"/> at all.
     /// </summary>
     private static void ThrowIfReservedHeaderKeyPresent(MessageHeaders headers)
     {
-        if (headers.ContainsKey(RequestReplyHeaderKeys.CorrelationId)
-            || headers.ContainsKey(RequestReplyHeaderKeys.Reply)
-            || headers.ContainsKey(DeliveryAcknowledgementHeaderKeys.CorrelationId)
-            || headers.ContainsKey(DeliveryAcknowledgementHeaderKeys.Request)
-            || headers.ContainsKey(DeliveryAcknowledgementHeaderKeys.Ack))
+        foreach (string reservedKey in ReservedHeaderKeys)
         {
-            throw new ArgumentException(
-                $"The header keys '{RequestReplyHeaderKeys.CorrelationId}', '{RequestReplyHeaderKeys.Reply}', "
-                + $"'{DeliveryAcknowledgementHeaderKeys.CorrelationId}', "
-                + $"'{DeliveryAcknowledgementHeaderKeys.Request}' and '{DeliveryAcknowledgementHeaderKeys.Ack}' "
-                + "are reserved for the request/response and delivery-acknowledgement helpers and cannot be "
-                + "set directly.",
-                nameof(headers));
+            if (headers.ContainsKey(reservedKey))
+            {
+                throw new ArgumentException(
+                    $"The header key '{reservedKey}' is reserved for a built-in helper (request/response, "
+                    + "delivery acknowledgement, or time-to-live) and cannot be set directly.",
+                    nameof(headers));
+            }
         }
     }
 
@@ -1061,7 +1094,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                             ReadOnlyMemory<byte> messageData = data.AsMemory(19 + headerBlockLength);
 
                             if (!TryCompletePendingAck(senderId, headers)
-                                && !TryCompletePendingRequest(senderId, headers, messageData))
+                                && !TryCompletePendingRequest(senderId, headers, messageData)
+                                && !IsExpired(headers, senderId))
                             {
                                 try
                                 {
@@ -1113,7 +1147,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                             MessageHeaders? headers = TryReadHeaderBlock(
                                 data.AsSpan(headerLengthOffset + 2), headerBlockLength, senderId);
 
-                            if (headers is not null)
+                            if (headers is not null && !IsExpired(headers, senderId))
                             {
                                 ReadOnlyMemory<byte> messageData = data.AsMemory(bodyOffset);
 
@@ -1356,6 +1390,35 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 ex, "Discarding a message from {SenderId} with a malformed header block", senderId);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Determines whether an incoming direct or group message has already passed the expiry its sender
+    /// attached via <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/>, so
+    /// it can be dropped before being handed to the application rather than delivered stale.
+    /// </summary>
+    /// <remarks>
+    /// Absent, unparseable or out-of-range expiry data means "does not expire" — identical to a message
+    /// with no time-to-live at all — mirroring <see cref="TryReadHeaderBlock"/>'s own tolerant treatment
+    /// of a malformed header block: a bad expiry value is not treated as a reason to fail delivery, and
+    /// critically must never itself throw and crash the receive loop over one hostile or malformed frame.
+    /// See <see cref="MessageExpiryHeaderKeys.TryParseExpiry"/>.
+    /// </remarks>
+    private bool IsExpired(MessageHeaders headers, Guid senderId)
+    {
+        if (!headers.TryGetValue(MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, out string? value)
+            || !MessageExpiryHeaderKeys.TryParseExpiry(value, out DateTimeOffset expiry))
+        {
+            return false;
+        }
+
+        if (DateTimeOffset.UtcNow <= expiry)
+        {
+            return false;
+        }
+
+        _logger.LogDebug("Discarding an expired message from {SenderId}", senderId);
+        return true;
     }
 
     /// <summary>

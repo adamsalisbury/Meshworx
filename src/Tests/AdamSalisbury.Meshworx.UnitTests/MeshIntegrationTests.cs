@@ -474,6 +474,49 @@ public sealed class MeshIntegrationTests
     }
 
     /// <summary>
+    /// A message sent with a time-to-live is delivered normally over the real wire protocol and hub
+    /// routing when it has not expired — proving the SendAsync(TimeSpan) overload's protocol-version
+    /// negotiation, header building, hub routing and client-side delivery all interoperate end to end.
+    /// </summary>
+    /// <remarks>
+    /// The negative case — an already-expired message being dropped rather than delivered — is proved
+    /// deterministically at the unit level instead (see MeshClientTests and MeshHubTests), against a
+    /// timestamp crafted to already be in the past. Racing a real elapsed-time expiry against delivery
+    /// over the in-memory transport here would not be deterministic: the whole client-to-hub-to-client
+    /// round trip typically completes well inside a millisecond, so there is no time-to-live short
+    /// enough to reliably still be positive (as the public API requires) yet reliably expire before
+    /// delivery completes.
+    /// </remarks>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_MessageWithTimeToLiveIsDelivered()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        await bob.ConnectAsync(listener.Connect(), "Bob");
+        await alice.ConnectAsync(listener.Connect(), "Alice");
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        bob.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        Guid? bobId = await alice.GetClientIdByNameAsync("Bob");
+        Assert.Equal(bob.Id, bobId);
+
+        byte[] payload = Encoding.UTF8.GetBytes("still fresh");
+        await alice.SendAsync(bobId!.Value, payload, TimeSpan.FromMinutes(5));
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(alice.Id, received.SenderId);
+        Assert.Equal(payload, received.Data.ToArray());
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
     /// A direct message sent with structured headers is delivered over the real wire protocol with
     /// both the headers and the body intact, and a group message carrying headers reaches every other
     /// member the same way — proving the header envelope round-trips end to end rather than only

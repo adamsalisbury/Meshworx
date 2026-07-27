@@ -44,8 +44,8 @@ sites in `MeshHub.cs` / `MeshClient.cs`.
    `ReceiveAsync`, and everything below this line is that payload, unchanged by which transport carried
    it. See [transport.md](transport.md) for each transport's framing in full.
 2. **Message** (owned by hub/client). The **first payload byte is the opcode** (`MessageType`); the rest
-   is opcode-specific. Empty frames (length 0) are ignored, not decoded (`MeshHub.cs:1009`,
-   `MeshClient.cs:996` — corrected this pass; the previous citation, `:848`, had pointed at unrelated
+   is opcode-specific. Empty frames (length 0) are ignored, not decoded (`MeshHub.cs:1010`,
+   `MeshClient.cs:1029` — corrected this pass; the previous citation, `:881`, had pointed at unrelated
    `CleanUpAsync` cleanup code since at least the PR #74 reconciliation, the same class of pre-existing
    drift found and fixed elsewhere in this file below).
 
@@ -121,33 +121,33 @@ the frame length, so it can be empty (the default). The hub does not interpret t
 them to the configured `ClientAuthenticator` and nothing else reads them. See
 [hub.md](hub.md#authentication) and [types.md](types.md#authentication-types).
 
-Hub-side validation order (`MeshHub.cs:890-984`), each failure sends the error (if applicable) and drops
+Hub-side validation order (`MeshHub.cs:891-985`), each failure sends the error (if applicable) and drops
 the connection:
-1. Frame ≥ **3** bytes and opcode `0x04` — else drop silently (no error frame) (`:890-895`).
+1. Frame ≥ **3** bytes and opcode `0x04` — else drop silently (no error frame) (`:891-896`).
 2. **Negotiate a version** via `TryNegotiateProtocolVersion(versionMin, versionMax, out negotiatedVersion)`
-   (`MeshHub.cs:1314-1336`, called at `:897`) — else `Error(UnsupportedProtocolVersion)` (`:897-903`).
+   (`MeshHub.cs:1315-1337`, called at `:898`) — else `Error(UnsupportedProtocolVersion)` (`:898-904`).
    Negotiation fails if `versionMin > versionMax` (an inverted range) or if `[versionMin, versionMax]`
    does not overlap `[Protocol.MinSupportedVersion, Protocol.MaxSupportedVersion]`; otherwise it picks the
    **highest version common to both ranges**. **This is checked before the length checks below**, so a
    3-byte frame carrying an unsupported range still gets an error reply.
-3. Frame ≥ 5 bytes, i.e. long enough to carry the name length — else drop silently (`:905-909`).
-4. `nameLen != 0` **and** frame ≥ `5 + nameLen` — else drop silently (`:911-918`). A declared length of
+3. Frame ≥ 5 bytes, i.e. long enough to carry the name length — else drop silently (`:906-910`).
+4. `nameLen != 0` **and** frame ≥ `5 + nameLen` — else drop silently (`:912-919`). A declared length of
    zero, or one running past the payload, is treated as malformed: **no error frame, connection
    dropped**. The empty name is refused here rather than admitted so it cannot reserve the empty string
    in the name registry.
 5. Decode the name from bytes `[5, 5+nameLen)`; `clientName.Length ≤ 256` **chars** — else
-   `Error(ClientNameTooLong)` (`:922-928`).
-6. **Authentication**, only when an authenticator was configured (`:930-951`). Two parts, in order: an
+   `Error(ClientNameTooLong)` (`:923-929`).
+6. **Authentication**, only when an authenticator was configured (`:931-952`). Two parts, in order: an
    at-capacity **early-out** — already-claimed slots `>= maxClients` → `Error(HubAtCapacity)` without the
-   callback running (`:937-941`) — then the callback itself, given the name and credential
-   (`:943-950`). Refusal, throw, cancellation or timeout → `Error(AuthenticationFailed)`.
-7. **Capacity claim** (`:958-962`): one atomic compare-and-swap takes a client slot if and only if fewer
+   callback running (`:938-942`) — then the callback itself, given the name and credential
+   (`:944-951`). Refusal, throw, cancellation or timeout → `Error(AuthenticationFailed)`.
+7. **Capacity claim** (`:959-963`): one atomic compare-and-swap takes a client slot if and only if fewer
    than `maxClients` are claimed. Failure → `Error(HubAtCapacity)`. This, not the early-out in step 6 and
    not the registered client count, is the decision that admits or refuses on capacity, so concurrent
    registrations cannot all pass and overshoot the cap.
-8. Name not already claimed (`_clientNames.TryAdd`) — else `Error(DuplicateClientName)` (`:966-971`).
+8. Name not already claimed (`_clientNames.TryAdd`) — else `Error(DuplicateClientName)` (`:967-972`).
 9. Send `RegistrationComplete` carrying the assigned id and the `negotiatedVersion` byte from step 2
-   (`:977-981`).
+   (`:978-982`).
 
 Note that the **binding** capacity decision happens **after** authentication — an unauthenticated peer
 cannot hold a slot away from one that would authenticate — and **before** the name is reserved, so a
@@ -160,7 +160,7 @@ trailing byte is read into `IMeshClient.NegotiatedProtocolVersion` (`MeshClient.
 `IMeshClient.cs:28`) — `0` whenever the client is not connected.
 
 A connection that never sends a valid registration within `registrationTimeout` (default 10 s) is
-dropped without an error frame (`MeshHub.cs:878-886`).
+dropped without an error frame (`MeshHub.cs:879-887`).
 
 ---
 
@@ -174,7 +174,7 @@ SendMessageWithHeaders    : [0x11][recipientId 16][headerLen u16 BE][headerBlock
 DeliverMessageWithHeaders : [0x12][senderId 16][headerLen u16 BE][headerBlock][body...]     # hub→client, needs len ≥ 19
 ```
 Broadcast is sent as `BroadcastMessage` but **delivered as `DeliverMessage`** — recipients cannot tell a
-broadcast from a direct message (`MeshHub.BroadcastMessage` builds a `0x03` frame, `MeshHub.cs:1552`):
+broadcast from a direct message (`MeshHub.BroadcastMessage` builds a `0x03` frame, `MeshHub.cs:1674`):
 ```
 BroadcastMessage  : [0x0B][body...]                              # client→hub
 ```
@@ -190,8 +190,8 @@ GroupMessageWithHeaders    : [0x13][nameLen u16 BE][utf8 groupName][headerLen u1
 DeliverGroupMessageWithHeaders : [0x14][senderId 16][nameLen u16 BE][utf8 groupName][headerLen u16 BE][headerBlock][body...]  # hub→client, needs len ≥ 21
 ```
 The hub passes the original name bytes straight through from the inbound `GroupMessage` into the
-outbound `DeliverGroupMessage` rather than re-encoding the decoded string (`MeshHub.cs:1060-1067`,
-`:2011-2016`). The header-bearing group frames do the same, and additionally pass the header block
+outbound `DeliverGroupMessage` rather than re-encoding the decoded string (`MeshHub.cs:1061-1068`,
+`:2133-2138`). The header-bearing group frames do the same, and additionally pass the header block
 through as an opaque `ReadOnlyMemory<byte>` — the hub reads only its **length**, never its content, on
 both the direct and group paths (`RouteMessageWithHeaders`/`SendToGroupWithHeaders`, see
 [hub.md](hub.md#routing-helpers)).
@@ -201,8 +201,11 @@ both the direct and group paths (`RouteMessageWithHeaders`/`SendToGroupWithHeade
 ### Message headers
 
 `MessageHeaders` (`Messages/MessageHeaders.cs`) is a small, immutable, string-keyed
-`IReadOnlyDictionary<string, string>` that travels alongside a message body without the hub ever
-decoding it. `MessageHeaders.Empty` is the shared no-headers instance; `SendAsync`/`SendToGroupAsync`
+`IReadOnlyDictionary<string, string>` that travels alongside a message body without the hub ever decoding
+it into a `MessageHeaders` object — the hub only ever reads a header block's declared *length*, to route
+or strip it, with **one narrow exception since PR #85**: it scans (without fully decoding) for a single
+well-known expiry key, see [Message expiry headers](#message-expiry-headers) below.
+`MessageHeaders.Empty` is the shared no-headers instance; `SendAsync`/`SendToGroupAsync`
 overloads taking a `MessageHeaders` fall back to the plain, header-less frame and cost nothing extra on
 the wire when it is empty (`headers.Count == 0`) — see [client.md](client.md#sending-headers).
 
@@ -215,12 +218,16 @@ at encode time (`ArgumentException`), as is a header set whose total encoded len
 
 **Decoding is defensive on both sides.** `HeaderEnvelope.Read` bounds-checks every internal key/value
 length against the block's own declared length and throws `FormatException` rather than letting a
-span-slice exception escape on a malformed block; the hub never calls it (it only reads the block's
-length to route/strip), but `MeshClient` does, on receipt of `DeliverMessageWithHeaders`/
-`DeliverGroupMessageWithHeaders`. There, `TryReadHeaderBlock` (`MeshClient.cs:1347-1359`) catches the
+span-slice exception escape on a malformed block; the hub never calls **this** method (it only reads the
+block's length to route/strip), but `MeshClient` does, on receipt of `DeliverMessageWithHeaders`/
+`DeliverGroupMessageWithHeaders`. There, `TryReadHeaderBlock` (`MeshClient.cs:1381-1393`) catches the
 `FormatException`, logs a warning, and drops **only that one frame** rather than tearing down the
 connection — the same "one bad frame must not kill the loop" principle as the rest of the receive loop
-(see [Length-guard behaviour](#length-guard-behaviour-why-malformed-frames-do-nothing)).
+(see [Length-guard behaviour](#length-guard-behaviour-why-malformed-frames-do-nothing)). **Since PR #85
+the hub does call a sibling method, `HeaderEnvelope.TryReadValue`**, which applies the identical
+bounds-checking and throws the identical `FormatException` on a malformed block, but returns one value
+instead of decoding every entry — see [Message expiry headers](#message-expiry-headers) below and
+[hub.md](hub.md#dropping-expired-frames) for how the hub's own call site treats that exception.
 
 **Headers require both ends to have negotiated at least protocol version 5**
 (`Protocol.HeaderEnvelopeMinVersion`). `MeshClient.SendAsync`/`SendToGroupAsync` throw
@@ -243,8 +250,8 @@ four behind `HeaderEnvelopeMinVersion` and having both hub and client check
 *originate*, not just receive.
 
 **`GroupJoinRefused` echoes the same bytes, and that is load-bearing rather than tidy.** The hub copies
-the inbound `JoinGroup` name bytes and replies with exactly those (`RefuseGroupJoin`, `MeshHub.cs:1874`,
-copy at `:1746`, echo at `:1884-1886`). Re-encoding the *decoded* string is not size-preserving: every
+the inbound `JoinGroup` name bytes and replies with exactly those (`RefuseGroupJoin`, `MeshHub.cs:1996`,
+copy at `:1868`, echo at `:2006-2008`). Re-encoding the *decoded* string is not size-preserving: every
 byte that is not valid UTF-8 decodes to `U+FFFD` and re-encodes as three, so a name of invalid bytes
 would **triple**. Join frames carry no length cap of their own (KI-8), so a re-encoded refusal could
 exceed the transport's 1 MiB payload limit and throw on send — which faults that connection's send loop,
@@ -253,7 +260,7 @@ the client's capacity slot. Echoing keeps the refusal no larger than the frame t
 the transport has already bounded. If you touch this path, keep the echo.
 
 **Group sends require membership.** The hub silently drops a `GroupMessage` from a client that has not
-joined the target group (`MeshHub.cs:1983`, `:1993-1999`). There is no error frame for this — a correct
+joined the target group (`MeshHub.cs:2105`, `:2115-2121`). There is no error frame for this — a correct
 client only sends to groups it has joined, and it learns that a join did *not* take effect from
 `GroupJoinRefused`. See [hub.md](hub.md#group-authorisation) and
 [known-issues.md](known-issues.md) KI-2.
@@ -314,6 +321,34 @@ differently-implemented peer, from sending one carrying `mesh.ack=1`, which any 
 will intercept and drop before `MessageReceived` regardless of who sent it. See
 [known-issues.md](known-issues.md) KI-42, KI-44, KI-45 and KI-46.
 
+<a id="message-expiry-headers"></a>
+
+### Message expiry headers (PR #85)
+
+`SendAsync(..., TimeSpan, ...)` (`IMeshClient`, see
+[client.md](client.md#message-expiry-time-to-live)) rides the same route again: an ordinary
+`SendMessageWithHeaders`/`DeliverMessageWithHeaders` (`0x11`/`0x12`) frame, gated by the same
+`HeaderEnvelopeMinVersion` (`5`) check, carrying one new well-known key,
+`Messages/MessageExpiryHeaderKeys.cs` (`internal`):
+
+| Key | Value | Wire string | Present on |
+|---|---|---|---|
+| `MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds` | the absolute expiry instant, Unix milliseconds, invariant-culture integer, computed from the **sender's own clock** | `"mesh.expires-at"` | the message only — there is no reply/acknowledgement frame for this feature |
+
+**This is the one exception to "the hub only ever reads a header block's length, never its content".**
+Every other header-bearing feature above (request/response, delivery acknowledgement) is invisible to the
+hub — it forwards or strips the whole block based on the recipient's negotiated version alone. Message
+expiry is different: `MeshHub.SendLoopAsync` calls a new, narrowly-scoped `HeaderEnvelope.TryReadValue`
+(`Messages/HeaderEnvelope.cs:175-233`) to search a queued frame's header block for exactly this one key,
+so it can drop an already-expired frame before writing it to the transport — see
+[hub.md](hub.md#dropping-expired-frames). `TryReadValue` is a linear scan of the block's raw entries, not
+the general `HeaderEnvelope.Read` decode: it never allocates the `Dictionary<string, string>`/
+`MessageHeaders` a full decode would, and it still never touches the sender id, group name or message
+body. The distinction that survives is "the hub never decodes the full header set, and never reads the
+body" — not "the hub never reads header content at all", which was true before this PR and is no longer
+quite accurate as a blanket statement. See [known-issues.md](known-issues.md) KI-47 for the clock-skew
+consequence of the check this enables.
+
 <a id="additive-opcodes-within-a-version"></a>
 
 ### Additive opcodes within a version
@@ -346,7 +381,7 @@ ClientLookupRequest : [0x06][correlationId i32 BE][utf8 name]    # client→hub,
 ClientLookupResponse: [0x07][correlationId i32 BE][found u8][id 16 if found==1]  # needs len ≥ 6
 ```
 `found == 0x01` **and** total length ≥ 22 → the 16-byte id follows; otherwise the client resolves the
-lookup to `null` (`MeshClient.cs:1178-1185` — re-pointed this pass for PR #84's shift; the citation was
+lookup to `null` (`MeshClient.cs:1212-1219` — re-pointed this pass for PR #84's shift; the citation was
 correct as of the PR #83 pass). The client only completes a lookup whose correlation id matches the
 pending request (see [client.md](client.md)).
 
@@ -357,7 +392,7 @@ Ping       : [0x09]     # hub→client liveness probe
 Pong       : [0x0A]     # client→hub reply
 ```
 `Ping`/`Pong` only exist when the hub is configured with a `heartbeatInterval`. The client replies to a
-`Ping` best-effort (`MeshClient.cs:1187-1200` — re-pointed this pass for PR #84's shift); the hub treats
+`Ping` best-effort (`MeshClient.cs:1221-1234` — re-pointed this pass for PR #84's shift); the hub treats
 **any** received frame (including `Pong`) as proof of life via its activity counter, so a busy client is
 never pinged.
 
@@ -366,7 +401,7 @@ never pinged.
 ## Length-guard behaviour (why malformed frames "do nothing")
 
 Both dispatch chains are length-guarded `if / else if` ladders with **no terminal `else`**
-(`MeshHub.cs:1015-1132`, `MeshClient.cs:1002-1206`). A frame that is too short for its opcode, or carries an
+(`MeshHub.cs:1016-1133`, `MeshClient.cs:1035-1240`). A frame that is too short for its opcode, or carries an
 unrecognised opcode, **falls through and is silently ignored** — no exception, no log at warning level.
 When debugging "my message never arrives", suspect a framing/offset error first; it will not surface as
 an error. If you add an opcode, add both the guard and the branch on the correct side, and mirror the
@@ -376,17 +411,17 @@ hub's by 118 (was 77) — the length-guard style scales additively, which is wha
 for a change like this one. **Neither PR #83 nor PR #84 added a branch** to the client's ladder — each
 nested a check *inside* the existing `DeliverMessageWithHeaders` branch: PR #83's
 `if (!TryCompletePendingRequest(...))`, and PR #84's `TryCompletePendingAck(...)` ahead of it in the same
-condition (`MeshClient.cs:1063-1064`, see [client.md](client.md#request-response) and
+condition (`MeshClient.cs:1096-1098`, see [client.md](client.md#request-response) and
 [client.md](client.md#delivery-acknowledgement)), so the ladder still has exactly the same number of
 `else if` branches after both PRs; only that one branch's body grew, twice.
 
 That fall-through is what makes a hub → client opcode addable without a version bump: the client's
-`GroupJoinRefused` branch (`MeshClient.cs:1139-1164`) guards on `data.Length > 1`, so a refusal carrying an
+`GroupJoinRefused` branch (`MeshClient.cs:1173-1198`) guards on `data.Length > 1`, so a refusal carrying an
 **empty** name — which a hub will never send, since `JoinGroupAsync` returns early on an empty name
-(`MeshHub.cs:1727`) — would itself fall through and be ignored.
+(`MeshHub.cs:1849`) — would itself fall through and be ignored.
 
 The **registration frame follows the same rule**: a truncated frame, a zero name length, or a declared
-name length running past the payload drops the connection with **no error frame** (`MeshHub.cs:905-918`).
+name length running past the payload drops the connection with **no error frame** (`MeshHub.cs:906-919`).
 A client with a bad framing bug therefore sees the connection close rather than a
 `RegistrationRefusedException` — do not read a silent close as "hub unreachable".
 
@@ -399,7 +434,7 @@ support it). `Protocol.cs` (`Messages/Protocol.cs`) declares `MinSupportedVersio
 `MaxSupportedVersion` (`5`) bounding the range this build of the hub/client will speak, plus
 `HeaderEnvelopeMinVersion` (`5`) marking the version at which the header envelope became available.
 `MeshClient.ConnectAsync` always advertises its own `[MinSupportedVersion, MaxSupportedVersion]`;
-`MeshHub.TryNegotiateProtocolVersion` (`MeshHub.cs:1314-1336`) intersects that with its own range and, on
+`MeshHub.TryNegotiateProtocolVersion` (`MeshHub.cs:1315-1337`) intersects that with its own range and, on
 overlap, picks the **highest** version common to both — a peer never has to downgrade further than
 necessary. A malformed range (`versionMin > versionMax`) or a non-overlapping one refuses with
 `Error(UnsupportedProtocolVersion)`.
@@ -414,9 +449,9 @@ the mechanism:
   with one that understands `5`; negotiation settles on `4`, and the peer that only sent the plain frames
   in the first place notices nothing.
 - **`MeshHub.ClientConnection` now records its own `NegotiatedProtocolVersion`**, captured once at
-  registration (`MeshHub.cs:2177`, constructor parameter, immutable thereafter) — the piece KI-14 said was
-  missing. `RouteMessageWithHeaders` (`MeshHub.cs:1609`) and `SendToGroupWithHeaders`
-  (`MeshHub.cs:2055`) — see [hub.md](hub.md#routing-helpers) — read it per-recipient to decide whether to
+  registration (`MeshHub.cs:2299`, constructor parameter, immutable thereafter) — the piece KI-14 said was
+  missing. `RouteMessageWithHeaders` (`MeshHub.cs:1731`) and `SendToGroupWithHeaders`
+  (`MeshHub.cs:2177`) — see [hub.md](hub.md#routing-helpers) — read it per-recipient to decide whether to
   forward a header-bearing frame unchanged or strip it to the plain equivalent.
 - **`MeshClient` reads its own `NegotiatedProtocolVersion` too**, refusing with `NotSupportedException`
   before it will send a non-empty `MessageHeaders` over a connection negotiated below
