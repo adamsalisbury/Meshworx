@@ -2164,6 +2164,71 @@ public sealed class MeshClientTests
         Assert.Equal(6, received.Data.Span[0]);
     }
 
+    /// <summary>
+    /// The expiry check applies to group messages too: an already-expired group message is discarded
+    /// rather than raised through GroupMessageReceived, mirroring the direct-message case. Proved the
+    /// same way — a non-expiring group message queued immediately afterwards is what actually arrives.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task ReceiveLoop_ExpiredGroupMessage_DoesNotRaiseGroupMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+
+        long alreadyExpired = DateTimeOffset.UtcNow.AddMinutes(-1).ToUnixTimeMilliseconds();
+        var expiredHeaders = new MessageHeaders(
+        [
+            new(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                alreadyExpired.ToString(CultureInfo.InvariantCulture)),
+        ]);
+        byte[] expiredPayload = MeshClientFixture.CreateDeliverGroupMessageWithHeadersPayload(
+            senderId, "team", expiredHeaders, new byte[] { 1 });
+
+        var barrierHeaders = new MessageHeaders([new("marker", "barrier")]);
+        byte[] barrierPayload = MeshClientFixture.CreateDeliverGroupMessageWithHeadersPayload(
+            senderId, "team", barrierHeaders, new byte[] { 2 });
+
+        fixture.SetupSuccessfulRegistration(expiredPayload, barrierPayload);
+
+        var receivedTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        fixture.Client.GroupMessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        GroupMessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(2, received.Data.Span[0]);
+    }
+
+    /// <summary>
+    /// A group message that has not yet expired is delivered exactly as an ordinary group message would be.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task ReceiveLoop_NonExpiredGroupMessage_RaisesGroupMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+
+        long farInFuture = DateTimeOffset.UtcNow.AddHours(1).ToUnixTimeMilliseconds();
+        var headers = new MessageHeaders(
+        [
+            new(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                farInFuture.ToString(CultureInfo.InvariantCulture)),
+        ]);
+        byte[] payload = MeshClientFixture.CreateDeliverGroupMessageWithHeadersPayload(
+            senderId, "team", headers, new byte[] { 3 });
+        fixture.SetupSuccessfulRegistration(payload);
+
+        var receivedTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        fixture.Client.GroupMessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        GroupMessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(3, received.Data.Span[0]);
+    }
+
     // ReceiveLoop (tested indirectly via MessageReceived event)
 
     /// <summary>

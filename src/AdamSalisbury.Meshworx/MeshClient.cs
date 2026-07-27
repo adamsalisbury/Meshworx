@@ -1147,7 +1147,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                             MessageHeaders? headers = TryReadHeaderBlock(
                                 data.AsSpan(headerLengthOffset + 2), headerBlockLength, senderId);
 
-                            if (headers is not null)
+                            if (headers is not null && !IsExpired(headers, senderId))
                             {
                                 ReadOnlyMemory<byte> messageData = data.AsMemory(bodyOffset);
 
@@ -1393,9 +1393,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <summary>
-    /// Determines whether an incoming message has already passed the expiry its sender attached via
-    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/>, so it can be
-    /// dropped before being handed to the application rather than delivered stale.
+    /// Determines whether an incoming direct or group message has already passed the expiry its sender
+    /// attached via <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/>, so
+    /// it can be dropped before being handed to the application rather than delivered stale.
     /// </summary>
     /// <remarks>
     /// Absent, unparseable or out-of-range expiry data means "does not expire" — identical to a message
