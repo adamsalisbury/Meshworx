@@ -16,7 +16,7 @@ namespace AdamSalisbury.Meshworx.UnitTests;
 
 public sealed class MeshClientReconnectorTests
 {
-    private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WaitTimeout = TestTimeouts.Wait;
     private static readonly string[] GroupsAbc = ["A", "B", "C"];
     private static readonly string[] GroupsAb = ["A", "B"];
 
@@ -120,7 +120,7 @@ public sealed class MeshClientReconnectorTests
     /// completion to await, so the handler's own catch is the only thing standing between a faulted
     /// restore and an unobserved exception on the thread pool; the reconnect loop carries on regardless.
     /// </summary>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
     public async Task Reconnected_HandlerIdiomFromDocumentation_ContainsPostSuspensionFailure()
     {
         var transport = new Mock<ITransport>();
@@ -600,7 +600,7 @@ public sealed class MeshClientReconnectorTests
     /// After a reconnect, the managed client still delivers messages: a handler subscribed once keeps
     /// firing, proving the receive loop restarts and subscriptions persist across reconnection.
     /// </summary>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
     public async Task DeliversMessages_AfterReconnect()
     {
         var firstListener = new InMemoryTransportListener();
@@ -656,7 +656,7 @@ public sealed class MeshClientReconnectorTests
     /// After an unexpected drop and reconnect, the reconnector re-joins the client's previous groups, so
     /// group messages resume without the application re-joining in the Reconnected handler.
     /// </summary>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
     public async Task RestoresGroupMembership_AfterReconnect()
     {
         var firstListener = new InMemoryTransportListener();

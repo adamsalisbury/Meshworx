@@ -8,7 +8,7 @@ namespace AdamSalisbury.Meshworx.UnitTests;
 
 public sealed class MeshClientReconnectorMetricsTests
 {
-    private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WaitTimeout = TestTimeouts.Wait;
 
     private static MeshClient CreateClient()
     {
@@ -24,7 +24,7 @@ public sealed class MeshClientReconnectorMetricsTests
     /// When the reconnector re-establishes a dropped connection, its reconnects counter is incremented —
     /// but not by the initial connection StartAsync makes, which is not a reconnect.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task Reconnects_AfterConnectionLost_IncrementsReconnectsCounter()
     {
         var firstListener = new InMemoryTransportListener();

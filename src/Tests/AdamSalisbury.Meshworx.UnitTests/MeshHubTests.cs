@@ -12,7 +12,7 @@ namespace AdamSalisbury.Meshworx.UnitTests;
 
 public sealed class MeshHubTests
 {
-    private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WaitTimeout = TestTimeouts.Wait;
 
     // Constructor
 
@@ -131,7 +131,7 @@ public sealed class MeshHubTests
     /// that shutdown or begun one of its own — which is what the frame count distinguishes. No settling
     /// delay is involved.
     /// </remarks>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task StopAsync_CalledWhileAShutdownIsInFlight_NotifiesEachClientOnce()
     {
         var fixture = new MeshHubFixture();
@@ -163,7 +163,7 @@ public sealed class MeshHubTests
     /// When StopAsync is called while a shutdown is already in flight, it returns only once that shutdown
     /// has finished, rather than reporting the hub stopped while it is still stopping.
     /// </summary>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task StopAsync_CalledWhileAShutdownIsInFlight_ReturnsOnlyOnceTheShutdownCompletes()
     {
         var fixture = new MeshHubFixture();
@@ -304,7 +304,7 @@ public sealed class MeshHubTests
     /// ownership there would leave the endpoint bound with nothing serving it and no way to recover, since
     /// the listener cannot be started a second time.
     /// </remarks>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task StopAsync_WhileAStartIsInProgress_LeavesTheStartedHubIntact()
     {
         var fixture = new MeshHubFixture();
@@ -363,7 +363,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client completes registration, the hub raises ClientConnected with the client's id and name.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ValidRegistration_RaisesClientConnected()
     {
         var fixture = new MeshHubFixture();
@@ -385,7 +385,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a registered client disconnects, the hub raises ClientDisconnected with the client's id and name.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientDisconnects_RaisesClientDisconnected()
     {
         var fixture = new MeshHubFixture();
@@ -407,7 +407,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a registration is refused, ClientConnected is not raised because no client was registered.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RegistrationRejected_DoesNotRaiseClientConnected()
     {
         var fixture = new MeshHubFixture();
@@ -438,7 +438,7 @@ public sealed class MeshHubTests
     /// ConnectedClientCount reflects the number of registered clients, rising as clients register and
     /// falling as they disconnect.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ConnectedClientCount_TracksRegisteredClients()
     {
         var fixture = new MeshHubFixture();
@@ -598,7 +598,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client's transport returns null during the registration read, the transport is disposed and no client is registered.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_NullRegistrationData_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -623,7 +623,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a first frame with an unexpected message type, the transport is disposed and no client is registered.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_InvalidMessageType_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -649,7 +649,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends registration data shorter than three bytes, the transport is disposed and no client is registered.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RegistrationDataTooShort_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -675,7 +675,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client's registration is rejected for any reason, no entry is added to the client registry.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RegistrationRejected_ClientNotRegistered()
     {
         var fixture = new MeshHubFixture();
@@ -704,7 +704,7 @@ public sealed class MeshHubTests
     /// When an accepted connection does not send its registration request within the configured
     /// timeout, the hub drops the connection by disposing the transport.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RegistrationTimesOut_DisposesTransport()
     {
         var fixture = new MeshHubFixture(TimeSpan.FromMilliseconds(100));
@@ -736,7 +736,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client attempts to register with a name that is already taken, the hub sends an Error response containing the DuplicateClientName error code.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_DuplicateClientName_SendsErrorResponse()
     {
         var fixture = new MeshHubFixture();
@@ -769,7 +769,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client is refused registration due to a duplicate name, the transport is disposed.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_DuplicateClientName_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -797,7 +797,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client is refused registration due to a duplicate name, only the original client remains in the registry.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_DuplicateClientName_DoesNotRegisterSecondClient()
     {
         var fixture = new MeshHubFixture();
@@ -829,7 +829,7 @@ public sealed class MeshHubTests
     /// refused with an Error response carrying the HubAtCapacity error code, and the client is
     /// not added to the registry.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_HubAtCapacity_RefusesRegistration()
     {
         var fixture = new MeshHubFixture(maxClients: 1);
@@ -868,7 +868,7 @@ public sealed class MeshHubTests
     /// what maxClients is enforced against, so registrations that all read the same count cannot all be
     /// admitted and overshoot the cap.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_LastSlotClaimedButNotYetRegistered_RefusesRatherThanExceedingMaxClients()
     {
         var authenticatorReached = new TaskCompletionSource();
@@ -924,7 +924,7 @@ public sealed class MeshHubTests
     /// the slot is given back rather than leaked, so the capacity it briefly held is still available to
     /// the next client.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RefusedForDuplicateNameAfterClaimingSlot_GivesTheSlotBack()
     {
         var fixture = new MeshHubFixture(maxClients: 2);
@@ -967,7 +967,7 @@ public sealed class MeshHubTests
     /// When a client disconnects, the slot it held is given back, so a hub that was at its maximum
     /// client count can admit a replacement.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientDisconnects_GivesItsSlotBackForAReplacement()
     {
         var fixture = new MeshHubFixture(maxClients: 1);
@@ -1093,7 +1093,7 @@ public sealed class MeshHubTests
     /// ever reading a registration frame from it — while a connection from a different address is
     /// unaffected by that address's limit.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task AcceptLoop_TooManyConnectionsFromSameAddress_RefusesFurtherConnectionWithoutHandshake()
     {
         var fixture = new MeshHubFixture(maxConnectionsPerRemoteEndpoint: 1);
@@ -1130,7 +1130,7 @@ public sealed class MeshHubTests
     /// When a connection from a remote address that was at its connection limit disconnects, the slot
     /// it held is given back, so a replacement connection from that same address is then admitted.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task AcceptLoop_ConnectionFromCappedAddressDisconnects_FreesSlotForAnotherFromSameAddress()
     {
         var fixture = new MeshHubFixture(maxConnectionsPerRemoteEndpoint: 1);
@@ -1184,7 +1184,7 @@ public sealed class MeshHubTests
     /// source for the connection cap. A single host with a routine /64 allocation cannot defeat the cap
     /// by connecting from a different address within it each time.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task AcceptLoop_TwoIPv6AddressesInSamePrefix_ShareTheConnectionCap()
     {
         var fixture = new MeshHubFixture(maxConnectionsPerRemoteEndpoint: 1);
@@ -1242,7 +1242,7 @@ public sealed class MeshHubTests
     /// When a client's advertised protocol version range does not overlap the hub's supported range, the
     /// hub sends an Error response containing the UnsupportedProtocolVersion error code.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_UnsupportedProtocolVersion_SendsErrorResponse()
     {
         var fixture = new MeshHubFixture();
@@ -1277,7 +1277,7 @@ public sealed class MeshHubTests
     /// advertised maximum, the range is malformed and the hub refuses it as an unsupported version rather
     /// than attempting to interpret it.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_InvertedProtocolVersionRange_SendsErrorResponse()
     {
         var fixture = new MeshHubFixture();
@@ -1314,7 +1314,7 @@ public sealed class MeshHubTests
     /// the highest version common to both — not merely an exact match — and echoes it in the
     /// RegistrationComplete response.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ProtocolVersionRangeOverlapsHub_NegotiatesHighestSharedVersion()
     {
         var fixture = new MeshHubFixture();
@@ -1355,7 +1355,7 @@ public sealed class MeshHubTests
     /// When a client sends a registration request with a name exceeding the maximum allowed length,
     /// the hub sends an Error response containing the ClientNameTooLong error code.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientNameTooLong_SendsErrorResponse()
     {
         var fixture = new MeshHubFixture();
@@ -1392,7 +1392,7 @@ public sealed class MeshHubTests
     /// When the hub has an authenticator that rejects the credential, registration is refused with the
     /// AuthenticationFailed error code and the client is not registered.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_AuthenticatorRejects_SendsAuthenticationFailedError()
     {
         var fixture = new MeshHubFixture(authenticator: (_, _) => ValueTask.FromResult(false));
@@ -1421,7 +1421,7 @@ public sealed class MeshHubTests
     /// When the authenticator hangs, the hub refuses the client once the registration timeout elapses
     /// rather than holding the connection open indefinitely.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_AuthenticatorHangs_RefusesAfterRegistrationTimeout()
     {
         var neverCompletes = new TaskCompletionSource<bool>();
@@ -1454,7 +1454,7 @@ public sealed class MeshHubTests
     /// When the authenticator throws, the client is refused with AuthenticationFailed rather than the
     /// exception faulting the handler.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_AuthenticatorThrows_SendsAuthenticationFailedError()
     {
         var fixture = new MeshHubFixture(
@@ -1485,7 +1485,7 @@ public sealed class MeshHubTests
     /// call timing out, for example — the client is refused with AuthenticationFailed rather than the
     /// connection being dropped silently as though the hub were shutting down.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_AuthenticatorThrowsOperationCancelled_SendsAuthenticationFailedError()
     {
         var fixture = new MeshHubFixture(
@@ -1515,7 +1515,7 @@ public sealed class MeshHubTests
     /// Only maxConcurrentAuthentications authenticator callbacks run at once, so an unauthenticated peer
     /// cannot drive unbounded concurrent authentication work simply by connecting.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ManyRegistrations_BoundsConcurrentAuthenticatorCalls()
     {
         const int ConcurrencyLimit = 2;
@@ -1587,7 +1587,7 @@ public sealed class MeshHubTests
     /// A registration frame declaring a zero-length name is malformed and is dropped, so the empty
     /// string is never reserved in the name registry.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_EmptyClientName_DropsConnectionWithoutRegistering()
     {
         var fixture = new MeshHubFixture();
@@ -1622,7 +1622,7 @@ public sealed class MeshHubTests
     /// When the hub has an authenticator that accepts, the client is admitted, and the authenticator
     /// is given the client's name and the exact credential bytes it supplied.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_AuthenticatorAccepts_AdmitsClientWithNameAndCredential()
     {
         string? seenName = null;
@@ -1685,7 +1685,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a registered client disconnects by the transport returning null, the client is removed from the registry.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientDisconnects_RemovesFromRegistry()
     {
         var fixture = new MeshHubFixture();
@@ -1710,7 +1710,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a registered client disconnects, its transport connection is disposed.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientDisconnects_DisposesConnection()
     {
         var fixture = new MeshHubFixture();
@@ -1735,7 +1735,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a message to a registered recipient, the hub delivers a payload containing the DeliverMessage type byte, the sender's Guid, and the original message data.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessage_RecipientExists_DeliversCorrectPayload()
     {
         var fixture = new MeshHubFixture();
@@ -1768,7 +1768,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a message is delivered to a recipient, the payload contains the sender's Guid so the recipient knows who sent the message.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessage_RecipientExists_PayloadContainsSenderId()
     {
         var fixture = new MeshHubFixture();
@@ -1799,7 +1799,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a message to a Guid that does not match any registered client, the message is silently dropped without error.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessage_RecipientDoesNotExist_SilentlyDrops()
     {
         var fixture = new MeshHubFixture();
@@ -1833,7 +1833,7 @@ public sealed class MeshHubTests
     /// A header-bearing direct message is forwarded to a recipient negotiated at the header-envelope's
     /// minimum version as a DeliverMessageWithHeaders frame, carrying the header block through unchanged.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessageWithHeaders_RecipientNegotiatedCurrentVersion_DeliversWithHeaders()
     {
         var fixture = new MeshHubFixture();
@@ -1871,7 +1871,7 @@ public sealed class MeshHubTests
     /// minimum version has its header block stripped: the recipient gets the plain DeliverMessage frame
     /// it already understands, rather than an opcode it would not recognise.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessageWithHeaders_RecipientNegotiatedOldVersion_StripsHeadersAndDeliversPlainFrame()
     {
         var fixture = new MeshHubFixture();
@@ -1906,7 +1906,7 @@ public sealed class MeshHubTests
     /// A header-bearing direct message addressed to a Guid that does not match any registered client is
     /// silently dropped, mirroring the plain SendMessage behaviour.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessageWithHeaders_RecipientDoesNotExist_SilentlyDrops()
     {
         var fixture = new MeshHubFixture();
@@ -2070,7 +2070,7 @@ public sealed class MeshHubTests
     /// When a client broadcasts a message, the hub delivers it to every other registered client but
     /// not back to the sender.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task BroadcastMessage_DeliversToAllOtherClients()
     {
         var fixture = new MeshHubFixture();
@@ -2119,7 +2119,7 @@ public sealed class MeshHubTests
     /// When the hub receives an empty frame, it is ignored without faulting the receive loop,
     /// so a subsequent SendMessage from the same client is still routed.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_EmptyFrame_IsIgnoredAndRoutingContinues()
     {
         var fixture = new MeshHubFixture();
@@ -2154,7 +2154,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a lookup request for a name that is registered, the hub responds with a found indicator and the matching client's Guid.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_LookupRequestForExistingName_SendsFoundResponse()
     {
         var fixture = new MeshHubFixture();
@@ -2190,7 +2190,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a lookup request for a name that is not registered, the hub responds with a not-found indicator.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_LookupRequestForUnknownName_SendsNotFoundResponse()
     {
         var fixture = new MeshHubFixture();
@@ -2225,7 +2225,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When the hub receives a frame from a client with an unrecognised message type, the frame is ignored and no routing occurs.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_WrongMessageType_IgnoresFrame()
     {
         var fixture = new MeshHubFixture();
@@ -2253,7 +2253,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When the hub receives a frame from a client shorter than 17 bytes, the frame is ignored and no routing occurs.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_MessageTooShort_IgnoresFrame()
     {
         var fixture = new MeshHubFixture();
@@ -2283,7 +2283,7 @@ public sealed class MeshHubTests
     /// When a registered client's transport throws an IOException during the receive loop, the client
     /// is removed from the registry and its transport is disposed.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_IOExceptionDuringReceiveLoop_RemovesClientFromRegistry()
     {
         var fixture = new MeshHubFixture();
@@ -2318,7 +2318,7 @@ public sealed class MeshHubTests
     /// When a recipient's transport throws an IOException during message delivery, the recipient
     /// is evicted from the registry and the sender remains connected.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RecipientTransportFailsDuringRouting_EvictsRecipient()
     {
         var fixture = new MeshHubFixture();
@@ -2360,7 +2360,7 @@ public sealed class MeshHubTests
     /// treated exactly like a transport fault: the recipient is evicted with its slot, name and group
     /// memberships released, not left to fault the send loop's awaiting task and skip that cleanup.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RecipientTransportRejectsOversizedDelivery_EvictsRecipientAndReleasesItsSlot()
     {
         var fixture = new MeshHubFixture(maxClients: 2);
@@ -2410,7 +2410,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When heartbeats are enabled and a client stays idle, the hub probes it with a Ping frame.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_IdleClientWithHeartbeatEnabled_SendsPing()
     {
         var fixture = new MeshHubFixture(
@@ -2439,7 +2439,7 @@ public sealed class MeshHubTests
     /// When heartbeats are enabled and a client never sends any frame in response, the hub evicts it
     /// after the configured number of missed intervals.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientMissesHeartbeats_IsEvicted()
     {
         var fixture = new MeshHubFixture(
@@ -2468,7 +2468,7 @@ public sealed class MeshHubTests
     /// after it. The hub therefore probes it exactly maxMissedHeartbeats minus one times before
     /// evicting, which pins the eviction interval: an extra ping means eviction ran an interval late.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_SilentClient_IsEvictedOnConfiguredIntervalNotTheOneAfter()
     {
         const int MaxMissedHeartbeats = 3;
@@ -2516,7 +2516,7 @@ public sealed class MeshHubTests
     /// With maxMissedHeartbeats set to 1 the client is evicted on the very first idle interval, so the
     /// hub never gets to probe it. This is the documented boundary of the silent-interval count.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_SilentClientWithSingleMissedHeartbeat_IsEvictedWithoutPinging()
     {
         // A 100 ms interval rather than 50 ms: eviction here lands on the very first tick, so the
@@ -2643,7 +2643,7 @@ public sealed class MeshHubTests
     /// When a client sends three messages to another client, all three are delivered in order
     /// with the correct payloads.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessage_ThreeConsecutiveMessages_AllDeliveredInOrder()
     {
         var fixture = new MeshHubFixture();
@@ -2713,7 +2713,7 @@ public sealed class MeshHubTests
     /// fanning it out to the members. Proved by a direct message sent immediately afterwards on the same
     /// connection — it arrives, and the group message it was queued behind never does.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task SendToGroup_SenderIsNotAMember_MessageIsNotDelivered()
     {
         var fixture = new MeshHubFixture();
@@ -2742,7 +2742,7 @@ public sealed class MeshHubTests
     /// counterpart to the non-member case above, so the membership gate cannot pass by rejecting
     /// everything.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task SendToGroup_SenderIsAMember_MessageIsDeliveredToOtherMembers()
     {
         var fixture = new MeshHubFixture();
@@ -2776,7 +2776,7 @@ public sealed class MeshHubTests
     /// below it gets the plain DeliverGroupMessage frame with the headers stripped — built once each,
     /// not per recipient.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task SendToGroupWithHeaders_MixedNegotiatedVersionMembers_EachGetsItsOwnFrameShape()
     {
         var fixture = new MeshHubFixture();
@@ -2832,7 +2832,7 @@ public sealed class MeshHubTests
     /// When a group authoriser refuses a join, the client is told so, is not admitted to the group, and
     /// therefore receives none of its traffic.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserRefuses_ClientIsToldAndReceivesNoGroupMessages()
     {
         var fixture = new MeshHubFixture(
@@ -2866,7 +2866,7 @@ public sealed class MeshHubTests
     /// An authorised join admits the client to the group, and the authoriser is given the joining
     /// client's hub-assigned id, its registered name, and the group it asked for.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserAllows_AdmitsClientAndSeesItsIdentity()
     {
         GroupJoinContext? seen = null;
@@ -2904,7 +2904,7 @@ public sealed class MeshHubTests
     /// An authoriser that throws refuses the join rather than faulting the client handler — the decision
     /// fails closed, and the connection survives.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserThrows_JoinIsRefused()
     {
         var fixture = new MeshHubFixture(
@@ -2931,7 +2931,7 @@ public sealed class MeshHubTests
     /// An authoriser that cancels of its own accord — an external policy lookup timing out is the usual
     /// cause — refuses the join rather than unwinding into the receive loop and dropping the connection.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserCancels_JoinIsRefused()
     {
         var fixture = new MeshHubFixture(
@@ -2956,7 +2956,7 @@ public sealed class MeshHubTests
     /// An authoriser that never returns refuses the join once the group authorisation timeout elapses,
     /// so a hanging integrator callback cannot wedge the calling client's receive loop indefinitely.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserHangs_JoinIsRefusedAtTheTimeout()
     {
         var neverCompletes = new TaskCompletionSource<bool>();
@@ -2985,7 +2985,7 @@ public sealed class MeshHubTests
     /// is exactly what MeshClientReconnector's membership restoration does — is authorised again on its
     /// own merits, so a restore cannot reinstate a membership the authoriser would now refuse.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
     public async Task JoinGroup_AfterReconnect_IsAuthorisedAgainRatherThanRestored()
     {
         int memberJoinAttempts = 0;
@@ -3060,7 +3060,7 @@ public sealed class MeshHubTests
     /// it would breach the 1 MiB one, which is what makes the invariant worth pinning.
     /// </para>
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserRefusesAnInvalidUtf8Name_RefusalEchoesTheNameWithoutGrowingIt()
     {
         var fixture = new MeshHubFixture(groupAuthoriser: (_, _) => ValueTask.FromResult(false));
@@ -3092,7 +3092,7 @@ public sealed class MeshHubTests
     /// its mind must be able to use it to revoke: leaving the earlier membership in place would mean a
     /// deliberate refusal left the client still receiving the group's traffic.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserRefusesAnExistingMember_RevokesTheMembership()
     {
         bool allowJoins = true;
@@ -3129,7 +3129,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// With no group authoriser configured, joins are unrestricted — the default behaviour is unchanged.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_NoAuthoriser_AdmitsAnyClient()
     {
         var fixture = new MeshHubFixture();
