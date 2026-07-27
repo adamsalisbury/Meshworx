@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Globalization;
 using System.Net;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
@@ -1927,6 +1928,139 @@ public sealed class MeshHubTests
             t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()),
             Times.Once); // only RegistrationComplete, no delivery bounce-back
 
+        await fixture.Hub.StopAsync();
+    }
+
+    // Message expiry (TTL)
+
+    private static string ExpiryHeaderValue(TimeSpan fromNow)
+    {
+        return DateTimeOffset.UtcNow.Add(fromNow).ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// A direct message whose expiry has already passed is dropped by the send loop rather than
+    /// delivered stale. Proved the same way as the other queue-ordering tests: a non-expiring message
+    /// queued immediately afterwards on the same connection is what actually arrives, and the expired
+    /// one queued ahead of it never does — because the hub processes one client's queued frames in
+    /// order, its arrival proves the expired frame was already dealt with.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task SendLoop_ExpiredDirectMessage_IsDroppedNotDelivered()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient", versionMin: 5, versionMax: 5);
+        var recipientFrames = new FrameRecorder(recipient.Transport);
+
+        var expiredHeaders = new MessageHeaders(
+        [
+            new(MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, ExpiryHeaderValue(TimeSpan.FromMinutes(-1))),
+        ]);
+        sender.EnqueueMessage(
+            MeshHubFixture.CreateDirectMessageWithHeaders(recipient.Id, expiredHeaders, [1, 2, 3]));
+
+        var barrierHeaders = new MessageHeaders([new("marker", "barrier")]);
+        sender.EnqueueMessage(
+            MeshHubFixture.CreateDirectMessageWithHeaders(recipient.Id, barrierHeaders, [9]));
+
+        byte[] delivered = await recipientFrames.WaitForAsync(f => f[0] == 0x12) // DeliverMessageWithHeaders
+            .WaitAsync(WaitTimeout);
+
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(delivered.AsSpan(17, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(delivered.AsSpan(19), headerLength);
+        Assert.Equal("barrier", decoded["marker"]);
+        Assert.Equal(new byte[] { 9 }, delivered[(19 + headerLength)..]);
+
+        // Exactly one DeliverMessageWithHeaders frame reached the recipient: the barrier. The expired
+        // one queued ahead of it never did.
+        Assert.Single(recipientFrames.Frames, f => f[0] == 0x12);
+
+        sender.Disconnect();
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A direct message with a time-to-live that has not yet elapsed is delivered exactly as a header-
+    /// bearing message without one would be.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendLoop_NonExpiredDirectMessage_IsDelivered()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var clientA = await fixture.RegisterClientAsync("ClientA");
+        var clientB = await fixture.RegisterClientAsync("ClientB", versionMin: 5, versionMax: 5);
+
+        var deliveredTcs = new TaskCompletionSource<byte[]>();
+        clientB.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => deliveredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        var headers = new MessageHeaders(
+        [
+            new(MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, ExpiryHeaderValue(TimeSpan.FromHours(1))),
+        ]);
+        byte[] sendPayload = MeshHubFixture.CreateDirectMessageWithHeaders(clientB.Id, headers, [4, 5, 6]);
+
+        clientA.DisconnectTcs.SetResult(sendPayload);
+
+        byte[] deliveredData = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x12, deliveredData[0]); // DeliverMessageWithHeaders
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(deliveredData.AsSpan(17, 2));
+        Assert.Equal(new byte[] { 4, 5, 6 }, deliveredData[(19 + headerLength)..]);
+
+        clientB.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// The expiry check applies to group messages too: an already-expired one queued for a member is
+    /// dropped, mirroring the direct-message case.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task SendLoop_ExpiredGroupMessage_IsDroppedNotDelivered()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var member = await fixture.RegisterMultiMessageClientAsync("Member", versionMin: 5, versionMax: 5);
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var memberFrames = new FrameRecorder(member.Transport);
+        var senderFrames = new FrameRecorder(sender.Transport);
+
+        member.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        await ApplyPendingFramesAsync(member, memberFrames, "Sender");
+
+        sender.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        await ApplyPendingFramesAsync(sender, senderFrames, "Member");
+
+        var expiredHeaders = new MessageHeaders(
+        [
+            new(MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, ExpiryHeaderValue(TimeSpan.FromMinutes(-1))),
+        ]);
+        sender.EnqueueMessage(MeshHubFixture.CreateGroupMessageWithHeaders("team", expiredHeaders, [1, 2, 3]));
+
+        var barrierHeaders = new MessageHeaders([new("marker", "barrier")]);
+        sender.EnqueueMessage(MeshHubFixture.CreateGroupMessageWithHeaders("team", barrierHeaders, [9]));
+
+        byte[] delivered = await memberFrames.WaitForAsync(f => f[0] == 0x14) // DeliverGroupMessageWithHeaders
+            .WaitAsync(WaitTimeout);
+
+        int nameLength = BinaryPrimitives.ReadUInt16BigEndian(delivered.AsSpan(17, 2));
+        int headerLengthOffset = 19 + nameLength;
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(delivered.AsSpan(headerLengthOffset, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(delivered.AsSpan(headerLengthOffset + 2), headerLength);
+        Assert.Equal("barrier", decoded["marker"]);
+
+        Assert.Single(memberFrames.Frames, f => f[0] == 0x14);
+
+        member.Disconnect();
+        sender.Disconnect();
         await fixture.Hub.StopAsync();
     }
 

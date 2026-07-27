@@ -153,6 +153,39 @@ public interface IMeshClient : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends a message to another client via the hub with a time-to-live: if it has not reached the
+    /// recipient's client within <paramref name="timeToLive"/>, it is discarded rather than delivered
+    /// stale.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is otherwise best-effort and fire-and-forget, mirroring
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, CancellationToken)"/> — this method's returned
+    /// task completes once the hub has accepted the message, exactly as that overload's does, and does
+    /// not itself wait to find out whether the message expired before delivery.
+    /// <para>
+    /// The expiry is an absolute instant computed from <b>this client's own clock</b> at the moment of
+    /// the call. There is no hub clock authority: the hub and the recipient both compare it against
+    /// their own local clock, so a short time-to-live is only meaningful between peers whose clocks are
+    /// reasonably synchronised — under material clock skew a message could expire earlier or later than
+    /// intended, or not at all.
+    /// </para>
+    /// </remarks>
+    /// <param name="recipientId">The unique identifier of the target client.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="timeToLive">How long the message remains valid, measured from now.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The hub negotiated a protocol version that predates the header envelope.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeToLive"/> is not positive.</exception>
+    Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        TimeSpan timeToLive,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Broadcasts a message to every other client currently registered with the hub.
     /// </summary>
     /// <remarks>

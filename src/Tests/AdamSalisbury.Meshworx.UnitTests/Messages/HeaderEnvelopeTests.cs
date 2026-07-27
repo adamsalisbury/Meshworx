@@ -153,4 +153,90 @@ public sealed class HeaderEnvelopeTests
 
         Assert.Throws<FormatException>(() => HeaderEnvelope.Read(block, block.Length));
     }
+
+    [Fact]
+    public void TryReadValue_ZeroLength_ReturnsFalse()
+    {
+        bool found = HeaderEnvelope.TryReadValue(ReadOnlySpan<byte>.Empty, 0, "key", out string? value);
+
+        Assert.False(found);
+        Assert.Null(value);
+    }
+
+    [Fact]
+    public void TryReadValue_KeyPresent_ReturnsTrueAndValue()
+    {
+        var headers = new MessageHeaders(
+        [
+            new("first", "one"),
+            new("second", "two"),
+            new("third", "three"),
+        ]);
+        int length = HeaderEnvelope.GetEncodedLength(headers);
+        var buffer = new byte[length];
+        HeaderEnvelope.Write(headers, buffer);
+
+        bool found = HeaderEnvelope.TryReadValue(buffer, length, "second", out string? value);
+
+        Assert.True(found);
+        Assert.Equal("two", value);
+    }
+
+    [Fact]
+    public void TryReadValue_KeyAbsent_ReturnsFalse()
+    {
+        var headers = new MessageHeaders([new("first", "one")]);
+        int length = HeaderEnvelope.GetEncodedLength(headers);
+        var buffer = new byte[length];
+        HeaderEnvelope.Write(headers, buffer);
+
+        bool found = HeaderEnvelope.TryReadValue(buffer, length, "missing", out string? value);
+
+        Assert.False(found);
+        Assert.Null(value);
+    }
+
+    /// <summary>
+    /// TryReadValue must find the same result as decoding the whole block via Read would, whichever
+    /// entry the searched-for key happens to be — not just the first or the last.
+    /// </summary>
+    [Fact]
+    public void TryReadValue_MatchesFullDecodeRegardlessOfEntryPosition()
+    {
+        var headers = new MessageHeaders(
+        [
+            new("alpha", "a"),
+            new("beta", "b"),
+            new("gamma", "g"),
+        ]);
+        int length = HeaderEnvelope.GetEncodedLength(headers);
+        var buffer = new byte[length];
+        HeaderEnvelope.Write(headers, buffer);
+
+        MessageHeaders decoded = HeaderEnvelope.Read(buffer, length);
+
+        foreach (string key in new[] { "alpha", "beta", "gamma" })
+        {
+            bool found = HeaderEnvelope.TryReadValue(buffer, length, key, out string? value);
+
+            Assert.True(found);
+            Assert.Equal(decoded[key], value);
+        }
+    }
+
+    [Fact]
+    public void TryReadValue_KeyRunsPastBlockLength_ThrowsFormatException()
+    {
+        byte[] block = [5];
+
+        Assert.Throws<FormatException>(() => HeaderEnvelope.TryReadValue(block, block.Length, "key", out _));
+    }
+
+    [Fact]
+    public void TryReadValue_ValueRunsPastBlockLength_ThrowsFormatException()
+    {
+        byte[] block = [1, (byte)'a', 0, 10];
+
+        Assert.Throws<FormatException>(() => HeaderEnvelope.TryReadValue(block, block.Length, "key", out _));
+    }
 }

@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Diagnostics.Metrics;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -86,6 +87,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private static readonly KeyValuePair<string, object?> GroupDirectionTag = new("direction", "group");
     private static readonly KeyValuePair<string, object?> UnknownRecipientDropTag = new("reason", "unknown-recipient");
     private static readonly KeyValuePair<string, object?> QueueFullDropTag = new("reason", "queue-full");
+    private static readonly KeyValuePair<string, object?> ExpiredDropTag = new("reason", "expired");
 
     // How many client slots are currently claimed. This, rather than _clients.Count, is what maxClients
     // is enforced against: a slot is claimed by a single atomic operation before the client is put into
@@ -1441,6 +1443,102 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // flushing. Small enough to bound the rented buffer, large enough to absorb fan-out bursts.
     private const int SendCoalesceByteBudget = 64 * 1024;
 
+    /// <summary>
+    /// Determines whether a queued outbound frame has already passed the expiry its sender attached, so
+    /// <see cref="SendLoopAsync"/> can drop it instead of delivering it stale, and records the drop on
+    /// <see cref="_messagesDroppedCounter"/> when it does.
+    /// </summary>
+    /// <remarks>
+    /// Absent or unparseable expiry data means "does not expire" — identical to a message with no
+    /// time-to-live at all. A malformed header block is not this check's concern either: the
+    /// recipient's own decode already handles that case (logging and dropping just that frame), so
+    /// treating it as non-expiring here does not lose anything twice over.
+    /// </remarks>
+    private bool IsExpiredFrame(byte[] frame, Guid recipientId)
+    {
+        if (!TryGetHeaderBlock(frame, out ReadOnlySpan<byte> block))
+        {
+            return false;
+        }
+
+        string? expiresAtText;
+        try
+        {
+            if (!HeaderEnvelope.TryReadValue(
+                block, block.Length, MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, out expiresAtText))
+            {
+                return false;
+            }
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+
+        if (!long.TryParse(
+                expiresAtText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long expiresAtUnixMilliseconds)
+            || DateTimeOffset.UtcNow <= DateTimeOffset.FromUnixTimeMilliseconds(expiresAtUnixMilliseconds))
+        {
+            return false;
+        }
+
+        _logger.LogDebug("Dropping an expired message queued for {RecipientId}", recipientId);
+        _messagesDroppedCounter.Add(1, ExpiredDropTag);
+        return true;
+    }
+
+    /// <summary>
+    /// Locates the header block within a queued outbound delivery frame, if it is one of the two
+    /// header-bearing delivery opcodes. Used only so <see cref="IsExpiredFrame"/> can check the one
+    /// well-known expiry header — the hub still never inspects a frame's body.
+    /// </summary>
+    private static bool TryGetHeaderBlock(ReadOnlySpan<byte> frame, out ReadOnlySpan<byte> block)
+    {
+        block = default;
+
+        if (frame.Length < 1)
+        {
+            return false;
+        }
+
+        switch ((MessageType)frame[0])
+        {
+            case MessageType.DeliverMessageWithHeaders when frame.Length >= 19:
+            {
+                int headerLength = BinaryPrimitives.ReadUInt16BigEndian(frame.Slice(17, 2));
+                if (frame.Length < 19 + headerLength)
+                {
+                    return false;
+                }
+
+                block = frame.Slice(19, headerLength);
+                return true;
+            }
+
+            case MessageType.DeliverGroupMessageWithHeaders when frame.Length >= 19:
+            {
+                int nameLength = BinaryPrimitives.ReadUInt16BigEndian(frame.Slice(17, 2));
+                int headerLengthOffset = 19 + nameLength;
+                if (frame.Length < headerLengthOffset + 2)
+                {
+                    return false;
+                }
+
+                int headerLength = BinaryPrimitives.ReadUInt16BigEndian(frame.Slice(headerLengthOffset, 2));
+                if (frame.Length < headerLengthOffset + 2 + headerLength)
+                {
+                    return false;
+                }
+
+                block = frame.Slice(headerLengthOffset + 2, headerLength);
+                return true;
+            }
+
+            default:
+                return false;
+        }
+    }
+
     private async Task SendLoopAsync(ClientConnection connection, CancellationTokenSource clientCts)
     {
         // Reused across the connection's lifetime so coalescing adds no per-frame allocation.
@@ -1451,8 +1549,19 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             await foreach (byte[] payload in connection.OutboundQueue.Reader
                 .ReadAllAsync(clientCts.Token).ConfigureAwait(false))
             {
-                batch.Add(payload);
+                // A frame that has already passed the expiry its sender attached (SendAsync's
+                // time-to-live overload) is dropped here rather than delivered stale — this is
+                // precisely the "expired while queued" case the feature exists for: the frame was
+                // still fresh when RouteMessageWithHeaders/SendToGroupWithHeaders queued it, but has
+                // since sat behind other traffic. IsExpiredFrame only ever inspects the one well-known
+                // expiry header, never the body, so this remains true to "the hub routes opaque bytes".
+                if (IsExpiredFrame(payload, connection.Id))
+                {
+                    continue;
+                }
+
                 long batchBytes = payload.Length;
+                batch.Add(payload);
 
                 // Drain whatever is already queued so a fan-out burst becomes one write. TryRead never
                 // blocks, so a lone frame is sent immediately with no added latency; only frames already
@@ -1460,8 +1569,19 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 while (batchBytes < SendCoalesceByteBudget
                     && connection.OutboundQueue.Reader.TryRead(out byte[]? next))
                 {
+                    if (IsExpiredFrame(next, connection.Id))
+                    {
+                        continue;
+                    }
+
                     batch.Add(next);
                     batchBytes += next.Length;
+                }
+
+                if (batch.Count == 0)
+                {
+                    // Everything drained on this pass had already expired; nothing left to send.
+                    continue;
                 }
 
                 if (batch.Count == 1)
