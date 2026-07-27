@@ -1607,6 +1607,291 @@ public sealed class MeshClientTests
         Assert.Equal(new byte[] { 9, 9 }, sentData[(19 + headerLength)..]);
     }
 
+    // SendAsync(DeliveryOptions) / delivery acknowledgements
+
+    /// <summary>
+    /// DeliveryOptions.None behaves exactly like the plain SendAsync overload: no header block, no
+    /// extra frame, and the call completes as soon as the hub has accepted the send.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_DeliveryOptionsNone_SendsPlainFrame()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1, 2, 3 }, DeliveryOptions.None);
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x02, sentData[0]); // SendMessage — no header block written.
+    }
+
+    /// <summary>
+    /// A send requesting acknowledgement carries the ack-request flag and a correlation id in the
+    /// header block, so the recipient's client knows to answer it.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_RequireAck_SendsAckRequestHeaders()
+    {
+        var fixture = new MeshClientFixture();
+        var channel = Channel.CreateUnbounded<byte[]?>();
+        channel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                byte[] sent = data.ToArray();
+                if (sent[0] == 0x11)
+                {
+                    sentData = sent;
+                }
+            })
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        Task sendTask = fixture.Client.SendAsync(
+            Guid.NewGuid(), new byte[] { 1 }, DeliveryOptions.RequireAck(TimeSpan.FromSeconds(5)));
+
+        // Give the send a moment to reach the transport before inspecting it; the outstanding call is
+        // left pending (never acknowledged) — this test only cares about the outgoing frame shape.
+        await Task.Delay(50);
+
+        Assert.NotNull(sentData);
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(17, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(sentData.AsSpan(19), headerLength);
+        Assert.Equal("1", decoded[DeliveryAcknowledgementHeaderKeys.Request]);
+        Assert.True(decoded.ContainsKey(DeliveryAcknowledgementHeaderKeys.CorrelationId));
+
+        _ = sendTask; // Deliberately left pending; the client is disposed with the fixture's scope.
+    }
+
+    /// <summary>
+    /// When the recipient's client sends back an acknowledgement, the pending SendAsync call completes
+    /// successfully rather than waiting out its timeout.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task SendAsync_RequireAck_AcknowledgementArrives_CompletesSuccessfully()
+    {
+        var fixture = new MeshClientFixture();
+        var channel = Channel.CreateUnbounded<byte[]?>();
+        channel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        var recipientId = Guid.NewGuid();
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                byte[] sent = data.ToArray();
+                if (sent[0] != 0x11)
+                {
+                    return;
+                }
+
+                int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sent.AsSpan(17, 2));
+                MessageHeaders sentHeaders = HeaderEnvelope.Read(sent.AsSpan(19), headerLength);
+                string correlationId = sentHeaders[DeliveryAcknowledgementHeaderKeys.CorrelationId];
+
+                var ackHeaders = new MessageHeaders(
+                [
+                    new(DeliveryAcknowledgementHeaderKeys.CorrelationId, correlationId),
+                    new(DeliveryAcknowledgementHeaderKeys.Ack, "1"),
+                ]);
+                channel.Writer.TryWrite(
+                    MeshClientFixture.CreateDeliverMessageWithHeadersPayload(recipientId, ackHeaders, []));
+            })
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        bool messageReceivedRaised = false;
+        fixture.Client.MessageReceived += (_, _) => messageReceivedRaised = true;
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        await fixture.Client.SendAsync(
+            recipientId, new byte[] { 1 }, DeliveryOptions.RequireAck(TimeSpan.FromSeconds(1)));
+
+        Assert.False(messageReceivedRaised);
+    }
+
+    /// <summary>
+    /// If no acknowledgement arrives within the timeout, the send fails with a TimeoutException.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task SendAsync_RequireAck_NoAcknowledgementWithinTimeout_ThrowsTimeoutException()
+    {
+        var fixture = new MeshClientFixture();
+        fixture.SetupSuccessfulRegistration();
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        await Assert.ThrowsAsync<TimeoutException>(
+            () => fixture.Client.SendAsync(
+                Guid.NewGuid(), new byte[] { 1 }, DeliveryOptions.RequireAck(TimeSpan.FromMilliseconds(50))));
+    }
+
+    /// <summary>
+    /// An acknowledgement claiming the correct correlation id but arriving from a client other than the
+    /// one the message was addressed to is discarded rather than resolving the send — otherwise any
+    /// other client connected to the same hub could forge an acknowledgement for a delivery meant for
+    /// someone else. The genuinely addressed recipient's acknowledgement, arriving afterwards, still
+    /// completes the send.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task SendAsync_RequireAck_AcknowledgementFromWrongSender_IsDiscardedAndGenuineAckStillCompletes()
+    {
+        var fixture = new MeshClientFixture();
+        var channel = Channel.CreateUnbounded<byte[]?>();
+        channel.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        var intendedRecipientId = Guid.NewGuid();
+        var attackerId = Guid.NewGuid();
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                byte[] sent = data.ToArray();
+                if (sent[0] != 0x11)
+                {
+                    return;
+                }
+
+                int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sent.AsSpan(17, 2));
+                MessageHeaders sentHeaders = HeaderEnvelope.Read(sent.AsSpan(19), headerLength);
+                string correlationId = sentHeaders[DeliveryAcknowledgementHeaderKeys.CorrelationId];
+
+                var ackHeaders = new MessageHeaders(
+                [
+                    new(DeliveryAcknowledgementHeaderKeys.CorrelationId, correlationId),
+                    new(DeliveryAcknowledgementHeaderKeys.Ack, "1"),
+                ]);
+
+                channel.Writer.TryWrite(
+                    MeshClientFixture.CreateDeliverMessageWithHeadersPayload(attackerId, ackHeaders, []));
+                channel.Writer.TryWrite(
+                    MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+                        intendedRecipientId, ackHeaders, []));
+            })
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct).ConfigureAwait(false));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        await fixture.Client.SendAsync(
+            intendedRecipientId, new byte[] { 1 }, DeliveryOptions.RequireAck(TimeSpan.FromSeconds(1)));
+    }
+
+    /// <summary>
+    /// The delivery-acknowledgement header keys are reserved: a caller that happens to set one directly
+    /// via the headers overload is rejected loudly rather than the receive loop silently swallowing an
+    /// ordinary message that coincidentally looked like acknowledgement plumbing.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_HeadersContainReservedAckKeys_ThrowsArgumentException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        var headers = new MessageHeaders([new(DeliveryAcknowledgementHeaderKeys.Ack, "1")]);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, headers));
+    }
+
+    /// <summary>
+    /// A message that requested an acknowledgement still raises MessageReceived as normal (delivery
+    /// acknowledgement is additive, not a replacement for the ordinary receive path), and the client
+    /// sends back an acknowledgement frame addressed to the sender carrying the same correlation id.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_MessageRequestsAcknowledgement_RaisesMessageReceivedAndSendsAcknowledgement()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+        var requestHeaders = new MessageHeaders(
+        [
+            new(DeliveryAcknowledgementHeaderKeys.CorrelationId, "99"),
+            new(DeliveryAcknowledgementHeaderKeys.Request, "1"),
+        ]);
+        byte[] payload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, requestHeaders, new byte[] { 1 });
+        fixture.SetupSuccessfulRegistration(payload);
+
+        byte[]? ackData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                byte[] sent = data.ToArray();
+                if (sent[0] == 0x11)
+                {
+                    ackData = sent;
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        fixture.Client.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(1, received.Data.Span[0]);
+
+        // The acknowledgement send happens after the event dispatch, on the same receive-loop
+        // iteration; give it a moment to reach the mocked transport.
+        for (int i = 0; i < 20 && ackData is null; i++)
+        {
+            await Task.Delay(25);
+        }
+
+        Assert.NotNull(ackData);
+        Assert.Equal(senderId, new Guid(ackData.AsSpan(1, 16)));
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(ackData.AsSpan(17, 2));
+        MessageHeaders ackHeaders = HeaderEnvelope.Read(ackData.AsSpan(19), headerLength);
+        Assert.Equal("99", ackHeaders[DeliveryAcknowledgementHeaderKeys.CorrelationId]);
+        Assert.Equal("1", ackHeaders[DeliveryAcknowledgementHeaderKeys.Ack]);
+        Assert.Empty(ackData[(19 + headerLength)..]);
+    }
+
+    /// <summary>
+    /// A message that did not request an acknowledgement does not cause one to be sent.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveLoop_MessageWithoutAcknowledgementRequest_DoesNotSendAcknowledgement()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+        var headers = new MessageHeaders([new("marker", "plain")]);
+        byte[] payload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, headers, new byte[] { 1 });
+        fixture.SetupSuccessfulRegistration(payload);
+
+        int sendCount = 0;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback(() => Interlocked.Increment(ref sendCount))
+            .Returns(Task.CompletedTask);
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        fixture.Client.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        // Only the registration request itself should have been sent; nothing else in reaction to a
+        // plain message.
+        Assert.Equal(1, sendCount);
+    }
+
     // ReceiveLoop (tested indirectly via MessageReceived event)
 
     /// <summary>

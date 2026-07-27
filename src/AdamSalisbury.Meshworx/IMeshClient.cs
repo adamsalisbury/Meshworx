@@ -121,6 +121,38 @@ public interface IMeshClient : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends a message to another client via the hub, optionally waiting for the recipient's client to
+    /// acknowledge that the message reached its application.
+    /// </summary>
+    /// <remarks>
+    /// With <see cref="DeliveryOptions.None"/> this is identical to
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, CancellationToken)"/> — best-effort,
+    /// fire-and-forget, and the returned task completes once the hub has accepted the message. With
+    /// <see cref="DeliveryOptions.RequireAck"/> the returned task instead completes once the recipient's
+    /// client has raised <see cref="MessageReceived"/> for the message and sent back an acknowledgement,
+    /// or fails with a <see cref="TimeoutException"/> if that does not happen in time. The
+    /// acknowledgement is an ordinary routed message between the two clients; the hub does not
+    /// participate in or observe it.
+    /// </remarks>
+    /// <param name="recipientId">The unique identifier of the target client.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="options">Whether to require a delivery acknowledgement, and its timeout.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="options"/> requires an acknowledgement but the hub negotiated a protocol version
+    /// that predates the header envelope.
+    /// </exception>
+    /// <exception cref="TimeoutException">
+    /// <paramref name="options"/> requires an acknowledgement and none arrived within its timeout.
+    /// </exception>
+    Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        DeliveryOptions options,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Broadcasts a message to every other client currently registered with the hub.
     /// </summary>
     /// <remarks>

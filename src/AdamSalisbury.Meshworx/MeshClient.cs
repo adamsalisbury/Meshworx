@@ -46,6 +46,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private readonly ConcurrentDictionary<long, PendingRequest> _pendingRequests = new();
     private long _requestCorrelationId;
 
+    // As _pendingRequests above, but for outstanding SendAsync(..., DeliveryOptions.RequireAck(...))
+    // calls awaiting the recipient's acknowledgement rather than a reply payload.
+    private readonly ConcurrentDictionary<long, PendingAck> _pendingAcks = new();
+    private long _ackCorrelationId;
+
     private readonly Lock _groupMembershipLock = new();
     private readonly HashSet<string> _joinedGroups = new(StringComparer.Ordinal);
 
@@ -381,11 +386,70 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <inheritdoc/>
+    public async Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        DeliveryOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        if (!options.RequireAcknowledgement)
+        {
+            await SendAsync(recipientId, message, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        long ackId = Interlocked.Increment(ref _ackCorrelationId);
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // As RequestAsync's PendingRequest: the expected acknowledger is recorded so a forged
+        // acknowledgement from a client other than the one this message was addressed to cannot
+        // convince the sender delivery succeeded when it did not.
+        _pendingAcks[ackId] = new PendingAck(recipientId, completion);
+
+        try
+        {
+            var headers = new MessageHeaders(
+            [
+                new KeyValuePair<string, string>(
+                    DeliveryAcknowledgementHeaderKeys.CorrelationId,
+                    ackId.ToString(CultureInfo.InvariantCulture)),
+                new KeyValuePair<string, string>(DeliveryAcknowledgementHeaderKeys.Request, "1"),
+            ]);
+
+            await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(options.AcknowledgementTimeout!.Value);
+
+            try
+            {
+                await completion.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"No delivery acknowledgement was received within {options.AcknowledgementTimeout}.");
+            }
+        }
+        finally
+        {
+            // Whether the acknowledgement arrived, the call timed out, or it was cancelled, this id is
+            // no longer awaited — a late acknowledgement for it is discarded rather than resolving a
+            // future send that happens to reuse it.
+            _pendingAcks.TryRemove(ackId, out _);
+        }
+    }
+
     /// <summary>
     /// Builds and sends a direct message frame, with or without a header block. Shared by the public
     /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, MessageHeaders, CancellationToken)"/> and by
-    /// <see cref="RequestAsync"/>/<see cref="ReplyAsync"/>, which construct
-    /// <see cref="RequestReplyHeaderKeys"/> headers themselves and so must bypass the public overload's
+    /// <see cref="RequestAsync"/>, <see cref="ReplyAsync"/>,
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, DeliveryOptions, CancellationToken)"/> and the
+    /// acknowledgement send in the receive loop, all of which construct
+    /// <see cref="RequestReplyHeaderKeys"/> or <see cref="DeliveryAcknowledgementHeaderKeys"/> headers
+    /// themselves and so must bypass the public overload's
     /// <see cref="ThrowIfReservedHeaderKeyPresent"/> guard rather than trip over their own headers.
     /// </summary>
     private async Task SendCoreAsync(
@@ -433,20 +497,26 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <summary>
-    /// Guards against an application header colliding with one of <see cref="RequestReplyHeaderKeys"/>.
-    /// Without this, a message that happened to carry a header literally named <c>mesh.reply</c> with
-    /// value <c>"1"</c> would be silently intercepted by the receive loop as if it were a reply to some
-    /// request and never raised through <see cref="MessageReceived"/> at all.
+    /// Guards against an application header colliding with one of <see cref="RequestReplyHeaderKeys"/>
+    /// or <see cref="DeliveryAcknowledgementHeaderKeys"/>. Without this, a message that happened to
+    /// carry a header literally named <c>mesh.reply</c> or <c>mesh.ack</c> with value <c>"1"</c> would
+    /// be silently intercepted by the receive loop as if it were answering a request or an
+    /// acknowledgement request, and never raised through <see cref="MessageReceived"/> at all.
     /// </summary>
     private static void ThrowIfReservedHeaderKeyPresent(MessageHeaders headers)
     {
         if (headers.ContainsKey(RequestReplyHeaderKeys.CorrelationId)
-            || headers.ContainsKey(RequestReplyHeaderKeys.Reply))
+            || headers.ContainsKey(RequestReplyHeaderKeys.Reply)
+            || headers.ContainsKey(DeliveryAcknowledgementHeaderKeys.CorrelationId)
+            || headers.ContainsKey(DeliveryAcknowledgementHeaderKeys.Request)
+            || headers.ContainsKey(DeliveryAcknowledgementHeaderKeys.Ack))
         {
             throw new ArgumentException(
-                $"The header keys '{RequestReplyHeaderKeys.CorrelationId}' and '{RequestReplyHeaderKeys.Reply}' "
-                + "are reserved for the request/response helper (RequestAsync/ReplyAsync) and cannot be set "
-                + "directly.",
+                $"The header keys '{RequestReplyHeaderKeys.CorrelationId}', '{RequestReplyHeaderKeys.Reply}', "
+                + $"'{DeliveryAcknowledgementHeaderKeys.CorrelationId}', "
+                + $"'{DeliveryAcknowledgementHeaderKeys.Request}' and '{DeliveryAcknowledgementHeaderKeys.Ack}' "
+                + "are reserved for the request/response and delivery-acknowledgement helpers and cannot be "
+                + "set directly.",
                 nameof(headers));
         }
     }
@@ -990,7 +1060,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         {
                             ReadOnlyMemory<byte> messageData = data.AsMemory(19 + headerBlockLength);
 
-                            if (!TryCompletePendingRequest(senderId, headers, messageData))
+                            if (!TryCompletePendingAck(senderId, headers)
+                                && !TryCompletePendingRequest(senderId, headers, messageData))
                             {
                                 try
                                 {
@@ -1008,6 +1079,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                                     // silently halt all further delivery. This is a callback boundary.
                                     _logger.LogError(ex, "A MessageReceived handler threw an exception");
                                 }
+
+                                // The acknowledgement is sent once the message has been handed to the
+                                // application (the event above has been raised, successfully or not),
+                                // matching the "delivered-to-application receipt" contract — not merely
+                                // that the frame arrived on the wire.
+                                await TrySendAcknowledgementAsync(senderId, headers, cancellationToken)
+                                    .ConfigureAwait(false);
                             }
                         }
                     }
@@ -1170,6 +1248,16 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
             _pendingRequests.Clear();
 
+            // Likewise the only thing that completes a pending SendAsync(..., DeliveryOptions.RequireAck)
+            // call.
+            foreach (KeyValuePair<long, PendingAck> pendingAck in _pendingAcks)
+            {
+                pendingAck.Value.Completion.TrySetException(
+                    new InvalidOperationException("The connection was closed before an acknowledgement arrived."));
+            }
+
+            _pendingAcks.Clear();
+
             await HandleReceiveLoopTerminationAsync(reason).ConfigureAwait(false);
         }
     }
@@ -1329,6 +1417,107 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <summary>
+    /// Completes a pending <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, DeliveryOptions, CancellationToken)"/>
+    /// call if <paramref name="headers"/> mark this frame as a delivery acknowledgement, so it is
+    /// resolved internally rather than surfaced through <see cref="MessageReceived"/>.
+    /// </summary>
+    /// <param name="senderId">
+    /// The actual sender of the frame, as stamped by the hub. Checked against the pending
+    /// acknowledgement's recorded <see cref="PendingAck.ExpectedAcknowledgerId"/> before completion, so
+    /// an acknowledgement cannot be forged by a client other than the one the message was addressed to.
+    /// </param>
+    /// <param name="headers">The frame's decoded headers.</param>
+    /// <returns>
+    /// <see langword="true"/> if the frame was an acknowledgement (whether or not it matched a
+    /// still-pending send from the expected acknowledger), so the caller must not raise it as an
+    /// ordinary message.
+    /// </returns>
+    private bool TryCompletePendingAck(Guid senderId, MessageHeaders headers)
+    {
+        if (!headers.TryGetValue(DeliveryAcknowledgementHeaderKeys.Ack, out string? ackFlag)
+            || !string.Equals(ackFlag, "1", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!headers.TryGetValue(DeliveryAcknowledgementHeaderKeys.CorrelationId, out string? correlationText)
+            || !long.TryParse(
+                correlationText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long correlationId))
+        {
+            _logger.LogWarning("Discarding an acknowledgement frame with a missing or malformed correlation id");
+            return true;
+        }
+
+        if (!_pendingAcks.TryGetValue(correlationId, out PendingAck? pending))
+        {
+            // The send this acknowledges has already timed out, been cancelled, or never existed on
+            // this connection; discard rather than misrouting it to an unrelated later send.
+            _logger.LogDebug(
+                "Discarding an acknowledgement with an unmatched or expired correlation id {CorrelationId}",
+                correlationId);
+        }
+        else if (pending.ExpectedAcknowledgerId != senderId)
+        {
+            // This frame claims to acknowledge a message addressed elsewhere. Left in place rather than
+            // removed, so a forged acknowledgement cannot be used to strand the real send — the
+            // genuinely addressed recipient's acknowledgement can still arrive and complete it.
+            _logger.LogWarning(
+                "Discarding an acknowledgement for correlation id {CorrelationId} from {SenderId}, which "
+                + "does not match the expected recipient {ExpectedAcknowledgerId}",
+                correlationId,
+                senderId,
+                pending.ExpectedAcknowledgerId);
+        }
+        else if (_pendingAcks.TryRemove(new KeyValuePair<long, PendingAck>(correlationId, pending)))
+        {
+            // As TryCompletePendingRequest's compare-remove: only succeeds against the exact instance
+            // just matched, so a forged acknowledgement cannot steal a slot a concurrent send has
+            // already claimed for itself.
+            pending.Completion.TrySetResult();
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Sends a delivery acknowledgement back to the sender if <paramref name="headers"/> requested one,
+    /// once the message has been handed to the application.
+    /// </summary>
+    private async Task TrySendAcknowledgementAsync(
+        Guid senderId, MessageHeaders headers, CancellationToken cancellationToken)
+    {
+        if (!headers.TryGetValue(DeliveryAcknowledgementHeaderKeys.Request, out string? requestFlag)
+            || !string.Equals(requestFlag, "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (!headers.TryGetValue(DeliveryAcknowledgementHeaderKeys.CorrelationId, out string? correlationText))
+        {
+            _logger.LogWarning("Discarding an acknowledgement request with a missing correlation id");
+            return;
+        }
+
+        var ackHeaders = new MessageHeaders(
+        [
+            new KeyValuePair<string, string>(DeliveryAcknowledgementHeaderKeys.CorrelationId, correlationText),
+            new KeyValuePair<string, string>(DeliveryAcknowledgementHeaderKeys.Ack, "1"),
+        ]);
+
+        try
+        {
+            await SendCoreAsync(senderId, ReadOnlyMemory<byte>.Empty, ackHeaders, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
+        {
+            // Best-effort: if the connection is already gone or tearing down there is nothing further
+            // to do — the sender's own pending acknowledgement wait will simply time out.
+            _logger.LogDebug(ex, "Failed to send a delivery acknowledgement to {SenderId}", senderId);
+        }
+    }
+
+    /// <summary>
     /// Reads the request correlation id from an incoming (non-reply) frame's headers, for exposure on
     /// <see cref="MessageReceivedEventArgs.CorrelationId"/>.
     /// </summary>
@@ -1360,4 +1549,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// so a client other than the one this request was addressed to cannot forge a reply and resolve it.
     /// </summary>
     private sealed record PendingRequest(Guid ExpectedResponderId, TaskCompletionSource<ReadOnlyMemory<byte>> Completion);
+
+    /// <summary>
+    /// A <c>SendAsync(..., DeliveryOptions.RequireAck(...))</c> call awaiting acknowledgement.
+    /// <see cref="ExpectedAcknowledgerId"/> is checked against the actual sender of an incoming
+    /// acknowledgement frame before <see cref="Completion"/> is resolved, so a client other than the one
+    /// the message was addressed to cannot forge an acknowledgement and resolve it.
+    /// </summary>
+    private sealed record PendingAck(Guid ExpectedAcknowledgerId, TaskCompletionSource Completion);
 }
