@@ -1398,20 +1398,21 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// dropped before being handed to the application rather than delivered stale.
     /// </summary>
     /// <remarks>
-    /// Absent or unparseable expiry data means "does not expire" — identical to a message with no
-    /// time-to-live at all — mirroring <see cref="TryReadHeaderBlock"/>'s own tolerant treatment of a
-    /// malformed header block: a bad expiry value is not treated as a reason to fail delivery.
+    /// Absent, unparseable or out-of-range expiry data means "does not expire" — identical to a message
+    /// with no time-to-live at all — mirroring <see cref="TryReadHeaderBlock"/>'s own tolerant treatment
+    /// of a malformed header block: a bad expiry value is not treated as a reason to fail delivery, and
+    /// critically must never itself throw and crash the receive loop over one hostile or malformed frame.
+    /// See <see cref="MessageExpiryHeaderKeys.TryParseExpiry"/>.
     /// </remarks>
     private bool IsExpired(MessageHeaders headers, Guid senderId)
     {
         if (!headers.TryGetValue(MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, out string? value)
-            || !long.TryParse(
-                value, NumberStyles.Integer, CultureInfo.InvariantCulture, out long expiresAtUnixMilliseconds))
+            || !MessageExpiryHeaderKeys.TryParseExpiry(value, out DateTimeOffset expiry))
         {
             return false;
         }
 
-        if (DateTimeOffset.UtcNow <= DateTimeOffset.FromUnixTimeMilliseconds(expiresAtUnixMilliseconds))
+        if (DateTimeOffset.UtcNow <= expiry)
         {
             return false;
         }

@@ -1945,7 +1945,7 @@ public sealed class MeshHubTests
     /// one queued ahead of it never does — because the hub processes one client's queued frames in
     /// order, its arrival proves the expired frame was already dealt with.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task SendLoop_ExpiredDirectMessage_IsDroppedNotDelivered()
     {
         var fixture = new MeshHubFixture();
@@ -1987,7 +1987,7 @@ public sealed class MeshHubTests
     /// A direct message with a time-to-live that has not yet elapsed is delivered exactly as a header-
     /// bearing message without one would be.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task SendLoop_NonExpiredDirectMessage_IsDelivered()
     {
         var fixture = new MeshHubFixture();
@@ -2019,10 +2019,49 @@ public sealed class MeshHubTests
     }
 
     /// <summary>
+    /// An expiry value that parses as a valid integer but falls outside the range DateTimeOffset can
+    /// represent is tolerated as "does not expire" rather than crashing the send loop — the header
+    /// block is sender-controlled bytes, so a hostile or merely malformed expiry value must not be able
+    /// to fault this connection (or, for a shared group frame, every member's connection at once).
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task SendLoop_OutOfRangeExpiryValue_MessageIsDeliveredNotDropped()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var clientA = await fixture.RegisterClientAsync("ClientA");
+        var clientB = await fixture.RegisterClientAsync("ClientB", versionMin: 5, versionMax: 5);
+
+        var deliveredTcs = new TaskCompletionSource<byte[]>();
+        clientB.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => deliveredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        var headers = new MessageHeaders(
+        [
+            new(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                long.MaxValue.ToString(CultureInfo.InvariantCulture)),
+        ]);
+        byte[] sendPayload = MeshHubFixture.CreateDirectMessageWithHeaders(clientB.Id, headers, [7, 8, 9]);
+
+        clientA.DisconnectTcs.SetResult(sendPayload);
+
+        byte[] deliveredData = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x12, deliveredData[0]); // DeliverMessageWithHeaders — delivered, connection intact
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(deliveredData.AsSpan(17, 2));
+        Assert.Equal(new byte[] { 7, 8, 9 }, deliveredData[(19 + headerLength)..]);
+
+        clientB.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
     /// The expiry check applies to group messages too: an already-expired one queued for a member is
     /// dropped, mirroring the direct-message case.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task SendLoop_ExpiredGroupMessage_IsDroppedNotDelivered()
     {
         var fixture = new MeshHubFixture();

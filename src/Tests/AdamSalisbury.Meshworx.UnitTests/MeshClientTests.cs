@@ -2028,7 +2028,7 @@ public sealed class MeshClientTests
     /// A message whose expiry has already passed by the time it is received is discarded rather than
     /// raised through MessageReceived.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_ExpiredMessage_DoesNotRaiseMessageReceived()
     {
         var fixture = new MeshClientFixture();
@@ -2064,7 +2064,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// A message that has not yet expired is delivered exactly as an ordinary message would be.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_NonExpiredMessage_RaisesMessageReceived()
     {
         var fixture = new MeshClientFixture();
@@ -2093,7 +2093,7 @@ public sealed class MeshClientTests
     /// <summary>
     /// A message with no expiry header at all behaves exactly as today: it is always delivered.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_MessageWithoutExpiry_RaisesMessageReceived()
     {
         var fixture = new MeshClientFixture();
@@ -2116,7 +2116,7 @@ public sealed class MeshClientTests
     /// A malformed (non-numeric) expiry value is tolerated as "does not expire", the same as an absent
     /// one, rather than being treated as a delivery failure.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ReceiveLoop_MalformedExpiryValue_RaisesMessageReceived()
     {
         var fixture = new MeshClientFixture();
@@ -2133,6 +2133,35 @@ public sealed class MeshClientTests
 
         MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
         Assert.Equal(5, received.Data.Span[0]);
+    }
+
+    /// <summary>
+    /// An expiry value that parses as a valid integer but falls outside the range DateTimeOffset can
+    /// represent (for example long.MaxValue) is tolerated exactly like a non-numeric one — the receive
+    /// loop must not crash over a hostile or malformed expiry header.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task ReceiveLoop_OutOfRangeExpiryValue_RaisesMessageReceived()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+        var headers = new MessageHeaders(
+        [
+            new(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                long.MaxValue.ToString(CultureInfo.InvariantCulture)),
+        ]);
+        byte[] payload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, headers, new byte[] { 6 });
+        fixture.SetupSuccessfulRegistration(payload);
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        fixture.Client.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(6, received.Data.Span[0]);
     }
 
     // ReceiveLoop (tested indirectly via MessageReceived event)

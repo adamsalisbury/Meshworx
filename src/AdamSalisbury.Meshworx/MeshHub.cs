@@ -1,7 +1,6 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Diagnostics.Metrics;
-using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -1449,8 +1448,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// <see cref="_messagesDroppedCounter"/> when it does.
     /// </summary>
     /// <remarks>
-    /// Absent or unparseable expiry data means "does not expire" — identical to a message with no
-    /// time-to-live at all. A malformed header block is not this check's concern either: the
+    /// Absent, unparseable or out-of-range expiry data means "does not expire" — identical to a message
+    /// with no time-to-live at all — via the shared, deliberately non-throwing
+    /// <see cref="MessageExpiryHeaderKeys.TryParseExpiry"/>: this header block's bytes are entirely
+    /// sender-controlled, so a hostile or merely malformed value (for example one numerically valid but
+    /// outside the range <see cref="DateTimeOffset"/> can represent) must never throw and abort this
+    /// connection's send loop. A malformed header block itself is not this check's concern either: the
     /// recipient's own decode already handles that case (logging and dropping just that frame), so
     /// treating it as non-expiring here does not lose anything twice over.
     /// </remarks>
@@ -1475,9 +1478,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return false;
         }
 
-        if (!long.TryParse(
-                expiresAtText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long expiresAtUnixMilliseconds)
-            || DateTimeOffset.UtcNow <= DateTimeOffset.FromUnixTimeMilliseconds(expiresAtUnixMilliseconds))
+        if (!MessageExpiryHeaderKeys.TryParseExpiry(expiresAtText, out DateTimeOffset expiry)
+            || DateTimeOffset.UtcNow <= expiry)
         {
             return false;
         }
