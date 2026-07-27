@@ -440,6 +440,40 @@ public sealed class MeshIntegrationTests
     }
 
     /// <summary>
+    /// A full delivery-acknowledgement round trip over the real wire protocol and hub routing: the
+    /// recipient's client automatically acknowledges the message once it has been handed to the
+    /// application (raised through MessageReceived, same as any other message), and that resolves the
+    /// sender's SendAsync(..., DeliveryOptions.RequireAck) call.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_DeliveryAcknowledgementRoundTripsOverInMemoryTransport()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        await bob.ConnectAsync(listener.Connect(), "Bob");
+        await alice.ConnectAsync(listener.Connect(), "Alice");
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        bob.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        Guid? bobId = await alice.GetClientIdByNameAsync("Bob");
+        Assert.Equal(bob.Id, bobId);
+
+        byte[] payload = Encoding.UTF8.GetBytes("must arrive");
+        await alice.SendAsync(bobId!.Value, payload, DeliveryOptions.RequireAck(TimeSpan.FromSeconds(5)));
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(payload, received.Data.ToArray());
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
     /// A direct message sent with structured headers is delivered over the real wire protocol with
     /// both the headers and the body intact, and a group message carrying headers reaches every other
     /// member the same way — proving the header envelope round-trips end to end rather than only

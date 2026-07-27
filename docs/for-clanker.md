@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 12b2785 (branch feature/rpc-request-response, PR #83, open, not yet merged to main) — two commits on top of main at 4b11234, clean working tree
+reconciled-to-commit: 9de6b23 (branch feature/delivery-acknowledgements, PR #84, open, not yet merged to main) — two commits on top of main at 78e0264, clean working tree
 reconciled-to-date: 2026-07-27
 mode: update
 -->
@@ -12,7 +12,84 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree, this pass:** branch `feature/rpc-request-response` (open **PR #83**, not tied to a
+> **Documented tree, this pass:** branch `feature/delivery-acknowledgements` (open **PR #84**, not tied
+> to a numbered issue in this handover), two commits (`f2f514c`, `9de6b23`) on top of `main` at `78e0264`
+> (`git merge-base main feature/delivery-acknowledgements` confirmed equal to `main`'s own tip — `main`
+> has advanced to `78e0264`, "feat: request/response (RPC) helper with correlation and timeout", which
+> **is** the previous pass's PR #83 merged, its content identical to branch tip `12b2785` that pass
+> reconciled to), clean working tree throughout. The second commit, "fix: stop the delivery-acknowledgement
+> send blocking the receive loop", is a fix to the first commit's own change, not a separate feature —
+> both are covered together below. Diffed with
+> `git diff main...feature/delivery-acknowledgements --stat`: 7 files, 823 insertions/11 deletions — a new
+> `DeliveryOptions.cs` (90 lines), a new `Messages/DeliveryAcknowledgementHeaderKeys.cs` (33 lines),
+> `IMeshClient.cs` (+32), `MeshClient.cs` (+234/−11), and growth in `DeliveryOptionsTests.cs` (61 lines,
+> new), `MeshClientTests.cs` (+350) and `MeshIntegrationTests.cs` (+34). **No `MeshHub.cs`, `IMeshHub.cs`,
+> transport, or DI-package file is touched at all** — confirmed directly from the diff stat — so nothing in
+> [hub.md](for-clanker/hub.md), [transport.md](for-clanker/transport.md) or
+> [dependency-injection.md](for-clanker/dependency-injection.md) needed correcting; this branch, like PR
+> #83 before it, is entirely a `MeshClient`-side addition.
+>
+> **This branch adds an opt-in, end-to-end delivery acknowledgement for a single direct send** —
+> `IMeshClient.SendAsync(Guid recipientId, ReadOnlyMemory<byte> message, DeliveryOptions options,
+> CancellationToken)`. `DeliveryOptions.None` (the struct's default) is identical to the plain `SendAsync`
+> overload; `DeliveryOptions.RequireAck(TimeSpan timeout)` makes the call await the recipient's
+> acknowledgement, or fail with `TimeoutException`. **Built the same way PR #83's `RequestAsync`/
+> `ReplyAsync` were**: entirely inside the existing header envelope (PR #74) — no new opcode, no protocol
+> version bump. Three new well-known `MessageHeaders` keys
+> (`Messages/DeliveryAcknowledgementHeaderKeys.cs`, `internal`): `"mesh.ack-id"` (correlation id, on both
+> frames), `"mesh.ack-request"` (marks the original message), `"mesh.ack"` (marks the reply). The
+> reserved-header-key guard PR #83 introduced now covers **five** keys, not two. The recipient's client
+> sends the acknowledgement **automatically** from inside the receive loop once `MessageReceived` has been
+> raised for the message — **fire-and-forget, not awaited**, so a slow write back to the sender cannot
+> block the connection's own inbound processing (including its `Ping`/`Pong` keepalive). A reply/ack is
+> only accepted from the client the message was actually addressed to (sender-id verification), the same
+> defensive pattern PR #83 established for replies. Full write-up in
+> [client.md](for-clanker/client.md#delivery-acknowledgement) and
+> [protocol.md](for-clanker/protocol.md#delivery-acknowledgement-headers).
+>
+> **This is the second capability built via the "fourth route"** — a capability needing no opcode or
+> version change at all, added entirely inside the existing header envelope, first used by PR #83. See
+> [index §6](#6-cross-cutting-conventions-imitate-these) below.
+>
+> **Three new known issues, all low severity, all by design — KI-44, KI-45, KI-46.** "Acknowledged" means
+> "handed to the application", not "the handler succeeded" — the acknowledgement fires regardless of
+> whether the `MessageReceived` subscriber threw (KI-44). A `RequireAck` timeout does not prove
+> non-delivery — the acknowledgement itself is an ordinary routed message subject to the same silent-drop
+> paths as any other send (KI-45, interacts with KI-1 and KI-5). And, mirroring KI-43 exactly, the hub is
+> completely blind to delivery acknowledgement, so any inbound frame carrying `mesh.ack=1` is intercepted
+> by any receiving `MeshClient`, matched or not (KI-46). **KI-5 ("no delivery acknowledgement") is now
+> only partly true** — it is corrected in place (status: partly addressed) rather than closed outright,
+> since broadcast/group sends and cross-connection ordering remain exactly as unacknowledged as before.
+> [known-issues.md](for-clanker/known-issues.md) carries the full entries.
+>
+> **Coordinate shift, this pass: `MeshClient.cs` +212 net lines (1363 → 1575) across eight separate
+> insertion points, `IMeshClient.cs` +32 in one place (the new `SendAsync(DeliveryOptions)` interface
+> member, inserted right after the headers overload — everything from `BroadcastAsync` onward shifts by
+> +32).** Derived from `git diff main...feature/delivery-acknowledgements -- '*.cs' | grep '^@@'` and
+> verified by comparing cited-line content before and after re-pointing at every insertion boundary, the
+> same technique validated on every prior pass back to #64. Every `MeshClient.cs`/`IMeshClient.cs`
+> coordinate in [client.md](for-clanker/client.md), [protocol.md](for-clanker/protocol.md),
+> [known-issues.md](for-clanker/known-issues.md) and this file was re-pointed this pass — a larger sweep
+> than usual, since `MeshClient.cs`'s shift touches citations throughout the whole of `client.md`, not
+> just the sections this branch's own diff added.
+>
+> **Two pre-existing, wrong (not merely stale) citations were found and corrected while re-pointing**, per
+> the standing "touching the file makes fixing it free" rule: [protocol.md](for-clanker/protocol.md)'s
+> empty-frame citation (`MeshClient.cs:848` → true `:996`, wrong since at least the PR #74 reconciliation
+> — it pointed at unrelated `CleanUpAsync` cleanup code) and
+> [client.md](for-clanker/client.md)/[known-issues.md](for-clanker/known-issues.md)'s `Disconnected`
+> contract citation (`IMeshClient.cs:249-259` → true `:334-344` — it pointed at `RequestAsync`'s own
+> declaration, a mistake dating from the PR #83 pass that first inserted `RequestAsync` at that exact
+> location). Both are flagged inline where corrected.
+>
+> **`testing.md` was deliberately not re-pointed this pass**, consistent with the standing instruction not
+> to fully re-derive individual-test citations and because this branch's diff does not touch
+> `MeshClientTests.cs`'s pre-existing content (append-only) or `MeshIntegrationTests.cs`'s (append-only).
+> `testing.md`'s existing `MeshClient.cs` prose citations were already flagged stale by the PR #83 pass and
+> remain so, now stale by a further +212 lines on top of whatever they were off by then; budget for a
+> dedicated pass if these are ever load-bearing for a task.
+>
+> **Documented tree (prior pass):** branch `feature/rpc-request-response` (open **PR #83**, not tied to a
 > numbered issue in this handover), two commits (`71ad727`, `12b2785`) on top of `main` at `4b11234`
 > (`git merge-base main feature/rpc-request-response` confirmed equal to `main`'s own tip — `main` has
 > advanced to `4b11234`, "feat: QUIC transport with multiplexed streams (System.Net.Quic)", which **is**
@@ -617,7 +694,8 @@ use the manual sequence directly; they do not go through the DI package.
 | Task | Call | Notes |
 |---|---|---|
 | Direct message | `SendAsync(recipientId, payload)` | Dropped silently if recipient unknown |
-| Direct message with headers | `SendAsync(recipientId, payload, headers)` | PR #74; `headers` is a `MessageHeaders` — throws `NotSupportedException` unless negotiated at protocol version 5+; throws `ArgumentException` if `headers` contains a reserved request/reply key (PR #83) |
+| Direct message with headers | `SendAsync(recipientId, payload, headers)` | PR #74; `headers` is a `MessageHeaders` — throws `NotSupportedException` unless negotiated at protocol version 5+; throws `ArgumentException` if `headers` contains a reserved request/reply/acknowledgement key (PR #83, extended by PR #84) |
+| Direct message with delivery acknowledgement | `SendAsync(recipientId, payload, DeliveryOptions.RequireAck(timeout))` | PR #84; awaits an end-to-end acknowledgement from the recipient's client, same version requirement as headers above — throws `TimeoutException` if none arrives (not proof of non-delivery, see KI-45), `InvalidOperationException` if the connection drops first; `DeliveryOptions.None` is identical to the plain overload; see [client.md](for-clanker/client.md#delivery-acknowledgement) |
 | Request and await a reply | `RequestAsync(recipientId, payload, timeout)` | PR #83; correlated request/response over a direct message, same version requirement as headers above — throws `TimeoutException` on no reply, `InvalidOperationException` if the connection drops first; see [client.md](for-clanker/client.md#request-response) |
 | Answer a request | `ReplyAsync(request, payload)` | PR #83; `request` is the `MessageReceivedEventArgs` a `CorrelationId is not null` message arrived on |
 | Broadcast | `BroadcastAsync(payload)` | Every other client; never echoed to sender |
@@ -947,14 +1025,19 @@ full house style; the points below are the ones the code actually enforces and d
 envelope.** PR #83's `RequestAsync`/`ReplyAsync` is the worked example — no new opcode, no version bump,
 no hub-side change at all. It reuses the existing header-bearing opcodes (`0x11`/`0x12`) and adds two new
 well-known `MessageHeaders` keys (`Messages/RequestReplyHeaderKeys.cs`) that only the two `MeshClient`
-instances involved interpret; the hub still never decodes header content. This route is only available
-when the capability is client-to-client and already fits inside "a direct message with metadata" — it
-does not extend to anything the hub itself needs to act on (routing, admission, groups), which still
-needs the numbered-route treatment above. See [client.md](for-clanker/client.md#request-response) and
-[protocol.md](for-clanker/protocol.md#request-response-headers). If you add reserved header keys of your
-own this way, guard them the same way `SendAsync` guards these two
-(`ThrowIfReservedHeaderKeyPresent`) — see [known-issues.md](for-clanker/known-issues.md) KI-42/KI-43 for
-what happens if you don't.
+instances involved interpret; the hub still never decodes header content. **PR #84's delivery
+acknowledgement (`SendAsync(..., DeliveryOptions.RequireAck(...), ...)`) is a second worked example of the
+identical route** — three more well-known keys (`Messages/DeliveryAcknowledgementHeaderKeys.cs`), again
+interpreted only by the two `MeshClient` instances, again no opcode or version change. This route is only
+available when the capability is client-to-client and already fits inside "a direct message with
+metadata" — it does not extend to anything the hub itself needs to act on (routing, admission, groups),
+which still needs the numbered-route treatment above. See
+[client.md](for-clanker/client.md#request-response), [client.md](for-clanker/client.md#delivery-acknowledgement),
+[protocol.md](for-clanker/protocol.md#request-response-headers) and
+[protocol.md](for-clanker/protocol.md#delivery-acknowledgement-headers). If you add reserved header keys
+of your own this way, guard them the same way `SendAsync` guards these five
+(`ThrowIfReservedHeaderKeyPresent`) — see [known-issues.md](for-clanker/known-issues.md) KI-42/KI-43/KI-46
+for what happens if you don't.
 
 **"Done" means:** `dotnet build Meshworx.slnx -c Release` clean (warnings are errors) **and**
 `dotnet test Meshworx.slnx` green. CI runs exactly this on push/PR to `main`
@@ -987,7 +1070,16 @@ there is no publish step in CI — CI only builds and tests.
 ## 8. System-wide pitfalls (full detail in known-issues.md)
 
 - **Delivery is lossy by design.** Full outbound queue → dropped frame (logged). Unknown recipient →
-  dropped silently. No acks. Do not assume a message sent is a message received.
+  dropped silently. No acks **for broadcast, group, or the plain/headers `SendAsync` overloads**. Do not
+  assume a message sent is a message received — except for the one opt-in exception below.
+- **A single direct send can opt into an end-to-end acknowledgement (PR #84), but it is a narrower
+  guarantee than it sounds.** `SendAsync(recipientId, payload, DeliveryOptions.RequireAck(timeout))` waits
+  for the recipient's client to raise `MessageReceived` and send back an acknowledgement. "Acknowledged"
+  means "handed to the application", not "the handler succeeded" — a throwing `MessageReceived` subscriber
+  still results in the sender's call completing (KI-44). A `TimeoutException` does not prove
+  non-delivery — the acknowledgement is itself an ordinary routed message, subject to the same silent-drop
+  paths as any other send (KI-45). Broadcast, group sends, and every other `SendAsync` overload remain as
+  unacked as ever. See [client.md](for-clanker/client.md#delivery-acknowledgement).
 - **Authentication is opt-in; authorisation covers groups only.** Without a `ClientAuthenticator` any
   reachable peer can register under any unused name and lookup/broadcast to everyone. Groups *can* be
   made a boundary — pass a `GroupAuthoriser` — but without one any admitted client may join any group,
@@ -1009,14 +1101,16 @@ there is no publish step in CI — CI only builds and tests.
   on the wire and works at any version. See [client.md](for-clanker/client.md#sending-headers).
 - **`MessageHeaders`'s constructor throws on a duplicate key** rather than keeping the last value like a
   plain `Dictionary` initializer would. De-duplicate your source before constructing one. KI-34.
-- **Two `MessageHeaders` keys are reserved for `RequestAsync`/`ReplyAsync` (PR #83) and cannot be set
-  through `SendAsync`.** `"mesh.request-id"` and `"mesh.reply"` (`RequestReplyHeaderKeys`) now make
-  `SendAsync`'s headers overload throw `ArgumentException` if your own headers happen to use either
-  string — a narrow but real breaking change for any caller that already did. Request/response itself is
-  a pure client-to-client convention: the hub never decodes header content, so it cannot see or protect
-  this at all, and any inbound frame carrying `mesh.reply=1` is intercepted before `MessageReceived`
-  whether or not it came from a real `RequestAsync` call. See
-  [client.md](for-clanker/client.md#request-response), KI-42, KI-43.
+- **Five `MessageHeaders` keys are reserved — two for `RequestAsync`/`ReplyAsync` (PR #83), three more for
+  delivery acknowledgement (PR #84) — and none of them can be set through `SendAsync`.**
+  `"mesh.request-id"`/`"mesh.reply"` (`RequestReplyHeaderKeys`) and `"mesh.ack-id"`/`"mesh.ack-request"`/
+  `"mesh.ack"` (`DeliveryAcknowledgementHeaderKeys`) now make `SendAsync`'s headers overload throw
+  `ArgumentException` if your own headers happen to use any of the five — a narrow but real breaking
+  change for any caller that already did. Both capabilities are pure client-to-client conventions: the
+  hub never decodes header content, so it cannot see or protect either at all, and any inbound frame
+  carrying `mesh.reply=1` or `mesh.ack=1` is intercepted before `MessageReceived` whether or not it came
+  from a real `RequestAsync`/`RequireAck` call. See [client.md](for-clanker/client.md#request-response),
+  [client.md](for-clanker/client.md#delivery-acknowledgement), KI-42, KI-43, KI-44, KI-45, KI-46.
 - **`new TcpTransportListener(port)` / `new WebSocketTransportListener(port)` both bind loopback**, not
   every interface. Remote clients cannot reach a hub created that way; pass an explicit `IPEndPoint` to
   expose it deliberately.

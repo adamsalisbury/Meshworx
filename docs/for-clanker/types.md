@@ -58,6 +58,30 @@ reserved vocabulary within any `MessageHeaders` an application constructs. `Corr
 `ArgumentException` if a caller's own `MessageHeaders` contains either key — see
 [client.md](client.md#request-response) and [known-issues.md](known-issues.md) KI-42/KI-43.
 
+`DeliveryOptions` (`readonly struct`, `IEquatable<DeliveryOptions>`, `DeliveryOptions.cs`, namespace
+`AdamSalisbury.Meshworx` — **not** `.Messages` — added by PR #84) — controls whether
+`IMeshClient.SendAsync(Guid, ReadOnlyMemory<byte>, DeliveryOptions, CancellationToken)` waits for an
+end-to-end delivery acknowledgement. Two ways to obtain one:
+
+- `DeliveryOptions.None` — a `static readonly` field, and the struct's own default value (so
+  `default(DeliveryOptions)` and a caller who never touches this type both get fire-and-forget, identical
+  to every other `SendAsync` overload).
+- `DeliveryOptions.RequireAck(TimeSpan timeout)` — a static factory; throws `ArgumentOutOfRangeException`
+  synchronously if `timeout` is not positive. `RequireAcknowledgement`/`AcknowledgementTimeout` are the
+  two read-only properties it sets; there is no public constructor.
+
+See [client.md](client.md#delivery-acknowledgement) for how to use it and
+[known-issues.md](known-issues.md) KI-44/KI-45 for what its guarantee does and does not cover.
+
+`DeliveryAcknowledgementHeaderKeys` (`internal static class`,
+`Messages/DeliveryAcknowledgementHeaderKeys.cs`, added by PR #84) — the acknowledgement counterpart to
+`RequestReplyHeaderKeys` above, same shape: not part of the public surface, listed here because its three
+`const string` values are reserved vocabulary. `CorrelationId = "mesh.ack-id"` (both the original message
+and its acknowledgement), `Request = "mesh.ack-request"` (marks the original message as wanting one),
+`Ack = "mesh.ack"` (marks the acknowledgement frame itself). `MeshClient.SendAsync`'s headers overload
+throws `ArgumentException` if a caller's own `MessageHeaders` contains any of the three — see
+[client.md](client.md#delivery-acknowledgement) and [known-issues.md](known-issues.md) KI-42/KI-46.
+
 ## Enums
 
 | Type | Values | Source |
