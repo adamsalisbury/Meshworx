@@ -1083,9 +1083,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                                 // The acknowledgement is sent once the message has been handed to the
                                 // application (the event above has been raised, successfully or not),
                                 // matching the "delivered-to-application receipt" contract — not merely
-                                // that the frame arrived on the wire.
-                                await TrySendAcknowledgementAsync(senderId, headers, cancellationToken)
-                                    .ConfigureAwait(false);
+                                // that the frame arrived on the wire. Fired and forgotten rather than
+                                // awaited: a slow or blocked write back to the peer (write-side
+                                // backpressure, a stalled socket) must not head-of-line-block this
+                                // connection's own inbound frame processing — including its Ping/Pong
+                                // keepalive — behind it. TrySendAcknowledgementAsync handles every
+                                // failure internally, so nothing here needs to observe the result.
+                                _ = TrySendAcknowledgementAsync(senderId, headers, cancellationToken);
                             }
                         }
                     }
@@ -1483,6 +1487,16 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// Sends a delivery acknowledgement back to the sender if <paramref name="headers"/> requested one,
     /// once the message has been handed to the application.
     /// </summary>
+    /// <remarks>
+    /// Called fire-and-forget from <see cref="ReceiveLoopAsync"/> — nothing awaits this task's
+    /// completion or observes its exception, so every failure must be handled inside it. The catch
+    /// below is deliberately broad (a callback/detached-task boundary, matching the pattern already used
+    /// for a throwing <see cref="MessageReceived"/> subscriber): a transport-specific exception
+    /// (<see cref="System.Net.WebSockets.WebSocketException"/> included), a send timeout, or
+    /// cancellation from the connection tearing down must all be swallowed here rather than becoming an
+    /// unobserved task exception or, had this still been awaited inline, tearing down the receive loop
+    /// over what is always a best-effort courtesy send.
+    /// </remarks>
     private async Task TrySendAcknowledgementAsync(
         Guid senderId, MessageHeaders headers, CancellationToken cancellationToken)
     {
@@ -1509,10 +1523,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             await SendCoreAsync(senderId, ReadOnlyMemory<byte>.Empty, ackHeaders, cancellationToken)
                 .ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
+        catch (Exception ex)
         {
-            // Best-effort: if the connection is already gone or tearing down there is nothing further
-            // to do — the sender's own pending acknowledgement wait will simply time out.
+            // Best-effort: if the connection is already gone or tearing down, the send timed out, or
+            // some transport-specific fault occurred, there is nothing further to do here — the
+            // sender's own pending acknowledgement wait will simply time out on its side.
             _logger.LogDebug(ex, "Failed to send a delivery acknowledgement to {SenderId}", senderId);
         }
     }

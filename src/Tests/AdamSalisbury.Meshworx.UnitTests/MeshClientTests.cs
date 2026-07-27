@@ -1863,6 +1863,71 @@ public sealed class MeshClientTests
     }
 
     /// <summary>
+    /// The acknowledgement send is fired and forgotten rather than awaited inline: a stalled write back
+    /// to the peer that requested the first message's acknowledgement must not head-of-line-block the
+    /// receive loop from processing a second, unrelated frame that arrives straight after it.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task ReceiveLoop_SlowAcknowledgementSend_DoesNotBlockSubsequentFrameProcessing()
+    {
+        var fixture = new MeshClientFixture();
+        var senderId = Guid.NewGuid();
+
+        var ackRequestHeaders = new MessageHeaders(
+        [
+            new(DeliveryAcknowledgementHeaderKeys.CorrelationId, "1"),
+            new(DeliveryAcknowledgementHeaderKeys.Request, "1"),
+        ]);
+        byte[] ackRequestingPayload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, ackRequestHeaders, new byte[] { 1 });
+
+        var plainHeaders = new MessageHeaders([new("marker", "second")]);
+        byte[] plainPayload = MeshClientFixture.CreateDeliverMessageWithHeadersPayload(
+            senderId, plainHeaders, new byte[] { 2 });
+
+        fixture.SetupSuccessfulRegistration(ackRequestingPayload, plainPayload);
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns<ReadOnlyMemory<byte>, CancellationToken>((data, ct) =>
+            {
+                byte[] sent = data.ToArray();
+                if (sent[0] == 0x11)
+                {
+                    int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sent.AsSpan(17, 2));
+                    MessageHeaders sentHeaders = HeaderEnvelope.Read(sent.AsSpan(19), headerLength);
+                    if (sentHeaders.TryGetValue(DeliveryAcknowledgementHeaderKeys.Ack, out string? ack)
+                        && ack == "1")
+                    {
+                        // Simulates a stalled write to the peer — never completes on its own, only
+                        // honours cancellation once the connection tears down.
+                        return Task.Delay(Timeout.Infinite, ct);
+                    }
+                }
+
+                return Task.CompletedTask;
+            });
+
+        var receivedMessages = new List<byte>();
+        var secondReceivedTcs = new TaskCompletionSource();
+        fixture.Client.MessageReceived += (_, e) =>
+        {
+            receivedMessages.Add(e.Data.Span[0]);
+            if (e.Data.Span[0] == 2)
+            {
+                secondReceivedTcs.TrySetResult();
+            }
+        };
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "TestClient");
+
+        // If the stalled acknowledgement send triggered by the first frame blocked the receive loop,
+        // this would never complete within the test's timeout.
+        await secondReceivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.Equal(new byte[] { 1, 2 }, receivedMessages);
+    }
+
+    /// <summary>
     /// A message that did not request an acknowledgement does not cause one to be sent.
     /// </summary>
     [Fact(Timeout = 1000)]
