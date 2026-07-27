@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 9de6b23 (branch feature/delivery-acknowledgements, PR #84, open, not yet merged to main) — two commits on top of main at 78e0264, clean working tree
+reconciled-to-commit: 1457756 (branch feature/message-ttl-expiry, PR #85, draft/open, not yet merged to main) — three commits on top of local main at 6bd05d4 (which is PR #84, feature/delivery-acknowledgements, merged), plus a merge of origin/main (which carries one further commit, PR #86 "test: align harness timeouts", not yet fast-forwarded into local main); working tree clean throughout this pass
 reconciled-to-date: 2026-07-27
 mode: update
 -->
@@ -12,7 +12,98 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree, this pass:** branch `feature/delivery-acknowledgements` (open **PR #84**, not tied
+> **Documented tree, this pass:** branch `feature/message-ttl-expiry` (open **PR #85**, closing issue
+> #29), three commits (`5ee8bf4`, `c7738f9`, `1457756`) plus a merge commit (`c942327`, merging
+> `origin/main` — which carries one commit local `main` did not yet have, `aa955d7` "test: align harness
+> timeouts", **PR #86**, entirely test-infrastructure, no library file touched) on top of `main` at
+> `6bd05d4` (`git merge-base main feature/message-ttl-expiry` confirmed equal to local `main`'s own tip
+> — `main` has advanced to `6bd05d4`, "feat: optional end-to-end delivery acknowledgements / receipts",
+> which **is** the previous pass's PR #84 merged), clean working tree throughout
+> (`git status --porcelain` empty at both the start and end of this pass). The second and third commits
+> are fixes to the first, not separate features: "harden expiry parsing against out-of-range values" and
+> "apply the expiry check to group messages on the client receive loop" — the latter closed a real gap
+> the first commit left open (see below). Diffed with `git diff main...feature/message-ttl-expiry --stat
+> -- src/AdamSalisbury.Meshworx/IMeshClient.cs src/AdamSalisbury.Meshworx/MeshClient.cs
+> src/AdamSalisbury.Meshworx/MeshHub.cs src/AdamSalisbury.Meshworx/Messages/HeaderEnvelope.cs
+> src/AdamSalisbury.Meshworx/Messages/MessageExpiryHeaderKeys.cs` (the library surface, deliberately
+> excluding the PR #86 test-timeout churn that a blanket `git diff main...HEAD --stat` also shows for this
+> branch): 5 files, 370 insertions/23 deletions — `IMeshClient.cs` (+33), `MeshClient.cs` (+107/−23 raw
+> diff lines, **+63 net** by `wc -l`, since some of the 107 insertions replace rather than add to the 23
+> deletions), a new method on `Messages/HeaderEnvelope.cs` (+72), and a new
+> `Messages/MessageExpiryHeaderKeys.cs` (57 lines, new file). **No transport or DI-package file is
+> touched at all** — confirmed directly from the diff, not assumed — so nothing in
+> [transport.md](for-clanker/transport.md) or [dependency-injection.md](for-clanker/dependency-injection.md)
+> needed correcting.
+>
+> **This branch adds an opt-in, per-message time-to-live** —
+> `IMeshClient.SendAsync(Guid recipientId, ReadOnlyMemory<byte> message, TimeSpan timeToLive,
+> CancellationToken cancellationToken = default)`. Built the same "fourth route" way as PR #83's
+> request/response and PR #84's delivery acknowledgement — entirely inside the existing header envelope
+> (PR #74), no new opcode, no protocol version bump — via one new well-known, `internal` header key,
+> `Messages/MessageExpiryHeaderKeys.cs`: `ExpiresAtUnixMilliseconds` (wire string `"mesh.expires-at"`).
+> **Unlike the first two "fourth route" capabilities, this one is not entirely hub-blind**: `MeshHub`
+> gained a narrow, single-key `HeaderEnvelope.TryReadValue` scan (new method, `Messages/HeaderEnvelope.cs:175-233`)
+> so `SendLoopAsync` can drop an already-expired queued frame before sending it — the first time the hub
+> reads header *content* rather than only a header block's declared *length*. The reserved-header-key
+> guard PR #83 introduced and PR #84 extended now covers **six** keys, not five, and was refactored from a
+> chain of individual `ContainsKey` checks into a `foreach` over a new `ReservedHeaderKeys` array in the
+> same commit. Full write-up in [client.md](for-clanker/client.md#message-expiry-time-to-live),
+> [hub.md](for-clanker/hub.md#dropping-expired-frames) and
+> [protocol.md](for-clanker/protocol.md#message-expiry-headers).
+>
+> **A real gap was found and fixed within this same PR, not by this documentation pass**: the first
+> commit only added the expiry check to `MeshClient`'s `DeliverMessageWithHeaders` receive-loop branch
+> (direct messages); an expired **group** message would still have reached `GroupMessageReceived` until
+> the third commit added the identical `!IsExpired(...)` check to `DeliverGroupMessageWithHeaders` too
+> (`MeshClient.cs:1150`).
+>
+> **This is the first "fourth route" capability whose clock semantics need calling out explicitly.** The
+> expiry is computed from the *sending client's own clock*; the hub and the recipient each compare it
+> against their *own* clock independently, with no synchronisation mechanism anywhere in the protocol.
+> Recorded as new **KI-47** (open, medium severity, by design). A second new finding, from re-reading the
+> metrics call sites while documenting the hub-side drop: a direct message that expires while queued is
+> counted **both** `messages.routed` (at enqueue) **and** `messages.dropped(reason=expired)` (at dequeue)
+> — the previously-reliable "routed − dropped = delivered, for `direct`" identity (part of KI-32) no
+> longer holds unconditionally. KI-32 is corrected in place (extended, not replaced) to cover this, per
+> the standing "correct in place, note which pass got it wrong" convention. See
+> [known-issues.md](for-clanker/known-issues.md) KI-32 and KI-47.
+>
+> **Coordinate shift, this pass: `MeshClient.cs` +63 net lines (1575 → 1638) across four separate
+> insertion points (a fifth hunk, the `DeliverGroupMessageWithHeaders` expiry check, is a net-zero
+> in-place edit — one line replaced for one), `IMeshClient.cs` +33 in one place (the new
+> `SendAsync(TimeSpan)` interface member,
+> inserted after the `DeliveryOptions` overload), `MeshHub.cs` +122 net lines (2231 → 2353) across four
+> insertion points, plus two new files.** Derived from `git diff main...feature/message-ttl-expiry --
+> '*.cs' | grep '^@@'` and verified by comparing cited-line content before and after re-pointing at every
+> insertion boundary, the same technique validated on every prior pass back to #64 — including a full
+> `` `:NNN` `` bare-citation sweep (tracking the last *genuine* `File.cs:NNN` citation per paragraph, not
+> merely the last filename mentioned in prose, which the PR #66/#72/#83 passes found is a distinct and
+> real failure mode) across [client.md](for-clanker/client.md), [hub.md](for-clanker/hub.md),
+> [protocol.md](for-clanker/protocol.md) and [known-issues.md](for-clanker/known-issues.md). A handful of
+> in-hunk coordinates (citations landing inside the diff's own changed lines, where a pure arithmetic
+> shift is ambiguous) were resolved by hand against the current source rather than shifted — see
+> `SendCoreAsync` (`:468-521`), `ThrowIfReservedHeaderKeyPresent` (`:543-555`) and the receive loop's
+> three-condition check (`:1096-1098`) in [client.md](for-clanker/client.md).
+> [testing.md](for-clanker/testing.md) was **not** re-pointed, consistent with the standing instruction
+> not to fully re-derive individual-test citations — and this branch's own diff does not touch any
+> library-adjacent prose in that file anyway (its test-file changes are covered by PR #86, see below).
+>
+> **A separate, out-of-scope finding, noted here rather than acted on: local `main` lags `origin/main` by
+> one commit, `aa955d7` ("test: align harness timeouts with the waits each test actually performs",
+> PR #86).** This branch merged `origin/main` in directly (commit `c942327`), so PR #86's content is
+> present in the working tree even though local `main` does not yet have it fast-forwarded. PR #86 is
+> entirely test-infrastructure (a new `TestTimeouts` class, and per-test timeout adjustments across
+> `MeshClientReconnectorTests.cs`, `MeshClientReconnectorMetricsTests.cs`, `MeshHubMetricsTests.cs`,
+> `MeshHubTests.cs`, `MeshClientTests.cs`, `MeshIntegrationTests.cs`, the QUIC/Unix-socket/WebSocket
+> integration test files) — no library source file is touched, confirmed by `git show aa955d7 --stat`.
+> Since [testing.md](for-clanker/testing.md) is already the deliberately-deferred file in this docs set
+> (per the standing instruction above), this does not change this pass's own scope, but a future pass
+> that does open `testing.md` for its own reasons should budget for PR #86's timeout-convention changes
+> as well as whatever coordinate drift that pass's own branch causes.
+>
+> ---
+>
+> **Documented tree (prior pass):** branch `feature/delivery-acknowledgements` (open **PR #84**, not tied
 > to a numbered issue in this handover), two commits (`f2f514c`, `9de6b23`) on top of `main` at `78e0264`
 > (`git merge-base main feature/delivery-acknowledgements` confirmed equal to `main`'s own tip — `main`
 > has advanced to `78e0264`, "feat: request/response (RPC) helper with correlation and timeout", which
@@ -694,8 +785,9 @@ use the manual sequence directly; they do not go through the DI package.
 | Task | Call | Notes |
 |---|---|---|
 | Direct message | `SendAsync(recipientId, payload)` | Dropped silently if recipient unknown |
-| Direct message with headers | `SendAsync(recipientId, payload, headers)` | PR #74; `headers` is a `MessageHeaders` — throws `NotSupportedException` unless negotiated at protocol version 5+; throws `ArgumentException` if `headers` contains a reserved request/reply/acknowledgement key (PR #83, extended by PR #84) |
+| Direct message with headers | `SendAsync(recipientId, payload, headers)` | PR #74; `headers` is a `MessageHeaders` — throws `NotSupportedException` unless negotiated at protocol version 5+; throws `ArgumentException` if `headers` contains a reserved request/reply/acknowledgement/expiry key (PR #83, extended by PR #84 and PR #85) |
 | Direct message with delivery acknowledgement | `SendAsync(recipientId, payload, DeliveryOptions.RequireAck(timeout))` | PR #84; awaits an end-to-end acknowledgement from the recipient's client, same version requirement as headers above — throws `TimeoutException` if none arrives (not proof of non-delivery, see KI-45), `InvalidOperationException` if the connection drops first; `DeliveryOptions.None` is identical to the plain overload; see [client.md](for-clanker/client.md#delivery-acknowledgement) |
+| Direct message with a time-to-live | `SendAsync(recipientId, payload, timeToLive)` | PR #85 (issue #29); throws `ArgumentOutOfRangeException` for a non-positive `timeToLive`; discarded by the hub or the recipient if not delivered within `timeToLive` — the sender is not notified either way; expiry is measured against the **sender's own clock**, no hub clock authority, see KI-47; see [client.md](for-clanker/client.md#message-expiry-time-to-live) |
 | Request and await a reply | `RequestAsync(recipientId, payload, timeout)` | PR #83; correlated request/response over a direct message, same version requirement as headers above — throws `TimeoutException` on no reply, `InvalidOperationException` if the connection drops first; see [client.md](for-clanker/client.md#request-response) |
 | Answer a request | `ReplyAsync(request, payload)` | PR #83; `request` is the `MessageReceivedEventArgs` a `CorrelationId is not null` message arrived on |
 | Broadcast | `BroadcastAsync(payload)` | Every other client; never echoed to sender |
@@ -1035,9 +1127,24 @@ which still needs the numbered-route treatment above. See
 [client.md](for-clanker/client.md#request-response), [client.md](for-clanker/client.md#delivery-acknowledgement),
 [protocol.md](for-clanker/protocol.md#request-response-headers) and
 [protocol.md](for-clanker/protocol.md#delivery-acknowledgement-headers). If you add reserved header keys
-of your own this way, guard them the same way `SendAsync` guards these five
+of your own this way, guard them the same way `SendAsync` guards these six
 (`ThrowIfReservedHeaderKeyPresent`) — see [known-issues.md](for-clanker/known-issues.md) KI-42/KI-43/KI-46
 for what happens if you don't.
+
+**PR #85's per-message time-to-live is a third example of the fourth route, and the first to break the
+"the hub still never decodes header content" half of that claim.** `SendAsync(..., TimeSpan, ...)` needed
+no opcode and no version bump either, but it is not entirely hub-blind the way the first two examples are:
+`MeshHub.SendLoopAsync` now scans a queued frame's header block for one specific well-known key
+(`mesh.expires-at`) via a new, narrowly-scoped `HeaderEnvelope.TryReadValue` — see
+[hub.md](for-clanker/hub.md#dropping-expired-frames) — so it can drop an already-expired frame before
+sending it. This is still not the numbered-route treatment above (no opcode, no `MessageType` change, no
+`Protocol.MaxSupportedVersion` bump), but it establishes that "fourth route" and "hub does not need to
+change" are not quite the same claim: a future header-only capability that needs the hub to *act* on a
+value (not just forward or strip the whole block) can follow this shape — add a narrow, single-key
+`HeaderEnvelope.TryReadValue` scan at the specific hub-side call site that needs it, rather than a general
+decode. See [client.md](for-clanker/client.md#message-expiry-time-to-live),
+[protocol.md](for-clanker/protocol.md#message-expiry-headers) and
+[known-issues.md](for-clanker/known-issues.md) KI-47 for the clock-skew consequence this enables.
 
 **"Done" means:** `dotnet build Meshworx.slnx -c Release` clean (warnings are errors) **and**
 `dotnet test Meshworx.slnx` green. CI runs exactly this on push/PR to `main`
@@ -1101,16 +1208,34 @@ there is no publish step in CI — CI only builds and tests.
   on the wire and works at any version. See [client.md](for-clanker/client.md#sending-headers).
 - **`MessageHeaders`'s constructor throws on a duplicate key** rather than keeping the last value like a
   plain `Dictionary` initializer would. De-duplicate your source before constructing one. KI-34.
-- **Five `MessageHeaders` keys are reserved — two for `RequestAsync`/`ReplyAsync` (PR #83), three more for
-  delivery acknowledgement (PR #84) — and none of them can be set through `SendAsync`.**
-  `"mesh.request-id"`/`"mesh.reply"` (`RequestReplyHeaderKeys`) and `"mesh.ack-id"`/`"mesh.ack-request"`/
-  `"mesh.ack"` (`DeliveryAcknowledgementHeaderKeys`) now make `SendAsync`'s headers overload throw
-  `ArgumentException` if your own headers happen to use any of the five — a narrow but real breaking
-  change for any caller that already did. Both capabilities are pure client-to-client conventions: the
-  hub never decodes header content, so it cannot see or protect either at all, and any inbound frame
-  carrying `mesh.reply=1` or `mesh.ack=1` is intercepted before `MessageReceived` whether or not it came
-  from a real `RequestAsync`/`RequireAck` call. See [client.md](for-clanker/client.md#request-response),
+- **Six `MessageHeaders` keys are reserved — two for `RequestAsync`/`ReplyAsync` (PR #83), three more for
+  delivery acknowledgement (PR #84), one more for time-to-live (PR #85) — and none of them can be set
+  through `SendAsync`.** `"mesh.request-id"`/`"mesh.reply"` (`RequestReplyHeaderKeys`),
+  `"mesh.ack-id"`/`"mesh.ack-request"`/`"mesh.ack"` (`DeliveryAcknowledgementHeaderKeys`) and
+  `"mesh.expires-at"` (`MessageExpiryHeaderKeys`) now make `SendAsync`'s headers overload throw
+  `ArgumentException` if your own headers happen to use any of the six — a narrow but real breaking
+  change for any caller that already did. Request/response and delivery acknowledgement are pure
+  client-to-client conventions the hub cannot see or protect at all, and any inbound frame carrying
+  `mesh.reply=1` or `mesh.ack=1` is intercepted before `MessageReceived` whether or not it came from a
+  real `RequestAsync`/`RequireAck` call. **Time-to-live is the one exception to "the hub never decodes
+  header content"** — since PR #85 the hub scans (without fully decoding) for `mesh.expires-at`
+  specifically, to drop an already-expired frame before sending it; see the time-to-live bullet below.
+  See [client.md](for-clanker/client.md#request-response),
   [client.md](for-clanker/client.md#delivery-acknowledgement), KI-42, KI-43, KI-44, KI-45, KI-46.
+- **A direct send can opt into a time-to-live (PR #85, issue #29), and the expiry clock is the sender's,
+  not the hub's.** `SendAsync(recipientId, payload, timeToLive)` computes an absolute expiry from the
+  *sending client's own clock* and attaches it as a header; both the hub (at send-loop dequeue) and the
+  recipient (at receive) independently drop an already-expired message before it is delivered or handed
+  to the application — the sender is never told either way. **There is no hub clock authority**: under
+  material clock skew between sender, hub and recipient, a message can expire earlier or later than the
+  sender intended, and the hub and recipient can even disagree with each other about whether a specific
+  message has expired. Meaningful use of a short time-to-live assumes NTP-class clock synchronisation
+  across the fleet. A side effect worth knowing if you monitor metrics: `messages.routed` and
+  `messages.dropped(reason=expired)` can **both** fire for the same direct message (the hub counts
+  `routed` when it queues the frame, then `dropped(reason=expired)` later if it is still queued when it
+  expires) — the previously-reliable "routed − dropped = delivered, for direct sends" identity no longer
+  holds unconditionally. See [client.md](for-clanker/client.md#message-expiry-time-to-live),
+  [hub.md](for-clanker/hub.md#dropping-expired-frames), KI-32, KI-47.
 - **`new TcpTransportListener(port)` / `new WebSocketTransportListener(port)` both bind loopback**, not
   every interface. Remote clients cannot reach a hub created that way; pass an explicit `IPEndPoint` to
   expose it deliberately.
