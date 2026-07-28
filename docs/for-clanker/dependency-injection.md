@@ -46,7 +46,7 @@ builder.Services.AddMeshHub(builder.Configuration.GetSection("MeshHub"));
 
 ### Using it efficiently
 
-- Registers a **singleton `IMeshHub`** (`CreateHub`, `MeshHubServiceCollectionExtensions.cs:94-112`),
+- Registers a **singleton `IMeshHub`** (`CreateHub`, `MeshHubServiceCollectionExtensions.cs:94-114`),
   built from a `TcpTransportListener` on `MeshHubOptions.Port` by default, or from
   `MeshHubOptions.Listener` when one is supplied (`:98`) — set `Listener` to get TLS, a non-loopback bind
   address, or `InMemoryTransportListener` instead. Every other `MeshHubOptions` property maps 1:1 to a
@@ -77,14 +77,20 @@ builder.Services.AddMeshHub(builder.Configuration.GetSection("MeshHub"));
   options.Port is > 0 and <= 65535, ...)` plus `.ValidateOnStart()` (`:85-86`) means an out-of-range port
   throws `OptionsValidationException` at host start, before any socket is touched. Every other property
   (`MaxClients`, `HeartbeatInterval`, `MaxMissedHeartbeats`, `GroupAuthorisationTimeout`,
-  `MaxConnectionsPerRemoteEndpoint`) is passed straight to the `MeshHub` constructor, which does its own
+  `MaxConnectionsPerRemoteEndpoint`, and, since PR #87 (issue #30), `NotifyOnQueueSaturation` /
+  `BackpressureAwaitTimeout`) is passed straight to the `MeshHub` constructor, which does its own
   range validation and throws `ArgumentOutOfRangeException` from inside the `IMeshHub` singleton's
   factory the first time it is resolved — not from `ValidateOnStart`, so a bad value there surfaces later
   and with a different exception type than a bad `Port` does.
 - **`MaxClients` / `HeartbeatInterval` / `MaxConnectionsPerRemoteEndpoint` are `int?`/`TimeSpan?` on
   `MeshHubOptions`, matching the constructor exactly** (`MeshHubOptions.cs:46`, `:51`, `:81`) — leaving
   one unset is indistinguishable from never passing the parameter, so PR #68's finite defaults (1000 /
-  30 s / 100) apply. There is no DI-specific default layered on top.
+  30 s / 100) apply. There is no DI-specific default layered on top. **`NotifyOnQueueSaturation`
+  (`bool`, `:87`) / `BackpressureAwaitTimeout` (`TimeSpan?`, `:93`)** follow the identical pattern for
+  PR #87's backpressure signalling — `NotifyOnQueueSaturation` defaults to `false` (unset means "off",
+  matching the constructor's own default) and an unset `BackpressureAwaitTimeout` means the constructor's
+  own 30 s default applies. See [hub.md](hub.md#backpressure-signalling-and-awaiting-capacity) and
+  [known-issues.md](known-issues.md) KI-1/KI-48/KI-49.
 - **Only the first `AddMeshHub` call's hub configuration composes as "layered".** Because the options are
   unnamed (`services.AddOptions<MeshHubOptions>()` with no name), a second `AddMeshHub` call's
   `configureOptions`/`configuration` runs against the **same** `MeshHubOptions` instance the first call

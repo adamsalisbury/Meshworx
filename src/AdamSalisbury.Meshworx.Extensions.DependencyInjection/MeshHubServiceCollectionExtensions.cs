@@ -108,6 +108,8 @@ public static class MeshHubServiceCollectionExtensions
             options.MaxConcurrentAuthentications,
             options.GroupAuthoriser,
             options.GroupAuthorisationTimeout,
-            options.MaxConnectionsPerRemoteEndpoint);
+            options.MaxConnectionsPerRemoteEndpoint,
+            options.NotifyOnQueueSaturation,
+            options.BackpressureAwaitTimeout);
     }
 }

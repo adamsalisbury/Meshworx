@@ -15,6 +15,8 @@ hunt for them. `namespace AdamSalisbury.Meshworx.Messages` unless noted otherwis
 | `GroupJoinRefusedEventArgs` | `required string GroupName` | `IMeshClient.GroupJoinRefused` | `Messages/GroupJoinRefusedEventArgs.cs:6` |
 | `DisconnectedEventArgs` | `required DisconnectReason Reason` | `IMeshClient.Disconnected` | `Messages/DisconnectedEventArgs.cs` |
 | `ClientConnectionEventArgs` | `required Guid ClientId`, `required string ClientName` | `IMeshHub.ClientConnected` / `ClientDisconnected` (namespace `AdamSalisbury.Meshworx`) | `ClientConnectionEventArgs.cs` |
+| `QueueSaturatedEventArgs` | `required Guid SenderId`, `required Guid RecipientId` | `IMeshHub.QueueSaturated` (namespace `AdamSalisbury.Meshworx`, **not** `.Messages` — PR #87, issue #30) | `QueueSaturatedEventArgs.cs` |
+| `SendRejectedEventArgs` | `required Guid RecipientId` | `IMeshClient.SendRejected` (PR #87, issue #30) | `Messages/SendRejectedEventArgs.cs` |
 
 All use `required` init-only properties (C# 11) — construct with object initialisers.
 
@@ -59,19 +61,28 @@ reserved vocabulary within any `MessageHeaders` an application constructs. `Corr
 [client.md](client.md#request-response) and [known-issues.md](known-issues.md) KI-42/KI-43.
 
 `DeliveryOptions` (`readonly struct`, `IEquatable<DeliveryOptions>`, `DeliveryOptions.cs`, namespace
-`AdamSalisbury.Meshworx` — **not** `.Messages` — added by PR #84) — controls whether
-`IMeshClient.SendAsync(Guid, ReadOnlyMemory<byte>, DeliveryOptions, CancellationToken)` waits for an
-end-to-end delivery acknowledgement. Two ways to obtain one:
+`AdamSalisbury.Meshworx` — **not** `.Messages` — added by PR #84, extended by PR #87, issue #30) —
+controls whether `IMeshClient.SendAsync(Guid, ReadOnlyMemory<byte>, DeliveryOptions, CancellationToken)`
+waits for an end-to-end delivery acknowledgement and/or asks the hub to await capacity on a saturated
+recipient queue instead of dropping. Three ways to obtain one, plus a combinator:
 
 - `DeliveryOptions.None` — a `static readonly` field, and the struct's own default value (so
   `default(DeliveryOptions)` and a caller who never touches this type both get fire-and-forget, identical
   to every other `SendAsync` overload).
 - `DeliveryOptions.RequireAck(TimeSpan timeout)` — a static factory; throws `ArgumentOutOfRangeException`
-  synchronously if `timeout` is not positive. `RequireAcknowledgement`/`AcknowledgementTimeout` are the
-  two read-only properties it sets; there is no public constructor.
+  synchronously if `timeout` is not positive. Sets `RequireAcknowledgement`/`AcknowledgementTimeout`.
+- `DeliveryOptions.AwaitingCapacity()` — a static factory (PR #87); sets `AwaitCapacity` without requiring
+  an acknowledgement. Does **not** make the `SendAsync` call itself wait — see
+  [client.md](client.md#backpressure-signalling).
+- `options.WithAwaitCapacity()` — an instance method (PR #87) returning a copy of `options` with
+  `AwaitCapacity` also set, so `RequireAck(...).WithAwaitCapacity()` gets both. Read its own remarks (and
+  [known-issues.md](known-issues.md) KI-49) before combining the two — their timeouts are independent.
+- There is no public constructor; `RequireAcknowledgement`, `AcknowledgementTimeout` and `AwaitCapacity`
+  are all read-only properties, and `Equals`/`GetHashCode` cover all three.
 
-See [client.md](client.md#delivery-acknowledgement) for how to use it and
-[known-issues.md](known-issues.md) KI-44/KI-45 for what its guarantee does and does not cover.
+See [client.md](client.md#delivery-acknowledgement) and [client.md](client.md#backpressure-signalling)
+for how to use it, and [known-issues.md](known-issues.md) KI-44/KI-45/KI-48/KI-49 for what its guarantees
+do and do not cover.
 
 `DeliveryAcknowledgementHeaderKeys` (`internal static class`,
 `Messages/DeliveryAcknowledgementHeaderKeys.cs`, added by PR #84) — the acknowledgement counterpart to
@@ -81,6 +92,26 @@ and its acknowledgement), `Request = "mesh.ack-request"` (marks the original mes
 `Ack = "mesh.ack"` (marks the acknowledgement frame itself). `MeshClient.SendAsync`'s headers overload
 throws `ArgumentException` if a caller's own `MessageHeaders` contains any of the three — see
 [client.md](client.md#delivery-acknowledgement) and [known-issues.md](known-issues.md) KI-42/KI-46.
+
+`MessageExpiryHeaderKeys` (`internal static class`, `Messages/MessageExpiryHeaderKeys.cs`, added by
+PR #85, issue #29) — reserved vocabulary for per-message time-to-live, same shape as the two above. One
+`const string`: `ExpiresAtUnixMilliseconds = "mesh.expires-at"`, an absolute Unix-millisecond expiry
+computed from the sending client's own clock. Unlike the request/response and delivery-acknowledgement
+keys, the hub itself reads this one (without fully decoding the header block) to drop an already-expired
+queued frame — see [protocol.md](protocol.md#message-expiry-headers) and
+[hub.md](hub.md#dropping-expired-frames). `MeshClient.SendAsync`'s headers overload throws
+`ArgumentException` if a caller's own `MessageHeaders` contains it — see
+[client.md](client.md#message-expiry-time-to-live) and [known-issues.md](known-issues.md) KI-42/KI-47.
+
+`BackpressureHeaderKeys` (`internal static class`, `Messages/BackpressureHeaderKeys.cs`, added by PR #87,
+issue #30) — reserved vocabulary for `DeliveryOptions.AwaitCapacity`, same shape again. One
+`const string`: `AwaitCapacity = "mesh.await-capacity"`, present with value `"1"` when the sender asked
+the hub to await room on the recipient's queue instead of dropping. The hub reads this one too (the
+second, alongside message expiry, to do so) via `MeshHub.WantsAwaitCapacity`, at **enqueue** time rather
+than expiry's **dequeue** time — see [protocol.md](protocol.md#backpressure-header) and
+[hub.md](hub.md#backpressure-signalling-and-awaiting-capacity). `MeshClient.SendAsync`'s headers overload
+throws `ArgumentException` if a caller's own `MessageHeaders` contains it — see
+[client.md](client.md#backpressure-signalling) and [known-issues.md](known-issues.md) KI-42.
 
 ## Enums
 
@@ -238,9 +269,10 @@ catch (RegistrationRefusedException ex) { /* ex.ErrorCode tells you why */ }
 - `static class HeaderEnvelope` (`Messages/HeaderEnvelope.cs`, added by PR #74) — encodes/decodes the
   header-block wire format for the four header-bearing opcodes; see
   [protocol.md](protocol.md#message-headers).
-- `MeshHub.ClientConnection` (now also carries `NegotiatedProtocolVersion`, PR #74), `MeshHub.Group`,
-  `MeshClient.ConnectionState`, `MeshClient.PendingLookup` — nested private helpers documented in
-  [hub.md](hub.md) / [client.md](client.md).
+- `MeshHub.ClientConnection` (carries `NegotiatedProtocolVersion`, PR #74; and, since PR #87,
+  `IsAwaitingCapacity`/`BeginAwaitingCapacity()`/`CapacityWaitScope` for the backpressure-parking
+  mechanism), `MeshHub.Group`, `MeshClient.ConnectionState`, `MeshClient.PendingLookup` — nested private
+  helpers documented in [hub.md](hub.md) / [client.md](client.md).
 
 Tests reach internals via `<InternalsVisibleTo Include="AdamSalisbury.Meshworx.UnitTests" />`
 (`AdamSalisbury.Meshworx.csproj:726`).

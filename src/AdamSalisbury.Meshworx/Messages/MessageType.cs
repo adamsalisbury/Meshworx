@@ -22,4 +22,5 @@ internal enum MessageType : byte
     DeliverMessageWithHeaders = 0x12,
     GroupMessageWithHeaders = 0x13,
     DeliverGroupMessageWithHeaders = 0x14,
+    QueueSaturated = 0x15,
 }

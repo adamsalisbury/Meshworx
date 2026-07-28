@@ -133,10 +133,23 @@ public interface IMeshClient : IAsyncDisposable
     /// or fails with a <see cref="TimeoutException"/> if that does not happen in time. The
     /// acknowledgement is an ordinary routed message between the two clients; the hub does not
     /// participate in or observe it.
+    /// <para>
+    /// With <see cref="DeliveryOptions.AwaitCapacity"/> the hub awaits capacity on the recipient's
+    /// outbound queue instead of dropping the message immediately if that queue is already full, so the
+    /// message is delivered late rather than lost — see <see cref="SendRejected"/> for the default
+    /// drop-on-full behaviour this opts out of. On its own it does not make this call wait; combined
+    /// with <see cref="DeliveryOptions.RequireAck"/> it does, but the two timeouts are independent and
+    /// must be reconciled — see <see cref="DeliveryOptions.WithAwaitCapacity"/>, whose remarks explain
+    /// why an acknowledgement timeout shorter than the hub's capacity wait can report a message as
+    /// failed that is then delivered anyway.
+    /// </para>
     /// </remarks>
     /// <param name="recipientId">The unique identifier of the target client.</param>
     /// <param name="message">The message payload to deliver.</param>
-    /// <param name="options">Whether to require a delivery acknowledgement, and its timeout.</param>
+    /// <param name="options">
+    /// Whether to require a delivery acknowledgement and its timeout, and/or whether to await capacity on
+    /// the recipient's outbound queue instead of dropping on full.
+    /// </param>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
     /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
     /// <exception cref="NotSupportedException">
@@ -375,4 +388,19 @@ public interface IMeshClient : IAsyncDisposable
     /// </para>
     /// </remarks>
     event EventHandler<DisconnectedEventArgs> Disconnected;
+
+    /// <summary>
+    /// Raised when the hub reports that a message this client sent was dropped because the recipient's
+    /// outbound queue was full.
+    /// </summary>
+    /// <remarks>
+    /// Only raised when the hub was constructed with <c>notifyOnQueueSaturation</c> set — otherwise a
+    /// dropped message stays silent to this client, exactly as before this event existed. Only
+    /// <b>directly addressed</b> sends are reported: a broadcast or group send dropped for a full queue
+    /// never raises this, because naming the dropped recipient would tell this client the identity of a
+    /// client it never addressed. The notification is best-effort: it is itself dropped rather than
+    /// retried if this client's own outbound queue happens to be full at the moment the hub tries to
+    /// send it.
+    /// </remarks>
+    event EventHandler<SendRejectedEventArgs> SendRejected;
 }

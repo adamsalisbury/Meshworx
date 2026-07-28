@@ -12,10 +12,11 @@ namespace AdamSalisbury.Meshworx;
 /// </remarks>
 public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
 {
-    private DeliveryOptions(bool requireAcknowledgement, TimeSpan? acknowledgementTimeout)
+    private DeliveryOptions(bool requireAcknowledgement, TimeSpan? acknowledgementTimeout, bool awaitCapacity)
     {
         RequireAcknowledgement = requireAcknowledgement;
         AcknowledgementTimeout = acknowledgementTimeout;
+        AwaitCapacity = awaitCapacity;
     }
 
     /// <summary>
@@ -37,6 +38,19 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     public TimeSpan? AcknowledgementTimeout { get; }
 
     /// <summary>
+    /// Gets a value indicating whether the hub should await capacity on the recipient's outbound queue,
+    /// rather than dropping the message immediately, if that queue is full at the moment the message is
+    /// routed.
+    /// </summary>
+    /// <remarks>
+    /// Honoured only for a directly addressed send. While the hub waits it stops reading further frames
+    /// from this client, so anything else this client sends meanwhile, including to entirely unrelated
+    /// recipients, waits behind it. Use it for traffic that genuinely must not be lost, not as a blanket
+    /// default. See <see cref="AwaitingCapacity"/> for why the send itself does not wait.
+    /// </remarks>
+    public bool AwaitCapacity { get; }
+
+    /// <summary>
     /// Requests a delivery acknowledgement: the send completes once the recipient's client has handed
     /// the message to its application, or fails with a <see cref="TimeoutException"/> if that does not
     /// happen within <paramref name="timeout"/>.
@@ -50,14 +64,55 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
             throw new ArgumentOutOfRangeException(nameof(timeout), "The acknowledgement timeout must be positive.");
         }
 
-        return new DeliveryOptions(requireAcknowledgement: true, acknowledgementTimeout: timeout);
+        return new DeliveryOptions(requireAcknowledgement: true, acknowledgementTimeout: timeout, awaitCapacity: false);
+    }
+
+    /// <summary>
+    /// Requests that the hub await capacity on the recipient's outbound queue instead of dropping the
+    /// message immediately, so a message addressed to a momentarily saturated recipient is delivered late
+    /// rather than lost. Only a direct send to a single recipient honours this — a broadcast or group
+    /// send never blocks its whole fan-out on one slow member.
+    /// </summary>
+    /// <remarks>
+    /// This does <b>not</b> make the returned task wait for capacity. On its own, the send completes as
+    /// soon as the frame reaches the transport, exactly like every other fire-and-forget overload — the
+    /// waiting happens hub-side, out of the caller's sight. Producer-side throttling is therefore
+    /// indirect: while the hub is parked it stops reading this connection, so a producer sending
+    /// continuously eventually blocks on its own transport once the socket's buffers fill, rather than at
+    /// the first saturated send. To have the call itself wait until the message has genuinely reached the
+    /// recipient, combine this with <see cref="RequireAck"/> via <see cref="WithAwaitCapacity"/> and read
+    /// that method's remarks first.
+    /// </remarks>
+    public static DeliveryOptions AwaitingCapacity()
+    {
+        return new DeliveryOptions(requireAcknowledgement: false, acknowledgementTimeout: null, awaitCapacity: true);
+    }
+
+    /// <summary>
+    /// Returns a copy of these options with <see cref="AwaitCapacity"/> also set, so a single send can
+    /// both require an acknowledgement and await capacity on the recipient's queue.
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="AwaitingCapacity"/> alone, this genuinely blocks the caller until the recipient
+    /// acknowledges — but the two waits are timed independently and must be reconciled by the caller.
+    /// <see cref="AcknowledgementTimeout"/> is measured by this client, while the hub's own wait for
+    /// capacity is bounded by its <c>backpressureAwaitTimeout</c> (30 seconds by default). Set the
+    /// acknowledgement timeout <b>longer</b> than the hub's: if it expires first, the send fails with a
+    /// <see cref="TimeoutException"/> while the hub is still waiting, and the message may be delivered
+    /// afterwards regardless — so a caller that retries on that timeout, which is the pattern
+    /// <see cref="RequireAck"/> exists to support, would deliver it twice.
+    /// </remarks>
+    public DeliveryOptions WithAwaitCapacity()
+    {
+        return new DeliveryOptions(RequireAcknowledgement, AcknowledgementTimeout, awaitCapacity: true);
     }
 
     /// <inheritdoc/>
     public bool Equals(DeliveryOptions other)
     {
         return RequireAcknowledgement == other.RequireAcknowledgement
-            && AcknowledgementTimeout == other.AcknowledgementTimeout;
+            && AcknowledgementTimeout == other.AcknowledgementTimeout
+            && AwaitCapacity == other.AwaitCapacity;
     }
 
     /// <inheritdoc/>
@@ -69,7 +124,7 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// <inheritdoc/>
     public override int GetHashCode()
     {
-        return HashCode.Combine(RequireAcknowledgement, AcknowledgementTimeout);
+        return HashCode.Combine(RequireAcknowledgement, AcknowledgementTimeout, AwaitCapacity);
     }
 
     /// <summary>

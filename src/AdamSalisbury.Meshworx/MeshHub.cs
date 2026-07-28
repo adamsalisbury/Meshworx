@@ -39,6 +39,13 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // handshake. Pass int.MaxValue explicitly to opt out.
     private const int DefaultMaxConnectionsPerRemoteEndpoint = 100;
 
+    // How long RouteMessageWithHeaders awaits free capacity on a saturated recipient queue before giving
+    // up and falling back to the drop-on-full behaviour, for a sender that opted into
+    // DeliveryOptions.AwaitCapacity. Bounds the worst case so a recipient that never drains cannot stall
+    // the sending client's receive loop indefinitely; 30 seconds mirrors the registration and group
+    // authorisation timeouts' own default.
+    private static readonly TimeSpan DefaultBackpressureAwaitTimeout = TimeSpan.FromSeconds(30);
+
     private readonly ILogger<MeshHub> _logger;
     private readonly ITransportListener _listener;
     private readonly TimeSpan _registrationTimeout;
@@ -48,6 +55,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly GroupAuthoriser? _groupAuthoriser;
     private readonly TimeSpan _groupAuthorisationTimeout;
     private readonly int _maxConnectionsPerRemoteEndpoint;
+    private readonly bool _notifyOnQueueSaturation;
+    private readonly TimeSpan _backpressureAwaitTimeout;
 
     // How many connections are currently open from each remote address, counting from acceptance
     // until the handler that owns that connection finishes — including the pre-registration window,
@@ -203,6 +212,27 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// cap by using a different address within it for every connection. Defaults to 100. Pass
     /// <see cref="int.MaxValue"/> to opt out.
     /// </param>
+    /// <param name="notifyOnQueueSaturation">
+    /// Whether a sender is sent a <see cref="Messages.MessageType.QueueSaturated"/> control frame when a
+    /// <b>directly addressed</b> message of its own is dropped because the recipient's outbound queue was
+    /// full. Broadcast and group sends never produce this frame however this is set, since their dropped
+    /// recipient's identity comes from the hub's registries rather than from the sender — see
+    /// <see cref="NotifySenderOfQueueSaturation"/>. The drop itself is always observable in-process via
+    /// <see cref="QueueSaturated"/> and the existing <c>meshworx.hub.messages.dropped</c> metric, for
+    /// every shape of send; this only controls whether the sender is also told over the wire. Defaults to
+    /// <see langword="false"/>, so a hub that does not opt in sends nothing beyond what it already sent
+    /// before this existed — the fire-and-forget default is unchanged.
+    /// </param>
+    /// <param name="backpressureAwaitTimeout">
+    /// The maximum time <c>RouteMessageWithHeaders</c> awaits free capacity on a saturated recipient
+    /// queue for a sender that opted into <see cref="DeliveryOptions.AwaitCapacity"/>, before giving up
+    /// and falling back to the drop-on-full behaviour. Bounds how long a recipient that never drains can
+    /// stall the sending client's receive loop — and, with it, how long that sender's messages to every
+    /// <em>other</em> recipient wait behind it, since one connection's frames are routed in order.
+    /// Defaults to 30 seconds. Pass <see cref="Timeout.InfiniteTimeSpan"/> to wait indefinitely; note
+    /// that a parked sender is deliberately exempt from idle eviction, so an infinite timeout removes
+    /// the only bound on how long a connection can sit parked.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
@@ -214,7 +244,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         int? maxConcurrentAuthentications = null,
         GroupAuthoriser? groupAuthoriser = null,
         TimeSpan? groupAuthorisationTimeout = null,
-        int? maxConnectionsPerRemoteEndpoint = null)
+        int? maxConnectionsPerRemoteEndpoint = null,
+        bool notifyOnQueueSaturation = false,
+        TimeSpan? backpressureAwaitTimeout = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -269,6 +301,18 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 "The maximum connections per remote endpoint must be positive.");
         }
 
+        // Timeout.InfiniteTimeSpan is the one negative value accepted here — the deliberate, explicit
+        // opt-in to waiting forever, mirroring heartbeatInterval's own sentinel.
+        if (backpressureAwaitTimeout is { } awaitTimeout
+            && awaitTimeout <= TimeSpan.Zero
+            && awaitTimeout != Timeout.InfiniteTimeSpan)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(backpressureAwaitTimeout),
+                "The backpressure await timeout must be positive, or Timeout.InfiniteTimeSpan to wait "
+                + "indefinitely.");
+        }
+
         _logger = logger;
         _listener = listener;
         _registrationTimeout = registrationTimeout ?? DefaultRegistrationTimeout;
@@ -285,6 +329,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _groupAuthoriser = groupAuthoriser;
         _groupAuthorisationTimeout = groupAuthorisationTimeout ?? DefaultGroupAuthorisationTimeout;
         _maxConnectionsPerRemoteEndpoint = maxConnectionsPerRemoteEndpoint ?? DefaultMaxConnectionsPerRemoteEndpoint;
+        _notifyOnQueueSaturation = notifyOnQueueSaturation;
+        _backpressureAwaitTimeout = backpressureAwaitTimeout ?? DefaultBackpressureAwaitTimeout;
 
         if (authenticator is not null)
         {
@@ -328,6 +374,22 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 _groupAuthorisationTimeout,
                 configuredInterval,
                 maxMissedHeartbeats);
+        }
+
+        // A sender parked awaiting capacity is exempt from idle eviction — it reads nothing while parked
+        // and cannot answer a ping, so evicting it would drop a healthy client for backpressure the hub
+        // itself applied. That exemption is safe precisely because the park is bounded by the await
+        // timeout. Setting the timeout to infinite removes that bound, leaving nothing at all to limit
+        // how long a connection sits parked against a recipient that never drains. Warn rather than
+        // throw: it is a legal, deliberate opt-in, and a hub whose recipients are known to drain
+        // eventually may genuinely want to wait rather than lose the message.
+        if (_backpressureAwaitTimeout == Timeout.InfiniteTimeSpan)
+        {
+            _logger.LogWarning(
+                "The backpressure await timeout is infinite, so a send that opted into awaiting capacity "
+                + "parks its sender's receive loop until the recipient drains, however long that takes. A "
+                + "parked sender is exempt from idle eviction, so nothing else bounds this. Set a finite "
+                + "timeout unless every recipient is known to drain.");
         }
 
         _meter = new Meter(MeshworxMeterName.Value);
@@ -579,6 +641,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
     /// <inheritdoc/>
     public event EventHandler<ClientConnectionEventArgs>? ClientDisconnected;
+
+    /// <inheritdoc/>
+    public event EventHandler<QueueSaturatedEventArgs>? QueueSaturated;
 
     /// <inheritdoc/>
     public int ConnectedClientCount => _clients.Count;
@@ -1032,7 +1097,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                         ReadOnlyMemory<byte> headerBlock = data.AsMemory(19, headerBlockLength);
                         ReadOnlyMemory<byte> body = data.AsMemory(19 + headerBlockLength);
 
-                        RouteMessageWithHeaders(clientId, recipientId, headerBlock, body);
+                        await RouteMessageWithHeaders(clientId, recipientId, headerBlock, body, clientCts.Token)
+                            .ConfigureAwait(false);
                     }
                 }
                 else if ((MessageType)data[0] == MessageType.BroadcastMessage)
@@ -1438,6 +1504,118 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Raises <see cref="QueueSaturated"/> for a message dropped because the recipient's outbound queue
+    /// was full. Always called, from every routing method's queue-full branch, so a hub-side subscriber
+    /// sees every drop regardless of which routing shape produced it.
+    /// </summary>
+    /// <remarks>
+    /// In-process only. The hub's own operator is already trusted with the identity of every client
+    /// connected to it, so this carries the recipient's id whatever shape of send was dropped — unlike
+    /// the wire notification in <see cref="NotifySenderOfQueueSaturation"/>, which does not.
+    /// </remarks>
+    private void RaiseQueueSaturated(Guid senderId, Guid recipientId)
+    {
+        EventHandler<QueueSaturatedEventArgs>? handler = QueueSaturated;
+        if (handler is null)
+        {
+            return;
+        }
+
+        try
+        {
+            handler(this, new QueueSaturatedEventArgs { SenderId = senderId, RecipientId = recipientId });
+        }
+        catch (Exception ex)
+        {
+            // A throwing subscriber must not fault the client handler task. Callback boundary.
+            _logger.LogError(ex, "A QueueSaturated handler threw an exception");
+        }
+    }
+
+    /// <summary>
+    /// Raises <see cref="QueueSaturated"/> and, only when this hub was constructed with
+    /// <c>notifyOnQueueSaturation</c>, best-effort sends the sender a
+    /// <see cref="MessageType.QueueSaturated"/> control frame naming the saturated recipient.
+    /// </summary>
+    /// <remarks>
+    /// Only ever called from the two <b>direct</b>-send paths (<see cref="RouteMessage"/> and
+    /// <see cref="RouteMessageWithHeaders"/>), where the sender supplied <paramref name="recipientId"/>
+    /// itself and so learns nothing from being told it. The fan-out paths
+    /// (<see cref="BroadcastMessage"/>, <see cref="SendToGroup"/>, <see cref="SendToGroupWithHeaders"/>)
+    /// deliberately call <see cref="RaiseQueueSaturated"/> instead and send no frame: there the id comes
+    /// from the hub's own client and group registries, not from the sender, so echoing it back would
+    /// disclose the identity of a client the sender never named. Since any client may broadcast, and may
+    /// address a group it never joined, that would let a sender enumerate the id of every client
+    /// connected to the hub simply by broadcasting until somebody's queue filled — an identity census
+    /// the name-based lookup deliberately does not offer, since that requires already knowing the name.
+    /// The control frame carries only routing metadata — the recipient's id — never the dropped
+    /// message's body.
+    /// </remarks>
+    private void NotifySenderOfQueueSaturation(Guid senderId, Guid recipientId)
+    {
+        RaiseQueueSaturated(senderId, recipientId);
+
+        if (!_notifyOnQueueSaturation)
+        {
+            return;
+        }
+
+        if (!_clients.TryGetValue(senderId, out ClientConnection? sender))
+        {
+            return;
+        }
+
+        var nackPayload = new byte[17];
+        nackPayload[0] = (byte)MessageType.QueueSaturated;
+        recipientId.TryWriteBytes(nackPayload.AsSpan(1));
+
+        // Best-effort: if the sender's own queue is also full, the notification is itself dropped rather
+        // than retried or escalated — this is routing-level signalling, not guaranteed delivery.
+        sender.OutboundQueue.Writer.TryWrite(nackPayload);
+    }
+
+    /// <summary>
+    /// Awaits free capacity on a saturated recipient queue, bounded by <see cref="_backpressureAwaitTimeout"/>,
+    /// for a sender that opted into <see cref="DeliveryOptions.AwaitCapacity"/> via
+    /// <see cref="BackpressureHeaderKeys.AwaitCapacity"/>.
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> if the frame was queued before the timeout elapsed; otherwise
+    /// <see langword="false"/>, in which case the caller falls back to the ordinary drop-on-full path.
+    /// </returns>
+    private static async Task<bool> TryAwaitCapacityAsync(
+        ClientConnection sender,
+        ClientConnection recipient,
+        byte[] payload,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        // The sender's own receive loop is parked for the duration of this wait, so mark it as such:
+        // it is not idle, and must not be evicted for failing to send frames it is not being read for.
+        using ClientConnection.CapacityWaitScope parked = sender.BeginAwaitingCapacity();
+
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(timeout);
+
+        try
+        {
+            await recipient.OutboundQueue.Writer.WriteAsync(payload, timeoutCts.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (OperationCanceledException)
+            when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            // Capacity did not free up within the timeout; fall back to dropping the message.
+            return false;
+        }
+        catch (ChannelClosedException)
+        {
+            // The recipient disconnected while capacity was being awaited; nothing left to queue onto.
+            return false;
+        }
+    }
+
     // How many bytes of already-queued frames the send loop will coalesce into a single write before
     // flushing. Small enough to bound the rented buffer, large enough to absorb fan-out bursts.
     private const int SendCoalesceByteBudget = 64 * 1024;
@@ -1655,6 +1833,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     continue;
                 }
 
+                // The connection read nothing across this interval because the hub deliberately parked
+                // its receive loop awaiting capacity for one of its messages — not because the client
+                // went silent. It cannot answer a ping the loop is not there to read, so probing it
+                // would be pointless and evicting it would drop a healthy client for backpressure the
+                // hub itself applied. Treat the park as liveness and reset the counter.
+                if (connection.IsAwaitingCapacity)
+                {
+                    missedHeartbeats = 0;
+                    continue;
+                }
+
                 // The client sent nothing across this interval. Evicting on the _maxMissedHeartbeats'th
                 // consecutive silent interval — not the one after it — is what the documented contract
                 // promises, so the comparison must be inclusive.
@@ -1707,6 +1896,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 recipientId,
                 senderId);
             _messagesDroppedCounter.Add(1, QueueFullDropTag);
+            NotifySenderOfQueueSaturation(senderId, recipientId);
             return;
         }
 
@@ -1722,14 +1912,21 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// that recipient's own negotiated protocol version.
     /// </summary>
     /// <remarks>
-    /// The header block is never decoded here — the hub reads only its length so it can either forward
-    /// it unchanged to a recipient that understands <see cref="MessageType.DeliverMessageWithHeaders"/>,
-    /// or strip it entirely and fall back to the plain <see cref="MessageType.DeliverMessage"/> frame for
-    /// a recipient negotiated below <see cref="Protocol.HeaderEnvelopeMinVersion"/>, which could not parse
-    /// a header block it does not recognise the opcode for.
+    /// The header block is never decoded here beyond a single well-known key — the hub reads its length
+    /// so it can either forward it unchanged to a recipient that understands
+    /// <see cref="MessageType.DeliverMessageWithHeaders"/>, or strip it entirely and fall back to the
+    /// plain <see cref="MessageType.DeliverMessage"/> frame for a recipient negotiated below
+    /// <see cref="Protocol.HeaderEnvelopeMinVersion"/>, which could not parse a header block it does not
+    /// recognise the opcode for. A sender that set <see cref="BackpressureHeaderKeys.AwaitCapacity"/>
+    /// (via <see cref="DeliveryOptions.AwaitCapacity"/>) is awaited on a saturated queue instead of being
+    /// dropped immediately — see <see cref="TryAwaitCapacityAsync"/>.
     /// </remarks>
-    private void RouteMessageWithHeaders(
-        Guid senderId, Guid recipientId, ReadOnlyMemory<byte> headerBlock, ReadOnlyMemory<byte> body)
+    private async Task RouteMessageWithHeaders(
+        Guid senderId,
+        Guid recipientId,
+        ReadOnlyMemory<byte> headerBlock,
+        ReadOnlyMemory<byte> body,
+        CancellationToken cancellationToken)
     {
         if (!_clients.TryGetValue(recipientId, out ClientConnection? recipient))
         {
@@ -1745,18 +1942,52 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             ? BuildDeliverMessageWithHeaders(senderId, headerBlock, body)
             : BuildDeliverMessage(senderId, body);
 
-        if (!recipient.OutboundQueue.Writer.TryWrite(deliveryPayload))
+        bool queued = recipient.OutboundQueue.Writer.TryWrite(deliveryPayload);
+
+        // Only awaited when the sender is still registered: the park is recorded on the sender's own
+        // connection, and a sender that has gone away has no receive loop left to park or protect.
+        if (!queued
+            && WantsAwaitCapacity(headerBlock)
+            && _clients.TryGetValue(senderId, out ClientConnection? sender))
+        {
+            queued = await TryAwaitCapacityAsync(
+                    sender, recipient, deliveryPayload, _backpressureAwaitTimeout, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        if (!queued)
         {
             _logger.LogWarning(
                 "Outbound queue for {RecipientId} is full, message from {SenderId} dropped",
                 recipientId,
                 senderId);
             _messagesDroppedCounter.Add(1, QueueFullDropTag);
+            NotifySenderOfQueueSaturation(senderId, recipientId);
             return;
         }
 
         _messagesRoutedCounter.Add(1, DirectDirectionTag);
         _bytesRoutedCounter.Add(body.Length, DirectDirectionTag);
+    }
+
+    /// <summary>
+    /// Checks the one well-known <see cref="BackpressureHeaderKeys.AwaitCapacity"/> header, without
+    /// decoding the rest of the block. A malformed block is tolerated as "not requested", mirroring
+    /// <see cref="IsExpiredFrame"/> — the header block is sender-supplied and must never be able to fault
+    /// the routing path that reads it.
+    /// </summary>
+    private static bool WantsAwaitCapacity(ReadOnlyMemory<byte> headerBlock)
+    {
+        try
+        {
+            return HeaderEnvelope.TryReadValue(
+                    headerBlock.Span, headerBlock.Length, BackpressureHeaderKeys.AwaitCapacity, out string? value)
+                && value == "1";
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -1822,6 +2053,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     entry.Key,
                     senderId);
                 _messagesDroppedCounter.Add(1, QueueFullDropTag);
+
+                // Event only, never a wire frame — see NotifySenderOfQueueSaturation's remarks. The
+                // sender never named this recipient, so telling it which one was saturated would let
+                // any client enumerate the hub's connected clients by broadcasting.
+                RaiseQueueSaturated(senderId, entry.Key);
             }
         }
 
@@ -2160,6 +2396,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     recipientId,
                     senderId);
                 _messagesDroppedCounter.Add(1, QueueFullDropTag);
+
+                // Event only, never a wire frame — see NotifySenderOfQueueSaturation's remarks.
+                RaiseQueueSaturated(senderId, recipientId);
             }
         }
     }
@@ -2241,6 +2480,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     recipientId,
                     senderId);
                 _messagesDroppedCounter.Add(1, QueueFullDropTag);
+
+                // Event only, never a wire frame — see NotifySenderOfQueueSaturation's remarks.
+                RaiseQueueSaturated(senderId, recipientId);
             }
         }
     }
@@ -2304,6 +2546,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         internal const int OutboundQueueCapacity = 1024;
         private int _disposed;
         private long _activitySequence;
+        private int _awaitingCapacityDepth;
 
         public Guid Id { get; } = id;
         public string Name { get; } = name;
@@ -2326,6 +2569,48 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         public void RecordActivity()
         {
             Interlocked.Increment(ref _activitySequence);
+        }
+
+        /// <summary>
+        /// Whether this connection's receive loop is currently parked awaiting capacity on some other
+        /// client's saturated outbound queue, rather than waiting on the client itself to send something.
+        /// </summary>
+        /// <remarks>
+        /// The heartbeat monitor treats a parked connection as alive. While the loop is parked it reads
+        /// nothing, so the client looks idle however healthy it is — and it cannot answer a ping the loop
+        /// is not there to read. Evicting it would punish a client for backpressure the hub itself chose
+        /// to apply, and behind a reconnector that becomes a reconnect loop. This is the same hazard the
+        /// constructor already warns about for a slow <see cref="GroupAuthoriser"/>, but here the hub
+        /// knows precisely when the loop is parked and for how long, so it can be exact rather than
+        /// merely warn. Incremented and decremented rather than set to a flag, so nested or repeated
+        /// parks on the same connection cannot have one unpark clear another's.
+        /// </remarks>
+        public bool IsAwaitingCapacity => Volatile.Read(ref _awaitingCapacityDepth) > 0;
+
+        /// <summary>
+        /// Marks the receive loop parked for the lifetime of the returned scope.
+        /// </summary>
+        public CapacityWaitScope BeginAwaitingCapacity()
+        {
+            Interlocked.Increment(ref _awaitingCapacityDepth);
+            return new CapacityWaitScope(this);
+        }
+
+        private void EndAwaitingCapacity()
+        {
+            Interlocked.Decrement(ref _awaitingCapacityDepth);
+        }
+
+        /// <summary>
+        /// Unparks the connection when disposed, so the park is released on every path out of the wait —
+        /// including cancellation and the timeout fallback.
+        /// </summary>
+        internal readonly struct CapacityWaitScope(ClientConnection connection) : IDisposable
+        {
+            public void Dispose()
+            {
+                connection.EndAwaitingCapacity();
+            }
         }
 
         /// <summary>

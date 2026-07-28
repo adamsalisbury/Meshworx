@@ -1,8 +1,8 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 1457756 (branch feature/message-ttl-expiry, PR #85, draft/open, not yet merged to main) — three commits on top of local main at 6bd05d4 (which is PR #84, feature/delivery-acknowledgements, merged), plus a merge of origin/main (which carries one further commit, PR #86 "test: align harness timeouts", not yet fast-forwarded into local main); working tree clean throughout this pass
-reconciled-to-date: 2026-07-27
+reconciled-to-commit: d89891d (branch feat/backpressure-signalling, PR #87, closing issue #30) — three commits on top of main at 43362b4 (which is PR #85, feature/message-ttl-expiry, merged); working tree clean throughout this pass
+reconciled-to-date: 2026-07-28
 mode: update
 -->
 
@@ -12,7 +12,95 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree, this pass:** branch `feature/message-ttl-expiry` (open **PR #85**, closing issue
+> **Documented tree, this pass:** branch `feat/backpressure-signalling` (**PR #87**, closing issue #30),
+> three commits (`67d744c`, `752e14e`, `d89891d`) on top of `main` at `43362b4` (`git merge-base main
+> feat/backpressure-signalling` confirmed equal to `main`'s own tip — `main` has advanced to `43362b4`,
+> "feat: per-message time-to-live (TTL) and expiry", which **is** the previous pass's PR #85 merged),
+> clean working tree throughout (`git status --porcelain` empty at both the start and end of this pass).
+> The second and third commits are fixes to the first, not separate features: "fix: stop queue-saturation
+> notifications disclosing unaddressed recipients" and "docs: state what awaiting capacity does and does
+> not guarantee the caller" (an XML-doc-comment-only change, no coordinate impact). Diffed with
+> `git diff main...HEAD --stat`: 17 files, 1054 insertions/24 deletions across library and test code —
+> `MeshHub.cs` (+305/−9), `MeshClient.cs` (+50/−7), `DeliveryOptions.cs` (+63/−8), `IMeshClient.cs`
+> (+30/−2), `IMeshHub.cs` (+14), two new files (`Messages/BackpressureHeaderKeys.cs`,
+> `Messages/SendRejectedEventArgs.cs`) and a new `QueueSaturatedEventArgs.cs` (root namespace, **not**
+> `.Messages`), plus `MeshHubOptions.cs`/`MeshHubServiceCollectionExtensions.cs` (+16 combined) and test
+> growth across five files. **No transport file is touched at all.**
+>
+> **This branch adds backpressure signalling for the hub's full-outbound-queue drop, replacing
+> silence with three independent, separately opt-in signals** — see
+> [known-issues.md](for-clanker/known-issues.md) KI-1 for the full write-up, and
+> [hub.md](for-clanker/hub.md#backpressure-signalling-and-awaiting-capacity) /
+> [client.md](for-clanker/client.md#backpressure-signalling) for the mechanics. In short: (1)
+> `MeshHub.QueueSaturated` — a new, always-raised in-process event, no opt-in, fired from all five
+> queue-full drop sites (`RouteMessage`, `RouteMessageWithHeaders`, `BroadcastMessage`, `SendToGroup`,
+> `SendToGroupWithHeaders`); (2) a new `0x15 QueueSaturated` wire opcode, opt-in via the new
+> `notifyOnQueueSaturation` constructor parameter (default `false`), sent to the sender **only** from the
+> two direct-send paths — deliberately never from the three fan-out paths, since their dropped
+> recipient's id comes from the hub's own registries rather than the sender, and echoing it back would
+> let a sender enumerate every connected client's id by broadcasting until somebody's queue filled;
+> `MeshClient` surfaces it as the new `SendRejected` event; (3) `DeliveryOptions.AwaitCapacity` (factory
+> `AwaitingCapacity()`, combinator `WithAwaitCapacity()`), opt-in per send, carried as a new reserved
+> header key (`mesh.await-capacity`, `Messages/BackpressureHeaderKeys.cs`) that only
+> `RouteMessageWithHeaders` (now `async`) honours — it awaits free capacity on the recipient's queue,
+> bounded by the new `backpressureAwaitTimeout` constructor parameter (default 30 s), before falling back
+> to the ordinary drop.
+>
+> **The capacity wait parks the sender's own receive loop, which forced a second, genuinely new
+> mechanism: exempting a parked connection from idle eviction.** `ClientConnection` gained
+> `IsAwaitingCapacity`/`BeginAwaitingCapacity()`/`CapacityWaitScope`; `MonitorHeartbeatAsync` now checks
+> `IsAwaitingCapacity` before the silent-interval counter and treats a park as liveness. This is the same
+> hazard class the constructor already warned about for a slow `GroupAuthoriser` (KI-28) — a client
+> parked awaiting an integrator callback also looks idle to the heartbeat monitor — but here the hub knows
+> precisely when and for how long the loop is parked, so it exempts it exactly rather than merely warning.
+> Two new known issues were recorded for consequences of this parking: **KI-48** (the park blocks this
+> sender's *other* traffic too, not just the one message — head-of-line blocking at the sender, bounded
+> by `backpressureAwaitTimeout`) and **KI-49** (combined with `RequireAck`, the two timeouts are
+> independent and enforced by different parties, so an ack timeout shorter than the hub's capacity wait
+> can report a send as failed that the hub delivers anyway — a retrying caller would duplicate it).
+>
+> **KI-1 needed a full rewrite, not a coordinate shift, since PR #87's whole point is that its central
+> claim ("silently drops") is no longer unconditionally true.** Corrected in place to "partly
+> addressed" — the drop remains the default when nothing opts in, and broadcast/group drops remain silent
+> to the sender by deliberate design — following the established "correct in place, note which pass got
+> it wrong" convention used for KI-2/KI-5/KI-9/KI-10/KI-20 before it. Its `Where` column also needed
+> updating regardless, since the routing methods it cites all moved in this diff.
+>
+> **This is the first PR to combine both the "numbered opcode" and "fourth route" additions in one
+> change**, worth noting in [index §6](#6-cross-cutting-conventions-imitate-these) as a new worked
+> example: `0x15 QueueSaturated` takes the numbered-opcode route (a genuine new opcode, additive within
+> version 5 the same way `GroupJoinRefused` was within version 3), while `AwaitCapacity` takes the fourth
+> route PR #83–#85 established (no opcode, no version bump, a narrow `HeaderEnvelope.TryReadValue` scan
+> at the one hub-side call site that needs it — PR #85's own precedent). Every prior PR since #83 asking
+> "which route" picked exactly one; this is the first to need both for one feature.
+>
+> **Coordinate shift, this pass: `MeshHub.cs` +285 net lines (2353 → 2638) across 20 separate insertion
+> points spread through nearly the entire file (climbing 0→+7→+9→+30→+32→+44→+46→+62→+65→+66→+178→+189→
+> +190→+197→+211→+231→+236→+239→+242→+243→+285), `MeshClient.cs` +38 net (1638 → 1676) across five, and
+> `IMeshClient.cs` +28 net (378 → 406) across two.** Given the blast radius, every `MeshHub.cs`/
+> `MeshClient.cs`/`IMeshClient.cs` coordinate in [hub.md](for-clanker/hub.md), [client.md](for-clanker/client.md),
+> [protocol.md](for-clanker/protocol.md), [types.md](for-clanker/types.md) and
+> [known-issues.md](for-clanker/known-issues.md) was re-derived this pass — not just the sections this
+> branch's own diff touches — using the same hunk-derived-offset-plus-content-equality technique
+> validated on every prior pass back to #64, with in-hunk coordinates resolved by hand against the
+> current source. [testing.md](for-clanker/testing.md) had only its Layout table's line counts and
+> descriptions updated for the files this branch touches, per the standing exemption from fully
+> re-deriving individual-test citations.
+>
+> **Several pre-existing wrong citations — not caused by this branch — were found and corrected while
+> re-pointing, all in [hub.md](for-clanker/hub.md)'s Metrics section**: a cluster of "recorded at every
+> drop site" bare citations had been off by a consistent −122 lines for at least one prior pass (each
+> resolved to real, plausible-looking code, so a range check could not have caught it), and several
+> "created" citations for individual instruments were off by one line each (pointing at the meter's own
+> creation rather than each counter's). [protocol.md](for-clanker/protocol.md) had two similar finds: a
+> `BroadcastMessage`-builds-`0x03` citation that pointed at unrelated `MonitorHeartbeatAsync` code, and a
+> registration-handshake citation range that was otherwise already correct. All ground-truthed directly
+> from the current source rather than shifted, per the standing "touching the file makes fixing it free"
+> rule — flagged inline where corrected rather than silently overwritten.
+>
+> ---
+>
+> **Documented tree (prior pass):** branch `feature/message-ttl-expiry` (**PR #85**, closing issue
 > #29), three commits (`5ee8bf4`, `c7738f9`, `1457756`) plus a merge commit (`c942327`, merging
 > `origin/main` — which carries one commit local `main` did not yet have, `aa955d7` "test: align harness
 > timeouts", **PR #86**, entirely test-infrastructure, no library file touched) on top of `main` at
@@ -645,6 +733,11 @@ rather than read directly, it says so.
 > `_groupAuthoriser` field and rewrote the group helpers wholesale, the `MeshHubTests.cs` set likewise
 > (PR #66 appended its tests but also added a `using`, shifting every pre-existing coordinate by one), and
 > the listener sets were re-pointed in full for PR #63 and remain untouched by PR #68, PR #71 or PR #72.
+>
+> **`MeshHub.cs`, `MeshClient.cs` and `IMeshClient.cs` were most recently re-pointed in full for PR #87**
+> (see the shift map at the top of this document), superseding every prior full re-pointing described
+> above — the gap this note has tracked since PR #73 remains closed. `MeshClientReconnector.cs` is
+> untouched by PR #87 and remains exactly as the PR #73 pass left it.
 
 ---
 
@@ -788,6 +881,7 @@ use the manual sequence directly; they do not go through the DI package.
 | Direct message with headers | `SendAsync(recipientId, payload, headers)` | PR #74; `headers` is a `MessageHeaders` — throws `NotSupportedException` unless negotiated at protocol version 5+; throws `ArgumentException` if `headers` contains a reserved request/reply/acknowledgement/expiry key (PR #83, extended by PR #84 and PR #85) |
 | Direct message with delivery acknowledgement | `SendAsync(recipientId, payload, DeliveryOptions.RequireAck(timeout))` | PR #84; awaits an end-to-end acknowledgement from the recipient's client, same version requirement as headers above — throws `TimeoutException` if none arrives (not proof of non-delivery, see KI-45), `InvalidOperationException` if the connection drops first; `DeliveryOptions.None` is identical to the plain overload; see [client.md](for-clanker/client.md#delivery-acknowledgement) |
 | Direct message with a time-to-live | `SendAsync(recipientId, payload, timeToLive)` | PR #85 (issue #29); throws `ArgumentOutOfRangeException` for a non-positive `timeToLive`; discarded by the hub or the recipient if not delivered within `timeToLive` — the sender is not notified either way; expiry is measured against the **sender's own clock**, no hub clock authority, see KI-47; see [client.md](for-clanker/client.md#message-expiry-time-to-live) |
+| Direct message that awaits capacity instead of dropping | `SendAsync(recipientId, payload, DeliveryOptions.AwaitingCapacity())` | PR #87 (issue #30); asks the hub to park and wait for room on a full recipient queue rather than drop immediately — does **not** itself make this call wait, only combined with `.WithAwaitCapacity()` on a `RequireAck` options value does; parks this sender's whole connection while waiting, see KI-48; combined with `RequireAck` the two timeouts are independent, see KI-49; see [client.md](for-clanker/client.md#backpressure-signalling) |
 | Request and await a reply | `RequestAsync(recipientId, payload, timeout)` | PR #83; correlated request/response over a direct message, same version requirement as headers above — throws `TimeoutException` on no reply, `InvalidOperationException` if the connection drops first; see [client.md](for-clanker/client.md#request-response) |
 | Answer a request | `ReplyAsync(request, payload)` | PR #83; `request` is the `MessageReceivedEventArgs` a `CorrelationId is not null` message arrived on |
 | Broadcast | `BroadcastAsync(payload)` | Every other client; never echoed to sender |
@@ -799,6 +893,7 @@ use the manual sequence directly; they do not go through the DI package.
 | Auto-reconnect | wrap in `MeshClientReconnector` | Re-establishes on drop; you restore app state |
 | Present a credential | `ConnectAsync(transport, name, credential)` | Opaque bytes; only meaningful if the hub has an `authenticator` |
 | Learn a join was refused | `GroupJoinRefused` event | Group already removed from `JoinedGroups` when it fires; not retried |
+| Learn a direct send was dropped for a full queue | `SendRejected` event | PR #87; only raised when the hub was constructed with `notifyOnQueueSaturation`, and only for a **direct** send — a broadcast/group drop never raises it, see KI-1; see [client.md](for-clanker/client.md#backpressure-signalling) |
 
 ---
 
@@ -925,8 +1020,12 @@ deadlocks or dropped messages that tests may not catch.
   monotonically increasing counter on every received frame; the monitor compares it between timer ticks.
   This avoids arming a `CancellationTokenSource`/timer per frame. Don't reintroduce per-frame timers.
 - **Bounded outbound queue (capacity 1024), `TryWrite` delivery.** If a recipient's queue is full,
-  the hub **drops the message and logs a warning** — it never blocks the router. This is intentional
-  back-pressure-by-dropping. See [known-issues.md](for-clanker/known-issues.md) KI-1.
+  the hub **drops the message and logs a warning**, by default — it never blocks the router. This is
+  intentional back-pressure-by-dropping. Since PR #87 (issue #30), a drop always raises
+  `QueueSaturated` in-process, optionally notifies a direct sender over the wire, and a direct sender may
+  opt into awaiting capacity instead via `DeliveryOptions.AwaitCapacity` — but that wait parks the
+  **sender's own connection**, not the router; the router itself still never blocks. See
+  [known-issues.md](for-clanker/known-issues.md) KI-1, KI-48.
 - **`SendLoopAsync`'s catch is load-bearing for cleanup ordering, not just logging.** It treats
   `IOException`/`ObjectDisposedException`/`ArgumentException` alike, cancelling the client rather than
   letting any of them propagate — an uncaught exception there would fault the task
@@ -952,7 +1051,7 @@ deadlocks or dropped messages that tests may not catch.
 There is **no config file, no environment variables, no external services**. Everything is configured
 through constructor parameters. The only ambient dependency is an `ILogger<T>` you supply.
 
-**`MeshHub` options** (`MeshHub.cs:178-273`, all optional):
+**`MeshHub` options** (`MeshHub.cs:187-421`, all optional):
 
 | Param | Default | Effect |
 |---|---|---|
@@ -965,6 +1064,8 @@ through constructor parameters. The only ambient dependency is an `ILogger<T>` y
 | `groupAuthoriser` | `null` (**any client may join any group**) | Decides whether each registered client may join a group; `false` → `GroupJoinRefused` to that client. Fails closed on throw, self-cancellation or timeout. Group **sends** require membership with or without this |
 | `groupAuthorisationTimeout` | 10 s | How long the hub waits for a decision before refusing. Bounds the **wait**, not the callback — see [known-issues.md](for-clanker/known-issues.md) KI-28. Ignored when `groupAuthoriser` is `null`; keep it below `heartbeatInterval × maxMissedHeartbeats` — now always relevant, since `heartbeatInterval` defaults to a real value |
 | `maxConnectionsPerRemoteEndpoint` | **100** (new in PR #68) | Caps connections accepted from one remote address at once, checked in the accept loop before any handshake — covers the pre-registration window `maxClients` does not. Only enforced for a transport reporting `IRemoteEndPointTransport.RemoteEndPoint`; an IPv6 address is masked to its `/64` first. Pass `int.MaxValue` to opt out. See [hub.md](for-clanker/hub.md#per-remote-endpoint-connection-cap) |
+| `notifyOnQueueSaturation` | `false` (new in PR #87) | Whether a direct-send sender is also told over the wire (`0x15 QueueSaturated`) when its recipient's queue was full. The in-process `QueueSaturated` event fires regardless of this flag; broadcast/group drops never produce the wire frame whatever this is set to. See [hub.md](for-clanker/hub.md#backpressure-signalling-and-awaiting-capacity) |
+| `backpressureAwaitTimeout` | 30 s (new in PR #87) | How long `RouteMessageWithHeaders` awaits free capacity for a sender that opted into `DeliveryOptions.AwaitCapacity`, before falling back to dropping. Pass `Timeout.InfiniteTimeSpan` to wait forever — logs a constructor warning, since a parked sender is exempt from idle eviction and this removes the only other bound. See KI-48 |
 
 > **Every `MeshHub` default is now finite (PR #68, issue #16).** A hub constructed with no arguments at
 > all — `new MeshHub(logger, listener)` — used to admit an unlimited number of clients and never evict an
@@ -1127,7 +1228,7 @@ which still needs the numbered-route treatment above. See
 [client.md](for-clanker/client.md#request-response), [client.md](for-clanker/client.md#delivery-acknowledgement),
 [protocol.md](for-clanker/protocol.md#request-response-headers) and
 [protocol.md](for-clanker/protocol.md#delivery-acknowledgement-headers). If you add reserved header keys
-of your own this way, guard them the same way `SendAsync` guards these six
+of your own this way, guard them the same way `SendAsync` guards these seven
 (`ThrowIfReservedHeaderKeyPresent`) — see [known-issues.md](for-clanker/known-issues.md) KI-42/KI-43/KI-46
 for what happens if you don't.
 
@@ -1145,6 +1246,20 @@ value (not just forward or strip the whole block) can follow this shape — add 
 decode. See [client.md](for-clanker/client.md#message-expiry-time-to-live),
 [protocol.md](for-clanker/protocol.md#message-expiry-headers) and
 [known-issues.md](for-clanker/known-issues.md) KI-47 for the clock-skew consequence this enables.
+
+**PR #87's backpressure signalling (issue #30) is split across both routes — worth understanding as the
+clearest illustration yet of where the line falls.** `DeliveryOptions.AwaitCapacity` is a fourth example
+of the fourth route, following PR #85's shape exactly: one new reserved header key
+(`mesh.await-capacity`, `Messages/BackpressureHeaderKeys.cs`), no opcode, no version bump, and the hub
+acts on it via its own narrow `HeaderEnvelope.TryReadValue` scan (`WantsAwaitCapacity`) rather than a
+general decode — see [hub.md](for-clanker/hub.md#backpressure-signalling-and-awaiting-capacity). But the
+**wire notification** the same PR adds, `0x15 QueueSaturated`, is **not** a fourth-route capability at
+all — it is a genuine new opcode, taking the numbered-route treatment at the top of this checklist (step
+1 onward), because it is hub → client only and needed no version bump for the reason
+[protocol.md's additive-opcodes rule](for-clanker/protocol.md#additive-opcodes-within-a-version)
+describes, the same route `GroupJoinRefused` took. **A single PR combining both routes is new**: prior
+PRs each committed to one route or the other; this is the worked example for a capability whose
+notification needs a real opcode while its request-side flag does not.
 
 **"Done" means:** `dotnet build Meshworx.slnx -c Release` clean (warnings are errors) **and**
 `dotnet test Meshworx.slnx` green. CI runs exactly this on push/PR to `main`
@@ -1176,9 +1291,10 @@ there is no publish step in CI — CI only builds and tests.
 
 ## 8. System-wide pitfalls (full detail in known-issues.md)
 
-- **Delivery is lossy by design.** Full outbound queue → dropped frame (logged). Unknown recipient →
-  dropped silently. No acks **for broadcast, group, or the plain/headers `SendAsync` overloads**. Do not
-  assume a message sent is a message received — except for the one opt-in exception below.
+- **Delivery is lossy by default.** Full outbound queue → dropped frame (logged and, since PR #87,
+  raised as `MeshHub.QueueSaturated` — see the backpressure bullet below). Unknown recipient → dropped
+  silently. No acks **for broadcast, group, or the plain/headers `SendAsync` overloads**. Do not
+  assume a message sent is a message received — except for the two opt-in exceptions below.
 - **A single direct send can opt into an end-to-end acknowledgement (PR #84), but it is a narrower
   guarantee than it sounds.** `SendAsync(recipientId, payload, DeliveryOptions.RequireAck(timeout))` waits
   for the recipient's client to raise `MessageReceived` and send back an acknowledgement. "Acknowledged"
@@ -1208,18 +1324,21 @@ there is no publish step in CI — CI only builds and tests.
   on the wire and works at any version. See [client.md](for-clanker/client.md#sending-headers).
 - **`MessageHeaders`'s constructor throws on a duplicate key** rather than keeping the last value like a
   plain `Dictionary` initializer would. De-duplicate your source before constructing one. KI-34.
-- **Six `MessageHeaders` keys are reserved — two for `RequestAsync`/`ReplyAsync` (PR #83), three more for
-  delivery acknowledgement (PR #84), one more for time-to-live (PR #85) — and none of them can be set
-  through `SendAsync`.** `"mesh.request-id"`/`"mesh.reply"` (`RequestReplyHeaderKeys`),
-  `"mesh.ack-id"`/`"mesh.ack-request"`/`"mesh.ack"` (`DeliveryAcknowledgementHeaderKeys`) and
-  `"mesh.expires-at"` (`MessageExpiryHeaderKeys`) now make `SendAsync`'s headers overload throw
-  `ArgumentException` if your own headers happen to use any of the six — a narrow but real breaking
-  change for any caller that already did. Request/response and delivery acknowledgement are pure
-  client-to-client conventions the hub cannot see or protect at all, and any inbound frame carrying
-  `mesh.reply=1` or `mesh.ack=1` is intercepted before `MessageReceived` whether or not it came from a
-  real `RequestAsync`/`RequireAck` call. **Time-to-live is the one exception to "the hub never decodes
-  header content"** — since PR #85 the hub scans (without fully decoding) for `mesh.expires-at`
-  specifically, to drop an already-expired frame before sending it; see the time-to-live bullet below.
+- **Seven `MessageHeaders` keys are reserved — two for `RequestAsync`/`ReplyAsync` (PR #83), three more
+  for delivery acknowledgement (PR #84), one more for time-to-live (PR #85), one more for backpressure
+  (PR #87) — and none of them can be set through `SendAsync`.**
+  `"mesh.request-id"`/`"mesh.reply"` (`RequestReplyHeaderKeys`),
+  `"mesh.ack-id"`/`"mesh.ack-request"`/`"mesh.ack"` (`DeliveryAcknowledgementHeaderKeys`),
+  `"mesh.expires-at"` (`MessageExpiryHeaderKeys`) and `"mesh.await-capacity"` (`BackpressureHeaderKeys`)
+  now make `SendAsync`'s headers overload throw `ArgumentException` if your own headers happen to use any
+  of the seven — a narrow but real breaking change for any caller that already did. Request/response and
+  delivery acknowledgement are pure client-to-client conventions the hub cannot see or protect at all, and
+  any inbound frame carrying `mesh.reply=1` or `mesh.ack=1` is intercepted before `MessageReceived`
+  whether or not it came from a real `RequestAsync`/`RequireAck` call. **Time-to-live and backpressure are
+  the two exceptions to "the hub never decodes header content"** — since PR #85 the hub scans (without
+  fully decoding) for `mesh.expires-at` to drop an already-expired frame before sending it, and since
+  PR #87 it scans for `mesh.await-capacity`, at enqueue rather than dequeue time, to decide whether to
+  park a sender awaiting room instead of dropping; see the time-to-live and backpressure bullets below.
   See [client.md](for-clanker/client.md#request-response),
   [client.md](for-clanker/client.md#delivery-acknowledgement), KI-42, KI-43, KI-44, KI-45, KI-46.
 - **A direct send can opt into a time-to-live (PR #85, issue #29), and the expiry clock is the sender's,
@@ -1236,6 +1355,19 @@ there is no publish step in CI — CI only builds and tests.
   expires) — the previously-reliable "routed − dropped = delivered, for direct sends" identity no longer
   holds unconditionally. See [client.md](for-clanker/client.md#message-expiry-time-to-live),
   [hub.md](for-clanker/hub.md#dropping-expired-frames), KI-32, KI-47.
+- **A full outbound queue is now signalled, not just dropped-and-logged (PR #87, issue #30) — but all
+  three signals are opt-in.** `MeshHub.QueueSaturated` (in-process) is the only one that is free: it fires
+  for every drop, every send shape, with no configuration. A direct send's sender additionally gets a
+  wire notification (`MeshClient.SendRejected`) only if the hub was built with `notifyOnQueueSaturation`
+  — **broadcast and group drops never produce this frame, by deliberate security design**: the dropped
+  recipient's id there comes from the hub's own registries, not the sender, and echoing it back would let
+  a sender enumerate every connected client's id by broadcasting until somebody's queue filled. Separately,
+  `DeliveryOptions.AwaitCapacity` on a direct send asks the hub to park and wait for room instead of
+  dropping — but this parks the **sender's whole connection**, so its other traffic queues up behind the
+  wait for up to `backpressureAwaitTimeout` (KI-48), and combined with `RequireAck` the two timeouts are
+  independent, so a caller can see a `TimeoutException` for a message the hub delivers anyway (KI-49). See
+  [client.md](for-clanker/client.md#backpressure-signalling),
+  [hub.md](for-clanker/hub.md#backpressure-signalling-and-awaiting-capacity), KI-1, KI-48, KI-49.
 - **`new TcpTransportListener(port)` / `new WebSocketTransportListener(port)` both bind loopback**, not
   every interface. Remote clients cannot reach a hub created that way; pass an explicit `IPEndPoint` to
   expose it deliberately.

@@ -58,6 +58,20 @@ public interface IMeshHub : IAsyncDisposable
     event EventHandler<ClientConnectionEventArgs> ClientDisconnected;
 
     /// <summary>
+    /// Raised whenever a message is dropped because the recipient's outbound queue was full, so
+    /// saturation is observable in-process even when no wire-level notification was configured.
+    /// </summary>
+    /// <remarks>
+    /// Raised from the client handler task that attempted the routing, so handlers may be invoked
+    /// concurrently for different senders and recipients and must be thread-safe. This is always raised,
+    /// for every shape of send — direct, broadcast and group alike — independently of whether the hub was
+    /// constructed with <c>notifyOnQueueSaturation</c>. That flag only controls whether the
+    /// <em>sender</em> is additionally told over the wire, which happens for directly addressed sends
+    /// only.
+    /// </remarks>
+    event EventHandler<QueueSaturatedEventArgs> QueueSaturated;
+
+    /// <summary>
     /// Gets the number of clients currently registered with the hub.
     /// </summary>
     /// <remarks>

@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using System.Diagnostics;
+using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.UnitTests.Fixtures;
 using Moq;
 
@@ -7,6 +9,11 @@ namespace AdamSalisbury.Meshworx.UnitTests;
 public sealed class MeshHubMetricsTests
 {
     private static readonly TimeSpan WaitTimeout = TestTimeouts.Wait;
+
+    // A short, fixed grace period used only to prove a background effect has *not* happened yet before
+    // deliberately triggering the condition that makes it happen — never used as a positive wait for
+    // something that must occur, which WaitUntilAsync/WaitTimeout cover instead.
+    private static readonly TimeSpan ShortGrace = TimeSpan.FromMilliseconds(200);
 
     private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
     {
@@ -216,6 +223,352 @@ public sealed class MeshHubMetricsTests
         // The recipient's receive loop is separately awaiting a fixed, never-completing Task — see
         // RegisterClientAsync — so it must be disconnected explicitly before StopAsync, or the hub's
         // shutdown would wait on that handler task forever.
+        var disposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        recipient.Disconnect();
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        await fixture.Hub.StopAsync();
+    }
+
+    // Backpressure signalling (#30)
+
+    /// <summary>
+    /// A message dropped because the recipient's outbound queue is full always raises
+    /// <see cref="IMeshHub.QueueSaturated"/>, regardless of whether the hub was configured to also notify
+    /// the sender over the wire — the acceptance criterion that saturation must be observable, not
+    /// swallowed.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task RouteMessage_RecipientQueueFull_RaisesQueueSaturatedEvent()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient");
+
+        var saturatedTcs = new TaskCompletionSource<QueueSaturatedEventArgs>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Hub.QueueSaturated += (_, e) => saturatedTcs.TrySetResult(e);
+
+        var sendCalledTcs = new TaskCompletionSource();
+        var blockedSendTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback(() => sendCalledTcs.TrySetResult())
+            .Returns(blockedSendTcs.Task);
+
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        await sendCalledTcs.Task.WaitAsync(WaitTimeout);
+
+        for (int i = 0; i < MeshHub.OutboundQueueCapacityForTesting; i++)
+        {
+            Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        }
+
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [1]));
+
+        QueueSaturatedEventArgs saturated = await saturatedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(sender.Id, saturated.SenderId);
+        Assert.Equal(recipient.Id, saturated.RecipientId);
+
+        blockedSendTcs.TrySetResult();
+
+        var disposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        recipient.Disconnect();
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// By default (<c>notifyOnQueueSaturation</c> left at its default of <see langword="false"/>), a
+    /// sender whose message was dropped for queue-full receives nothing over the wire beyond what it
+    /// would have received before this feature existed — the fire-and-forget default is unchanged.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task RouteMessage_RecipientQueueFull_DefaultDoesNotNotifySenderOverTheWire()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var senderFrames = new FrameRecorder(sender.Transport);
+        var recipient = await fixture.RegisterClientAsync("Recipient");
+
+        var sendCalledTcs = new TaskCompletionSource();
+        var blockedSendTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback(() => sendCalledTcs.TrySetResult())
+            .Returns(blockedSendTcs.Task);
+
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        await sendCalledTcs.Task.WaitAsync(WaitTimeout);
+
+        for (int i = 0; i < MeshHub.OutboundQueueCapacityForTesting; i++)
+        {
+            Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        }
+
+        using var droppedCapture = new MetricsCapture<long>(
+            fixture.Hub.GetMeterForTesting(), "meshworx.hub.messages.dropped");
+
+        // A second message sent afterwards, on the same connection, that the hub certainly does route —
+        // its arrival at a fresh recipient proves the queue-full path above ran and completed first, so
+        // senderFrames has already seen everything the drop could possibly have produced. Waiting on the
+        // absence of a frame is never deterministic on its own (see FrameRecorder's own remarks); pairing
+        // it with a frame the hub certainly will send afterwards on the same connection is what makes it
+        // provable.
+        var second = await fixture.RegisterClientAsync("Second");
+        var secondFrames = new FrameRecorder(second.Transport);
+
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [1]));
+        await WaitUntilAsync(() => droppedCapture.Values.Count > 0, WaitTimeout);
+
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(second.Id, [9]));
+        await secondFrames.WaitForAsync(f => f.Length > 0 && f[0] == 0x03).WaitAsync(WaitTimeout); // DeliverMessage
+
+        int droppedIndex = droppedCapture.Values.ToList().IndexOf(1L);
+        Assert.Equal("queue-full", TagValue(droppedCapture.Tags[droppedIndex], "reason"));
+        Assert.DoesNotContain(senderFrames.Frames, f => f.Length > 0 && f[0] == 0x15); // QueueSaturated
+
+        blockedSendTcs.TrySetResult();
+
+        var disposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        recipient.Disconnect();
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+        second.Disconnect();
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// With <c>notifyOnQueueSaturation</c> enabled, the sender is sent a
+    /// <see cref="MessageType.QueueSaturated"/> control frame naming the saturated recipient.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task RouteMessage_RecipientQueueFull_NotifyEnabled_SendsQueueSaturatedFrameToSender()
+    {
+        var fixture = new MeshHubFixture(notifyOnQueueSaturation: true);
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient");
+        var senderFrames = new FrameRecorder(sender.Transport);
+
+        var sendCalledTcs = new TaskCompletionSource();
+        var blockedSendTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback(() => sendCalledTcs.TrySetResult())
+            .Returns(blockedSendTcs.Task);
+
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        await sendCalledTcs.Task.WaitAsync(WaitTimeout);
+
+        for (int i = 0; i < MeshHub.OutboundQueueCapacityForTesting; i++)
+        {
+            Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        }
+
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [1]));
+
+        byte[] nack = await senderFrames.WaitForAsync(f => f.Length > 0 && f[0] == 0x15) // QueueSaturated
+            .WaitAsync(WaitTimeout);
+
+        Assert.Equal(recipient.Id, new Guid(nack.AsSpan(1, 16)));
+
+        blockedSendTcs.TrySetResult();
+
+        var disposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        recipient.Disconnect();
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A broadcast dropped for a full queue raises the in-process event but never sends the sender a
+    /// QueueSaturated frame, even with <c>notifyOnQueueSaturation</c> enabled. The sender never named
+    /// that recipient — the hub found it in its own registry — so echoing its id back would let any
+    /// client enumerate every connected client's id simply by broadcasting until a queue filled.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task BroadcastMessage_RecipientQueueFull_NotifyEnabled_RaisesEventButSendsNoFrame()
+    {
+        var fixture = new MeshHubFixture(notifyOnQueueSaturation: true);
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var senderFrames = new FrameRecorder(sender.Transport);
+        var recipient = await fixture.RegisterClientAsync("Recipient");
+
+        var saturatedTcs = new TaskCompletionSource<QueueSaturatedEventArgs>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Hub.QueueSaturated += (_, e) => saturatedTcs.TrySetResult(e);
+
+        var sendCalledTcs = new TaskCompletionSource();
+        var blockedSendTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback(() => sendCalledTcs.TrySetResult())
+            .Returns(blockedSendTcs.Task);
+
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        await sendCalledTcs.Task.WaitAsync(WaitTimeout);
+
+        for (int i = 0; i < MeshHub.OutboundQueueCapacityForTesting; i++)
+        {
+            Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        }
+
+        var broadcastFrame = new byte[2];
+        broadcastFrame[0] = 0x0B; // BroadcastMessage
+        broadcastFrame[1] = 1;
+        sender.EnqueueMessage(broadcastFrame);
+
+        // The hub-side event still fires, naming the saturated recipient — the operator is trusted with
+        // that; only the wire notification is withheld.
+        QueueSaturatedEventArgs saturated = await saturatedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(recipient.Id, saturated.RecipientId);
+
+        // A directly addressed send to a third client afterwards, on the same connection, is delivered —
+        // proving the broadcast drop above has been fully processed, so anything it was going to send
+        // back to the sender has already been recorded.
+        var third = await fixture.RegisterClientAsync("Third");
+        var thirdFrames = new FrameRecorder(third.Transport);
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(third.Id, [9]));
+        await thirdFrames.WaitForAsync(f => f.Length > 0 && f[0] == 0x03).WaitAsync(WaitTimeout);
+
+        Assert.DoesNotContain(senderFrames.Frames, f => f.Length > 0 && f[0] == 0x15); // QueueSaturated
+
+        blockedSendTcs.TrySetResult();
+
+        var disposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        recipient.Disconnect();
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+        third.Disconnect();
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A direct send that opted into <see cref="DeliveryOptions.AwaitCapacity"/> (carried as the
+    /// <c>mesh.await-capacity</c> header) is not dropped when the recipient's queue is momentarily full:
+    /// the hub awaits capacity, and once the slow consumer drains a slot the message is delivered —
+    /// proving no loss under a slow consumer, the acceptance criterion for the opt-in blocking mode.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task RouteMessageWithHeaders_AwaitCapacityRequested_DeliversOnceSlowConsumerDrainsASlot()
+    {
+        var fixture = new MeshHubFixture(backpressureAwaitTimeout: TimeSpan.FromSeconds(30));
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient", versionMin: 5, versionMax: 5);
+
+        using var droppedCapture = new MetricsCapture<long>(
+            fixture.Hub.GetMeterForTesting(), "meshworx.hub.messages.dropped");
+
+        // Simulate a slow consumer: the send loop dequeues one frame and gets stuck delivering it, so
+        // nothing else drains until releaseTcs is completed below. The same mock also records the
+        // eventually delivered frame — set up once, rather than layering a FrameRecorder on top, since a
+        // later Moq Setup on the same method replaces an earlier one rather than composing with it.
+        var sendCalledTcs = new TaskCompletionSource();
+        var releaseTcs = new TaskCompletionSource();
+        var deliveredTcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns<ReadOnlyMemory<byte>, CancellationToken>(async (data, _) =>
+            {
+                byte[] frame = data.ToArray();
+                sendCalledTcs.TrySetResult();
+                await releaseTcs.Task.ConfigureAwait(false);
+
+                if (frame.Length > 0 && frame[0] == 0x12) // DeliverMessageWithHeaders
+                {
+                    deliveredTcs.TrySetResult(frame);
+                }
+            });
+
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        await sendCalledTcs.Task.WaitAsync(WaitTimeout);
+
+        for (int i = 0; i < MeshHub.OutboundQueueCapacityForTesting; i++)
+        {
+            Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        }
+
+        var headers = new MessageHeaders([new(BackpressureHeaderKeys.AwaitCapacity, "1")]);
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessageWithHeaders(recipient.Id, headers, [42]));
+
+        // Give the awaited write every opportunity to (wrongly) resolve as a drop before capacity frees.
+        await Task.Delay(ShortGrace);
+        Assert.Empty(droppedCapture.Values);
+
+        // Free exactly one slot; the awaited write should claim it and the message should be delivered.
+        releaseTcs.TrySetResult();
+
+        byte[] delivered = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(delivered.AsSpan(17, 2));
+        Assert.Equal(new byte[] { 42 }, delivered[(19 + headerLength)..]);
+        Assert.Empty(droppedCapture.Values);
+
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// When capacity does not free up before <c>backpressureAwaitTimeout</c> elapses, an await-capacity
+    /// send falls back to the ordinary drop-on-full behaviour rather than blocking the sender's receive
+    /// loop indefinitely.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task RouteMessageWithHeaders_AwaitCapacityRequested_FallsBackToDropAfterTimeout()
+    {
+        var fixture = new MeshHubFixture(backpressureAwaitTimeout: ShortGrace);
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient", versionMin: 5, versionMax: 5);
+
+        using var droppedCapture = new MetricsCapture<long>(
+            fixture.Hub.GetMeterForTesting(), "meshworx.hub.messages.dropped");
+
+        var sendCalledTcs = new TaskCompletionSource();
+        var blockedSendTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback(() => sendCalledTcs.TrySetResult())
+            .Returns(blockedSendTcs.Task);
+
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        await sendCalledTcs.Task.WaitAsync(WaitTimeout);
+
+        for (int i = 0; i < MeshHub.OutboundQueueCapacityForTesting; i++)
+        {
+            Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        }
+
+        var headers = new MessageHeaders([new(BackpressureHeaderKeys.AwaitCapacity, "1")]);
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessageWithHeaders(recipient.Id, headers, [7]));
+
+        await WaitUntilAsync(() => droppedCapture.Values.Count > 0, WaitTimeout);
+        int droppedIndex = droppedCapture.Values.ToList().IndexOf(1L);
+        Assert.Equal("queue-full", TagValue(droppedCapture.Tags[droppedIndex], "reason"));
+
+        blockedSendTcs.TrySetResult();
+
         var disposedTcs = new TaskCompletionSource();
         recipient.Transport.Setup(t => t.DisposeAsync())
             .Callback(() => disposedTcs.TrySetResult())
