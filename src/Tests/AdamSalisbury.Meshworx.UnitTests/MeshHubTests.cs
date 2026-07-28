@@ -2560,6 +2560,133 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    // Priority lanes (#31)
+
+    /// <summary>
+    /// A high-priority frame queued behind a whole backlog of normal-priority frames is still delivered
+    /// ahead of every one of them, satisfying issue #31's first acceptance criterion end to end through
+    /// the hub's send loop. The backlog is driven directly via <see cref="MeshHub.TryQueueRawFrameForTesting(Guid, byte[], MessagePriority)"/>
+    /// rather than racing real sends through the wire, mirroring the technique
+    /// <see cref="HandleClient_ParkedAwaitingCapacity_IsNotEvictedForLookingIdle"/> already uses to drive
+    /// the outbound queue to a specific state deterministically.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task SendLoop_HighPriorityFrameQueuedAfterNormalBacklog_IsDeliveredFirst()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var recipient = await fixture.RegisterClientAsync("Recipient", versionMin: 5, versionMax: 5);
+
+        var recordedFramesLock = new Lock();
+        var recordedFrames = new List<byte[]>();
+        var sendCalledTcs = new TaskCompletionSource();
+        var blockedSendTcs = new TaskCompletionSource();
+        var lastBacklogFrameSentTcs = new TaskCompletionSource();
+
+        const int BacklogSize = 10;
+        const byte LastBacklogTag = 0x10 + BacklogSize - 1;
+
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                byte[] frame = data.ToArray();
+
+                lock (recordedFramesLock)
+                {
+                    recordedFrames.Add(frame);
+                }
+
+                sendCalledTcs.TrySetResult();
+
+                if (frame is [LastBacklogTag])
+                {
+                    lastBacklogFrameSentTcs.TrySetResult();
+                }
+            })
+            .Returns(blockedSendTcs.Task);
+
+        // The very first frame parks the send loop mid-send, before the backlog below exists. Queued at
+        // Low priority deliberately: the send loop's anti-starvation cycle resumes exactly where a yield
+        // left it, and a low-lane yield is the one spot in that cycle that falls straight through to the
+        // top of the next pass rather than leaving the enumerator mid-way through a burst — a Normal- or
+        // High-priority park frame would instead leave it parked partway through that lane's burst
+        // counter, letting a few more same-priority frames slip out before the newly queued high-priority
+        // frame is even reconsidered. Using Low here isolates the assertion below to the guarantee the
+        // acceptance criterion actually asks for, rather than an artefact of which lane happened to hold
+        // the frame that was already in flight when the backlog was queued.
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xAA], MessagePriority.Low));
+        await sendCalledTcs.Task.WaitAsync(WaitTimeout);
+
+        // Queue a backlog of normal-priority frames, then a single high-priority frame enqueued last,
+        // while the send loop is still parked and cannot drain any of them yet.
+        for (int i = 0; i < BacklogSize; i++)
+        {
+            Assert.True(fixture.Hub.TryQueueRawFrameForTesting(
+                recipient.Id, [(byte)(0x10 + i)], MessagePriority.Normal));
+        }
+
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFE], MessagePriority.High));
+
+        blockedSendTcs.TrySetResult();
+
+        // The backlog drains in FIFO order relative to itself, so the last backlog frame arriving proves
+        // every earlier frame — including the high-priority one, if it overtook the backlog as expected —
+        // has already been sent, mirroring FrameRecorder's own documented technique.
+        await lastBacklogFrameSentTcs.Task.WaitAsync(WaitTimeout);
+
+        byte[][] snapshot;
+        lock (recordedFramesLock)
+        {
+            snapshot = [.. recordedFrames];
+        }
+
+        int highIndex = Array.FindIndex(snapshot, f => f is [0xFE]);
+        int firstNormalIndex = Array.FindIndex(snapshot, f => f.Length == 1 && f[0] is >= 0x10 and < 0x10 + BacklogSize);
+
+        Assert.True(highIndex >= 0, "The high-priority frame was never delivered.");
+        Assert.True(firstNormalIndex >= 0, "No normal-priority backlog frame was ever delivered.");
+        Assert.True(
+            highIndex < firstNormalIndex,
+            "The high-priority frame did not overtake the normal-priority backlog it was queued behind.");
+
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A genuine <c>mesh.priority</c> header, sent over the wire rather than injected directly onto the
+    /// outbound queue, is parsed correctly and does not disrupt ordinary delivery — proving
+    /// <c>ReadPriority</c> is wired into <see cref="MeshHub"/>'s real header-bearing routing path, not
+    /// just exercised by the deterministic queue-injection test above.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task RouteMessageWithHeaders_PriorityHeaderOverWire_DeliversPayloadUnaffected()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender", versionMin: 5, versionMax: 5);
+        var recipient = await fixture.RegisterClientAsync("Recipient", versionMin: 5, versionMax: 5);
+
+        var deliveredTcs = new TaskCompletionSource<byte[]>();
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => deliveredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        var headers = new MessageHeaders([new(MessagePriorityHeaderKeys.Priority, "high")]);
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessageWithHeaders(recipient.Id, headers, [0x42]));
+
+        byte[] delivered = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x12, delivered[0]); // DeliverMessageWithHeaders
+        Assert.Equal(0x42, delivered[^1]);
+
+        sender.Disconnect();
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     /// <summary>
     /// A silent client is evicted on the maxMissedHeartbeats'th consecutive idle interval, not the one
     /// after it. The hub therefore probes it exactly maxMissedHeartbeats minus one times before

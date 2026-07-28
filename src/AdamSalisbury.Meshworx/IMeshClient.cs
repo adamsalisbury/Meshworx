@@ -288,6 +288,30 @@ public interface IMeshClient : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends a message to every other member of the named group at the given priority, so it can
+    /// overtake a backlog of lower-priority traffic already queued for the same recipients.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget, mirroring
+    /// <see cref="SendToGroupAsync(string, ReadOnlyMemory{byte}, CancellationToken)"/>. Passing
+    /// <see cref="MessagePriority.Normal"/> is equivalent to calling the overload without a priority.
+    /// </remarks>
+    /// <param name="groupName">The name of the group to send to.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="priority">The priority to queue this send at on each recipient's outbound queue.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="priority"/> is not <see cref="MessagePriority.Normal"/> but the hub negotiated a
+    /// protocol version that predates the header envelope.
+    /// </exception>
+    Task SendToGroupAsync(
+        string groupName,
+        ReadOnlyMemory<byte> message,
+        MessagePriority priority,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Queries the hub for a client's Id based on its name
     /// </summary>
     /// <param name="name">The name of the client for which the Id should be retrieved.</param>

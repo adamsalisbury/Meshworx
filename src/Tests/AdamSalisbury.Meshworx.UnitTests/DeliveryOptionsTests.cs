@@ -1,3 +1,5 @@
+using AdamSalisbury.Meshworx.Messages;
+
 namespace AdamSalisbury.Meshworx.UnitTests;
 
 public sealed class DeliveryOptionsTests
@@ -90,6 +92,47 @@ public sealed class DeliveryOptionsTests
     {
         DeliveryOptions first = DeliveryOptions.None;
         DeliveryOptions second = DeliveryOptions.AwaitingCapacity();
+
+        Assert.NotEqual(first, second);
+        Assert.False(first == second);
+        Assert.True(first != second);
+    }
+
+    [Fact]
+    public void None_IsNormalPriority()
+    {
+        Assert.Equal(MessagePriority.Normal, DeliveryOptions.None.Priority);
+    }
+
+    [Fact]
+    public void AtPriority_SetsPriorityWithoutRequiringAcknowledgementOrCapacity()
+    {
+        DeliveryOptions options = DeliveryOptions.AtPriority(MessagePriority.High);
+
+        Assert.Equal(MessagePriority.High, options.Priority);
+        Assert.False(options.RequireAcknowledgement);
+        Assert.False(options.AwaitCapacity);
+        Assert.Null(options.AcknowledgementTimeout);
+    }
+
+    [Fact]
+    public void WithPriority_OnRequireAckWithAwaitCapacity_KeepsExistingOptionsAndAddsPriority()
+    {
+        DeliveryOptions options = DeliveryOptions.RequireAck(TimeSpan.FromSeconds(5))
+            .WithAwaitCapacity()
+            .WithPriority(MessagePriority.Low);
+
+        Assert.True(options.RequireAcknowledgement);
+        Assert.Equal(TimeSpan.FromSeconds(5), options.AcknowledgementTimeout);
+        Assert.True(options.AwaitCapacity);
+        Assert.Equal(MessagePriority.Low, options.Priority);
+    }
+
+    [Fact]
+    public void Equality_DifferentPriority_AreNotEqual()
+    {
+        DeliveryOptions first = DeliveryOptions.AtPriority(MessagePriority.High);
+        DeliveryOptions second = DeliveryOptions.AtPriority(MessagePriority.Low);
 
         Assert.NotEqual(first, second);
         Assert.False(first == second);

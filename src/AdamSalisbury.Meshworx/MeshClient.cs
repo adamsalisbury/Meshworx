@@ -398,18 +398,28 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     {
         if (!options.RequireAcknowledgement)
         {
-            if (!options.AwaitCapacity)
+            if (!options.AwaitCapacity && options.Priority == MessagePriority.Normal)
             {
                 await SendAsync(recipientId, message, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
-            var awaitCapacityHeaders = new MessageHeaders(
-            [
-                new KeyValuePair<string, string>(BackpressureHeaderKeys.AwaitCapacity, "1"),
-            ]);
+            List<KeyValuePair<string, string>> plainHeaderEntries = [];
 
-            await SendCoreAsync(recipientId, message, awaitCapacityHeaders, cancellationToken).ConfigureAwait(false);
+            if (options.AwaitCapacity)
+            {
+                plainHeaderEntries.Add(new KeyValuePair<string, string>(BackpressureHeaderKeys.AwaitCapacity, "1"));
+            }
+
+            if (options.Priority != MessagePriority.Normal)
+            {
+                plainHeaderEntries.Add(new KeyValuePair<string, string>(
+                    MessagePriorityHeaderKeys.Priority, MessagePriorityHeaderKeys.ToHeaderValue(options.Priority)));
+            }
+
+            var plainHeaders = new MessageHeaders(plainHeaderEntries);
+
+            await SendCoreAsync(recipientId, message, plainHeaders, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -434,6 +444,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             if (options.AwaitCapacity)
             {
                 headerEntries.Add(new KeyValuePair<string, string>(BackpressureHeaderKeys.AwaitCapacity, "1"));
+            }
+
+            if (options.Priority != MessagePriority.Normal)
+            {
+                headerEntries.Add(new KeyValuePair<string, string>(
+                    MessagePriorityHeaderKeys.Priority, MessagePriorityHeaderKeys.ToHeaderValue(options.Priority)));
             }
 
             var headers = new MessageHeaders(headerEntries);
@@ -554,6 +570,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         DeliveryAcknowledgementHeaderKeys.Ack,
         MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
         BackpressureHeaderKeys.AwaitCapacity,
+        MessagePriorityHeaderKeys.Priority,
     ];
 
     /// <summary>
@@ -570,7 +587,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             {
                 throw new ArgumentException(
                     $"The header key '{reservedKey}' is reserved for a built-in helper (request/response, "
-                    + "delivery acknowledgement, time-to-live, or backpressure) and cannot be set directly.",
+                    + "delivery acknowledgement, time-to-live, backpressure, or priority) and cannot be set "
+                    + "directly.",
                     nameof(headers));
             }
         }
@@ -709,6 +727,27 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
 
         await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public Task SendToGroupAsync(
+        string groupName,
+        ReadOnlyMemory<byte> message,
+        MessagePriority priority,
+        CancellationToken cancellationToken = default)
+    {
+        if (priority == MessagePriority.Normal)
+        {
+            // No header block is written at all — byte-for-byte identical to the headerless overload.
+            return SendToGroupAsync(groupName, message, cancellationToken);
+        }
+
+        var headers = new MessageHeaders(
+        [
+            new KeyValuePair<string, string>(MessagePriorityHeaderKeys.Priority, MessagePriorityHeaderKeys.ToHeaderValue(priority)),
+        ]);
+
+        return SendToGroupAsync(groupName, message, headers, cancellationToken);
     }
 
     /// <summary>
