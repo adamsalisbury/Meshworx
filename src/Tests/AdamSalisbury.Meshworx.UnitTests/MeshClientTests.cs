@@ -1958,6 +1958,96 @@ public sealed class MeshClientTests
         Assert.Equal(1, sendCount);
     }
 
+    // SendAsync(DeliveryOptions.AwaitCapacity) / QueueSaturated (#30)
+
+    /// <summary>
+    /// DeliveryOptions.AwaitingCapacity() carries the await-capacity header and no acknowledgement
+    /// request, distinct from DeliveryOptions.RequireAck.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_AwaitingCapacity_SendsAwaitCapacityHeader()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, DeliveryOptions.AwaitingCapacity());
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x11, sentData[0]); // SendMessageWithHeaders
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(17, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(sentData.AsSpan(19), headerLength);
+        Assert.Equal("1", decoded[BackpressureHeaderKeys.AwaitCapacity]);
+        Assert.False(decoded.ContainsKey(DeliveryAcknowledgementHeaderKeys.Request));
+    }
+
+    /// <summary>
+    /// DeliveryOptions.RequireAck(...).WithAwaitCapacity() carries both the acknowledgement-request
+    /// headers and the await-capacity header on the same send.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_RequireAckWithAwaitCapacity_SendsBothHeaders()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        Task sendTask = fixture.Client.SendAsync(
+            Guid.NewGuid(),
+            new byte[] { 1 },
+            DeliveryOptions.RequireAck(TimeSpan.FromSeconds(5)).WithAwaitCapacity());
+
+        await Task.Delay(50);
+
+        Assert.NotNull(sentData);
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(17, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(sentData.AsSpan(19), headerLength);
+        Assert.Equal("1", decoded[DeliveryAcknowledgementHeaderKeys.Request]);
+        Assert.Equal("1", decoded[BackpressureHeaderKeys.AwaitCapacity]);
+
+        _ = sendTask; // Deliberately left pending; the client is disposed with the fixture's scope.
+    }
+
+    /// <summary>
+    /// A QueueSaturated control frame from the hub raises SendRejected, naming the recipient whose queue
+    /// was full, so an application can observe a drop the hub was configured to report.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task QueueSaturatedFrame_FromHub_RaisesSendRejectedEvent()
+    {
+        var fixture = new MeshClientFixture();
+        var inbound = Channel.CreateUnbounded<byte[]?>();
+        inbound.Writer.TryWrite(fixture.CreateRegistrationResponse());
+
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        fixture.Transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .Returns<CancellationToken>(async ct => await inbound.Reader.ReadAsync(ct));
+
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "Alice");
+
+        var rejectedTcs = new TaskCompletionSource<SendRejectedEventArgs>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        fixture.Client.SendRejected += (_, e) => rejectedTcs.TrySetResult(e);
+
+        var saturatedRecipientId = Guid.NewGuid();
+        var frame = new byte[17];
+        frame[0] = 0x15; // QueueSaturated
+        saturatedRecipientId.TryWriteBytes(frame.AsSpan(1));
+        inbound.Writer.TryWrite(frame);
+
+        SendRejectedEventArgs rejected = await rejectedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(saturatedRecipientId, rejected.RecipientId);
+    }
+
     // SendAsync(TimeSpan) / message expiry
 
     /// <summary>

@@ -58,4 +58,41 @@ public sealed class DeliveryOptionsTests
         Assert.False(first == second);
         Assert.True(first != second);
     }
+
+    [Fact]
+    public void None_DoesNotAwaitCapacity()
+    {
+        Assert.False(DeliveryOptions.None.AwaitCapacity);
+    }
+
+    [Fact]
+    public void AwaitingCapacity_SetsAwaitCapacityWithoutRequiringAcknowledgement()
+    {
+        DeliveryOptions options = DeliveryOptions.AwaitingCapacity();
+
+        Assert.True(options.AwaitCapacity);
+        Assert.False(options.RequireAcknowledgement);
+        Assert.Null(options.AcknowledgementTimeout);
+    }
+
+    [Fact]
+    public void WithAwaitCapacity_OnRequireAck_KeepsAcknowledgementAndAddsAwaitCapacity()
+    {
+        DeliveryOptions options = DeliveryOptions.RequireAck(TimeSpan.FromSeconds(5)).WithAwaitCapacity();
+
+        Assert.True(options.RequireAcknowledgement);
+        Assert.Equal(TimeSpan.FromSeconds(5), options.AcknowledgementTimeout);
+        Assert.True(options.AwaitCapacity);
+    }
+
+    [Fact]
+    public void Equality_DifferentAwaitCapacity_AreNotEqual()
+    {
+        DeliveryOptions first = DeliveryOptions.None;
+        DeliveryOptions second = DeliveryOptions.AwaitingCapacity();
+
+        Assert.NotEqual(first, second);
+        Assert.False(first == second);
+        Assert.True(first != second);
+    }
 }

@@ -12,10 +12,11 @@ namespace AdamSalisbury.Meshworx;
 /// </remarks>
 public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
 {
-    private DeliveryOptions(bool requireAcknowledgement, TimeSpan? acknowledgementTimeout)
+    private DeliveryOptions(bool requireAcknowledgement, TimeSpan? acknowledgementTimeout, bool awaitCapacity)
     {
         RequireAcknowledgement = requireAcknowledgement;
         AcknowledgementTimeout = acknowledgementTimeout;
+        AwaitCapacity = awaitCapacity;
     }
 
     /// <summary>
@@ -37,6 +38,13 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     public TimeSpan? AcknowledgementTimeout { get; }
 
     /// <summary>
+    /// Gets a value indicating whether the hub should await capacity on the recipient's outbound queue,
+    /// rather than dropping the message immediately, if that queue is full at the moment the message is
+    /// routed.
+    /// </summary>
+    public bool AwaitCapacity { get; }
+
+    /// <summary>
     /// Requests a delivery acknowledgement: the send completes once the recipient's client has handed
     /// the message to its application, or fails with a <see cref="TimeoutException"/> if that does not
     /// happen within <paramref name="timeout"/>.
@@ -50,14 +58,35 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
             throw new ArgumentOutOfRangeException(nameof(timeout), "The acknowledgement timeout must be positive.");
         }
 
-        return new DeliveryOptions(requireAcknowledgement: true, acknowledgementTimeout: timeout);
+        return new DeliveryOptions(requireAcknowledgement: true, acknowledgementTimeout: timeout, awaitCapacity: false);
+    }
+
+    /// <summary>
+    /// Requests that the hub await capacity on the recipient's outbound queue instead of dropping the
+    /// message immediately, turning a persistently slow recipient into backpressure on this send rather
+    /// than silent loss. Only a direct send to a single recipient honours this — a broadcast or group
+    /// send never blocks its whole fan-out on one slow member.
+    /// </summary>
+    public static DeliveryOptions AwaitingCapacity()
+    {
+        return new DeliveryOptions(requireAcknowledgement: false, acknowledgementTimeout: null, awaitCapacity: true);
+    }
+
+    /// <summary>
+    /// Returns a copy of these options with <see cref="AwaitCapacity"/> also set, so a single send can
+    /// both require an acknowledgement and await capacity on the recipient's queue.
+    /// </summary>
+    public DeliveryOptions WithAwaitCapacity()
+    {
+        return new DeliveryOptions(RequireAcknowledgement, AcknowledgementTimeout, awaitCapacity: true);
     }
 
     /// <inheritdoc/>
     public bool Equals(DeliveryOptions other)
     {
         return RequireAcknowledgement == other.RequireAcknowledgement
-            && AcknowledgementTimeout == other.AcknowledgementTimeout;
+            && AcknowledgementTimeout == other.AcknowledgementTimeout
+            && AwaitCapacity == other.AwaitCapacity;
     }
 
     /// <inheritdoc/>
@@ -69,7 +98,7 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// <inheritdoc/>
     public override int GetHashCode()
     {
-        return HashCode.Combine(RequireAcknowledgement, AcknowledgementTimeout);
+        return HashCode.Combine(RequireAcknowledgement, AcknowledgementTimeout, AwaitCapacity);
     }
 
     /// <summary>

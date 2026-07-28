@@ -27,7 +27,9 @@ internal sealed class MeshHubFixture
         int? maxConcurrentAuthentications = null,
         GroupAuthoriser? groupAuthoriser = null,
         TimeSpan? groupAuthorisationTimeout = null,
-        int? maxConnectionsPerRemoteEndpoint = null)
+        int? maxConnectionsPerRemoteEndpoint = null,
+        bool notifyOnQueueSaturation = false,
+        TimeSpan? backpressureAwaitTimeout = null)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -53,7 +55,9 @@ internal sealed class MeshHubFixture
             maxConcurrentAuthentications,
             groupAuthoriser,
             groupAuthorisationTimeout,
-            maxConnectionsPerRemoteEndpoint);
+            maxConnectionsPerRemoteEndpoint,
+            notifyOnQueueSaturation,
+            backpressureAwaitTimeout);
     }
 
     /// <summary>

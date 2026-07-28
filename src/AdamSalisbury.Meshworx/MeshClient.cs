@@ -173,6 +173,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public event EventHandler<DisconnectedEventArgs>? Disconnected;
 
     /// <inheritdoc/>
+    public event EventHandler<SendRejectedEventArgs>? SendRejected;
+
+    /// <inheritdoc/>
     public async Task ConnectAsync(
         ITransport transport,
         string clientName,
@@ -395,7 +398,18 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     {
         if (!options.RequireAcknowledgement)
         {
-            await SendAsync(recipientId, message, cancellationToken).ConfigureAwait(false);
+            if (!options.AwaitCapacity)
+            {
+                await SendAsync(recipientId, message, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            var awaitCapacityHeaders = new MessageHeaders(
+            [
+                new KeyValuePair<string, string>(BackpressureHeaderKeys.AwaitCapacity, "1"),
+            ]);
+
+            await SendCoreAsync(recipientId, message, awaitCapacityHeaders, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -409,13 +423,20 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         try
         {
-            var headers = new MessageHeaders(
+            List<KeyValuePair<string, string>> headerEntries =
             [
-                new KeyValuePair<string, string>(
+                new(
                     DeliveryAcknowledgementHeaderKeys.CorrelationId,
                     ackId.ToString(CultureInfo.InvariantCulture)),
-                new KeyValuePair<string, string>(DeliveryAcknowledgementHeaderKeys.Request, "1"),
-            ]);
+                new(DeliveryAcknowledgementHeaderKeys.Request, "1"),
+            ];
+
+            if (options.AwaitCapacity)
+            {
+                headerEntries.Add(new KeyValuePair<string, string>(BackpressureHeaderKeys.AwaitCapacity, "1"));
+            }
+
+            var headers = new MessageHeaders(headerEntries);
 
             await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
 
@@ -532,6 +553,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         DeliveryAcknowledgementHeaderKeys.Request,
         DeliveryAcknowledgementHeaderKeys.Ack,
         MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+        BackpressureHeaderKeys.AwaitCapacity,
     ];
 
     /// <summary>
@@ -548,7 +570,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             {
                 throw new ArgumentException(
                     $"The header key '{reservedKey}' is reserved for a built-in helper (request/response, "
-                    + "delivery acknowledgement, or time-to-live) and cannot be set directly.",
+                    + "delivery acknowledgement, time-to-live, or backpressure) and cannot be set directly.",
                     nameof(headers));
             }
         }
@@ -1216,6 +1238,22 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     else
                     {
                         pending.Completion.TrySetResult(null);
+                    }
+                }
+                else if (data.Length >= 17
+                    && (MessageType)data[0] == MessageType.QueueSaturated)
+                {
+                    var saturatedRecipientId = new Guid(data.AsSpan(1, 16));
+
+                    try
+                    {
+                        SendRejected?.Invoke(
+                            this, new SendRejectedEventArgs { RecipientId = saturatedRecipientId });
+                    }
+                    catch (Exception ex)
+                    {
+                        // Callback boundary — a throwing subscriber must not halt the loop.
+                        _logger.LogError(ex, "A SendRejected handler threw an exception");
                     }
                 }
                 else if ((MessageType)data[0] == MessageType.Ping)

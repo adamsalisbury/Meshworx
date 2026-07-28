@@ -65,6 +65,8 @@ public sealed class MeshHubServiceCollectionExtensionsTests
         Assert.Null(options.GroupAuthoriser);
         Assert.Null(options.GroupAuthorisationTimeout);
         Assert.Null(options.MaxConnectionsPerRemoteEndpoint);
+        Assert.False(options.NotifyOnQueueSaturation);
+        Assert.Null(options.BackpressureAwaitTimeout);
     }
 
     [Fact(Timeout = 1000)]

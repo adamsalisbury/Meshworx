@@ -79,4 +79,16 @@ public sealed class MeshHubOptions
     /// Gets or sets the maximum number of concurrent connections the hub accepts from a single remote address.
     /// </summary>
     public int? MaxConnectionsPerRemoteEndpoint { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether a sender is sent a control frame when one of its messages is dropped because
+    /// the recipient's outbound queue was full.
+    /// </summary>
+    public bool NotifyOnQueueSaturation { get; set; }
+
+    /// <summary>
+    /// Gets or sets how long the hub awaits free capacity on a saturated recipient queue for a sender
+    /// that opted into <see cref="AdamSalisbury.Meshworx.DeliveryOptions.AwaitCapacity"/>.
+    /// </summary>
+    public TimeSpan? BackpressureAwaitTimeout { get; set; }
 }
