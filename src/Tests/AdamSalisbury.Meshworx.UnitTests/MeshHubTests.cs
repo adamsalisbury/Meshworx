@@ -2503,6 +2503,64 @@ public sealed class MeshHubTests
     }
 
     /// <summary>
+    /// A sender whose receive loop the hub has deliberately parked awaiting capacity for one of its
+    /// messages is not evicted for looking idle. It reads nothing while parked, so it cannot answer a
+    /// ping and its activity sequence cannot advance — but the silence is backpressure the hub itself
+    /// applied, not a dead client, and evicting it would turn opting into AwaitCapacity into a way to
+    /// get disconnected. The park is held open here well past the eviction budget (50 ms × 2), and the
+    /// client must still be registered afterwards.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task HandleClient_ParkedAwaitingCapacity_IsNotEvictedForLookingIdle()
+    {
+        var fixture = new MeshHubFixture(
+            heartbeatInterval: TimeSpan.FromMilliseconds(50),
+            maxMissedHeartbeats: 2,
+            backpressureAwaitTimeout: Timeout.InfiniteTimeSpan);
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender", versionMin: 5, versionMax: 5);
+        var recipient = await fixture.RegisterClientAsync("Recipient", versionMin: 5, versionMax: 5);
+
+        // Park the recipient's send loop so its queue can be filled and stay full.
+        var sendCalledTcs = new TaskCompletionSource();
+        var blockedSendTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback(() => sendCalledTcs.TrySetResult())
+            .Returns(blockedSendTcs.Task);
+
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        await sendCalledTcs.Task.WaitAsync(WaitTimeout);
+
+        for (int i = 0; i < MeshHub.OutboundQueueCapacityForTesting; i++)
+        {
+            Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        }
+
+        // The sender's receive loop parks here, indefinitely, until the recipient's queue drains.
+        var headers = new MessageHeaders([new(BackpressureHeaderKeys.AwaitCapacity, "1")]);
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessageWithHeaders(recipient.Id, headers, [1]));
+
+        // Well beyond the 100 ms eviction budget, during which the sender reads nothing at all.
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
+
+        Assert.True(fixture.Hub.IsClientRegistered(sender.Id));
+
+        blockedSendTcs.TrySetResult();
+
+        var disposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        recipient.Disconnect();
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+        sender.Disconnect();
+
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
     /// A silent client is evicted on the maxMissedHeartbeats'th consecutive idle interval, not the one
     /// after it. The hub therefore probes it exactly maxMissedHeartbeats minus one times before
     /// evicting, which pins the eviction interval: an extra ping means eviction ran an interval late.

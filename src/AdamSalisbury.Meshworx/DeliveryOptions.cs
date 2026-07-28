@@ -42,6 +42,12 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// rather than dropping the message immediately, if that queue is full at the moment the message is
     /// routed.
     /// </summary>
+    /// <remarks>
+    /// Honoured only for a directly addressed send. While the hub waits it stops reading further frames
+    /// from this client, which is what turns a slow recipient into backpressure on the sender — but it
+    /// also means anything else this client sends meanwhile, including to entirely unrelated recipients,
+    /// waits behind it. Use it for traffic that genuinely must not be lost, not as a blanket default.
+    /// </remarks>
     public bool AwaitCapacity { get; }
 
     /// <summary>
@@ -65,7 +71,8 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// Requests that the hub await capacity on the recipient's outbound queue instead of dropping the
     /// message immediately, turning a persistently slow recipient into backpressure on this send rather
     /// than silent loss. Only a direct send to a single recipient honours this — a broadcast or group
-    /// send never blocks its whole fan-out on one slow member.
+    /// send never blocks its whole fan-out on one slow member. See <see cref="AwaitCapacity"/> for what
+    /// waiting costs the rest of this client's traffic.
     /// </summary>
     public static DeliveryOptions AwaitingCapacity()
     {

@@ -391,9 +391,12 @@ public interface IMeshClient : IAsyncDisposable
     /// </summary>
     /// <remarks>
     /// Only raised when the hub was constructed with <c>notifyOnQueueSaturation</c> set — otherwise a
-    /// dropped message stays silent to this client, exactly as before this event existed. The
-    /// notification is best-effort: it is itself dropped rather than retried if this client's own
-    /// outbound queue happens to be full at the moment the hub tries to send it.
+    /// dropped message stays silent to this client, exactly as before this event existed. Only
+    /// <b>directly addressed</b> sends are reported: a broadcast or group send dropped for a full queue
+    /// never raises this, because naming the dropped recipient would tell this client the identity of a
+    /// client it never addressed. The notification is best-effort: it is itself dropped rather than
+    /// retried if this client's own outbound queue happens to be full at the moment the hub tries to
+    /// send it.
     /// </remarks>
     event EventHandler<SendRejectedEventArgs> SendRejected;
 }
