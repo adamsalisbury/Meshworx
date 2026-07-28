@@ -44,9 +44,9 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// </summary>
     /// <remarks>
     /// Honoured only for a directly addressed send. While the hub waits it stops reading further frames
-    /// from this client, which is what turns a slow recipient into backpressure on the sender — but it
-    /// also means anything else this client sends meanwhile, including to entirely unrelated recipients,
-    /// waits behind it. Use it for traffic that genuinely must not be lost, not as a blanket default.
+    /// from this client, so anything else this client sends meanwhile, including to entirely unrelated
+    /// recipients, waits behind it. Use it for traffic that genuinely must not be lost, not as a blanket
+    /// default. See <see cref="AwaitingCapacity"/> for why the send itself does not wait.
     /// </remarks>
     public bool AwaitCapacity { get; }
 
@@ -69,11 +69,20 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
 
     /// <summary>
     /// Requests that the hub await capacity on the recipient's outbound queue instead of dropping the
-    /// message immediately, turning a persistently slow recipient into backpressure on this send rather
-    /// than silent loss. Only a direct send to a single recipient honours this — a broadcast or group
-    /// send never blocks its whole fan-out on one slow member. See <see cref="AwaitCapacity"/> for what
-    /// waiting costs the rest of this client's traffic.
+    /// message immediately, so a message addressed to a momentarily saturated recipient is delivered late
+    /// rather than lost. Only a direct send to a single recipient honours this — a broadcast or group
+    /// send never blocks its whole fan-out on one slow member.
     /// </summary>
+    /// <remarks>
+    /// This does <b>not</b> make the returned task wait for capacity. On its own, the send completes as
+    /// soon as the frame reaches the transport, exactly like every other fire-and-forget overload — the
+    /// waiting happens hub-side, out of the caller's sight. Producer-side throttling is therefore
+    /// indirect: while the hub is parked it stops reading this connection, so a producer sending
+    /// continuously eventually blocks on its own transport once the socket's buffers fill, rather than at
+    /// the first saturated send. To have the call itself wait until the message has genuinely reached the
+    /// recipient, combine this with <see cref="RequireAck"/> via <see cref="WithAwaitCapacity"/> and read
+    /// that method's remarks first.
+    /// </remarks>
     public static DeliveryOptions AwaitingCapacity()
     {
         return new DeliveryOptions(requireAcknowledgement: false, acknowledgementTimeout: null, awaitCapacity: true);
@@ -83,6 +92,16 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// Returns a copy of these options with <see cref="AwaitCapacity"/> also set, so a single send can
     /// both require an acknowledgement and await capacity on the recipient's queue.
     /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="AwaitingCapacity"/> alone, this genuinely blocks the caller until the recipient
+    /// acknowledges — but the two waits are timed independently and must be reconciled by the caller.
+    /// <see cref="AcknowledgementTimeout"/> is measured by this client, while the hub's own wait for
+    /// capacity is bounded by its <c>backpressureAwaitTimeout</c> (30 seconds by default). Set the
+    /// acknowledgement timeout <b>longer</b> than the hub's: if it expires first, the send fails with a
+    /// <see cref="TimeoutException"/> while the hub is still waiting, and the message may be delivered
+    /// afterwards regardless — so a caller that retries on that timeout, which is the pattern
+    /// <see cref="RequireAck"/> exists to support, would deliver it twice.
+    /// </remarks>
     public DeliveryOptions WithAwaitCapacity()
     {
         return new DeliveryOptions(RequireAcknowledgement, AcknowledgementTimeout, awaitCapacity: true);

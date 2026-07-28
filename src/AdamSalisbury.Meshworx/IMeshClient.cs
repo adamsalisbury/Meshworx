@@ -135,9 +135,13 @@ public interface IMeshClient : IAsyncDisposable
     /// participate in or observe it.
     /// <para>
     /// With <see cref="DeliveryOptions.AwaitCapacity"/> the hub awaits capacity on the recipient's
-    /// outbound queue instead of dropping the message immediately if that queue is already full,
-    /// turning a persistently slow recipient into backpressure on this call rather than silent loss —
-    /// see <see cref="SendRejected"/> for the default drop-on-full behaviour this opts out of.
+    /// outbound queue instead of dropping the message immediately if that queue is already full, so the
+    /// message is delivered late rather than lost — see <see cref="SendRejected"/> for the default
+    /// drop-on-full behaviour this opts out of. On its own it does not make this call wait; combined
+    /// with <see cref="DeliveryOptions.RequireAck"/> it does, but the two timeouts are independent and
+    /// must be reconciled — see <see cref="DeliveryOptions.WithAwaitCapacity"/>, whose remarks explain
+    /// why an acknowledgement timeout shorter than the hub's capacity wait can report a message as
+    /// failed that is then delivered anyway.
     /// </para>
     /// </remarks>
     /// <param name="recipientId">The unique identifier of the target client.</param>
