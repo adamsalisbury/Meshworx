@@ -889,6 +889,42 @@ corresponding `AddMeshHub`/`AddMeshClient` call to have registered the hub or cl
 both accept an optional `name` — `AddMeshHub` defaults to `"meshhub"`, `AddMeshClient` to
 `"meshclient:{clientName}"`.
 
+## Large messages
+
+A single frame is capped at 1 MiB. `SendLargeAsync` sends a payload of any size by splitting it across
+as many frames as it needs, with the receiving client reassembling it:
+
+```csharp
+await client.SendLargeAsync(recipientId, fortyMegabytes);
+```
+
+The recipient raises `MessageReceived` **once**, when the last chunk arrives and the whole message has
+been rebuilt. A subscriber never sees a partial message and needs no code to tell a chunked message
+from an ordinary one. Headers passed to `SendLargeAsync` ride on every chunk and are delivered once,
+with the reassembled whole.
+
+**The hub is not involved.** It routes each chunk as an ordinary opaque frame and never reassembles or
+buffers one, so a 40 MiB transfer costs it exactly what the same volume of small messages would.
+Reassembly is purely an endpoint concern, carried in the header block the hub already passes through.
+
+Because reassembly means holding memory on behalf of a peer that may never finish, it is bounded on
+both axes, configurable on `MeshClient`'s constructor:
+
+| Parameter | Default | Bounds |
+|---|---|---|
+| `maxReassemblyBytes` | 64 MiB | Total memory held across every part-received message at once. A chunk that would breach it is dropped and its transfer abandoned. |
+| `chunkTransferTimeout` | 1 minute | How long an incomplete transfer may sit without a further chunk before it is discarded and its memory reclaimed. |
+
+A transfer that breaches either bound is dropped **without telling the sender** — matching how a full
+outbound queue is already handled, and deliberately: a receiver that reported which chunks it refused
+would hand an unauthenticated peer a probe for its remaining budget. Pair large sends with an
+application-level acknowledgement if you need delivery confirmation.
+
+Chunking requires the header envelope to carry its reassembly metadata, so a connection that negotiated
+below protocol version 5 cannot send one. That throws rather than degrading quietly — unlike trace
+context, which is an optional extra; here the caller has explicitly asked to send something that cannot
+go any other way.
+
 ## Typed messages
 
 The core library is byte-oriented and stays that way — the hub routes opaque bodies and takes no
