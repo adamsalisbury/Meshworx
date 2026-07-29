@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Package">
+    <Version>0.1.0</Version>
+    <Authors>Adam Salisbury</Authors>
+    <Company>Adam Salisbury</Company>
+    <Product>Meshworx</Product>
+    <Description>Strongly-typed client contracts for Meshworx: mark an interface [MeshContract] and get a source-generated proxy and dispatcher, with no runtime reflection.</Description>
+    <PackageTags>messaging;hub;mesh;networking;tcp;sourcegenerator;rpc</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/adamsalisbury/Meshworx</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/adamsalisbury/Meshworx</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AdamSalisbury.Meshworx\AdamSalisbury.Meshworx.csproj" />
+    <ProjectReference Include="..\AdamSalisbury.Meshworx.Serialization\AdamSalisbury.Meshworx.Serialization.csproj" />
+    <ProjectReference Include="..\AdamSalisbury.Meshworx.Contracts.Generator\AdamSalisbury.Meshworx.Contracts.Generator.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>
