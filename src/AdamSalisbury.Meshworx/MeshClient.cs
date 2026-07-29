@@ -74,10 +74,27 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
     private static readonly TimeSpan DefaultSendRetryDelay = TimeSpan.FromMilliseconds(100);
 
+    // How much payload one chunk carries. A frame must fit the transport's 1 MiB cap once the message
+    // type, recipient id, header-length prefix and the header block itself are added, so the budget is
+    // the cap less a reserve for all of that. The three chunk headers cost about 110 bytes at their
+    // longest (a 36-character GUID plus two four-digit numbers, with their keys); 4 KiB leaves room for
+    // an application's own headers to travel on a chunked send as well, which they must, since
+    // SendLargeAsync copies the caller's headers onto every chunk. A caller whose headers exceed that
+    // reserve gets the same ArgumentException from the framer that any oversized frame would produce,
+    // rather than a silently truncated transfer.
+    private const int ChunkFrameOverheadReserve = 4 * 1024;
+
+    private const int MaxChunkBodySize =
+        Transport.Framing.StreamFramer.MaxPayloadSize - ChunkFrameOverheadReserve;
+
     private readonly TimeSpan? _idleTimeout;
     private readonly TimeSpan? _sendTimeout;
     private readonly int _maxSendAttempts;
     private readonly TimeSpan _sendRetryDelay;
+
+    // Holds the chunks of every part-received large message until each is whole. Only ever touched from
+    // the receive loop, which processes one frame at a time, so it needs no lock of its own.
+    private readonly ChunkReassembler _reassembler;
 
     /// <param name="logger">The logger used to record client activity.</param>
     /// <param name="idleTimeout">
@@ -105,14 +122,43 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// number (linear back-off). Only used when <paramref name="maxSendAttempts"/> is greater than 1.
     /// Defaults to 100 milliseconds.
     /// </param>
+    /// <param name="maxReassemblyBytes">
+    /// The ceiling on memory held across every part-received chunked message at once. A chunk that
+    /// would take this client past the ceiling is dropped and its transfer abandoned, so a peer that
+    /// starts transfers and never finishes them costs a bounded, reclaimable amount. Defaults to
+    /// 64 MiB.
+    /// </param>
+    /// <param name="chunkTransferTimeout">
+    /// How long an incomplete chunked transfer may sit without a further chunk before it is discarded
+    /// and its memory reclaimed. Defaults to one minute.
+    /// </param>
+    /// <param name="timeProvider">
+    /// The clock used to age out incomplete chunked transfers. Defaults to
+    /// <see cref="TimeProvider.System"/>; supply one to control time in a test.
+    /// </param>
     public MeshClient(
         ILogger<MeshClient> logger,
         TimeSpan? idleTimeout = null,
         TimeSpan? sendTimeout = null,
         int maxSendAttempts = 1,
-        TimeSpan? sendRetryDelay = null)
+        TimeSpan? sendRetryDelay = null,
+        int? maxReassemblyBytes = null,
+        TimeSpan? chunkTransferTimeout = null,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
+
+        if (maxReassemblyBytes is { } reassemblyBytes && reassemblyBytes <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxReassemblyBytes), "The maximum reassembly bytes must be positive.");
+        }
+
+        if (chunkTransferTimeout is { } chunkTimeout && chunkTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(chunkTransferTimeout), "The chunk transfer timeout must be positive.");
+        }
 
         if (idleTimeout is { } timeout && timeout <= TimeSpan.Zero)
         {
@@ -143,6 +189,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         _sendTimeout = sendTimeout;
         _maxSendAttempts = maxSendAttempts;
         _sendRetryDelay = sendRetryDelay ?? DefaultSendRetryDelay;
+        _reassembler = new ChunkReassembler(maxReassemblyBytes, chunkTransferTimeout, timeProvider);
     }
 
     /// <inheritdoc/>
@@ -519,6 +566,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             NegotiatedProtocolVersion = 0;
             SessionResumed = false;
             _state = ConnectionState.Disconnected;
+
+            // Part-assembled transfers cannot be completed by a different connection: a sender's chunk
+            // ids are only meaningful within the session that issued them, so holding them past
+            // disconnect would keep memory for a completion that can never arrive.
+            _reassembler.Clear();
         }
     }
 
@@ -764,6 +816,63 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     + "directly.",
                     nameof(headers));
             }
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <inheritdoc/>
+    public async Task SendLargeAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders? headers = null,
+        CancellationToken cancellationToken = default)
+    {
+        headers ??= MessageHeaders.Empty;
+        ThrowIfReservedHeaderKeyPresent(headers);
+
+        // Explicit rather than degrading, unlike trace context: a caller reaching for this method is
+        // asking to send something that cannot go any other way, so a peer that cannot receive it is a
+        // failed send rather than a quiet loss of an optional extra.
+        RequireHeaderEnvelopeSupport(NegotiatedProtocolVersion);
+
+        int chunkCount = (message.Length + MaxChunkBodySize - 1) / MaxChunkBodySize;
+
+        // A zero-length payload is still one chunk. Sending none would complete no transfer at the far
+        // end, so an empty large-send would silently never arrive.
+        chunkCount = Math.Max(chunkCount, 1);
+
+        if (chunkCount > ChunkHeaderKeys.MaxChunksPerMessage)
+        {
+            throw new ArgumentException(
+                $"The message is too large to chunk: it needs {chunkCount} chunks, and the maximum is "
+                + $"{ChunkHeaderKeys.MaxChunksPerMessage}.",
+                nameof(message));
+        }
+
+        var chunkId = Guid.NewGuid();
+
+        for (int index = 0; index < chunkCount; index++)
+        {
+            int offset = index * MaxChunkBodySize;
+            int length = Math.Min(MaxChunkBodySize, message.Length - offset);
+
+            var chunkHeaders = new Dictionary<string, string>(headers.Count + 3, StringComparer.Ordinal);
+
+            foreach (KeyValuePair<string, string> header in headers)
+            {
+                chunkHeaders[header.Key] = header.Value;
+            }
+
+            chunkHeaders[ChunkHeaderKeys.Id] = chunkId.ToString("D", CultureInfo.InvariantCulture);
+            chunkHeaders[ChunkHeaderKeys.Index] = index.ToString(CultureInfo.InvariantCulture);
+            chunkHeaders[ChunkHeaderKeys.Count] = chunkCount.ToString(CultureInfo.InvariantCulture);
+
+            await SendCoreAsync(
+                    recipientId,
+                    message.Slice(offset, length),
+                    MessageHeaders.FromOwnedDictionary(chunkHeaders),
+                    cancellationToken)
+                .ConfigureAwait(false);
         }
     }
 
@@ -1415,6 +1524,29 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         {
                             ReadOnlyMemory<byte> messageData = data.AsMemory(19 + headerBlockLength);
 
+                            // A chunk is not a message yet. It is absorbed here and raises nothing
+                            // until its last sibling arrives, at which point the reassembled whole is
+                            // raised once — so a subscriber sees large messages exactly as it sees
+                            // small ones, never a partial one.
+                            if (ChunkHeaderKeys.TryReadChunkHeaders(
+                                    headers, out Guid chunkId, out int chunkIndex, out int chunkCount))
+                            {
+                                if (_reassembler.TryAddChunk(
+                                        senderId,
+                                        chunkId,
+                                        chunkIndex,
+                                        chunkCount,
+                                        messageData,
+                                        out byte[]? reassembled))
+                                {
+                                    messageData = reassembled;
+                                }
+                                else
+                                {
+                                    continue;
+                                }
+                            }
+
                             if (!TryCompletePendingAck(senderId, headers)
                                 && !TryCompletePendingRequest(senderId, headers, messageData)
                                 && !IsExpired(headers, senderId))
@@ -1721,6 +1853,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             NegotiatedProtocolVersion = 0;
             SessionResumed = false;
             _state = ConnectionState.Disconnected;
+
+            // Part-assembled transfers cannot be completed by a different connection: a sender's chunk
+            // ids are only meaningful within the session that issued them, so holding them past
+            // disconnect would keep memory for a completion that can never arrive.
+            _reassembler.Clear();
 
             // Take the decision to raise under the same lock that publishes the disconnected state,
             // so a DisconnectAsync racing this teardown either claims it before this point or finds

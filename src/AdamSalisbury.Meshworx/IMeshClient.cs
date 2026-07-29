@@ -232,6 +232,48 @@ public interface IMeshClient : IAsyncDisposable
     Task BroadcastAsync(ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends a message of any size to a single recipient, splitting it across as many frames as it
+    /// needs and having the receiving client reassemble it.
+    /// </summary>
+    /// <param name="recipientId">The id of the recipient.</param>
+    /// <param name="message">The message to send. May exceed the transport's single-frame cap.</param>
+    /// <param name="headers">
+    /// Headers to send with the message, or <see langword="null"/> for none. They are copied onto every
+    /// chunk and delivered once, with the reassembled message.
+    /// </param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <returns>A task that completes once every chunk has been handed to the transport.</returns>
+    /// <remarks>
+    /// The recipient raises <see cref="MessageReceived"/> exactly once, when the last chunk arrives and
+    /// the whole message has been rebuilt — a subscriber never sees a partial one, and needs no code to
+    /// distinguish a chunked message from an ordinary one.
+    /// <para>
+    /// The hub is not involved in any of this. It routes each chunk as an ordinary opaque frame and
+    /// never reassembles or buffers one, so a large transfer costs it exactly what the same volume of
+    /// small messages would.
+    /// </para>
+    /// <para>
+    /// Reassembly is bounded on the receiving side, by both memory and time — see
+    /// <c>maxReassemblyBytes</c> and <c>chunkTransferTimeout</c> on <see cref="MeshClient"/>'s
+    /// constructor. A transfer that breaches either is dropped without notifying the sender, so a
+    /// caller that must know the message arrived should pair this with an application-level
+    /// acknowledgement.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="NotSupportedException">
+    /// The connection negotiated a protocol version below the one that supports message headers, which
+    /// chunking requires to carry its reassembly metadata.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// The message needs more chunks than a single logical message may be split into.
+    /// </exception>
+    Task SendLargeAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders? headers = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Joins the named group, so that messages sent to the group are delivered to this client.
     /// </summary>
     /// <remarks>
