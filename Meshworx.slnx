@@ -3,6 +3,8 @@
     <Project Path="src/AdamSalisbury.Meshworx/AdamSalisbury.Meshworx.csproj" />
     <Project Path="src/AdamSalisbury.Meshworx.Extensions.DependencyInjection/AdamSalisbury.Meshworx.Extensions.DependencyInjection.csproj" />
     <Project Path="src/AdamSalisbury.Meshworx.Serialization/AdamSalisbury.Meshworx.Serialization.csproj" />
+    <Project Path="src/AdamSalisbury.Meshworx.Contracts/AdamSalisbury.Meshworx.Contracts.csproj" />
+    <Project Path="src/AdamSalisbury.Meshworx.Contracts.Generator/AdamSalisbury.Meshworx.Contracts.Generator.csproj" />
   </Folder>
   <Folder Name="/src/AdamSalisbury.Meshworx.TestApps/">
     <Project Path="src/AdamSalisbury.Meshworx.TestApps/ClientApp/ClientApp.csproj" />
@@ -10,6 +12,7 @@
   </Folder>
   <Folder Name="/src/Tests/">
     <Project Path="src/Tests/AdamSalisbury.Meshworx.Extensions.DependencyInjection.UnitTests/AdamSalisbury.Meshworx.Extensions.DependencyInjection.UnitTests.csproj" />
+    <Project Path="src/Tests/AdamSalisbury.Meshworx.Contracts.UnitTests/AdamSalisbury.Meshworx.Contracts.UnitTests.csproj" />
     <Project Path="src/Tests/AdamSalisbury.Meshworx.Serialization.UnitTests/AdamSalisbury.Meshworx.Serialization.UnitTests.csproj" />
     <Project Path="src/Tests/AdamSalisbury.Meshworx.UnitTests/AdamSalisbury.Meshworx.UnitTests.csproj" />
   </Folder>
