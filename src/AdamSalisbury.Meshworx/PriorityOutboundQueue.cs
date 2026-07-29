@@ -28,6 +28,12 @@ internal sealed class PriorityOutboundQueue : IDisposable
     private const int NormalBurstLimit = 4;
 
     private readonly SemaphoreSlim _capacityGate;
+
+    // A single wake-up signal covering all three lanes, released once per successful write and once by
+    // Complete. Lets ReadAllAsync park on one await rather than racing three lanes' WaitToReadAsync calls,
+    // which had to be promoted from ValueTask to Task to be passed to Task.WhenAny — several heap
+    // allocations on every wait, and the wait branch is reached on ordinary traffic, not just when idle.
+    private readonly SemaphoreSlim _readySignal = new(0);
     private readonly Channel<byte[]> _highLane = CreateLane();
     private readonly Channel<byte[]> _normalLane = CreateLane();
     private readonly Channel<byte[]> _lowLane = CreateLane();
@@ -92,6 +98,9 @@ internal sealed class PriorityOutboundQueue : IDisposable
         // than leaking it against a queue nothing will ever drain again.
         if (LaneFor(priority).Writer.TryWrite(frame))
         {
+            // Signalled only after the frame is in its lane, so a reader woken by this credit is
+            // guaranteed to see the frame when it rechecks the lanes.
+            _readySignal.Release();
             return true;
         }
 
@@ -127,6 +136,7 @@ internal sealed class PriorityOutboundQueue : IDisposable
 
         if (LaneFor(priority).Writer.TryWrite(frame))
         {
+            _readySignal.Release();
             return true;
         }
 
@@ -173,11 +183,10 @@ internal sealed class PriorityOutboundQueue : IDisposable
     {
         while (true)
         {
-            // Checked at the top of every iteration, not just inside the wait branch below: once the
-            // token is cancelled, every lane's WaitToReadAsync resolves (cancelled) immediately, so
-            // without this check the loop would spin tightly re-entering the wait branch forever instead
-            // of ever returning — starving the thread pool rather than propagating the cancellation the
-            // way the original Channel{T}.Reader.ReadAllAsync did.
+            // Checked at the top of every iteration, not just inside the wait branch below: a queue with
+            // frames always ready never reaches that branch, so without this check a cancelled token
+            // would go unobserved for as long as the traffic kept up, instead of propagating the way the
+            // original Channel{T}.Reader.ReadAllAsync did.
             cancellationToken.ThrowIfCancellationRequested();
 
             bool servicedAny = false;
@@ -217,14 +226,21 @@ internal sealed class PriorityOutboundQueue : IDisposable
                 yield break;
             }
 
-            // Nothing in any lane right now: wait for whichever becomes readable (or completes) first.
-            // Only reached when this connection is idle, never on the busy path a steady stream of
-            // messages takes, so the per-wait allocation here does not touch the hot path.
-            Task<bool> highWait = _highLane.Reader.WaitToReadAsync(cancellationToken).AsTask();
-            Task<bool> normalWait = _normalLane.Reader.WaitToReadAsync(cancellationToken).AsTask();
-            Task<bool> lowWait = _lowLane.Reader.WaitToReadAsync(cancellationToken).AsTask();
+            // Nothing in any lane right now: park on the shared signal until an enqueue — on any lane — or
+            // Complete releases a credit. This branch is reached whenever nothing arrived between one
+            // MoveNextAsync and the next, which includes ordinary single-frame delivery with no backlog
+            // behind it, so it stays on a single await rather than allocating a wait per lane.
+            await _readySignal.WaitAsync(cancellationToken).ConfigureAwait(false);
 
-            await Task.WhenAny(highWait, normalWait, lowWait).ConfigureAwait(false);
+            // Every enqueue since the last park left a credit behind, so take the surplus with the one
+            // just consumed: the next pass rechecks all three lanes from scratch regardless, and leaving
+            // stale credits would send this branch straight back round for each of them in turn. Draining
+            // before the lanes are rechecked cannot lose a wake-up, because a credit is only ever released
+            // after its frame is already in its lane.
+            // No token: a zero-timeout take never blocks, so there is nothing for cancellation to cut short.
+            while (_readySignal.Wait(0, CancellationToken.None))
+            {
+            }
         }
     }
 
@@ -238,6 +254,10 @@ internal sealed class PriorityOutboundQueue : IDisposable
         _highLane.Writer.TryComplete();
         _normalLane.Writer.TryComplete();
         _lowLane.Writer.TryComplete();
+
+        // Wake a reader parked on the shared signal so it observes the completed lanes and finishes,
+        // rather than waiting on a credit no further enqueue will ever release.
+        _readySignal.Release();
 
         // Cancel only, never dispose here: a concurrent TryEnqueueAsync call may still be reading
         // DisposalToken to build its linked token source, and disposing this source underneath that
@@ -255,6 +275,7 @@ internal sealed class PriorityOutboundQueue : IDisposable
     public void Dispose()
     {
         _capacityGate.Dispose();
+        _readySignal.Dispose();
         _disposalCts.Dispose();
     }
 }

@@ -144,6 +144,59 @@ public sealed class PriorityOutboundQueueTests
     }
 
     /// <summary>
+    /// Regression test for the shared wake-up signal: after a backlog has been drained — leaving one
+    /// spent credit behind per frame that went through — a reader that parks on an empty queue must still
+    /// be woken by the next single enqueue. Guards both halves of the drain: dropping the surplus must not
+    /// swallow the wake-up for a frame queued afterwards, and leaving it in place must not let the wait
+    /// branch return without a frame to show for it.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task ReadAllAsync_FrameQueuedAfterABacklogWasDrained_StillWakesTheParkedReader()
+    {
+        var queue = new PriorityOutboundQueue(capacity: 100);
+
+        for (byte i = 0; i < 20; i++)
+        {
+            Assert.True(queue.TryEnqueue(MessagePriority.Normal, [i]));
+        }
+
+        using var cts = new CancellationTokenSource();
+        await using IAsyncEnumerator<byte[]> enumerator = queue.ReadAllAsync(cts.Token).GetAsyncEnumerator();
+
+        for (byte i = 0; i < 20; i++)
+        {
+            Assert.True(await enumerator.MoveNextAsync());
+            Assert.Equal([i], enumerator.Current);
+        }
+
+        // The queue is now empty and every credit those 20 frames released has been spent, so this call
+        // parks in the wait branch rather than completing from an already-queued frame.
+        ValueTask<bool> parked = enumerator.MoveNextAsync();
+        Assert.True(queue.TryEnqueue(MessagePriority.Low, [0xFF]));
+
+        Assert.True(await parked.AsTask().WaitAsync(TimeSpan.FromSeconds(1)));
+        Assert.Equal([0xFF], enumerator.Current);
+    }
+
+    /// <summary>
+    /// Completing the queue while a reader is parked on an empty one ends the enumeration, rather than
+    /// leaving the reader waiting on a wake-up no further enqueue will ever send.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task ReadAllAsync_QueueCompletedWhileParked_EndsTheEnumeration()
+    {
+        var queue = new PriorityOutboundQueue(capacity: 10);
+
+        using var cts = new CancellationTokenSource();
+        await using IAsyncEnumerator<byte[]> enumerator = queue.ReadAllAsync(cts.Token).GetAsyncEnumerator();
+
+        ValueTask<bool> parked = enumerator.MoveNextAsync();
+        queue.Complete();
+
+        Assert.False(await parked.AsTask().WaitAsync(TimeSpan.FromSeconds(1)));
+    }
+
+    /// <summary>
     /// Completing the queue (mirroring a client disconnecting) unblocks a pending
     /// <see cref="PriorityOutboundQueue.TryEnqueueAsync"/> wait rather than leaving it parked for its full
     /// timeout with no capacity that will ever free up again.
