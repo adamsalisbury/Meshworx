@@ -1,3 +1,5 @@
+using AdamSalisbury.Meshworx.Messages;
+
 namespace AdamSalisbury.Meshworx;
 
 /// <summary>
@@ -12,11 +14,16 @@ namespace AdamSalisbury.Meshworx;
 /// </remarks>
 public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
 {
-    private DeliveryOptions(bool requireAcknowledgement, TimeSpan? acknowledgementTimeout, bool awaitCapacity)
+    private DeliveryOptions(
+        bool requireAcknowledgement,
+        TimeSpan? acknowledgementTimeout,
+        bool awaitCapacity,
+        MessagePriority priority)
     {
         RequireAcknowledgement = requireAcknowledgement;
         AcknowledgementTimeout = acknowledgementTimeout;
         AwaitCapacity = awaitCapacity;
+        Priority = priority;
     }
 
     /// <summary>
@@ -51,6 +58,13 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     public bool AwaitCapacity { get; }
 
     /// <summary>
+    /// Gets the priority this send should be queued at on the recipient's outbound queue.
+    /// <see cref="MessagePriority.Normal"/> is the default, giving exactly the queueing behaviour that
+    /// existed before priority lanes did.
+    /// </summary>
+    public MessagePriority Priority { get; }
+
+    /// <summary>
     /// Requests a delivery acknowledgement: the send completes once the recipient's client has handed
     /// the message to its application, or fails with a <see cref="TimeoutException"/> if that does not
     /// happen within <paramref name="timeout"/>.
@@ -64,7 +78,8 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
             throw new ArgumentOutOfRangeException(nameof(timeout), "The acknowledgement timeout must be positive.");
         }
 
-        return new DeliveryOptions(requireAcknowledgement: true, acknowledgementTimeout: timeout, awaitCapacity: false);
+        return new DeliveryOptions(
+            requireAcknowledgement: true, acknowledgementTimeout: timeout, awaitCapacity: false, priority: default);
     }
 
     /// <summary>
@@ -85,7 +100,20 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// </remarks>
     public static DeliveryOptions AwaitingCapacity()
     {
-        return new DeliveryOptions(requireAcknowledgement: false, acknowledgementTimeout: null, awaitCapacity: true);
+        return new DeliveryOptions(
+            requireAcknowledgement: false, acknowledgementTimeout: null, awaitCapacity: true, priority: default);
+    }
+
+    /// <summary>
+    /// Requests that this send be queued at the given <see cref="MessagePriority"/> on the recipient's
+    /// outbound queue, so it can overtake a backlog of lower-priority traffic already queued for the same
+    /// recipient.
+    /// </summary>
+    /// <param name="priority">The priority to queue this send at.</param>
+    public static DeliveryOptions AtPriority(MessagePriority priority)
+    {
+        return new DeliveryOptions(
+            requireAcknowledgement: false, acknowledgementTimeout: null, awaitCapacity: false, priority: priority);
     }
 
     /// <summary>
@@ -104,7 +132,17 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// </remarks>
     public DeliveryOptions WithAwaitCapacity()
     {
-        return new DeliveryOptions(RequireAcknowledgement, AcknowledgementTimeout, awaitCapacity: true);
+        return new DeliveryOptions(RequireAcknowledgement, AcknowledgementTimeout, awaitCapacity: true, Priority);
+    }
+
+    /// <summary>
+    /// Returns a copy of these options with <see cref="Priority"/> also set, so a single send can
+    /// combine a priority with an acknowledgement and/or an await-capacity request.
+    /// </summary>
+    /// <param name="priority">The priority to queue this send at.</param>
+    public DeliveryOptions WithPriority(MessagePriority priority)
+    {
+        return new DeliveryOptions(RequireAcknowledgement, AcknowledgementTimeout, AwaitCapacity, priority);
     }
 
     /// <inheritdoc/>
@@ -112,7 +150,8 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     {
         return RequireAcknowledgement == other.RequireAcknowledgement
             && AcknowledgementTimeout == other.AcknowledgementTimeout
-            && AwaitCapacity == other.AwaitCapacity;
+            && AwaitCapacity == other.AwaitCapacity
+            && Priority == other.Priority;
     }
 
     /// <inheritdoc/>
@@ -124,7 +163,7 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// <inheritdoc/>
     public override int GetHashCode()
     {
-        return HashCode.Combine(RequireAcknowledgement, AcknowledgementTimeout, AwaitCapacity);
+        return HashCode.Combine(RequireAcknowledgement, AcknowledgementTimeout, AwaitCapacity, Priority);
     }
 
     /// <summary>

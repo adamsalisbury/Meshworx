@@ -4,7 +4,6 @@ using System.Diagnostics.Metrics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Diagnostics;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
@@ -435,7 +434,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         int depth = 0;
         foreach (ClientConnection connection in _clients.Values)
         {
-            depth += connection.OutboundQueue.Reader.Count;
+            depth += connection.OutboundQueue.Count;
         }
 
         yield return new Measurement<int>(depth);
@@ -1208,7 +1207,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
         finally
         {
-            connection?.OutboundQueue.Writer.TryComplete();
+            connection?.OutboundQueue.Complete();
 
             if (clientCts is not null)
             {
@@ -1342,13 +1341,23 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// </returns>
     internal bool TryQueueRawFrameForTesting(Guid clientId, byte[] frame)
     {
+        return TryQueueRawFrameForTesting(clientId, frame, MessagePriority.Normal);
+    }
+
+    /// <summary>
+    /// As <see cref="TryQueueRawFrameForTesting(Guid, byte[])"/>, but onto a specific priority lane, so a
+    /// test can drive the shared capacity gate to full from a mix of lanes, or assert lane-drain order
+    /// directly.
+    /// </summary>
+    internal bool TryQueueRawFrameForTesting(Guid clientId, byte[] frame, MessagePriority priority)
+    {
         return _clients.TryGetValue(clientId, out ClientConnection? connection)
-            && connection.OutboundQueue.Writer.TryWrite(frame);
+            && connection.OutboundQueue.TryEnqueue(priority, frame);
     }
 
     /// <summary>
     /// The capacity of a client's outbound queue, exposed for a test driving one to that capacity via
-    /// <see cref="TryQueueRawFrameForTesting"/>.
+    /// <see cref="TryQueueRawFrameForTesting(Guid, byte[])"/>.
     /// </summary>
     internal const int OutboundQueueCapacityForTesting = ClientConnection.OutboundQueueCapacity;
 
@@ -1571,8 +1580,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         recipientId.TryWriteBytes(nackPayload.AsSpan(1));
 
         // Best-effort: if the sender's own queue is also full, the notification is itself dropped rather
-        // than retried or escalated — this is routing-level signalling, not guaranteed delivery.
-        sender.OutboundQueue.Writer.TryWrite(nackPayload);
+        // than retried or escalated — this is routing-level signalling, not guaranteed delivery. Sent
+        // High priority: a control frame telling a sender to back off should not itself be stuck behind
+        // the very backlog it is warning about.
+        sender.OutboundQueue.TryEnqueue(MessagePriority.High, nackPayload);
     }
 
     /// <summary>
@@ -1587,6 +1598,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private static async Task<bool> TryAwaitCapacityAsync(
         ClientConnection sender,
         ClientConnection recipient,
+        MessagePriority priority,
         byte[] payload,
         TimeSpan timeout,
         CancellationToken cancellationToken)
@@ -1595,25 +1607,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         // it is not idle, and must not be evicted for failing to send frames it is not being read for.
         using ClientConnection.CapacityWaitScope parked = sender.BeginAwaitingCapacity();
 
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeoutCts.CancelAfter(timeout);
-
-        try
-        {
-            await recipient.OutboundQueue.Writer.WriteAsync(payload, timeoutCts.Token).ConfigureAwait(false);
-            return true;
-        }
-        catch (OperationCanceledException)
-            when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
-        {
-            // Capacity did not free up within the timeout; fall back to dropping the message.
-            return false;
-        }
-        catch (ChannelClosedException)
-        {
-            // The recipient disconnected while capacity was being awaited; nothing left to queue onto.
-            return false;
-        }
+        // TryEnqueueAsync already bounds the wait by the timeout and by the recipient's own disposal —
+        // the recipient disconnecting while capacity is being awaited is handled there, not here.
+        return await recipient.OutboundQueue
+            .TryEnqueueAsync(priority, payload, timeout, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     // How many bytes of already-queued frames the send loop will coalesce into a single write before
@@ -1726,7 +1724,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         try
         {
-            await foreach (byte[] payload in connection.OutboundQueue.Reader
+            await foreach (byte[] payload in connection.OutboundQueue
                 .ReadAllAsync(clientCts.Token).ConfigureAwait(false))
             {
                 // A frame that has already passed the expiry its sender attached (SendAsync's
@@ -1747,7 +1745,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 // blocks, so a lone frame is sent immediately with no added latency; only frames already
                 // waiting are batched, and only up to the byte budget so the write stays bounded.
                 while (batchBytes < SendCoalesceByteBudget
-                    && connection.OutboundQueue.Reader.TryRead(out byte[]? next))
+                    && connection.OutboundQueue.TryDequeue(out byte[]? next))
                 {
                     if (IsExpiredFrame(next, connection.Id))
                     {
@@ -1859,8 +1857,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 }
 
                 // Probe liveness via the outbound queue so the ping serialises with any other queued
-                // frames. A live client replies with a Pong (or any frame), resetting the counter.
-                connection.OutboundQueue.Writer.TryWrite([(byte)MessageType.Ping]);
+                // frames. A live client replies with a Pong (or any frame), resetting the counter. Sent
+                // High priority so a liveness probe is never delayed behind a client's own backlog — a
+                // ping stuck behind bulk traffic could otherwise starve into a false eviction.
+                connection.OutboundQueue.TryEnqueue(MessagePriority.High, [(byte)MessageType.Ping]);
             }
         }
         catch (OperationCanceledException)
@@ -1889,7 +1889,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
         messageData.CopyTo(deliveryPayload.AsMemory(17));
 
-        if (!recipient.OutboundQueue.Writer.TryWrite(deliveryPayload))
+        // The plain (headerless) opcode carries no priority hint, so it always lands on the normal
+        // lane — exactly the queueing behaviour that existed before priority lanes did.
+        if (!recipient.OutboundQueue.TryEnqueue(MessagePriority.Normal, deliveryPayload))
         {
             _logger.LogWarning(
                 "Outbound queue for {RecipientId} is full, message from {SenderId} dropped",
@@ -1942,7 +1944,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             ? BuildDeliverMessageWithHeaders(senderId, headerBlock, body)
             : BuildDeliverMessage(senderId, body);
 
-        bool queued = recipient.OutboundQueue.Writer.TryWrite(deliveryPayload);
+        MessagePriority priority = ReadPriority(headerBlock);
+        bool queued = recipient.OutboundQueue.TryEnqueue(priority, deliveryPayload);
 
         // Only awaited when the sender is still registered: the park is recorded on the sender's own
         // connection, and a sender that has gone away has no receive loop left to park or protect.
@@ -1951,7 +1954,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             && _clients.TryGetValue(senderId, out ClientConnection? sender))
         {
             queued = await TryAwaitCapacityAsync(
-                    sender, recipient, deliveryPayload, _backpressureAwaitTimeout, cancellationToken)
+                    sender, recipient, priority, deliveryPayload, _backpressureAwaitTimeout, cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -1987,6 +1990,31 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         catch (FormatException)
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Reads the one well-known <see cref="MessagePriorityHeaderKeys.Priority"/> header, without decoding
+    /// the rest of the block, to decide which outbound lane a frame is queued on.
+    /// </summary>
+    /// <remarks>
+    /// A malformed block, or a value that is not one of the recognised priority strings, resolves to
+    /// <see cref="MessagePriority.Normal"/> — the header block is sender-supplied and must never be able
+    /// to fault the routing path that reads it, mirroring <see cref="WantsAwaitCapacity"/> and
+    /// <see cref="IsExpiredFrame"/>.
+    /// </remarks>
+    private static MessagePriority ReadPriority(ReadOnlyMemory<byte> headerBlock)
+    {
+        try
+        {
+            return HeaderEnvelope.TryReadValue(
+                    headerBlock.Span, headerBlock.Length, MessagePriorityHeaderKeys.Priority, out string? value)
+                ? MessagePriorityHeaderKeys.Parse(value)
+                : MessagePriority.Normal;
+        }
+        catch (FormatException)
+        {
+            return MessagePriority.Normal;
         }
     }
 
@@ -2046,7 +2074,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
             hasRecipient = true;
 
-            if (!entry.Value.OutboundQueue.Writer.TryWrite(deliveryPayload))
+            // BroadcastMessage has no headers-bearing counterpart, so this always lands on the normal
+            // lane — unchanged from the queueing behaviour before priority lanes existed.
+            if (!entry.Value.OutboundQueue.TryEnqueue(MessagePriority.Normal, deliveryPayload))
             {
                 _logger.LogWarning(
                     "Outbound queue for {RecipientId} is full, broadcast from {SenderId} dropped",
@@ -2243,7 +2273,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         refusal[0] = (byte)MessageType.GroupJoinRefused;
         groupNameBytes.Span.CopyTo(refusal.AsSpan(1));
 
-        if (!connection.OutboundQueue.Writer.TryWrite(refusal))
+        // Control frame: sent High priority so a join refusal is not stuck behind the client's own
+        // application backlog.
+        if (!connection.OutboundQueue.TryEnqueue(MessagePriority.High, refusal))
         {
             _logger.LogWarning(
                 "Outbound queue for {ClientId} is full, group join refusal for {GroupName} dropped",
@@ -2388,8 +2420,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 continue;
             }
 
+            // SendToGroup has no headers-bearing counterpart, so this always lands on the normal lane —
+            // unchanged from the queueing behaviour before priority lanes existed.
             if (_clients.TryGetValue(recipientId, out ClientConnection? recipient)
-                && !recipient.OutboundQueue.Writer.TryWrite(deliveryPayload))
+                && !recipient.OutboundQueue.TryEnqueue(MessagePriority.Normal, deliveryPayload))
             {
                 _logger.LogWarning(
                     "Outbound queue for {RecipientId} is full, group message from {SenderId} dropped",
@@ -2453,6 +2487,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _messagesRoutedCounter.Add(1, GroupDirectionTag);
         _bytesRoutedCounter.Add(body.Length, GroupDirectionTag);
 
+        // One priority for the whole fan-out: the header block describes the sender's single group
+        // send, not any one recipient, so every member's copy of it is queued at the same priority.
+        MessagePriority priority = ReadPriority(headerBlock);
+
         byte[]? withHeadersFrame = null;
         byte[]? strippedFrame = null;
 
@@ -2473,7 +2511,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 ? withHeadersFrame ??= BuildDeliverGroupMessageWithHeaders(senderId, groupNameBytes, headerBlock, body)
                 : strippedFrame ??= BuildDeliverGroupMessage(senderId, groupNameBytes, body);
 
-            if (!recipient.OutboundQueue.Writer.TryWrite(deliveryPayload))
+            if (!recipient.OutboundQueue.TryEnqueue(priority, deliveryPayload))
             {
                 _logger.LogWarning(
                     "Outbound queue for {RecipientId} is full, group message from {SenderId} dropped",
@@ -2619,19 +2657,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         /// </summary>
         public HashSet<string> Groups { get; } = new(StringComparer.Ordinal);
 
-        public Channel<byte[]> OutboundQueue { get; } = Channel.CreateBounded<byte[]>(
-            new BoundedChannelOptions(OutboundQueueCapacity)
-            {
-                SingleReader = true,
-                SingleWriter = false,
-            });
+        public PriorityOutboundQueue OutboundQueue { get; } = new(OutboundQueueCapacity);
 
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 0)
             {
-                OutboundQueue.Writer.TryComplete();
+                OutboundQueue.Complete();
                 await Transport.DisposeAsync().ConfigureAwait(false);
+                OutboundQueue.Dispose();
             }
         }
     }

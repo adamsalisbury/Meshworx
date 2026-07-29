@@ -2016,6 +2016,120 @@ public sealed class MeshClientTests
         _ = sendTask; // Deliberately left pending; the client is disposed with the fixture's scope.
     }
 
+    // SendAsync(DeliveryOptions.AtPriority) / SendToGroupAsync(priority) (#31)
+
+    /// <summary>
+    /// DeliveryOptions.AtPriority(MessagePriority.Normal) is the default priority, so it writes no header
+    /// block at all — byte-for-byte the same plain frame as DeliveryOptions.None.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_AtNormalPriority_SendsPlainFrameWithNoHeaderBlock()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.SendAsync(
+            Guid.NewGuid(), new byte[] { 1 }, DeliveryOptions.AtPriority(MessagePriority.Normal));
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x02, sentData[0]); // SendMessage, not SendMessageWithHeaders
+    }
+
+    /// <summary>
+    /// DeliveryOptions.AtPriority(MessagePriority.High) carries the priority header and no other reserved
+    /// header, so the recipient's hub can queue it ahead of normal-priority traffic.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_AtHighPriority_SendsPriorityHeader()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.SendAsync(
+            Guid.NewGuid(), new byte[] { 1 }, DeliveryOptions.AtPriority(MessagePriority.High));
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x11, sentData[0]); // SendMessageWithHeaders
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(17, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(sentData.AsSpan(19), headerLength);
+        Assert.Equal("high", decoded[MessagePriorityHeaderKeys.Priority]);
+        Assert.False(decoded.ContainsKey(BackpressureHeaderKeys.AwaitCapacity));
+    }
+
+    /// <summary>
+    /// The priority header key is reserved, mirroring the request/response, acknowledgement, expiry and
+    /// backpressure keys: a caller that happens to set it directly on a headers-accepting send is refused
+    /// rather than silently overridden.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_HeadersContainReservedPriorityKey_ThrowsArgumentException()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        var headers = new MessageHeaders([new(MessagePriorityHeaderKeys.Priority, "high")]);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, headers));
+    }
+
+    /// <summary>
+    /// SendToGroupAsync's priority overload writes the same reserved header as the direct-send overload,
+    /// so the hub's fan-out queues the group message at the requested priority for every member.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendToGroupAsync_AtLowPriority_SendsPriorityHeader()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.SendToGroupAsync("group-a", new byte[] { 1 }, MessagePriority.Low);
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x13, sentData[0]); // GroupMessageWithHeaders
+        int nameLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(1, 2));
+        int headerLengthOffset = 3 + nameLength;
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(headerLengthOffset, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(sentData.AsSpan(headerLengthOffset + 2), headerLength);
+        Assert.Equal("low", decoded[MessagePriorityHeaderKeys.Priority]);
+    }
+
+    /// <summary>
+    /// SendToGroupAsync's priority overload is equivalent to the plain overload when the priority is
+    /// Normal — no header block is written at all.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendToGroupAsync_AtNormalPriority_SendsPlainFrameWithNoHeaderBlock()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.SendToGroupAsync("group-a", new byte[] { 1 }, MessagePriority.Normal);
+
+        Assert.NotNull(sentData);
+        Assert.Equal(0x0E, sentData[0]); // GroupMessage, not GroupMessageWithHeaders
+    }
+
     /// <summary>
     /// A QueueSaturated control frame from the hub raises SendRejected, naming the recipient whose queue
     /// was full, so an application can observe a drop the hub was configured to report.
