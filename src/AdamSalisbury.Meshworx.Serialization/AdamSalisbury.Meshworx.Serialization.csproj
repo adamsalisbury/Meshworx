@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Package">
+    <Version>0.1.0</Version>
+    <Authors>Adam Salisbury</Authors>
+    <Company>Adam Salisbury</Company>
+    <Product>Meshworx</Product>
+    <Description>Optional typed-message codec layer for Meshworx: an IMessageSerializer abstraction, a System.Text.Json implementation, and typed send and receive extensions. The core library keeps its byte-oriented contract and takes no serialization dependency.</Description>
+    <PackageTags>messaging;hub;mesh;networking;tcp;serialization;json</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/adamsalisbury/Meshworx</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/adamsalisbury/Meshworx</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AdamSalisbury.Meshworx.Serialization.UnitTests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AdamSalisbury.Meshworx\AdamSalisbury.Meshworx.csproj" />
+  </ItemGroup>
+
+</Project>

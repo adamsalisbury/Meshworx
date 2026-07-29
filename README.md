@@ -889,6 +889,43 @@ corresponding `AddMeshHub`/`AddMeshClient` call to have registered the hub or cl
 both accept an optional `name` — `AddMeshHub` defaults to `"meshhub"`, `AddMeshClient` to
 `"meshclient:{clientName}"`.
 
+## Typed messages
+
+The core library is byte-oriented and stays that way — the hub routes opaque bodies and takes no
+serialization dependency. The optional `AdamSalisbury.Meshworx.Serialization` package adds a codec
+layer on top of it, so an application can exchange typed values instead of hand-rolling
+`Encoding.UTF8.GetBytes`/`GetString` at every call site.
+
+```csharp
+// Send a value — serialized, and tagged with the codec's content type.
+await client.SendAsync(recipientId, new Order(42, "Widget"), JsonMessageSerializer.Default);
+
+// Receive one.
+client.MessageReceived += (_, e) =>
+{
+    if (e.TryDeserialize(JsonMessageSerializer.Default, out Order? order))
+    {
+        Handle(order);
+    }
+};
+```
+
+Typed overloads are provided for `SendAsync`, `SendToGroupAsync`, `RequestAsync` and `ReplyAsync`,
+each a thin wrapper over the byte-oriented method of the same name. `BroadcastAsync` has no typed
+overload: it takes no headers, so a broadcast body cannot carry the content type that makes it
+decodable at the other end — serialize explicitly and broadcast the bytes if you need this.
+
+Every typed send writes the codec's `IMessageSerializer.ContentType` to the `mesh.content-type`
+header, and `TryDeserialize` checks it before decoding. That check is what makes a connection
+carrying more than one kind of traffic safe: bytes alone carry no format, so a codec asked to decode
+another codec's output would otherwise either throw or — worse — succeed and produce a plausible but
+wrong value. A message with no content-type header at all is accepted, since its absence means a
+byte-oriented sender and the caller reaching for a codec is asserting it knows the format.
+
+`JsonMessageSerializer` is the out-of-the-box implementation. Swap in a denser codec — MessagePack,
+Protobuf, anything — by implementing `IMessageSerializer`; nothing in the core library or the hub
+changes, and the same send and receive extensions work unaltered.
+
 ## Observability
 
 `AdamSalisbury.Meshworx` publishes first-class metrics through a `System.Diagnostics.Metrics.Meter`
