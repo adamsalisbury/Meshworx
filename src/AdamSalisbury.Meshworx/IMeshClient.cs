@@ -16,6 +16,37 @@ public interface IMeshClient : IAsyncDisposable
     string Name { get; }
 
     /// <summary>
+    /// Gets the wire-protocol version negotiated with the hub during the last successful
+    /// <see cref="ConnectAsync"/>, or <c>0</c> if the client is not connected.
+    /// </summary>
+    /// <remarks>
+    /// The hub selects the highest version common to its own supported range and the range this
+    /// client advertised, so a newer client connecting to an older hub negotiates down to whatever
+    /// that hub supports rather than being refused outright. Only the shared feature set of the
+    /// negotiated version is guaranteed to work.
+    /// </remarks>
+    byte NegotiatedProtocolVersion { get; }
+
+    /// <summary>
+    /// Gets a value indicating whether the most recent <see cref="ConnectAsync"/> reclaimed the identity
+    /// this client held before its previous connection ended, rather than being assigned a fresh one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see langword="true"/> means <see cref="Id"/> is the same value peers were holding before the
+    /// drop, and any group memberships the hub had recorded have been re-established — subject to the
+    /// hub's <c>GroupAuthoriser</c>, which is consulted afresh for each one and may refuse.
+    /// </para>
+    /// <para>
+    /// <see langword="false"/> is the ordinary case and is never an error: the hub may have resumption
+    /// switched off, the connection may have negotiated below the version that supports it, the window
+    /// may have closed, or this may simply be a first connection. The client is connected and usable
+    /// either way; only <see cref="Id"/> differs.
+    /// </para>
+    /// </remarks>
+    bool SessionResumed { get; }
+
+    /// <summary>
     /// Gets a value indicating whether the client is currently connected to a hub.
     /// </summary>
     bool IsConnected { get; }
@@ -84,10 +115,114 @@ public interface IMeshClient : IAsyncDisposable
     Task SendAsync(Guid recipientId, ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends a message to another client via the hub, carrying structured headers alongside the
+    /// opaque message body.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget, mirroring <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, CancellationToken)"/>.
+    /// Headers are metadata the hub can route and observe without ever decoding <paramref name="message"/>
+    /// itself. Passing <see cref="MessageHeaders.Empty"/> is equivalent to calling the overload without
+    /// headers — no header block is written to the wire, so it costs nothing extra.
+    /// </remarks>
+    /// <param name="recipientId">The unique identifier of the target client.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="headers">The structured headers to attach to the message.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="headers"/> is non-empty but the hub negotiated a protocol version that predates
+    /// the header envelope.
+    /// </exception>
+    Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a message to another client via the hub, optionally waiting for the recipient's client to
+    /// acknowledge that the message reached its application.
+    /// </summary>
+    /// <remarks>
+    /// With <see cref="DeliveryOptions.None"/> this is identical to
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, CancellationToken)"/> — best-effort,
+    /// fire-and-forget, and the returned task completes once the hub has accepted the message. With
+    /// <see cref="DeliveryOptions.RequireAck"/> the returned task instead completes once the recipient's
+    /// client has raised <see cref="MessageReceived"/> for the message and sent back an acknowledgement,
+    /// or fails with a <see cref="TimeoutException"/> if that does not happen in time. The
+    /// acknowledgement is an ordinary routed message between the two clients; the hub does not
+    /// participate in or observe it.
+    /// <para>
+    /// With <see cref="DeliveryOptions.AwaitCapacity"/> the hub awaits capacity on the recipient's
+    /// outbound queue instead of dropping the message immediately if that queue is already full, so the
+    /// message is delivered late rather than lost — see <see cref="SendRejected"/> for the default
+    /// drop-on-full behaviour this opts out of. On its own it does not make this call wait; combined
+    /// with <see cref="DeliveryOptions.RequireAck"/> it does, but the two timeouts are independent and
+    /// must be reconciled — see <see cref="DeliveryOptions.WithAwaitCapacity"/>, whose remarks explain
+    /// why an acknowledgement timeout shorter than the hub's capacity wait can report a message as
+    /// failed that is then delivered anyway.
+    /// </para>
+    /// </remarks>
+    /// <param name="recipientId">The unique identifier of the target client.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="options">
+    /// Whether to require a delivery acknowledgement and its timeout, and/or whether to await capacity on
+    /// the recipient's outbound queue instead of dropping on full.
+    /// </param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="options"/> requires an acknowledgement but the hub negotiated a protocol version
+    /// that predates the header envelope.
+    /// </exception>
+    /// <exception cref="TimeoutException">
+    /// <paramref name="options"/> requires an acknowledgement and none arrived within its timeout.
+    /// </exception>
+    Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        DeliveryOptions options,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a message to another client via the hub with a time-to-live: if it has not reached the
+    /// recipient's client within <paramref name="timeToLive"/>, it is discarded rather than delivered
+    /// stale.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is otherwise best-effort and fire-and-forget, mirroring
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, CancellationToken)"/> — this method's returned
+    /// task completes once the hub has accepted the message, exactly as that overload's does, and does
+    /// not itself wait to find out whether the message expired before delivery.
+    /// <para>
+    /// The expiry is an absolute instant computed from <b>this client's own clock</b> at the moment of
+    /// the call. There is no hub clock authority: the hub and the recipient both compare it against
+    /// their own local clock, so a short time-to-live is only meaningful between peers whose clocks are
+    /// reasonably synchronised — under material clock skew a message could expire earlier or later than
+    /// intended, or not at all.
+    /// </para>
+    /// </remarks>
+    /// <param name="recipientId">The unique identifier of the target client.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="timeToLive">How long the message remains valid, measured from now.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The hub negotiated a protocol version that predates the header envelope.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeToLive"/> is not positive.</exception>
+    Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        TimeSpan timeToLive,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Broadcasts a message to every other client currently registered with the hub.
     /// </summary>
     /// <remarks>
-    /// Delivery is best-effort and fire-and-forget, mirroring <see cref="SendAsync"/>. The message is
+    /// Delivery is best-effort and fire-and-forget, mirroring
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, CancellationToken)"/>. The message is
     /// not echoed back to the sender. Recipients receive it through <see cref="MessageReceived"/> and
     /// cannot distinguish it from a directly addressed message.
     /// </remarks>
@@ -147,6 +282,55 @@ public interface IMeshClient : IAsyncDisposable
     Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends a message to every other member of the named group, carrying structured headers
+    /// alongside the opaque message body.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget, mirroring
+    /// <see cref="SendToGroupAsync(string, ReadOnlyMemory{byte}, CancellationToken)"/>. Passing
+    /// <see cref="MessageHeaders.Empty"/> is equivalent to calling the overload without headers — no
+    /// header block is written to the wire, so it costs nothing extra.
+    /// </remarks>
+    /// <param name="groupName">The name of the group to send to.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="headers">The structured headers to attach to the message.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="headers"/> is non-empty but the hub negotiated a protocol version that predates
+    /// the header envelope.
+    /// </exception>
+    Task SendToGroupAsync(
+        string groupName,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a message to every other member of the named group at the given priority, so it can
+    /// overtake a backlog of lower-priority traffic already queued for the same recipients.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget, mirroring
+    /// <see cref="SendToGroupAsync(string, ReadOnlyMemory{byte}, CancellationToken)"/>. Passing
+    /// <see cref="MessagePriority.Normal"/> is equivalent to calling the overload without a priority.
+    /// </remarks>
+    /// <param name="groupName">The name of the group to send to.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="priority">The priority to queue this send at on each recipient's outbound queue.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="priority"/> is not <see cref="MessagePriority.Normal"/> but the hub negotiated a
+    /// protocol version that predates the header envelope.
+    /// </exception>
+    Task SendToGroupAsync(
+        string groupName,
+        ReadOnlyMemory<byte> message,
+        MessagePriority priority,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Queries the hub for a client's Id based on its name
     /// </summary>
     /// <param name="name">The name of the client for which the Id should be retrieved.</param>
@@ -154,6 +338,59 @@ public interface IMeshClient : IAsyncDisposable
     /// <returns>Guid? value representing the client's Id, or null if no client by that name is found.</returns>
     /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
     Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a request to another client and awaits a correlated reply.
+    /// </summary>
+    /// <remarks>
+    /// The correlation id that ties the reply back to this call travels as a header, so this requires a
+    /// connection that negotiated a protocol version supporting the structured header envelope (see
+    /// <see cref="MessageHeaders"/>). The responder observes the request through
+    /// <see cref="MessageReceived"/> — a raised event whose
+    /// <see cref="MessageReceivedEventArgs.CorrelationId"/> is not <see langword="null"/> is a
+    /// request awaiting a reply — and answers it with <see cref="ReplyAsync"/>.
+    /// <para>
+    /// Concurrent requests from the same client are independent: each is tracked by its own correlation
+    /// id and resolved only by a reply carrying that same id. A reply that arrives after this call has
+    /// already timed out or been cancelled is discarded rather than misrouted to a later request that
+    /// happens to reuse the id.
+    /// </para>
+    /// </remarks>
+    /// <param name="recipientId">The unique identifier of the client to request a reply from.</param>
+    /// <param name="message">The request payload.</param>
+    /// <param name="timeout">The maximum time to wait for a reply before the call fails.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <returns>The reply payload sent back via <see cref="ReplyAsync"/>.</returns>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The hub negotiated a protocol version that predates the header envelope.
+    /// </exception>
+    /// <exception cref="TimeoutException">No reply arrived within <paramref name="timeout"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeout"/> is not positive.</exception>
+    Task<ReadOnlyMemory<byte>> RequestAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Replies to a request previously received via <see cref="MessageReceived"/>, completing the
+    /// sender's pending <see cref="RequestAsync"/> call.
+    /// </summary>
+    /// <param name="request">
+    /// The <see cref="MessageReceivedEventArgs"/> the request arrived on. Its
+    /// <see cref="MessageReceivedEventArgs.CorrelationId"/> must be set, i.e. it must have come
+    /// from a <see cref="RequestAsync"/> call rather than an ordinary send.
+    /// </param>
+    /// <param name="message">The reply payload.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">
+    /// The client is not connected to a hub, or <paramref name="request"/> was not a request.
+    /// </exception>
+    Task ReplyAsync(
+        MessageReceivedEventArgs request,
+        ReadOnlyMemory<byte> message,
+        CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Raised when a directly addressed or broadcast message is received from another client.
@@ -194,4 +431,19 @@ public interface IMeshClient : IAsyncDisposable
     /// </para>
     /// </remarks>
     event EventHandler<DisconnectedEventArgs> Disconnected;
+
+    /// <summary>
+    /// Raised when the hub reports that a message this client sent was dropped because the recipient's
+    /// outbound queue was full.
+    /// </summary>
+    /// <remarks>
+    /// Only raised when the hub was constructed with <c>notifyOnQueueSaturation</c> set — otherwise a
+    /// dropped message stays silent to this client, exactly as before this event existed. Only
+    /// <b>directly addressed</b> sends are reported: a broadcast or group send dropped for a full queue
+    /// never raises this, because naming the dropped recipient would tell this client the identity of a
+    /// client it never addressed. The notification is best-effort: it is itself dropped rather than
+    /// retried if this client's own outbound queue happens to be full at the moment the hub tries to
+    /// send it.
+    /// </remarks>
+    event EventHandler<SendRejectedEventArgs> SendRejected;
 }

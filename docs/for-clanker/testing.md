@@ -7,16 +7,54 @@ The test suite is the best source of **intended usage** and the required place t
 wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test names), `CA2007`, and
 `xUnit1030`.
 
+**A second, separate suite** covers the DI/hosting package (PR #70, plus health checks added by PR #71):
+`src/Tests/AdamSalisbury.Meshworx.Extensions.DependencyInjection.UnitTests`, same stack and
+`NoWarn` set, seven files —
+`MeshHubServiceCollectionExtensionsTests.cs`, `MeshClientServiceCollectionExtensionsTests.cs`,
+`MeshHubHostedServiceTests.cs`, `MeshHubHealthCheckTests.cs`, `MeshClientHealthCheckTests.cs`,
+`MeshHubHealthCheckBuilderExtensionsTests.cs` and `MeshClientHealthCheckBuilderExtensionsTests.cs`. Most
+tests build a `ServiceCollection`/`ServiceProvider` or a real `HostBuilder`/`IHost` directly, mocking only
+`ITransportListener`/`IMeshHub`/`ILogger`; the hosted-service **lifecycle** tests (host start/stop
+connecting and disconnecting a client) run against a real `MeshHub` over `InMemoryTransport` rather than
+a mock, because `ConnectAsync` performs a genuine registration handshake a bare transport mock cannot
+answer (`MeshClientServiceCollectionExtensionsTests.cs:214-274`) — no real sockets are used anywhere in
+this suite. `MeshClientServiceCollectionExtensionsTests.AddMeshClient_CalledTwiceForTheSameName_RegistersOnlyOneHostedService`
+covers the double-registration guard described in [known-issues.md](known-issues.md) KI-30; an
+`AddMeshHub`-called-twice scenario is not separately covered, since that path is deduplicated by the
+framework itself (`AddHostedService<T>()`) rather than by anything this repo wrote. See
+[dependency-injection.md](dependency-injection.md) for what the package does.
+
+**The health-check test files follow the same "mock for unit behaviour, real object for the end-to-end
+flip" split as the rest of the suite.** `MeshHubHealthCheckTests.cs`/`MeshClientHealthCheckTests.cs` test
+`MeshHubHealthCheck`/`MeshClientHealthCheck` directly against a mocked `IMeshHub`/`IMeshClient` resolved
+from a small `ServiceProvider`, including a not-registered case that asserts
+`CheckHealthAsync` throws `InvalidOperationException` (proving the health check service, not the check
+itself, is what turns that into a status — see [dependency-injection.md](dependency-injection.md#health-checks)).
+`MeshHubHealthCheckBuilderExtensionsTests.cs`/`MeshClientHealthCheckBuilderExtensionsTests.cs` test
+`AddMeshHub`/`AddMeshClient` through a real `HealthCheckService`, including one test each that drives a
+**real** `MeshHub`/`MeshClient` through its actual start/stop or connect/disconnect lifecycle and asserts
+the reported `HealthStatus` flips `Unhealthy` → `Healthy` → `Unhealthy` — the acceptance criteria from
+issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand in for the real thing.
+
 ## Layout
 
 | File | Lines | Covers |
 |---|---|---|
-| `Fixtures/MeshHubFixture.cs` | 304 | Hub test harness (mock listener/transport, register helpers, **authenticator and group-authoriser pass-throughs**, group/lookup/direct frame builders, `FrameRecorder`) |
-| `Fixtures/MeshClientFixture.cs` | 118 | Client test harness (mock transport, scripted receive, **`CreateGroupJoinRefusal`**) |
-| `MeshHubTests.cs` | 2498 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction)**, **capacity claim/release under a concurrent registration**, **groups as an authorisation boundary**, lifecycle, **concurrent stop/dispose and start-vs-stop races** |
-| `MeshClientTests.cs` | 1602 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race**, **group-join refusal handling** |
+| `Fixtures/MeshHubFixture.cs` | 371 | Hub test harness (mock listener/transport, register helpers, **authenticator and group-authoriser pass-throughs**, group/lookup/direct frame builders, `FrameRecorder`, `CreateRegistrationRequest`'s `versionMin`/`versionMax` parameters (PR #73), **header-bearing frame builders and a `remoteEndPointTransport` negotiated-version overload on `RegisterClientAsync`, PR #74**, **`notifyOnQueueSaturation`/`backpressureAwaitTimeout` constructor pass-throughs, PR #87**, **`offlineStore`/`offlineStoreTimeout` pass-throughs and `RegisterClientWithRecorderAsync`, issue #28**) |
+| `MeshHubSessionResumptionTests.cs` | 383 | **New for issue #43.** The hub's half of session resumption, driven straight against the wire through the mock transport: token issued only when the feature is on *and* version 6 was negotiated, the reclaimed id routing for a peer's cached id, group membership restored, the authoriser consulted again on restore (the resumption-shaped counterpart to `JoinGroup_AfterReconnect_IsAuthorisedAgainRatherThanRestored`), and the five refusal paths — token replayed, wrong name, unknown, session still live, window closed. Uses a **one-tick window** to pin expiry rather than waiting out a realistic one |
+| `MeshClientSessionResumptionTests.cs` | 216 | **New for issue #43.** The client's half: the token is retained across a disconnect and presented on the next connect, the reclaimed id is adopted, a refusal leaves the client connected on the fresh identity, and no attempt is made under a different name, with no token, or below version 6. Its harness scripts the hub's reply **in response to observing the `ResumeSession` send** rather than queueing it — see the note below |
+| `InMemoryOfflineStoreTests.cs` | 213 | **New for issue #28.** `InMemoryOfflineStore` in isolation: arrival-order drain, take-removes, all four bounds (per-name message count, byte count including headers, distinct-name cap, retention window), the refuse-not-evict policy, a full-of-expired queue accepting again, concurrent writers, and the constructor guards. **The retention window is pinned without waiting real time** — the test supplies the message's own `QueuedAt`, which is why that is a constructor parameter of `OfflineMessage` rather than stamped by the store |
+| `MeshHubOfflineDeliveryTests.cs` | 405 | **New for issue #28.** Store-and-forward through the hub: held-and-delivered-on-reconnect, arrival order across a reconnect, header block kept for a version-5 return and stripped for a version-4 one, the stale-id-after-reconnect drop, the disabled-by-default path, and the refusing/throwing store paths. Carries three `IOfflineStore` doubles — `ObservableOfflineStore` (wraps a real store and signals each accepted message, so a test reconnects only once the hub has actually stored something), `RefusingOfflineStore`, `ThrowingOfflineStore` |
+| `Fixtures/MeshClientFixture.cs` | 170 | Client test harness (mock transport, scripted receive, `CreateGroupJoinRefusal`, an 18-byte `RegistrationComplete` builder taking a negotiated-version byte (PR #73), **header-bearing `DeliverMessage`/`DeliverGroupMessage` frame builders, PR #74**) |
+| `Fixtures/MetricsCapture.cs` | 88 | **Metrics test harness (PR #72):** a `MeterListener` filtered to one `Meter` reference plus one instrument name, capturing every measurement and its tags in recording order |
+| `Messages/MessageHeadersTests.cs` | 62 | **New in PR #74.** `MessageHeaders.Empty`, constructor null-guard and copy-not-alias semantics, indexer/`TryGetValue`, `GetEnumerator` — does **not** cover the duplicate-key throw (see [known-issues.md](known-issues.md) KI-34) |
+| `Messages/HeaderEnvelopeTests.cs` | 156 | **New in PR #74.** `HeaderEnvelope` encode/decode round-trips, the empty-block short-circuit, the per-field length caps (255-byte key, 65 535-byte value) and the aggregate 65 535-byte block cap, and `FormatException` on each of the three ways a block can be truncated |
+| `MeshHubTests.cs` | 3299 | Registration, **authentication**, routing, broadcast, groups, **heartbeat schedule (eviction interval, N=1 no-probe boundary, no false eviction, and — PR #87 — a parked-awaiting-capacity connection is exempt from it)**, **capacity claim/release under a concurrent registration**, **groups as an authorisation boundary**, lifecycle, **concurrent stop/dispose and start-vs-stop races**, **`IsRunning`/`MaxClients` accessors (PR #71)**, **inverted/non-overlapping version-range refusal and highest-shared-version negotiation (PR #73)**, **`RouteMessageWithHeaders`/`SendToGroupWithHeaders` frame-shape selection by recipient version, malformed-header-block frame drop, oversized-delivery-frame `ArgumentException` handling, PR #74**, **`QueueSaturated` raised from all five drop sites, the direct-only wire notification gated on `notifyOnQueueSaturation`, and `AwaitCapacity` freeing up before/after the timeout, PR #87** |
+| `MeshHubMetricsTests.cs` | 775 | **All five `MeshHub` instruments (PR #72):** connected-clients up/down counter, routed/dropped counters per direction/reason, the zero-recipient exclusion for broadcast, the outbound-queue-depth gauge. **Extended by PR #86** (test-timeout-convention alignment only, no new coverage) **and by PR #87's own test-suite growth** (see `MeshHubTests.cs` above for the backpressure coverage itself; this file's own additions are metrics-focused, e.g. confirming `messages.dropped` still fires once per drop regardless of the new signalling) |
+| `MeshClientTests.cs` | 3040 | Connect/disconnect, send/broadcast/group, lookup correlation, idle timeout, events, **local-disconnect vs. receive-loop teardown race**, **group-join refusal handling**, **`NegotiatedProtocolVersion` recorded on connect and reset on disconnect (PR #73)**, **`SendAsync`/`SendToGroupAsync` headers overloads (empty-headers wire-identity, `NotSupportedException` below version 5, malformed-header-block frame drop), PR #74**, **`SendRejected` raised on an inbound `0x15` frame, and the `AwaitCapacity`/`WithAwaitCapacity` header-attachment paths on the `DeliveryOptions` overload, PR #87** |
 | `MeshClientReconnectorTests.cs` | 944 | Fail-fast start, reconnect-on-drop, coalescing, `Reconnected`, credential replay, **TLS transport factory**, **drop-before-subscription race, duplicate-signal settling, rejected-attempt transport disposal**, **restored membership re-authorised by the hub**, **the documented `Reconnected` handler idiom containing a post-suspension failure** |
-| `MeshIntegrationTests.cs` | 481 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets** and **non-member/unauthorised group paths** |
+| `MeshClientReconnectorMetricsTests.cs` | 73 | **The `meshworx.client.reconnects` counter (PR #72):** excluded on the initial `StartAsync` connect, incremented exactly once on a genuine reconnect |
+| `MeshIntegrationTests.cs` | 540 | Hub + real clients over `InMemoryTransport`, end-to-end, plus **one mutual-TLS run over real sockets**, **non-member/unauthorised group paths**, and **end-to-end header delivery across mixed negotiated versions, PR #74** |
 | `Transport/InMemory/InMemoryTransportTests.cs` | 173 | Pair semantics, copy-on-send, close signalling |
 | `Transport/InMemory/InMemoryTransportListenerTests.cs` | 90 | **Listener disposal contract in memory (4 tests):** accept after dispose, dispose-without-ever-starting, a queued connection closed rather than served, repeated/concurrent dispose |
 | `Transport/Tcp/TcpTransportTests.cs` | 342 | Framing, oversize rejection, invalid length, batch send |
@@ -24,7 +62,22 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 | `Transport/Tcp/TcpTransportListenerTests.cs` | 282 | Start/accept/dispose (cleartext), **plus the disposal contract (11 tests): start-after-dispose, pending accept ended by dispose, accept raced against dispose, concurrent dispose (cleartext and TLS), `IsStoppedListenerFailure` vs the framework** |
 | `Transport/Tcp/TcpTransportTlsTests.cs` | 494 | Server TLS, mutual TLS, rejection paths, handshake timeout, silent-peer flood, constructor guards, `TargetHost` defaulting, `IsEncrypted` |
 | `Transport/Tcp/TlsOptionsCloneTests.cs` | 242 | Reflection-driven proof that both TLS option clones copy **every** settable property |
-| `Transport/Tcp/TestCertificates.cs` | 67 | Helper: self-signed certificate generation and a pinning validation callback |
+| `Transport/Tcp/TestCertificates.cs` | 67 | Helper: self-signed certificate generation and a pinning validation callback (also used directly by the WebSocket TLS tests below, PR #78) |
+| `Transport/WebSocket/WebSocketTransportListenerTests.cs` | 207 | **New in PR #78 (issue #18).** Constructor guards, start/accept/dispose lifecycle, and the same raced-accept-vs-dispose and concurrent-dispose shapes as `TcpTransportListenerTests.cs` |
+| `Transport/WebSocket/WebSocketTransportLoopbackTests.cs` | 485 | **New in PR #78.** Round-trip send/receive over a real loopback socket, multi-frame reassembly, batch send (incl. deliver-then-fault), oversize payload on both send and receive, graceful close, wrong-path rejection, TLS variants (cert trust, silent-peer flood against negotiation slots, cert rejection, handshake-failure recovery, cleartext-against-TLS-only rejection) |
+| `Transport/WebSocket/WebSocketMeshIntegrationTests.cs` | 117 | **New in PR #78.** One end-to-end test: register/lookup/direct-send/broadcast/group-message over a real `wss://` connection, using the actual `MeshHub` and `MeshClient` — proves the WebSocket transport is a drop-in replacement for TCP with no protocol-level difference |
+| `Transport/Unix/TempSocketPath.cs` | 13 | **New in PR #81 (issue #20, not yet merged to `main`).** Helper only: generates a short `{Guid:N}.sock` path under the temp directory, kept short deliberately to stay under the platform's `sun_path` length limit |
+| `Transport/Unix/UnixSocketTransportTests.cs` | 87 | **New in PR #81.** Framing-level tests driven directly against a `MemoryStream` via the internal `UnixSocketTransport(Stream)` constructor — negative/oversize/truncated length-prefix handling and a round-trip — mirroring `TcpTransportTests.cs`'s malformed-frame coverage of the shared `StreamFramer` code, since both transports frame identically and each needs the same coverage rather than trusting the TCP tests alone to prove the shared path |
+| `Transport/Unix/UnixSocketTransportListenerTests.cs` | 258 | **New in PR #81.** Constructor guards, start/accept/dispose lifecycle, raced-accept-vs-dispose and concurrent-dispose (mirroring `TcpTransportListenerTests.cs`'s shapes), stale-socket-file deletion before bind, and the socket-file **permission-hardening** tests (owner-only default, custom `socketFileMode`) added during the security-review pass |
+| `Transport/Unix/UnixSocketTransportLoopbackTests.cs` | 147 | **New in PR #81.** Round-trip send/receive over a real Unix domain socket, oversize-payload rejection, remote-dispose-returns-null, batch send (`IBatchSendTransport`), and connect-with-nothing-listening |
+| `Transport/Unix/UnixSocketMeshIntegrationTests.cs` | 97 | **New in PR #81.** One end-to-end test: register/lookup/direct-send/broadcast/group-message over a real Unix domain socket, using the actual `MeshHub` and `MeshClient` — the same shape as `MeshIntegrationTests.cs`/`WebSocketMeshIntegrationTests.cs`, proving interoperability is identical for this transport too |
+| `Transport/NamedPipes/NamedPipeTransportTests.cs` | 39 | **New in PR #81.** Constructor/argument guard (`ArgumentException` on an empty pipe name) plus the `PlatformNotSupportedException` guard on `ConnectAsync` for non-Windows — **the happy path itself is untested on this repo's CI**, see the platform-guard note below |
+| `Transport/NamedPipes/NamedPipeTransportListenerTests.cs` | 93 | **New in PR #81.** Constructor guards (`maxServerInstances`), start-after-dispose/dispose-never-started/accept-not-started lifecycle checks, and the `PlatformNotSupportedException` guard on `StartAsync` for non-Windows — same platform-guard-only caveat as the transport's own tests |
+| `Transport/Quic/QuicTransportTests.cs` | 100 | **New in PR #82 (issue #21, not yet merged to `main`).** Framing-level tests driven directly against a `MemoryStream` via the internal `QuicTransport(Stream)` constructor — negative/oversize/truncated length-prefix handling and a round-trip, mirroring `TcpTransportTests.cs`/`UnixSocketTransportTests.cs`'s coverage of the shared `StreamFramer` code — plus `RemoteEndPoint_ConstructedOverPlainStream_IsNull` |
+| `Transport/Quic/QuicTransportListenerTests.cs` | 402 | **New in PR #82.** Constructor guards, start/accept/dispose lifecycle, the sequential `StartAsync_AlreadyRunning_ThrowsInvalidOperationException` case, **and three race tests**: `AcceptAsync_RacedAgainstDispose_OnlyEverReportsDisposal` (the same release-together shape as `TcpTransportListenerTests.cs`'s), `DisposeAsync_RacedAgainstStartAsync_NeverLeavesAnUnpublishedListenerRunning`, and `StartAsync_CalledConcurrently_OnlyOneSucceeds` (added once KI-41 was found and fixed) — the latter two are **QUIC-specific**, since they only exist because `QuicListener.ListenAsync` is itself the asynchronous bind step, unlike every other listener's synchronous one (see [known-issues.md](known-issues.md) KI-41, now fixed) |
+| `Transport/Quic/QuicTransportListenerSourceAdmissionTests.cs` | 157 | **New in PR #82.** Deterministic, non-network tests for the per-source admission primitives (`TryAdmitSource`/`ReleaseSource`/`NormaliseForSourceCap`) called directly — admit-then-refuse at the cap, slot release and re-admission, independent caps for different sources, concurrent callers for the same source never exceeding the cap, and the IPv6 `/64` normalisation both within and across prefixes |
+| `Transport/Quic/QuicTransportLoopbackTests.cs` | 357 | **New in PR #82.** Round-trip over a real QUIC connection, remote-endpoint reporting, oversize-payload rejection, batch send, remote-dispose-returns-null, and `StreamOpenTimeout_SilentPeerAbandoned_SlotReclaimedForLaterClient` (proves a silent peer's negotiation slot is reclaimed after `streamOpenTimeout` by driving `maxConcurrentNegotiations: 1` and proving a later genuine client can only connect if the slot was freed) |
+| `Transport/Quic/QuicMeshIntegrationTests.cs` | 124 | **New in PR #82.** One end-to-end test, `EndToEnd_RegisterSendBroadcastAndGroupMessage_OverQuic` — register/direct-send/broadcast/group-message over a real QUIC connection using the actual `MeshHub`/`MeshClient`, the same shape as the Unix-socket/WebSocket integration tests |
 
 ## Testing conventions (follow these)
 
@@ -41,6 +94,108 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   disposes the listener in a `finally`, because these tests can genuinely hang rather than fail.
   Shrink the bounds under test — `tlsHandshakeTimeout: TimeSpan.FromMilliseconds(300)`,
   `maxConcurrentTlsHandshakes: 2` — rather than waiting out the production defaults.
+- **The WebSocket transport's tests (PR #78, issue #18) follow the TCP transport's conventions
+  deliberately, not by coincidence — copy from there first.** `WebSocketTransportLoopbackTests.cs` binds
+  loopback on port 0 and reads `((IPEndPoint)listener.LocalEndPoint!).Port` back exactly like the TCP
+  loopback tests; its TLS variants reuse `TestCertificates.CreateSelfSigned`/`PinnedTo` unchanged rather
+  than inventing a second certificate helper; and
+  `ServerTls_SilentPeersOutnumberNegotiationSlots_GenuineClientStillConnects`
+  (`WebSocketTransportLoopbackTests.cs:282`) is the same "flood more silent peers than there are
+  negotiation slots, then prove a genuine client still gets through" shape as
+  `TcpTransportTlsTests.cs:263`, applied to `WebSocketTransportListener`'s negotiation pump instead of
+  `TcpTransportListener`'s handshake pump — see the pairing this shape exists to close under "Assert the
+  negative directly" below. `WebSocketTransportListenerTests.cs`'s raced-accept-vs-dispose and
+  concurrent-dispose tests are the same shapes as `TcpTransportListenerTests.cs`'s, applied to the
+  channel-backed listener instead of the TLS-mode one. Two conventions specific to this transport:
+  - **To prove the receiver's own accumulation cap, not just the sender's check, rejects an oversized
+    message,** `ReceiveAsync_PayloadExceedsMaxSize_ThrowsIOException`
+    (`WebSocketTransportLoopbackTests.cs:402`) reaches past `WebSocketTransport.SendAsync`'s own guard
+    entirely — reflection pulls the private `_webSocket` field out of the client transport and drives the
+    raw `System.Net.WebSockets.WebSocket` directly, since the wrapped `SendAsync` would otherwise refuse
+    the oversized payload before it ever reached the wire.
+  - **`WebSocketMeshIntegrationTests.cs` mirrors `MeshIntegrationTests.cs`'s mutual-TLS end-to-end run**
+    almost exactly (same three-client register/send/broadcast/group shape), over `wss://` instead of a TLS
+    `TcpTransport` — the point of the test is that the interoperability surface is identical, so copying
+    the existing integration test's shape rather than inventing a new one is itself part of what the test
+    demonstrates.
+- **The Unix domain socket transport's tests (PR #81, issue #20, not yet merged to `main`) follow the
+  same "copy the TCP conventions first" rule the WebSocket transport's did.**
+  `UnixSocketTransportListenerTests.cs`'s raced-accept-vs-dispose
+  (`AcceptAsync_RacedAgainstDispose_OnlyEverReportsDisposal`) and concurrent-dispose
+  (`DisposeAsync_CalledConcurrently_DoesNotThrowAndLeavesListenerDisposed`) tests are the same
+  release-together-on-separate-`Task.Run`s shapes as `TcpTransportListenerTests.cs`'s, applied to the
+  socket-file-backed listener instead of the TLS-mode one. Two conventions specific to this transport:
+  - **`UnixSocketTransportTests.cs` proves the shared `StreamFramer` code directly, against a
+    `MemoryStream`, rather than only through a real loopback socket.** It drives the internal
+    `UnixSocketTransport(Stream)` constructor with a hand-built `MemoryStream` to exercise the same
+    negative-length/oversize-length/truncated-payload/round-trip cases `TcpTransportTests.cs` covers for
+    `TcpTransport` — deliberately, since both transports now share one framing implementation and a
+    regression in it should fail on **both** transports' test suites, not rely on one of them to catch it
+    for the other. `UnixSocketTransportLoopbackTests.cs` then separately proves the same behaviour holds
+    over a genuine socket, the way `TcpTransportLoopbackTests.cs` does for TCP.
+  - **The socket-file permission-hardening tests skip themselves on Windows with a plain runtime check**
+    (`if (OperatingSystem.IsWindows()) { return; }`), not a `[SkipOnPlatform]`-style attribute — POSIX
+    mode bits (`UnixFileMode`) are meaningless on Windows' `AF_UNIX` implementation, which uses NTFS ACLs
+    instead, so `StartAsync_Default_HardensSocketFileToOwnerOnly` and
+    `StartAsync_CustomSocketFileMode_AppliesIt` both early-return there rather than asserting anything.
+    Since this repo's CI runs `ubuntu-latest` only (`.github/workflows/ci.yml`), these two tests always
+    run for real in CI; the early-return exists for anyone running the suite locally on Windows.
+- **The named-pipe transport's tests (PR #81) are, by necessity, platform-guard tests only on this
+  repo's CI.** Named pipes are Windows-only, and `.github/workflows/ci.yml` runs `ubuntu-latest`
+  exclusively, so **the only behaviour `NamedPipeTransportTests.cs`/`NamedPipeTransportListenerTests.cs`
+  can actually exercise here is that `ConnectAsync`/`StartAsync` throw
+  `PlatformNotSupportedException` promptly rather than hanging or failing with a confusing lower-level
+  error** — every test that would drive a real accept/round-trip is written to check
+  `OperatingSystem.IsWindows()` first and either return early (documented as "nothing to assert here") or
+  branch into a genuine start-and-dispose call that only ever runs if this suite is one day executed on a
+  Windows agent. Constructor-argument guards (`Constructor_EmptyPipeName_ThrowsArgumentException`,
+  `Constructor_NonPositiveMaxServerInstances_ThrowsArgumentOutOfRangeException`) run on every platform
+  regardless, since they throw before the platform check is reached. Do not read a green run of these two
+  files on this repo's CI as proof the happy path works — it proves only that the guard does.
+- **The QUIC transport's tests (PR #82, issue #21, not yet merged to `main`) are documented no-ops
+  wherever `QuicListener.IsSupported`/`QuicConnection.IsSupported` is `false`.** Every test in
+  `Transport/Quic/*.cs` opens with `if (!IsQuicSupported) { return; }` (or the `QuicListener.IsSupported`
+  equivalent) rather than an attribute-driven skip, matching the pattern the named-pipe tests use for
+  their own platform gate — CI installs `libmsquic` explicitly (`.github/workflows/ci.yml`) precisely so
+  this repo's own CI run exercises the real thing rather than silently taking the no-op path. Do not read
+  a green run elsewhere (a machine without `libmsquic`) as proof the transport works — check whether the
+  support check actually passed.
+  - **`QuicTransportListenerSourceAdmissionTests.cs` tests the per-source admission primitives
+    (`TryAdmitSource`/`ReleaseSource`/`NormaliseForSourceCap`) directly and deterministically, not through
+    a real multi-source network flood.** A genuine test of "does the per-source cap actually cap a
+    distributed set of sources" is not reproducible from a single loopback test box — every connection a
+    test process opens shares one local address (or, at best, one narrow local range) — so the primitives
+    that implement the bookkeeping are unit-tested in isolation instead, calling the `internal static`
+    methods directly with hand-picked `IPAddress` values. This is the same "test what you can prove
+    deterministically, not what would need a distributed rig" reasoning that keeps
+    `MeshHubTests.cs`'s IPv6 per-remote-endpoint cap tests (see
+    [per-remote-endpoint-connection-cap](#per-remote-endpoint-connection-cap) above) hand-picking specific
+    addresses rather than generating a real flood — copy this shape for the equivalent reason if you add
+    another per-source primitive.
+  - **QUIC's test loopback shape is the reverse of every other transport's: send before you accept, not
+    after.** A QUIC stream is invisible to the peer until data actually arrives on it — opening one is a
+    purely local operation — so `QuicTransportListener.AcceptAsync` cannot complete until the connecting
+    client has called `SendAsync` at least once. Every test in `QuicTransportLoopbackTests.cs` and
+    `QuicMeshIntegrationTests.cs` therefore sends the first payload (or relies on `MeshClient.ConnectAsync`
+    sending the registration frame) **before** awaiting the listener's `AcceptAsync`, the opposite order
+    every TCP/WebSocket/Unix-socket loopback test uses. Copy the send-then-accept order if you add another
+    QUIC test directly against the transport rather than through a `MeshClient`/`MeshHub` pair — getting
+    the order backwards deadlocks the test rather than failing it cleanly, so give any such test an
+    explicit `[Fact(Timeout = …)]`.
+  - **`DisposeAsync_RacedAgainstStartAsync_NeverLeavesAnUnpublishedListenerRunning`
+    (`QuicTransportListenerTests.cs:286`) has no analogue on any other listener in this suite, because no
+    other listener has an asynchronous bind step to race against.** `QuicListener.ListenAsync` is itself
+    the async bind/listen call, unlike every socket-backed listener's synchronous one, so
+    `QuicTransportListener` is the only listener where `StartAsync` and `DisposeAsync` can genuinely
+    interleave mid-bind. **This file also covers the equivalent `StartAsync`-vs-`StartAsync` race**, via
+    `StartAsync_CalledConcurrently_OnlyOneSucceeds` — added once [known-issues.md](known-issues.md) KI-41
+    was found and fixed.
+- **Neither new local-IPC transport has a test proving `maxConnectionsPerRemoteEndpoint` caps it** —
+  correctly, because it doesn't: [known-issues.md](known-issues.md) KI-38 records that gap as a
+  deliberate scope decision, not a regression to catch. Do not add a test asserting the cap works over
+  `UnixSocketTransport`/`NamedPipeTransport` without first reading that entry; it would either fail
+  honestly or need to assert the *absence* of the cap, which is a strange thing for a test suite to lock
+  in without a comment explaining why.
 - **Assert the negative directly when testing a denial-of-service property.** The silent-peer tests
   (`TcpTransportTlsTests.cs:207`, `:263`) make the point that a surviving-client assertion alone is not
   proof: one test asserts the abandoned peer's socket actually reaches end of stream (a zero-byte read),
@@ -69,7 +224,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   ([known-issues.md](known-issues.md) KI-22). Copy this shape whenever a guard is written against
   undocumented platform behaviour.
 - **When the bug is "one interval late", assert a count, not an outcome.** The heartbeat tests
-  (`MeshHubTests.cs:2057`, `:2105`) do not merely assert that a silent client was evicted — that passes
+  (`MeshHubTests.cs:2103`, `:2151`) do not merely assert that a silent client was evicted — that passes
   whether eviction fires on the Nth or the (N+1)th interval, which was exactly the KI-11 defect. They
   count `Ping` frames in the mock's `SendAsync` callback and **snapshot the count inside the
   `DisposeAsync` setup**, so the teardown itself latches the value and no later write can inflate it,
@@ -77,7 +232,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   `DisposeAsync` callback to wait for eviction rather than sleeping. Copy this shape for any timing
   contract where the wrong answer is still a *plausible* answer. The complementary direction — a client
   that keeps sending is never evicted — is `HandleClient_ClientSendingFramesEveryInterval_IsNotEvicted`
-  (`:2149`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
+  (`:2195`); it deliberately runs at `maxMissedHeartbeats: 3` with a send cadence well inside the
   interval so a scheduling stall on a loaded runner cannot masquerade as a genuine eviction.
 - **Drive the receive loop with a `Channel`, not `SetupSequence` returning `null`.** A completed/`null`
   receive is now interpreted as a lost connection and triggers teardown. `MeshClientFixture`
@@ -133,7 +288,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   back. Prefer these over anything timing-based.
 
   1. **To park a caller *inside* a shutdown, hold the mocked `ITransport.SendAsync` open on the
-     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:427-437`) awaits each client's
+     `Disconnect` frame.** The shutdown's notification loop (`MeshHub.cs:499-509`) awaits each client's
      `SendAsync` in turn, and that await sits **after** the caller has claimed the hub's state but
      **before** the shutdown has finished — so returning an incomplete task there pins the hub
      mid-shutdown for as long as the test needs. The helper is already written:
@@ -184,14 +339,14 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 - **Assert a resolved default through an `internal` accessor rather than waiting out a real interval.**
   Added with the finite-defaults work in PR #68 (issue #16), and following the same shape as
   `TryReserveClientSlot`/`ReleaseClientSlot` below: `GetHeartbeatIntervalForTesting()`
-  (`MeshHub.cs:529-532`) is `internal` rather than `private` purely so a test can assert what
+  (`MeshHub.cs:619-622`) is `internal` rather than `private` purely so a test can assert what
   `heartbeatInterval` resolved to — including the 30 s default and the
   `Timeout.InfiniteTimeSpan` opt-out — without a real `PeriodicTimer` interval ever having to elapse.
-  `Constructor_HeartbeatIntervalNotSpecified_DefaultsToThirtySeconds` (`MeshHubTests.cs:989`) and
-  `Constructor_HeartbeatIntervalSetToInfinite_DisablesIdleEviction` (`:1002`) are the
+  `Constructor_HeartbeatIntervalNotSpecified_DefaultsToThirtySeconds` (`MeshHubTests.cs:1035`) and
+  `Constructor_HeartbeatIntervalSetToInfinite_DisablesIdleEviction` (`:1048`) are the
   reference pair. Copy this shape — an `internal` read-only accessor plus `InternalsVisibleTo` — for any
   future constructor-resolved default that would otherwise need a real timer/interval to observe.
-  `Constructor_MaxClientsNotSpecified_DefaultsToOneThousand` (`:970`) pins the `maxClients` default the
+  `Constructor_MaxClientsNotSpecified_DefaultsToOneThousand` (`:1016`) pins the `maxClients` default the
   same way, but through `TryReserveClientSlot` directly (claiming it 1000 times) rather than a dedicated
   accessor, since `maxClients` has no equivalent private field worth exposing.
 <a id="per-remote-endpoint-connection-cap"></a>
@@ -201,7 +356,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   optional `remoteEndPoint` parameter — when given, the mock also implements
   `IRemoteEndPointTransport` and reports it, so it participates in the cap exactly as `TcpTransport`
   does. The four tests under the `// AcceptLoop — per-remote-endpoint connection cap` banner
-  (`MeshHubTests.cs:1040`) are the reference set:
+  (`MeshHubTests.cs:1086`) are the reference set:
   - `AcceptLoop_TooManyConnectionsFromSameAddress_RefusesFurtherConnectionWithoutHandshake` proves the
     refusal happens **before any handshake** — it asserts `ReceiveAsync` was `Times.Never` called on the
     refused mock, not merely that registration failed.
@@ -225,7 +380,7 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   before the hub takes its capacity decision — the only window in which the racing state can be staged:
 
   ```csharp
-  // MeshHubTests.cs:824
+  // MeshHubTests.cs:870
   var fixture = new MeshHubFixture(
       maxClients: 1,
       authenticator: async (_, ct) =>
@@ -265,13 +420,16 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   certainly will — a direct message to the same client — and because a client's outbound queue is drained
   **in order**, the later frame's arrival proves the earlier one was never queued. Prefer this to a
   settle-and-count wherever the thing you are excluding shares a queue with something you can trigger.
-  See `SendToGroup_SenderIsNotAMember_MessageIsNotDelivered` (`MeshHubTests.cs:2302`).
+  See `SendToGroup_SenderIsNotAMember_MessageIsNotDelivered` (`MeshHubTests.cs:2348`).
 - **Fixture helpers build wire frames by hand** (`CreateRegistrationRequest`, `CreateDeliverMessagePayload`,
   `CreateLookupFound/NotFoundResponse`) with the raw opcodes — a useful cross-check of
   [protocol.md](protocol.md). If you change a frame layout, these helpers must change too.
-  `CreateRegistrationRequest(name, credential)` builds a **version 3** frame
-  (`[0x04][0x03][nameLen u16 BE][name][credential]`) and hard-codes the version byte, so a
-  `Protocol.Version` bump requires editing it (`Fixtures/MeshHubFixture.cs:118-130`).
+  `CreateRegistrationRequest(name, credential, versionMin=0x04, versionMax=0x04)` builds a
+  `[0x04][versionMin][versionMax][nameLen u16 BE][name][credential]` frame, defaulting both version
+  bytes to the current `Protocol.MinSupportedVersion`/`MaxSupportedVersion` (`Fixtures/MeshHubFixture.cs:118-131`,
+  updated for the min/max negotiation in PR #73). Most call sites take the defaults; pass explicit
+  `versionMin`/`versionMax` to exercise `TryNegotiateProtocolVersion`'s refusal paths (inverted or
+  non-overlapping range) without touching `Protocol.cs` itself.
 - **Test the authenticator through the hub, not in isolation.** `MeshHubFixture` takes `authenticator`
   and `maxConcurrentAuthentications` pass-throughs, so the seam is exercised over the real registration
   path. The `HandleClient_Authenticator*` tests in `MeshHubTests.cs` cover the outcomes worth copying:
@@ -282,9 +440,9 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
 - **Test the group authoriser the same way, through the hub.** `MeshHubFixture` takes `groupAuthoriser`
   and `groupAuthorisationTimeout` (`Fixtures/MeshHubFixture.cs:27-28`). The twelve
   `SendToGroup_*` / `JoinGroup_*` tests under the `// Groups as an authorisation boundary` banner
-  (`MeshHubTests.cs:2282`) are the reference set — they are enumerated in
+  (`MeshHubTests.cs:2328`) are the reference set — they are enumerated in
   [hub.md](hub.md#idiomatic-usage-from-tests). Note the hanging-authoriser test releases its callback at
-  the end (`MeshHubTests.cs:2502`) so an abandoned task does not outlive the test; do the same, because
+  the end (`MeshHubTests.cs:2548`) so an abandoned task does not outlive the test; do the same, because
   the hub's timeout does not stop the callback (KI-28 in [known-issues.md](known-issues.md)).
 - **End-to-end coverage lives in `MeshIntegrationTests.cs`**: `EndToEnd_NonMemberCannotSendToGroup`
   (`:152`) and `EndToEnd_UnauthorisedClientIsRefusedGroupMembership` (`:191`) run the rules over real
@@ -314,6 +472,66 @@ wired for coverage. `IsPackable=false`; suppresses `CA1707` (underscore test nam
   fix the clone in `TcpTransport.CloneClientOptions` / `TcpTransportListener.CloneServerOptions` — do
   not add an exclusion.
 - Test names use `Method_State_ExpectedBehaviour` with underscores (hence `CA1707` suppressed).
+
+<a id="metrics-tests"></a>
+- **Filter a `MeterListener` by `Meter` reference, not by instrument name alone, when testing metrics.**
+  Added with the instrumentation in PR #72 (issue #24). `MetricsCapture<T>`
+  (`Fixtures/MetricsCapture.cs`) wraps a `MeterListener` whose `InstrumentPublished` callback enables
+  measurement events only when `ReferenceEquals(instrument.Meter, meter)` **and** the name matches
+  (`:27`); every value and its tags are appended in recording order (`Values`, `Tags`). Construct one
+  from `fixture.Hub.GetMeterForTesting()` or `reconnector.GetMeterForTesting()` — both `internal`
+  accessors exist for exactly this — so a test is immune to another `MeshHub`/`MeshClientReconnector`
+  publishing to the same meter name concurrently, in the same test class or a parallel one. Call
+  `RecordObservableInstruments()` to force an `ObservableGauge` to report immediately rather than waiting
+  out its own collection cycle — `OutboundQueueDepth_MessagesQueued_ReportsPositiveAggregateDepth`
+  (`MeshHubMetricsTests.cs:375`) does this to assert `meshworx.hub.outbound_queue.depth` without a real
+  collector attached.
+  - **Proving a broadcast/group send recorded `messages.routed` exactly once, not once per recipient,**
+    needs a genuine multi-recipient send: `BroadcastMessage_MultipleRecipients_IncrementsRoutedCounterOnceTaggedBroadcast`
+    (`:238`) registers three clients, asserts `routedCapture.Values` filtered to `direction=broadcast`
+    contains a **single** `1L`, not a count matching the recipient total.
+  - **Proving the zero-recipient case records nothing** is the harder direction, and both fan-out kinds
+    have a dedicated test: `BroadcastMessage_SenderIsOnlyClient_DoesNotIncrementRoutedCounter` (`:282`)
+    registers only the sender, sends a broadcast, then a **lookup on the same connection** as a barrier —
+    since the hub processes one client's frames in order, the lookup's response proves the broadcast was
+    already handled, so asserting `routedCapture.Tags` contains no `direction=broadcast` entry at that
+    point is deterministic rather than a timing guess. Copy this barrier-then-assert-absence shape (the
+    same one `FrameRecorder` uses elsewhere in this suite) for any "this must not have recorded" metrics
+    assertion — a bare settle-and-check would pass just as easily against a regression that recorded the
+    zero-recipient case anyway.
+  - **`MeshClientReconnectorMetricsTests.cs`'s one test**,
+    `Reconnects_AfterConnectionLost_IncrementsReconnectsCounter` (`:28`), asserts **both** halves of the
+    exclusion in one run: `capture.Values` is empty immediately after `StartAsync`'s initial connect, then
+    reads exactly `[1L]` after a real hub-initiated drop and reconnect to a second, freshly stood-up hub.
+    Asserting only the second half would miss a regression that counted the initial connect too.
+
+### Scripting a reply to something the client sends
+
+`MeshClientSessionResumptionTests`'s harness answers the `ResumeSession` frame from the transport's
+**`SendAsync` callback**, writing the reply into the inbound channel at the moment it sees the frame go
+out. Queueing the reply up front alongside the registration response would be simpler and is wrong: the
+receive loop could read it before `ConnectAsync` has registered the completion it is waiting on, which
+no real hub can do — it has not been asked yet — so the test would be pinning an interleaving the
+production code is not required to survive. **When a frame is a *response*, script it as one.**
+
+### Frames the hub sends unprompted at registration
+
+**`RegisterClientAsync` cannot capture them, and a recorder attached afterwards races them.** It installs
+its own `SendAsync` callback to grab the `RegistrationComplete` reply; a test that then constructs a
+`FrameRecorder` over the same transport *replaces* that callback — fine for frames the test provokes
+later, but the offline store's drain (issue #28) is queued by the hub between sending
+`RegistrationComplete` and reading the client's first frame, so it can land in the gap and vanish.
+
+`RegisterClientWithRecorderAsync` (`Fixtures/MeshHubFixture.cs`) exists for exactly this: it attaches the
+recorder **before** the connection is enqueued for acceptance, and derives the registration response from
+the recorder rather than a separate callback. Reach for it whenever you are asserting on something the
+hub emits of its own accord at registration time; use the plain `RegisterClientAsync` otherwise.
+
+The offline tests' second synchronisation point is worth copying too. `ObservableOfflineStore` wraps a
+real store and signals each accepted message, so a test reconnects the recipient only once the hub has
+genuinely stored what it is about to drain — without it, the reconnect can win the race, drain an empty
+store, and the test hangs on a frame that was never going to arrive. **The same principle as
+`FrameRecorder`'s pairing: find the event that proves the state you need, rather than sleeping.**
 
 ### Minimal end-to-end pattern (integration style)
 

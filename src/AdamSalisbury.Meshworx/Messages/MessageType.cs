@@ -18,4 +18,12 @@ internal enum MessageType : byte
     GroupMessage = 0x0E,
     DeliverGroupMessage = 0x0F,
     GroupJoinRefused = 0x10,
+    SendMessageWithHeaders = 0x11,
+    DeliverMessageWithHeaders = 0x12,
+    GroupMessageWithHeaders = 0x13,
+    DeliverGroupMessageWithHeaders = 0x14,
+    QueueSaturated = 0x15,
+    ResumeSession = 0x16,
+    SessionResumed = 0x17,
+    SessionResumeRefused = 0x18,
 }

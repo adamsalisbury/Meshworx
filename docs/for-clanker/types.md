@@ -10,11 +10,13 @@ hunt for them. `namespace AdamSalisbury.Meshworx.Messages` unless noted otherwis
 
 | Type | Members | Raised by | Source |
 |---|---|---|---|
-| `MessageReceivedEventArgs` | `required Guid SenderId`, `required ReadOnlyMemory<byte> Data` | `IMeshClient.MessageReceived` (direct **and** broadcast) | `Messages/MessageReceivedEventArgs.cs` |
-| `GroupMessageReceivedEventArgs` | `required Guid SenderId`, `required string GroupName`, `required ReadOnlyMemory<byte> Data` | `IMeshClient.GroupMessageReceived` | `Messages/GroupMessageReceivedEventArgs.cs` |
+| `MessageReceivedEventArgs` | `required Guid SenderId`, `required ReadOnlyMemory<byte> Data`, `MessageHeaders Headers = MessageHeaders.Empty`, `long? CorrelationId = null` (PR #83) | `IMeshClient.MessageReceived` (direct **and** broadcast) | `Messages/MessageReceivedEventArgs.cs` |
+| `GroupMessageReceivedEventArgs` | `required Guid SenderId`, `required string GroupName`, `required ReadOnlyMemory<byte> Data`, `MessageHeaders Headers = MessageHeaders.Empty` | `IMeshClient.GroupMessageReceived` | `Messages/GroupMessageReceivedEventArgs.cs` |
 | `GroupJoinRefusedEventArgs` | `required string GroupName` | `IMeshClient.GroupJoinRefused` | `Messages/GroupJoinRefusedEventArgs.cs:6` |
 | `DisconnectedEventArgs` | `required DisconnectReason Reason` | `IMeshClient.Disconnected` | `Messages/DisconnectedEventArgs.cs` |
 | `ClientConnectionEventArgs` | `required Guid ClientId`, `required string ClientName` | `IMeshHub.ClientConnected` / `ClientDisconnected` (namespace `AdamSalisbury.Meshworx`) | `ClientConnectionEventArgs.cs` |
+| `QueueSaturatedEventArgs` | `required Guid SenderId`, `required Guid RecipientId` | `IMeshHub.QueueSaturated` (namespace `AdamSalisbury.Meshworx`, **not** `.Messages` — PR #87, issue #30) | `QueueSaturatedEventArgs.cs` |
+| `SendRejectedEventArgs` | `required Guid RecipientId` | `IMeshClient.SendRejected` (PR #87, issue #30) | `Messages/SendRejectedEventArgs.cs` |
 
 All use `required` init-only properties (C# 11) — construct with object initialisers.
 
@@ -22,6 +24,94 @@ All use `required` init-only properties (C# 11) — construct with object initia
 > (see [transport.md](transport.md)), so retaining it is safe today; the robust idiom is to copy
 > (`e.Data.ToArray()` / `e.Data.Span.CopyTo(...)`) if you keep it past the handler. `Span` is the usual
 > access, e.g. `Encoding.UTF8.GetString(e.Data.Span)`.
+
+> **`MessageReceivedEventArgs.CorrelationId` (PR #83)** is set only when this message is a request sent
+> via `IMeshClient.RequestAsync`, awaiting a reply — `null` for every ordinary message, including
+> broadcasts. A handler that finds it set should answer with `IMeshClient.ReplyAsync`, passing the same
+> event args back in. It is never set on `GroupMessageReceivedEventArgs` — group sends cannot be requests.
+> A *reply* frame is resolved internally by the receive loop before `MessageReceived` is ever raised for
+> it, so this property never distinguishes "is a reply" from "is an ordinary message" — only "is a
+> request". See [client.md](client.md#request-response).
+
+## Message content types
+
+`MessageHeaders` (`sealed class`, `Messages/MessageHeaders.cs`, added by PR #74, issue #32) —
+`IReadOnlyDictionary<string, string>`, `StringComparer.Ordinal` (case-sensitive keys). A small,
+immutable bag of metadata that travels alongside a message body without the hub ever interpreting it —
+see [protocol.md](protocol.md#message-headers) for the wire format and
+[client.md](client.md#sending-headers) for how to send/receive it.
+
+- `MessageHeaders.Empty` — the shared, zero-entry instance used as the default on
+  `MessageReceivedEventArgs`/`GroupMessageReceivedEventArgs.Headers` and accepted by `SendAsync`/
+  `SendToGroupAsync` to mean "no headers" (produces the plain, header-less frame).
+- **Public constructor copies its input** into a fresh `Dictionary<string, string>` — mutating the
+  source afterwards does not affect the `MessageHeaders`. **Throws `ArgumentException` if the input
+  contains a duplicate key**, the same as calling `Dictionary<TKey,TValue>.Add` twice for the same key —
+  this differs from an object initializer or indexer assignment, which would silently keep the last
+  value. See [known-issues.md](known-issues.md) KI-34.
+- An `internal` `FromOwnedDictionary` factory (not part of the public surface) wraps a dictionary without
+  copying — used only by `HeaderEnvelope.Read`, which builds a fresh one for this purpose and never
+  touches it again.
+
+`RequestReplyHeaderKeys` (`internal static class`, `Messages/RequestReplyHeaderKeys.cs`, added by PR #83)
+— not part of the public surface, listed here because its two `const string` values are effectively
+reserved vocabulary within any `MessageHeaders` an application constructs. `CorrelationId =
+"mesh.request-id"`, `Reply = "mesh.reply"`. `MeshClient.SendAsync`'s headers overload throws
+`ArgumentException` if a caller's own `MessageHeaders` contains either key — see
+[client.md](client.md#request-response) and [known-issues.md](known-issues.md) KI-42/KI-43.
+
+`DeliveryOptions` (`readonly struct`, `IEquatable<DeliveryOptions>`, `DeliveryOptions.cs`, namespace
+`AdamSalisbury.Meshworx` — **not** `.Messages` — added by PR #84, extended by PR #87, issue #30) —
+controls whether `IMeshClient.SendAsync(Guid, ReadOnlyMemory<byte>, DeliveryOptions, CancellationToken)`
+waits for an end-to-end delivery acknowledgement and/or asks the hub to await capacity on a saturated
+recipient queue instead of dropping. Three ways to obtain one, plus a combinator:
+
+- `DeliveryOptions.None` — a `static readonly` field, and the struct's own default value (so
+  `default(DeliveryOptions)` and a caller who never touches this type both get fire-and-forget, identical
+  to every other `SendAsync` overload).
+- `DeliveryOptions.RequireAck(TimeSpan timeout)` — a static factory; throws `ArgumentOutOfRangeException`
+  synchronously if `timeout` is not positive. Sets `RequireAcknowledgement`/`AcknowledgementTimeout`.
+- `DeliveryOptions.AwaitingCapacity()` — a static factory (PR #87); sets `AwaitCapacity` without requiring
+  an acknowledgement. Does **not** make the `SendAsync` call itself wait — see
+  [client.md](client.md#backpressure-signalling).
+- `options.WithAwaitCapacity()` — an instance method (PR #87) returning a copy of `options` with
+  `AwaitCapacity` also set, so `RequireAck(...).WithAwaitCapacity()` gets both. Read its own remarks (and
+  [known-issues.md](known-issues.md) KI-49) before combining the two — their timeouts are independent.
+- There is no public constructor; `RequireAcknowledgement`, `AcknowledgementTimeout` and `AwaitCapacity`
+  are all read-only properties, and `Equals`/`GetHashCode` cover all three.
+
+See [client.md](client.md#delivery-acknowledgement) and [client.md](client.md#backpressure-signalling)
+for how to use it, and [known-issues.md](known-issues.md) KI-44/KI-45/KI-48/KI-49 for what its guarantees
+do and do not cover.
+
+`DeliveryAcknowledgementHeaderKeys` (`internal static class`,
+`Messages/DeliveryAcknowledgementHeaderKeys.cs`, added by PR #84) — the acknowledgement counterpart to
+`RequestReplyHeaderKeys` above, same shape: not part of the public surface, listed here because its three
+`const string` values are reserved vocabulary. `CorrelationId = "mesh.ack-id"` (both the original message
+and its acknowledgement), `Request = "mesh.ack-request"` (marks the original message as wanting one),
+`Ack = "mesh.ack"` (marks the acknowledgement frame itself). `MeshClient.SendAsync`'s headers overload
+throws `ArgumentException` if a caller's own `MessageHeaders` contains any of the three — see
+[client.md](client.md#delivery-acknowledgement) and [known-issues.md](known-issues.md) KI-42/KI-46.
+
+`MessageExpiryHeaderKeys` (`internal static class`, `Messages/MessageExpiryHeaderKeys.cs`, added by
+PR #85, issue #29) — reserved vocabulary for per-message time-to-live, same shape as the two above. One
+`const string`: `ExpiresAtUnixMilliseconds = "mesh.expires-at"`, an absolute Unix-millisecond expiry
+computed from the sending client's own clock. Unlike the request/response and delivery-acknowledgement
+keys, the hub itself reads this one (without fully decoding the header block) to drop an already-expired
+queued frame — see [protocol.md](protocol.md#message-expiry-headers) and
+[hub.md](hub.md#dropping-expired-frames). `MeshClient.SendAsync`'s headers overload throws
+`ArgumentException` if a caller's own `MessageHeaders` contains it — see
+[client.md](client.md#message-expiry-time-to-live) and [known-issues.md](known-issues.md) KI-42/KI-47.
+
+`BackpressureHeaderKeys` (`internal static class`, `Messages/BackpressureHeaderKeys.cs`, added by PR #87,
+issue #30) — reserved vocabulary for `DeliveryOptions.AwaitCapacity`, same shape again. One
+`const string`: `AwaitCapacity = "mesh.await-capacity"`, present with value `"1"` when the sender asked
+the hub to await room on the recipient's queue instead of dropping. The hub reads this one too (the
+second, alongside message expiry, to do so) via `MeshHub.WantsAwaitCapacity`, at **enqueue** time rather
+than expiry's **dequeue** time — see [protocol.md](protocol.md#backpressure-header) and
+[hub.md](hub.md#backpressure-signalling-and-awaiting-capacity). `MeshClient.SendAsync`'s headers overload
+throws `ArgumentException` if a caller's own `MessageHeaders` contains it — see
+[client.md](client.md#backpressure-signalling) and [known-issues.md](known-issues.md) KI-42.
 
 ## Enums
 
@@ -77,14 +167,14 @@ public sealed record RegistrationContext
 ```
 
 A `sealed record` with `required` init-only properties — construct with an object initialiser (the hub
-does, at `MeshHub.cs:1154`). Trivially constructible in tests.
+does, at `MeshHub.cs:1366`). Trivially constructible in tests.
 
 - `ClientName` — the name being registered under. Already validated for length, **not** yet checked for
   uniqueness, so two concurrent registrations for the same name can both reach your authenticator.
 - `Credential` — exactly the bytes the client sent after its name, empty if it sent none. The library
   assigns no meaning to them.
 - **Only guaranteed valid for the duration of the call** — copy it if it must outlive the invocation.
-  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:1153`, so
+  (In the current implementation the hub already copies it out of the inbound frame, `MeshHub.cs:1365`, so
   it does not alias a larger buffer — but the documented contract is the one to code against.)
 
 <a id="authorisation-types"></a>
@@ -114,7 +204,7 @@ A **delegate, not an interface**, matching `ClientAuthenticator`. Return `true` 
 the group; `false` refuses the join and the hub sends the client a `GroupJoinRefused` frame.
 
 Contract, from the delegate's own XML docs and the hub's call site (`AuthoriseGroupJoinAsync`,
-`MeshHub.cs:1470`):
+`MeshHub.cs:1909`):
 
 - Invoked **once per join request**, including every re-join a client issues after reconnecting, so a
   decision is never carried across a connection and a reconnector's membership restore cannot bypass it.
@@ -124,7 +214,7 @@ Contract, from the delegate's own XML docs and the hub's call site (`AuthoriseGr
 - **Fails closed.** Returning `false`, throwing, cancelling from inside the callback, or exceeding
   `groupAuthorisationTimeout` all refuse the join.
 - `ValueTask<bool>` — a synchronous decision (`ValueTask.FromResult(...)`) takes an explicitly
-  allocation-free fast path in the hub (`MeshHub.cs:1500-1505`) and is the common case; anything else,
+  allocation-free fast path in the hub (`MeshHub.cs:1939-1944`) and is the common case; anything else,
   including an already-faulted result, goes through the bounded `WaitAsync`.
 - **It runs on input from an already-admitted client**, driven from that client's own receive loop, which
   reads nothing else from that client until it returns. So a slow callback stalls only the client that
@@ -143,7 +233,7 @@ public sealed record GroupJoinContext
 ```
 
 A `sealed record` with `required` init-only properties — construct with an object initialiser (the hub
-does, at `MeshHub.cs:1473`). Trivially constructible in tests.
+does, at `MeshHub.cs:1912`). Trivially constructible in tests.
 
 - `ClientId` — the hub-assigned id. Fresh per connection, so it is **not** stable across a reconnect;
   authorise on the name plus your own state if you need continuity.
@@ -152,6 +242,54 @@ does, at `MeshHub.cs:1473`). Trivially constructible in tests.
 - `GroupName` — client-supplied and **untrusted**. Match it against known groups rather than parsing
   meaning out of it. It is also unbounded in length (KI-8), so do not use it as a key in anything you
   cannot afford a client to grow.
+
+## Offline delivery types
+
+Added for issue #28. The seam that turns store-and-forward on, plus the shape of what is stored. See
+[hub.md](hub.md#offline-delivery) for how the hub drives them.
+
+### `IOfflineStore` — `IOfflineStore.cs`
+
+Two methods, both keyed by **client name** rather than id — the id is minted per connection, so it is
+the name that survives a client going away and coming back.
+
+| Member | Signature | Contract |
+|---|---|---|
+| `TryEnqueueAsync` | `ValueTask<bool>(string clientName, OfflineMessage message, CancellationToken = default)` | `true` = stored, `false` = refused (the hub then drops the message as if the feature were off). An implementation that *evicts* to make room still returns `true` — the result describes this message, not what it displaced |
+| `TakeAllAsync` | `ValueTask<IReadOnlyList<OfflineMessage>>(string clientName, CancellationToken = default)` | Removes and returns everything held, **oldest first**. Called once per successful registration, so make "this name holds nothing" cheap. Discard anything past its window here rather than returning it |
+
+**Implementations must be thread-safe** — both methods are called from per-connection handler tasks that
+run concurrently, and one name can be enqueued to by many senders while its owner is reconnecting.
+
+### `OfflineMessage` — `OfflineMessage.cs`
+
+`public sealed record OfflineMessage(Guid SenderId, ReadOnlyMemory<byte> HeaderBlock,
+ReadOnlyMemory<byte> Body, DateTimeOffset QueuedAt)`, plus `int ByteCount => Body.Length +
+HeaderBlock.Length`.
+
+**It holds the message's parts, not a built delivery frame, and that is the design point** — the frame's
+shape depends on the version the *returning* connection negotiates, which is unknowable at storage time.
+The hub copies both byte ranges out of the receive buffer before constructing one, so neither aliases a
+buffer that is about to be reused; an implementation may hold them indefinitely.
+
+### `InMemoryOfflineStore` — `InMemoryOfflineStore.cs`
+
+`public sealed class InMemoryOfflineStore : IOfflineStore`, the bounded process-local default.
+Constructor: `(int? maxMessagesPerClient = null, int? maxBytesPerClient = null, TimeSpan? timeToLive =
+null, int? maxClients = null)`, defaulting to 100 messages, 1 MiB, 5 minutes and 1000 names —
+each exposed as a `Default*` constant. Non-positive values throw `ArgumentOutOfRangeException`.
+
+- **A full queue refuses the new message rather than evicting the oldest.** That keeps "accepted means
+  it will be delivered unless it expires" true, and makes the loss visible where it happens (the hub
+  counts `reason=offline-queue-full`). Implement the interface for the opposite policy.
+- **Expiry is purged lazily**, on the next call touching that name, not by a timer — a store nobody is
+  using does no work, and a queue whose messages have all aged out accepts new ones rather than staying
+  nominally full. Because the queue is in arrival order, the expired messages are always a prefix.
+- **One lock per name**, with the same `Removed`-flag retire-and-retry dance the hub uses for groups
+  (`MeshHub.RemoveMemberFromGroup`) — including doing the `TryRemove` *inside* the lock, which is what
+  makes the enqueue-side retry terminate rather than spin against a queue that is dead but still mapped.
+- **The name cap counts distinct names holding something**, checked only when a genuinely new name is
+  about to be added; a name already in the store is never refused by it. Draining a name frees its slot.
 
 ## Exception
 
@@ -172,9 +310,20 @@ catch (RegistrationRefusedException ex) { /* ex.ErrorCode tells you why */ }
 ## Internal types (not visible outside the assembly, listed for orientation)
 
 - `enum MessageType : byte` (`Messages/MessageType.cs`) — the opcodes; see [protocol.md](protocol.md).
-- `static class Protocol` (`Messages/Protocol.cs`) — `Version = 3`, `MaxClientNameLength = 256`.
-- `MeshHub.ClientConnection`, `MeshHub.Group`, `MeshClient.ConnectionState`, `MeshClient.PendingLookup`
-  — nested private helpers documented in [hub.md](hub.md) / [client.md](client.md).
+- `static class Protocol` (`Messages/Protocol.cs`) — `MinSupportedVersion = 4`, `MaxSupportedVersion = 6`
+  (raised from `4` to `5` by PR #74, issue #32, to admit the header envelope, and from `5` to `6` by
+  issue #43 to admit session resumption; replaced the single `Version = 3` constant in PR #73; see
+  [protocol.md](protocol.md#versioning)), `HeaderEnvelopeMinVersion = 5` (added by PR #74 — the lowest
+  negotiated version at which `MessageHeaders` may be used), `SessionResumptionMinVersion = 6` and
+  `SessionTokenLength = 32` (issue #43), `MaxClientNameLength = 256`.
+- `static class HeaderEnvelope` (`Messages/HeaderEnvelope.cs`, added by PR #74) — encodes/decodes the
+  header-block wire format for the four header-bearing opcodes; see
+  [protocol.md](protocol.md#message-headers).
+- `MeshHub.ClientConnection` (carries `NegotiatedProtocolVersion`, PR #74; since PR #87,
+  `IsAwaitingCapacity`/`BeginAwaitingCapacity()`/`CapacityWaitScope` for the backpressure-parking
+  mechanism; and, since issue #43, a **settable** `Id` via `Rebind` plus `SessionTokenHash`),
+  `MeshHub.ResumableSession` (issue #43), `MeshHub.Group`, `MeshClient.ConnectionState`, `MeshClient.PendingLookup` — nested private
+  helpers documented in [hub.md](hub.md) / [client.md](client.md).
 
 Tests reach internals via `<InternalsVisibleTo Include="AdamSalisbury.Meshworx.UnitTests" />`
 (`AdamSalisbury.Meshworx.csproj:726`).

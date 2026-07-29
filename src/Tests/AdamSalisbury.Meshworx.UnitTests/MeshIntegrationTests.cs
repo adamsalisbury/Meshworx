@@ -19,7 +19,7 @@ namespace AdamSalisbury.Meshworx.UnitTests;
 /// </summary>
 public sealed class MeshIntegrationTests
 {
-    private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WaitTimeout = TestTimeouts.Wait;
 
     private static MeshHub CreateHub(TcpTransportListener listener)
     {
@@ -68,7 +68,7 @@ public sealed class MeshIntegrationTests
     /// <summary>
     /// A broadcast from one client is delivered to every other connected client over the real protocol.
     /// </summary>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task EndToEnd_BroadcastReachesAllOtherClients()
     {
         var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
@@ -187,7 +187,7 @@ public sealed class MeshIntegrationTests
     /// A hub with a group authoriser makes groups an access-control boundary over the real protocol: an
     /// unauthorised client is refused membership, told so, and receives none of the group's traffic.
     /// </summary>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task EndToEnd_UnauthorisedClientIsRefusedGroupMembership()
     {
         var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
@@ -339,14 +339,15 @@ public sealed class MeshIntegrationTests
         await hub.StartAsync();
 
         // A raw endpoint that completes registration by hand, then goes silent (never replies to pings).
-        // Frame: [type][version][name length (2, big-endian)][name][credential].
+        // Frame: [type][versionMin][versionMax][name length (2, big-endian)][name][credential].
         var raw = listener.Connect();
         byte[] nameBytes = Encoding.UTF8.GetBytes("Silent");
-        var registration = new byte[4 + nameBytes.Length];
+        var registration = new byte[5 + nameBytes.Length];
         registration[0] = 0x04; // RegistrationRequest
-        registration[1] = 0x03; // protocol version
-        BinaryPrimitives.WriteUInt16BigEndian(registration.AsSpan(2, 2), (ushort)nameBytes.Length);
-        nameBytes.CopyTo(registration, 4);
+        registration[1] = Protocol.MinSupportedVersion;
+        registration[2] = Protocol.MaxSupportedVersion;
+        BinaryPrimitives.WriteUInt16BigEndian(registration.AsSpan(3, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(registration, 5);
         await raw.SendAsync(registration);
 
         byte[]? response = await raw.ReceiveAsync().WaitAsync(WaitTimeout);
@@ -371,7 +372,7 @@ public sealed class MeshIntegrationTests
     /// The full hub and client stack works over the in-memory transport, confirming the transport
     /// abstraction is pluggable: a message is routed between two clients without any sockets.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task EndToEnd_MessageRoutedOverInMemoryTransport()
     {
         var listener = new InMemoryTransportListener();
@@ -396,6 +397,179 @@ public sealed class MeshIntegrationTests
         MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
         Assert.Equal(alice.Id, received.SenderId);
         Assert.Equal(payload, received.Data.ToArray());
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A full request/reply round trip over the real wire protocol and hub routing: the responder's
+    /// MessageReceived event carries the requester's correlation id, and answering it via ReplyAsync
+    /// resolves the requester's RequestAsync call with the reply payload — proving the two halves of
+    /// the RPC helper interoperate through the header envelope rather than only within isolated
+    /// unit-level tests of each half.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_RequestReplyRoundTripsOverInMemoryTransport()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        await bob.ConnectAsync(listener.Connect(), "Bob");
+        await alice.ConnectAsync(listener.Connect(), "Alice");
+
+        bob.MessageReceived += async (_, e) =>
+        {
+            Assert.NotNull(e.CorrelationId);
+            byte[] reply = Encoding.UTF8.GetBytes($"echo:{Encoding.UTF8.GetString(e.Data.Span)}");
+            await bob.ReplyAsync(e, reply);
+        };
+
+        Guid? bobId = await alice.GetClientIdByNameAsync("Bob");
+        Assert.Equal(bob.Id, bobId);
+
+        byte[] requestPayload = Encoding.UTF8.GetBytes("ping");
+        ReadOnlyMemory<byte> reply = await alice.RequestAsync(bobId!.Value, requestPayload, TimeSpan.FromSeconds(5));
+
+        Assert.Equal("echo:ping", Encoding.UTF8.GetString(reply.Span));
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A full delivery-acknowledgement round trip over the real wire protocol and hub routing: the
+    /// recipient's client automatically acknowledges the message once it has been handed to the
+    /// application (raised through MessageReceived, same as any other message), and that resolves the
+    /// sender's SendAsync(..., DeliveryOptions.RequireAck) call.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_DeliveryAcknowledgementRoundTripsOverInMemoryTransport()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        await bob.ConnectAsync(listener.Connect(), "Bob");
+        await alice.ConnectAsync(listener.Connect(), "Alice");
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        bob.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        Guid? bobId = await alice.GetClientIdByNameAsync("Bob");
+        Assert.Equal(bob.Id, bobId);
+
+        byte[] payload = Encoding.UTF8.GetBytes("must arrive");
+        await alice.SendAsync(bobId!.Value, payload, DeliveryOptions.RequireAck(TimeSpan.FromSeconds(5)));
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(payload, received.Data.ToArray());
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A message sent with a time-to-live is delivered normally over the real wire protocol and hub
+    /// routing when it has not expired — proving the SendAsync(TimeSpan) overload's protocol-version
+    /// negotiation, header building, hub routing and client-side delivery all interoperate end to end.
+    /// </summary>
+    /// <remarks>
+    /// The negative case — an already-expired message being dropped rather than delivered — is proved
+    /// deterministically at the unit level instead (see MeshClientTests and MeshHubTests), against a
+    /// timestamp crafted to already be in the past. Racing a real elapsed-time expiry against delivery
+    /// over the in-memory transport here would not be deterministic: the whole client-to-hub-to-client
+    /// round trip typically completes well inside a millisecond, so there is no time-to-live short
+    /// enough to reliably still be positive (as the public API requires) yet reliably expire before
+    /// delivery completes.
+    /// </remarks>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_MessageWithTimeToLiveIsDelivered()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        await bob.ConnectAsync(listener.Connect(), "Bob");
+        await alice.ConnectAsync(listener.Connect(), "Alice");
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        bob.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        Guid? bobId = await alice.GetClientIdByNameAsync("Bob");
+        Assert.Equal(bob.Id, bobId);
+
+        byte[] payload = Encoding.UTF8.GetBytes("still fresh");
+        await alice.SendAsync(bobId!.Value, payload, TimeSpan.FromMinutes(5));
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(alice.Id, received.SenderId);
+        Assert.Equal(payload, received.Data.ToArray());
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A direct message sent with structured headers is delivered over the real wire protocol with
+    /// both the headers and the body intact, and a group message carrying headers reaches every other
+    /// member the same way — proving the header envelope round-trips end to end rather than only
+    /// within the unit-level frame-building and frame-parsing tests.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task EndToEnd_HeadersRoundTripForDirectAndGroupMessages()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        await bob.ConnectAsync(listener.Connect(), "Bob");
+        await alice.ConnectAsync(listener.Connect(), "Alice");
+
+        var directReceivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        bob.MessageReceived += (_, e) => directReceivedTcs.TrySetResult(e);
+
+        Guid? bobId = await alice.GetClientIdByNameAsync("Bob");
+        Assert.Equal(bob.Id, bobId);
+
+        byte[] directPayload = Encoding.UTF8.GetBytes("with headers");
+        var directHeaders = new MessageHeaders([new("correlationId", "abc-123")]);
+        await alice.SendAsync(bobId!.Value, directPayload, directHeaders);
+
+        MessageReceivedEventArgs directReceived = await directReceivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(alice.Id, directReceived.SenderId);
+        Assert.Equal(directPayload, directReceived.Data.ToArray());
+        Assert.Equal("abc-123", directReceived.Headers["correlationId"]);
+
+        var groupReceivedTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        bob.GroupMessageReceived += (_, e) => groupReceivedTcs.TrySetResult(e);
+
+        await bob.JoinGroupAsync("team");
+        await alice.JoinGroupAsync("team");
+
+        // Give the hub's own group-join processing (on Bob's connection) a moment to land before Alice
+        // sends, since JoinGroupAsync returns as soon as the request is sent rather than once applied.
+        Guid? aliceId = await bob.GetClientIdByNameAsync("Alice");
+        Assert.Equal(alice.Id, aliceId);
+
+        byte[] groupPayload = Encoding.UTF8.GetBytes("team update");
+        var groupHeaders = new MessageHeaders([new("priority", "high")]);
+        await alice.SendToGroupAsync("team", groupPayload, groupHeaders);
+
+        GroupMessageReceivedEventArgs groupReceived = await groupReceivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(alice.Id, groupReceived.SenderId);
+        Assert.Equal("team", groupReceived.GroupName);
+        Assert.Equal(groupPayload, groupReceived.Data.ToArray());
+        Assert.Equal("high", groupReceived.Headers["priority"]);
 
         await hub.StopAsync();
     }
@@ -477,5 +651,62 @@ public sealed class MeshIntegrationTests
         MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
         Assert.Equal(alice.Id, received.SenderId);
         Assert.Equal(payload, received.Data.ToArray());
+    }
+
+    /// <summary>
+    /// End-to-end session resumption (issue #43): a client that reconnects within the hub's resumption
+    /// window keeps the id its peers already hold and the group memberships it had, so a peer that cached
+    /// the id before the drop goes on reaching it without ever looking it up again — the whole point of
+    /// the feature, and the thing a fresh registration cannot give.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task EndToEnd_ClientReconnectsWithinTheWindow_KeepsItsIdentityAndGroups()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = new MeshHub(
+            new Mock<ILogger<MeshHub>>().Object, listener, sessionResumptionWindow: TimeSpan.FromMinutes(5));
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var bob = CreateClient();
+        await using var alice = CreateClient();
+
+        await bob.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Bob");
+        await alice.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Alice");
+        await alice.JoinGroupAsync("news");
+        await bob.JoinGroupAsync("news");
+
+        // The id Bob would have cached, and which must survive the reconnect.
+        Guid aliceIdBeforeDrop = alice.Id;
+
+        await alice.DisconnectAsync();
+        while (hub.IsClientRegistered(aliceIdBeforeDrop))
+        {
+            await Task.Yield();
+        }
+
+        await alice.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Alice");
+
+        Assert.True(alice.SessionResumed);
+        Assert.Equal(aliceIdBeforeDrop, alice.Id);
+
+        // Bob's cached id still delivers.
+        var directTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        alice.MessageReceived += (_, e) => directTcs.TrySetResult(e);
+        await bob.SendAsync(aliceIdBeforeDrop, Encoding.UTF8.GetBytes("still you"));
+
+        MessageReceivedEventArgs direct = await directTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(bob.Id, direct.SenderId);
+        Assert.Equal("still you", Encoding.UTF8.GetString(direct.Data.Span));
+
+        // And the membership came back with the identity: Alice never re-joined "news" on this
+        // connection, and her own JoinedGroups was reset by the disconnect.
+        var groupTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        alice.GroupMessageReceived += (_, e) => groupTcs.TrySetResult(e);
+        await bob.SendToGroupAsync("news", Encoding.UTF8.GetBytes("group news"));
+
+        GroupMessageReceivedEventArgs group = await groupTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal("news", group.GroupName);
+        Assert.Equal("group news", Encoding.UTF8.GetString(group.Data.Span));
     }
 }

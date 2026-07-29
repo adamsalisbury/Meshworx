@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.Globalization;
 using System.Net;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
@@ -10,7 +12,7 @@ namespace AdamSalisbury.Meshworx.UnitTests;
 
 public sealed class MeshHubTests
 {
-    private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan WaitTimeout = TestTimeouts.Wait;
 
     // Constructor
 
@@ -129,7 +131,7 @@ public sealed class MeshHubTests
     /// that shutdown or begun one of its own — which is what the frame count distinguishes. No settling
     /// delay is involved.
     /// </remarks>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task StopAsync_CalledWhileAShutdownIsInFlight_NotifiesEachClientOnce()
     {
         var fixture = new MeshHubFixture();
@@ -161,7 +163,7 @@ public sealed class MeshHubTests
     /// When StopAsync is called while a shutdown is already in flight, it returns only once that shutdown
     /// has finished, rather than reporting the hub stopped while it is still stopping.
     /// </summary>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task StopAsync_CalledWhileAShutdownIsInFlight_ReturnsOnlyOnceTheShutdownCompletes()
     {
         var fixture = new MeshHubFixture();
@@ -302,7 +304,7 @@ public sealed class MeshHubTests
     /// ownership there would leave the endpoint bound with nothing serving it and no way to recover, since
     /// the listener cannot be started a second time.
     /// </remarks>
-    [Fact(Timeout = 10000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task StopAsync_WhileAStartIsInProgress_LeavesTheStartedHubIntact()
     {
         var fixture = new MeshHubFixture();
@@ -361,7 +363,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client completes registration, the hub raises ClientConnected with the client's id and name.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ValidRegistration_RaisesClientConnected()
     {
         var fixture = new MeshHubFixture();
@@ -383,7 +385,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a registered client disconnects, the hub raises ClientDisconnected with the client's id and name.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientDisconnects_RaisesClientDisconnected()
     {
         var fixture = new MeshHubFixture();
@@ -405,7 +407,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a registration is refused, ClientConnected is not raised because no client was registered.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RegistrationRejected_DoesNotRaiseClientConnected()
     {
         var fixture = new MeshHubFixture();
@@ -436,7 +438,7 @@ public sealed class MeshHubTests
     /// ConnectedClientCount reflects the number of registered clients, rising as clients register and
     /// falling as they disconnect.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task ConnectedClientCount_TracksRegisteredClients()
     {
         var fixture = new MeshHubFixture();
@@ -463,6 +465,52 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
 
         Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+    }
+
+    // IsRunning
+
+    /// <summary>
+    /// IsRunning reflects the hub's lifecycle: false before StartAsync, true once it has started, and
+    /// false again once StopAsync has completed.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task IsRunning_TracksHubLifecycle()
+    {
+        var fixture = new MeshHubFixture();
+
+        Assert.False(fixture.Hub.IsRunning);
+
+        await fixture.Hub.StartAsync();
+        Assert.True(fixture.Hub.IsRunning);
+
+        await fixture.Hub.StopAsync();
+        Assert.False(fixture.Hub.IsRunning);
+    }
+
+    // MaxClients
+
+    /// <summary>
+    /// MaxClients reflects the value passed to the constructor.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task MaxClients_ConstructedWithExplicitValue_ReflectsThatValue()
+    {
+        await Task.CompletedTask;
+        var fixture = new MeshHubFixture(maxClients: 5);
+
+        Assert.Equal(5, fixture.Hub.MaxClients);
+    }
+
+    /// <summary>
+    /// MaxClients defaults to one thousand when the constructor is not given an explicit value.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task MaxClients_NotSpecified_DefaultsToOneThousand()
+    {
+        await Task.CompletedTask;
+        var fixture = new MeshHubFixture();
+
+        Assert.Equal(1000, fixture.Hub.MaxClients);
     }
 
     // IsClientRegistered
@@ -550,7 +598,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client's transport returns null during the registration read, the transport is disposed and no client is registered.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_NullRegistrationData_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -575,7 +623,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a first frame with an unexpected message type, the transport is disposed and no client is registered.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_InvalidMessageType_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -601,7 +649,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends registration data shorter than three bytes, the transport is disposed and no client is registered.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RegistrationDataTooShort_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -627,7 +675,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client's registration is rejected for any reason, no entry is added to the client registry.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RegistrationRejected_ClientNotRegistered()
     {
         var fixture = new MeshHubFixture();
@@ -656,7 +704,7 @@ public sealed class MeshHubTests
     /// When an accepted connection does not send its registration request within the configured
     /// timeout, the hub drops the connection by disposing the transport.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RegistrationTimesOut_DisposesTransport()
     {
         var fixture = new MeshHubFixture(TimeSpan.FromMilliseconds(100));
@@ -688,7 +736,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client attempts to register with a name that is already taken, the hub sends an Error response containing the DuplicateClientName error code.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_DuplicateClientName_SendsErrorResponse()
     {
         var fixture = new MeshHubFixture();
@@ -721,7 +769,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client is refused registration due to a duplicate name, the transport is disposed.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_DuplicateClientName_DisposesTransport()
     {
         var fixture = new MeshHubFixture();
@@ -749,7 +797,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client is refused registration due to a duplicate name, only the original client remains in the registry.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_DuplicateClientName_DoesNotRegisterSecondClient()
     {
         var fixture = new MeshHubFixture();
@@ -781,7 +829,7 @@ public sealed class MeshHubTests
     /// refused with an Error response carrying the HubAtCapacity error code, and the client is
     /// not added to the registry.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_HubAtCapacity_RefusesRegistration()
     {
         var fixture = new MeshHubFixture(maxClients: 1);
@@ -820,7 +868,7 @@ public sealed class MeshHubTests
     /// what maxClients is enforced against, so registrations that all read the same count cannot all be
     /// admitted and overshoot the cap.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_LastSlotClaimedButNotYetRegistered_RefusesRatherThanExceedingMaxClients()
     {
         var authenticatorReached = new TaskCompletionSource();
@@ -876,7 +924,7 @@ public sealed class MeshHubTests
     /// the slot is given back rather than leaked, so the capacity it briefly held is still available to
     /// the next client.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RefusedForDuplicateNameAfterClaimingSlot_GivesTheSlotBack()
     {
         var fixture = new MeshHubFixture(maxClients: 2);
@@ -919,7 +967,7 @@ public sealed class MeshHubTests
     /// When a client disconnects, the slot it held is given back, so a hub that was at its maximum
     /// client count can admit a replacement.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientDisconnects_GivesItsSlotBackForAReplacement()
     {
         var fixture = new MeshHubFixture(maxClients: 1);
@@ -1366,6 +1414,52 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    /// <summary>
+    /// A header-carrying group send is charged against the fan-out frequency budget exactly like the
+    /// header-less one. The two frame types reach the same members and cost the hub the same deliveries,
+    /// so a client must not be able to opt out of the fan-out budget simply by attaching a header block.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_GroupMessageWithHeadersExceedsFanOutBudget_ExcessSendsAreDropped()
+    {
+        var fixture = new MeshHubFixture(
+            maxInboundMessagesPerSecond: int.MaxValue,
+            maxInboundBytesPerSecond: int.MaxValue,
+            maxFanOutMessagesPerSecond: 1);
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender", versionMax: 0x06);
+        var member = await fixture.RegisterMultiMessageClientAsync("Member", versionMax: 0x06);
+        var memberFrames = new FrameRecorder(member.Transport);
+
+        member.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("news"));
+        sender.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("news"));
+
+        // A lookup on the member's own connection is a barrier: frames from one client are processed in
+        // order, so its reply proves the join above has already been applied and the sender's group
+        // messages below cannot arrive at a group the member has not yet joined. Recorded through the
+        // same FrameRecorder — a second one would replace this transport's send setup and silence the
+        // first.
+        member.EnqueueMessage(MeshHubFixture.CreateLookupRequest(1234, "Sender"));
+        await memberFrames.WaitForAsync(f => f[0] == 0x07).WaitAsync(WaitTimeout);
+
+        var headers = new MessageHeaders(new Dictionary<string, string> { ["trace"] = "abc" });
+        sender.EnqueueMessage(MeshHubFixture.CreateGroupMessageWithHeaders("news", headers, [1]));
+        sender.EnqueueMessage(MeshHubFixture.CreateGroupMessageWithHeaders("news", headers, [2]));
+
+        // A direct message on the same connection, ordered after both group sends, proves the hub has
+        // finished with them — so a second delivery that never arrives is genuinely dropped rather than
+        // merely still in flight.
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(member.Id, [77]));
+        await memberFrames.WaitForAsync(f => f[0] == 0x03 && f[17] == 77).WaitAsync(WaitTimeout);
+
+        Assert.Single(memberFrames.Frames, f => f[0] == 0x14);
+
+        sender.Disconnect();
+        member.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // AcceptLoop — per-remote-endpoint connection cap
 
     /// <summary>
@@ -1374,7 +1468,7 @@ public sealed class MeshHubTests
     /// ever reading a registration frame from it — while a connection from a different address is
     /// unaffected by that address's limit.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task AcceptLoop_TooManyConnectionsFromSameAddress_RefusesFurtherConnectionWithoutHandshake()
     {
         var fixture = new MeshHubFixture(maxConnectionsPerRemoteEndpoint: 1);
@@ -1411,7 +1505,7 @@ public sealed class MeshHubTests
     /// When a connection from a remote address that was at its connection limit disconnects, the slot
     /// it held is given back, so a replacement connection from that same address is then admitted.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task AcceptLoop_ConnectionFromCappedAddressDisconnects_FreesSlotForAnotherFromSameAddress()
     {
         var fixture = new MeshHubFixture(maxConnectionsPerRemoteEndpoint: 1);
@@ -1465,7 +1559,7 @@ public sealed class MeshHubTests
     /// source for the connection cap. A single host with a routine /64 allocation cannot defeat the cap
     /// by connecting from a different address within it each time.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task AcceptLoop_TwoIPv6AddressesInSamePrefix_ShareTheConnectionCap()
     {
         var fixture = new MeshHubFixture(maxConnectionsPerRemoteEndpoint: 1);
@@ -1520,10 +1614,10 @@ public sealed class MeshHubTests
     // HandleClient — unsupported protocol version
 
     /// <summary>
-    /// When a client sends a registration request with an unsupported protocol version, the hub sends
-    /// an Error response containing the UnsupportedProtocolVersion error code.
+    /// When a client's advertised protocol version range does not overlap the hub's supported range, the
+    /// hub sends an Error response containing the UnsupportedProtocolVersion error code.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_UnsupportedProtocolVersion_SendsErrorResponse()
     {
         var fixture = new MeshHubFixture();
@@ -1531,7 +1625,8 @@ public sealed class MeshHubTests
         var sentDataTcs = new TaskCompletionSource<byte[]>();
         var disposedTcs = new TaskCompletionSource();
 
-        byte[] badVersion = [0x04, 0xFF, 0x41]; // RegistrationRequest + bad version + 'A'
+        // RegistrationRequest advertising versions 1-2, which do not overlap the hub's version 4.
+        byte[] badVersion = [0x04, 0x01, 0x02];
         transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
             .ReturnsAsync(badVersion);
         transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
@@ -1552,13 +1647,90 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    /// <summary>
+    /// When a client sends a registration request whose advertised minimum version is greater than its
+    /// advertised maximum, the range is malformed and the hub refuses it as an unsupported version rather
+    /// than attempting to interpret it.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task HandleClient_InvertedProtocolVersionRange_SendsErrorResponse()
+    {
+        var fixture = new MeshHubFixture();
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+        var disposedTcs = new TaskCompletionSource();
+
+        // RegistrationRequest advertising min=5, max=4: an inverted, malformed range.
+        byte[] invertedRange = [0x04, 0x05, 0x04];
+        transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(invertedRange);
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+        transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x05, sentData[0]); // Error
+        Assert.Equal(0x02, sentData[1]); // UnsupportedProtocolVersion
+
+        await fixture.Hub.StopAsync();
+    }
+
+    // HandleClient — protocol version negotiation
+
+    /// <summary>
+    /// When a client advertises a version range wider than the hub's own supported range, the hub picks
+    /// the highest version common to both — not merely an exact match — and echoes it in the
+    /// RegistrationComplete response.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task HandleClient_ProtocolVersionRangeOverlapsHub_NegotiatesHighestSharedVersion()
+    {
+        var fixture = new MeshHubFixture();
+        var transport = MeshHubFixture.CreateMockTransport();
+        var sentDataTcs = new TaskCompletionSource<byte[]>();
+        var blockingReceive = new TaskCompletionSource<byte[]?>();
+
+        // A client that supports every version from the hub's minimum up to one past its maximum, so
+        // the hub's own maximum is the highest shared version. The receive loop's next call parks
+        // rather than spinning on the same registration frame once the client is admitted.
+        byte[] wideRange = MeshHubFixture.CreateRegistrationRequest(
+            "Alpha",
+            versionMin: Protocol.MinSupportedVersion,
+            versionMax: (byte)(Protocol.MaxSupportedVersion + 1));
+        transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(wideRange)
+            .Returns(blockingReceive.Task);
+        transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentDataTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        fixture.EnqueueClient(transport.Object);
+        await fixture.Hub.StartAsync();
+
+        byte[] sentData = await sentDataTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x01, sentData[0]); // RegistrationComplete
+        Assert.Equal(18, sentData.Length);
+        Assert.Equal(Protocol.MaxSupportedVersion, sentData[17]); // negotiated version
+
+        blockingReceive.TrySetResult(null);
+        await fixture.Hub.StopAsync();
+    }
+
     // HandleClient — client name too long
 
     /// <summary>
     /// When a client sends a registration request with a name exceeding the maximum allowed length,
     /// the hub sends an Error response containing the ClientNameTooLong error code.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientNameTooLong_SendsErrorResponse()
     {
         var fixture = new MeshHubFixture();
@@ -1595,7 +1767,7 @@ public sealed class MeshHubTests
     /// When the hub has an authenticator that rejects the credential, registration is refused with the
     /// AuthenticationFailed error code and the client is not registered.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_AuthenticatorRejects_SendsAuthenticationFailedError()
     {
         var fixture = new MeshHubFixture(authenticator: (_, _) => ValueTask.FromResult(false));
@@ -1624,7 +1796,7 @@ public sealed class MeshHubTests
     /// When the authenticator hangs, the hub refuses the client once the registration timeout elapses
     /// rather than holding the connection open indefinitely.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_AuthenticatorHangs_RefusesAfterRegistrationTimeout()
     {
         var neverCompletes = new TaskCompletionSource<bool>();
@@ -1657,7 +1829,7 @@ public sealed class MeshHubTests
     /// When the authenticator throws, the client is refused with AuthenticationFailed rather than the
     /// exception faulting the handler.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_AuthenticatorThrows_SendsAuthenticationFailedError()
     {
         var fixture = new MeshHubFixture(
@@ -1688,7 +1860,7 @@ public sealed class MeshHubTests
     /// call timing out, for example — the client is refused with AuthenticationFailed rather than the
     /// connection being dropped silently as though the hub were shutting down.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_AuthenticatorThrowsOperationCancelled_SendsAuthenticationFailedError()
     {
         var fixture = new MeshHubFixture(
@@ -1718,7 +1890,7 @@ public sealed class MeshHubTests
     /// Only maxConcurrentAuthentications authenticator callbacks run at once, so an unauthenticated peer
     /// cannot drive unbounded concurrent authentication work simply by connecting.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ManyRegistrations_BoundsConcurrentAuthenticatorCalls()
     {
         const int ConcurrencyLimit = 2;
@@ -1790,7 +1962,7 @@ public sealed class MeshHubTests
     /// A registration frame declaring a zero-length name is malformed and is dropped, so the empty
     /// string is never reserved in the name registry.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_EmptyClientName_DropsConnectionWithoutRegistering()
     {
         var fixture = new MeshHubFixture();
@@ -1825,7 +1997,7 @@ public sealed class MeshHubTests
     /// When the hub has an authenticator that accepts, the client is admitted, and the authenticator
     /// is given the client's name and the exact credential bytes it supplied.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_AuthenticatorAccepts_AdmitsClientWithNameAndCredential()
     {
         string? seenName = null;
@@ -1888,7 +2060,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a registered client disconnects by the transport returning null, the client is removed from the registry.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientDisconnects_RemovesFromRegistry()
     {
         var fixture = new MeshHubFixture();
@@ -1913,7 +2085,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a registered client disconnects, its transport connection is disposed.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientDisconnects_DisposesConnection()
     {
         var fixture = new MeshHubFixture();
@@ -1938,7 +2110,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a message to a registered recipient, the hub delivers a payload containing the DeliverMessage type byte, the sender's Guid, and the original message data.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessage_RecipientExists_DeliversCorrectPayload()
     {
         var fixture = new MeshHubFixture();
@@ -1971,7 +2143,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a message is delivered to a recipient, the payload contains the sender's Guid so the recipient knows who sent the message.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessage_RecipientExists_PayloadContainsSenderId()
     {
         var fixture = new MeshHubFixture();
@@ -2002,7 +2174,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a message to a Guid that does not match any registered client, the message is silently dropped without error.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessage_RecipientDoesNotExist_SilentlyDrops()
     {
         var fixture = new MeshHubFixture();
@@ -2030,13 +2202,289 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    // RouteMessage — header envelope
+
+    /// <summary>
+    /// A header-bearing direct message is forwarded to a recipient negotiated at the header-envelope's
+    /// minimum version as a DeliverMessageWithHeaders frame, carrying the header block through unchanged.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task RouteMessageWithHeaders_RecipientNegotiatedCurrentVersion_DeliversWithHeaders()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var clientA = await fixture.RegisterClientAsync("ClientA");
+        var clientB = await fixture.RegisterClientAsync("ClientB", versionMin: 5, versionMax: 5);
+
+        var deliveredTcs = new TaskCompletionSource<byte[]>();
+        clientB.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => deliveredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        var messageContent = new byte[] { 10, 20, 30 };
+        var headers = new MessageHeaders([new("correlationId", "abc-123")]);
+        byte[] sendPayload = MeshHubFixture.CreateDirectMessageWithHeaders(clientB.Id, headers, messageContent);
+
+        clientA.DisconnectTcs.SetResult(sendPayload);
+
+        byte[] deliveredData = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x12, deliveredData[0]); // DeliverMessageWithHeaders
+        Assert.Equal(clientA.Id, new Guid(deliveredData.AsSpan(1, 16)));
+
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(deliveredData.AsSpan(17, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(deliveredData.AsSpan(19), headerLength);
+        Assert.Equal("abc-123", decoded["correlationId"]);
+        Assert.Equal(messageContent, deliveredData[(19 + headerLength)..]);
+
+        clientB.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A header-bearing direct message routed to a recipient negotiated below the header-envelope's
+    /// minimum version has its header block stripped: the recipient gets the plain DeliverMessage frame
+    /// it already understands, rather than an opcode it would not recognise.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task RouteMessageWithHeaders_RecipientNegotiatedOldVersion_StripsHeadersAndDeliversPlainFrame()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var clientA = await fixture.RegisterClientAsync("ClientA");
+        var clientB = await fixture.RegisterClientAsync("ClientB"); // negotiates version 4 by default
+
+        var deliveredTcs = new TaskCompletionSource<byte[]>();
+        clientB.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => deliveredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        Assert.Equal(4, clientB.NegotiatedProtocolVersion);
+
+        var messageContent = new byte[] { 10, 20, 30 };
+        var headers = new MessageHeaders([new("correlationId", "abc-123")]);
+        byte[] sendPayload = MeshHubFixture.CreateDirectMessageWithHeaders(clientB.Id, headers, messageContent);
+
+        clientA.DisconnectTcs.SetResult(sendPayload);
+
+        byte[] deliveredData = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x03, deliveredData[0]); // DeliverMessage — the plain frame, headers stripped
+        Assert.Equal(clientA.Id, new Guid(deliveredData.AsSpan(1, 16)));
+        Assert.Equal(messageContent, deliveredData[17..]);
+
+        clientB.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A header-bearing direct message addressed to a Guid that does not match any registered client is
+    /// silently dropped, mirroring the plain SendMessage behaviour.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task RouteMessageWithHeaders_RecipientDoesNotExist_SilentlyDrops()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var client = await fixture.RegisterClientAsync();
+
+        var disposedTcs = new TaskCompletionSource();
+        client.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        var headers = new MessageHeaders([new("correlationId", "abc-123")]);
+        byte[] sendPayload = MeshHubFixture.CreateDirectMessageWithHeaders(Guid.NewGuid(), headers, [1, 2, 3]);
+
+        client.DisconnectTcs.SetResult(sendPayload);
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+
+        client.Transport.Verify(
+            t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()),
+            Times.Once); // only RegistrationComplete, no delivery bounce-back
+
+        await fixture.Hub.StopAsync();
+    }
+
+    // Message expiry (TTL)
+
+    private static string ExpiryHeaderValue(TimeSpan fromNow)
+    {
+        return DateTimeOffset.UtcNow.Add(fromNow).ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>
+    /// A direct message whose expiry has already passed is dropped by the send loop rather than
+    /// delivered stale. Proved the same way as the other queue-ordering tests: a non-expiring message
+    /// queued immediately afterwards on the same connection is what actually arrives, and the expired
+    /// one queued ahead of it never does — because the hub processes one client's queued frames in
+    /// order, its arrival proves the expired frame was already dealt with.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task SendLoop_ExpiredDirectMessage_IsDroppedNotDelivered()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient", versionMin: 5, versionMax: 5);
+        var recipientFrames = new FrameRecorder(recipient.Transport);
+
+        var expiredHeaders = new MessageHeaders(
+        [
+            new(MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, ExpiryHeaderValue(TimeSpan.FromMinutes(-1))),
+        ]);
+        sender.EnqueueMessage(
+            MeshHubFixture.CreateDirectMessageWithHeaders(recipient.Id, expiredHeaders, [1, 2, 3]));
+
+        var barrierHeaders = new MessageHeaders([new("marker", "barrier")]);
+        sender.EnqueueMessage(
+            MeshHubFixture.CreateDirectMessageWithHeaders(recipient.Id, barrierHeaders, [9]));
+
+        byte[] delivered = await recipientFrames.WaitForAsync(f => f[0] == 0x12) // DeliverMessageWithHeaders
+            .WaitAsync(WaitTimeout);
+
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(delivered.AsSpan(17, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(delivered.AsSpan(19), headerLength);
+        Assert.Equal("barrier", decoded["marker"]);
+        Assert.Equal(new byte[] { 9 }, delivered[(19 + headerLength)..]);
+
+        // Exactly one DeliverMessageWithHeaders frame reached the recipient: the barrier. The expired
+        // one queued ahead of it never did.
+        Assert.Single(recipientFrames.Frames, f => f[0] == 0x12);
+
+        sender.Disconnect();
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A direct message with a time-to-live that has not yet elapsed is delivered exactly as a header-
+    /// bearing message without one would be.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task SendLoop_NonExpiredDirectMessage_IsDelivered()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var clientA = await fixture.RegisterClientAsync("ClientA");
+        var clientB = await fixture.RegisterClientAsync("ClientB", versionMin: 5, versionMax: 5);
+
+        var deliveredTcs = new TaskCompletionSource<byte[]>();
+        clientB.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => deliveredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        var headers = new MessageHeaders(
+        [
+            new(MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, ExpiryHeaderValue(TimeSpan.FromHours(1))),
+        ]);
+        byte[] sendPayload = MeshHubFixture.CreateDirectMessageWithHeaders(clientB.Id, headers, [4, 5, 6]);
+
+        clientA.DisconnectTcs.SetResult(sendPayload);
+
+        byte[] deliveredData = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x12, deliveredData[0]); // DeliverMessageWithHeaders
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(deliveredData.AsSpan(17, 2));
+        Assert.Equal(new byte[] { 4, 5, 6 }, deliveredData[(19 + headerLength)..]);
+
+        clientB.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// An expiry value that parses as a valid integer but falls outside the range DateTimeOffset can
+    /// represent is tolerated as "does not expire" rather than crashing the send loop — the header
+    /// block is sender-controlled bytes, so a hostile or merely malformed expiry value must not be able
+    /// to fault this connection (or, for a shared group frame, every member's connection at once).
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task SendLoop_OutOfRangeExpiryValue_MessageIsDeliveredNotDropped()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+        var clientA = await fixture.RegisterClientAsync("ClientA");
+        var clientB = await fixture.RegisterClientAsync("ClientB", versionMin: 5, versionMax: 5);
+
+        var deliveredTcs = new TaskCompletionSource<byte[]>();
+        clientB.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => deliveredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        var headers = new MessageHeaders(
+        [
+            new(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                long.MaxValue.ToString(CultureInfo.InvariantCulture)),
+        ]);
+        byte[] sendPayload = MeshHubFixture.CreateDirectMessageWithHeaders(clientB.Id, headers, [7, 8, 9]);
+
+        clientA.DisconnectTcs.SetResult(sendPayload);
+
+        byte[] deliveredData = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x12, deliveredData[0]); // DeliverMessageWithHeaders — delivered, connection intact
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(deliveredData.AsSpan(17, 2));
+        Assert.Equal(new byte[] { 7, 8, 9 }, deliveredData[(19 + headerLength)..]);
+
+        clientB.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// The expiry check applies to group messages too: an already-expired one queued for a member is
+    /// dropped, mirroring the direct-message case.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task SendLoop_ExpiredGroupMessage_IsDroppedNotDelivered()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var member = await fixture.RegisterMultiMessageClientAsync("Member", versionMin: 5, versionMax: 5);
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var memberFrames = new FrameRecorder(member.Transport);
+        var senderFrames = new FrameRecorder(sender.Transport);
+
+        member.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        await ApplyPendingFramesAsync(member, memberFrames, "Sender");
+
+        sender.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        await ApplyPendingFramesAsync(sender, senderFrames, "Member");
+
+        var expiredHeaders = new MessageHeaders(
+        [
+            new(MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, ExpiryHeaderValue(TimeSpan.FromMinutes(-1))),
+        ]);
+        sender.EnqueueMessage(MeshHubFixture.CreateGroupMessageWithHeaders("team", expiredHeaders, [1, 2, 3]));
+
+        var barrierHeaders = new MessageHeaders([new("marker", "barrier")]);
+        sender.EnqueueMessage(MeshHubFixture.CreateGroupMessageWithHeaders("team", barrierHeaders, [9]));
+
+        byte[] delivered = await memberFrames.WaitForAsync(f => f[0] == 0x14) // DeliverGroupMessageWithHeaders
+            .WaitAsync(WaitTimeout);
+
+        int nameLength = BinaryPrimitives.ReadUInt16BigEndian(delivered.AsSpan(17, 2));
+        int headerLengthOffset = 19 + nameLength;
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(delivered.AsSpan(headerLengthOffset, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(delivered.AsSpan(headerLengthOffset + 2), headerLength);
+        Assert.Equal("barrier", decoded["marker"]);
+
+        Assert.Single(memberFrames.Frames, f => f[0] == 0x14);
+
+        member.Disconnect();
+        sender.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // BroadcastMessage
 
     /// <summary>
     /// When a client broadcasts a message, the hub delivers it to every other registered client but
     /// not back to the sender.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task BroadcastMessage_DeliversToAllOtherClients()
     {
         var fixture = new MeshHubFixture();
@@ -2085,7 +2533,7 @@ public sealed class MeshHubTests
     /// When the hub receives an empty frame, it is ignored without faulting the receive loop,
     /// so a subsequent SendMessage from the same client is still routed.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_EmptyFrame_IsIgnoredAndRoutingContinues()
     {
         var fixture = new MeshHubFixture();
@@ -2120,7 +2568,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a lookup request for a name that is registered, the hub responds with a found indicator and the matching client's Guid.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_LookupRequestForExistingName_SendsFoundResponse()
     {
         var fixture = new MeshHubFixture();
@@ -2156,7 +2604,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When a client sends a lookup request for a name that is not registered, the hub responds with a not-found indicator.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_LookupRequestForUnknownName_SendsNotFoundResponse()
     {
         var fixture = new MeshHubFixture();
@@ -2191,7 +2639,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When the hub receives a frame from a client with an unrecognised message type, the frame is ignored and no routing occurs.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_WrongMessageType_IgnoresFrame()
     {
         var fixture = new MeshHubFixture();
@@ -2219,7 +2667,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// When the hub receives a frame from a client shorter than 17 bytes, the frame is ignored and no routing occurs.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_MessageTooShort_IgnoresFrame()
     {
         var fixture = new MeshHubFixture();
@@ -2249,7 +2697,7 @@ public sealed class MeshHubTests
     /// When a registered client's transport throws an IOException during the receive loop, the client
     /// is removed from the registry and its transport is disposed.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_IOExceptionDuringReceiveLoop_RemovesClientFromRegistry()
     {
         var fixture = new MeshHubFixture();
@@ -2284,7 +2732,7 @@ public sealed class MeshHubTests
     /// When a recipient's transport throws an IOException during message delivery, the recipient
     /// is evicted from the registry and the sender remains connected.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_RecipientTransportFailsDuringRouting_EvictsRecipient()
     {
         var fixture = new MeshHubFixture();
@@ -2319,12 +2767,64 @@ public sealed class MeshHubTests
         await fixture.Hub.StopAsync();
     }
 
+    /// <summary>
+    /// A transport's SendAsync can reject an oversized delivery frame with an ArgumentException — as
+    /// TcpTransport does when a near-maximum-size inbound payload grows past the frame cap once the
+    /// hub adds routing fields (and, for a header-bearing message, the header block). This must be
+    /// treated exactly like a transport fault: the recipient is evicted with its slot, name and group
+    /// memberships released, not left to fault the send loop's awaiting task and skip that cleanup.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task HandleClient_RecipientTransportRejectsOversizedDelivery_EvictsRecipientAndReleasesItsSlot()
+    {
+        var fixture = new MeshHubFixture(maxClients: 2);
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterMultiMessageClientAsync("Recipient");
+
+        var recipientDisposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => recipientDisposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ArgumentException("Payload size exceeds the maximum frame payload of 1048576 bytes."));
+
+        var sendPayload = new byte[1 + 16 + 3];
+        sendPayload[0] = 0x02; // SendMessage
+        recipient.Id.TryWriteBytes(sendPayload.AsSpan(1));
+        new byte[] { 1, 2, 3 }.CopyTo(sendPayload, 17);
+        sender.EnqueueMessage(sendPayload);
+
+        await recipientDisposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.False(fixture.Hub.IsClientRegistered(recipient.Id));
+        Assert.True(fixture.Hub.IsClientRegistered(sender.Id));
+
+        // The recipient's claimed slot must have been released too, not just its registry entry
+        // removed — otherwise a third client could never register against the 2-client cap.
+        var thirdClient = MeshHubFixture.CreateMockTransport();
+        var thirdRegisteredTcs = new TaskCompletionSource<byte[]>();
+        thirdClient.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Third"));
+        thirdClient.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => thirdRegisteredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+        fixture.EnqueueClient(thirdClient.Object);
+
+        byte[] thirdResponse = await thirdRegisteredTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(0x01, thirdResponse[0]); // RegistrationComplete, not HubAtCapacity
+
+        sender.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // HandleClient — heartbeat
 
     /// <summary>
     /// When heartbeats are enabled and a client stays idle, the hub probes it with a Ping frame.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_IdleClientWithHeartbeatEnabled_SendsPing()
     {
         var fixture = new MeshHubFixture(
@@ -2353,7 +2853,7 @@ public sealed class MeshHubTests
     /// When heartbeats are enabled and a client never sends any frame in response, the hub evicts it
     /// after the configured number of missed intervals.
     /// </summary>
-    [Fact(Timeout = 2000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_ClientMissesHeartbeats_IsEvicted()
     {
         var fixture = new MeshHubFixture(
@@ -2378,11 +2878,196 @@ public sealed class MeshHubTests
     }
 
     /// <summary>
+    /// A sender whose receive loop the hub has deliberately parked awaiting capacity for one of its
+    /// messages is not evicted for looking idle. It reads nothing while parked, so it cannot answer a
+    /// ping and its activity sequence cannot advance — but the silence is backpressure the hub itself
+    /// applied, not a dead client, and evicting it would turn opting into AwaitCapacity into a way to
+    /// get disconnected. The park is held open here well past the eviction budget (50 ms × 2), and the
+    /// client must still be registered afterwards.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task HandleClient_ParkedAwaitingCapacity_IsNotEvictedForLookingIdle()
+    {
+        var fixture = new MeshHubFixture(
+            heartbeatInterval: TimeSpan.FromMilliseconds(50),
+            maxMissedHeartbeats: 2,
+            backpressureAwaitTimeout: Timeout.InfiniteTimeSpan);
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender", versionMin: 5, versionMax: 5);
+        var recipient = await fixture.RegisterClientAsync("Recipient", versionMin: 5, versionMax: 5);
+
+        // Park the recipient's send loop so its queue can be filled and stay full.
+        var sendCalledTcs = new TaskCompletionSource();
+        var blockedSendTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback(() => sendCalledTcs.TrySetResult())
+            .Returns(blockedSendTcs.Task);
+
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        await sendCalledTcs.Task.WaitAsync(WaitTimeout);
+
+        for (int i = 0; i < MeshHub.OutboundQueueCapacityForTesting; i++)
+        {
+            Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFF]));
+        }
+
+        // The sender's receive loop parks here, indefinitely, until the recipient's queue drains.
+        var headers = new MessageHeaders([new(BackpressureHeaderKeys.AwaitCapacity, "1")]);
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessageWithHeaders(recipient.Id, headers, [1]));
+
+        // Well beyond the 100 ms eviction budget, during which the sender reads nothing at all.
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
+
+        Assert.True(fixture.Hub.IsClientRegistered(sender.Id));
+
+        blockedSendTcs.TrySetResult();
+
+        var disposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => disposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        recipient.Disconnect();
+        await disposedTcs.Task.WaitAsync(WaitTimeout);
+        sender.Disconnect();
+
+        await fixture.Hub.StopAsync();
+    }
+
+    // Priority lanes (#31)
+
+    /// <summary>
+    /// A high-priority frame queued behind a whole backlog of normal-priority frames is still delivered
+    /// ahead of every one of them, satisfying issue #31's first acceptance criterion end to end through
+    /// the hub's send loop. The backlog is driven directly via <see cref="MeshHub.TryQueueRawFrameForTesting(Guid, byte[], MessagePriority)"/>
+    /// rather than racing real sends through the wire, mirroring the technique
+    /// <see cref="HandleClient_ParkedAwaitingCapacity_IsNotEvictedForLookingIdle"/> already uses to drive
+    /// the outbound queue to a specific state deterministically.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task SendLoop_HighPriorityFrameQueuedAfterNormalBacklog_IsDeliveredFirst()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var recipient = await fixture.RegisterClientAsync("Recipient", versionMin: 5, versionMax: 5);
+
+        var recordedFramesLock = new Lock();
+        var recordedFrames = new List<byte[]>();
+        var sendCalledTcs = new TaskCompletionSource();
+        var blockedSendTcs = new TaskCompletionSource();
+        var lastBacklogFrameSentTcs = new TaskCompletionSource();
+
+        const int BacklogSize = 10;
+        const byte LastBacklogTag = 0x10 + BacklogSize - 1;
+
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                byte[] frame = data.ToArray();
+
+                lock (recordedFramesLock)
+                {
+                    recordedFrames.Add(frame);
+                }
+
+                sendCalledTcs.TrySetResult();
+
+                if (frame is [LastBacklogTag])
+                {
+                    lastBacklogFrameSentTcs.TrySetResult();
+                }
+            })
+            .Returns(blockedSendTcs.Task);
+
+        // The very first frame parks the send loop mid-send, before the backlog below exists. Queued at
+        // Low priority deliberately: the send loop's anti-starvation cycle resumes exactly where a yield
+        // left it, and a low-lane yield is the one spot in that cycle that falls straight through to the
+        // top of the next pass rather than leaving the enumerator mid-way through a burst — a Normal- or
+        // High-priority park frame would instead leave it parked partway through that lane's burst
+        // counter, letting a few more same-priority frames slip out before the newly queued high-priority
+        // frame is even reconsidered. Using Low here isolates the assertion below to the guarantee the
+        // acceptance criterion actually asks for, rather than an artefact of which lane happened to hold
+        // the frame that was already in flight when the backlog was queued.
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xAA], MessagePriority.Low));
+        await sendCalledTcs.Task.WaitAsync(WaitTimeout);
+
+        // Queue a backlog of normal-priority frames, then a single high-priority frame enqueued last,
+        // while the send loop is still parked and cannot drain any of them yet.
+        for (int i = 0; i < BacklogSize; i++)
+        {
+            Assert.True(fixture.Hub.TryQueueRawFrameForTesting(
+                recipient.Id, [(byte)(0x10 + i)], MessagePriority.Normal));
+        }
+
+        Assert.True(fixture.Hub.TryQueueRawFrameForTesting(recipient.Id, [0xFE], MessagePriority.High));
+
+        blockedSendTcs.TrySetResult();
+
+        // The backlog drains in FIFO order relative to itself, so the last backlog frame arriving proves
+        // every earlier frame — including the high-priority one, if it overtook the backlog as expected —
+        // has already been sent, mirroring FrameRecorder's own documented technique.
+        await lastBacklogFrameSentTcs.Task.WaitAsync(WaitTimeout);
+
+        byte[][] snapshot;
+        lock (recordedFramesLock)
+        {
+            snapshot = [.. recordedFrames];
+        }
+
+        int highIndex = Array.FindIndex(snapshot, f => f is [0xFE]);
+        int firstNormalIndex = Array.FindIndex(snapshot, f => f.Length == 1 && f[0] is >= 0x10 and < 0x10 + BacklogSize);
+
+        Assert.True(highIndex >= 0, "The high-priority frame was never delivered.");
+        Assert.True(firstNormalIndex >= 0, "No normal-priority backlog frame was ever delivered.");
+        Assert.True(
+            highIndex < firstNormalIndex,
+            "The high-priority frame did not overtake the normal-priority backlog it was queued behind.");
+
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A genuine <c>mesh.priority</c> header, sent over the wire rather than injected directly onto the
+    /// outbound queue, is parsed correctly and does not disrupt ordinary delivery — proving
+    /// <c>ReadPriority</c> is wired into <see cref="MeshHub"/>'s real header-bearing routing path, not
+    /// just exercised by the deterministic queue-injection test above.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task RouteMessageWithHeaders_PriorityHeaderOverWire_DeliversPayloadUnaffected()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender", versionMin: 5, versionMax: 5);
+        var recipient = await fixture.RegisterClientAsync("Recipient", versionMin: 5, versionMax: 5);
+
+        var deliveredTcs = new TaskCompletionSource<byte[]>();
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => deliveredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+
+        var headers = new MessageHeaders([new(MessagePriorityHeaderKeys.Priority, "high")]);
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessageWithHeaders(recipient.Id, headers, [0x42]));
+
+        byte[] delivered = await deliveredTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(0x12, delivered[0]); // DeliverMessageWithHeaders
+        Assert.Equal(0x42, delivered[^1]);
+
+        sender.Disconnect();
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
     /// A silent client is evicted on the maxMissedHeartbeats'th consecutive idle interval, not the one
     /// after it. The hub therefore probes it exactly maxMissedHeartbeats minus one times before
     /// evicting, which pins the eviction interval: an extra ping means eviction ran an interval late.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_SilentClient_IsEvictedOnConfiguredIntervalNotTheOneAfter()
     {
         const int MaxMissedHeartbeats = 3;
@@ -2430,7 +3115,7 @@ public sealed class MeshHubTests
     /// With maxMissedHeartbeats set to 1 the client is evicted on the very first idle interval, so the
     /// hub never gets to probe it. This is the documented boundary of the silent-interval count.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task HandleClient_SilentClientWithSingleMissedHeartbeat_IsEvictedWithoutPinging()
     {
         // A 100 ms interval rather than 50 ms: eviction here lands on the very first tick, so the
@@ -2557,7 +3242,7 @@ public sealed class MeshHubTests
     /// When a client sends three messages to another client, all three are delivered in order
     /// with the correct payloads.
     /// </summary>
-    [Fact(Timeout = 1000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task RouteMessage_ThreeConsecutiveMessages_AllDeliveredInOrder()
     {
         var fixture = new MeshHubFixture();
@@ -2627,7 +3312,7 @@ public sealed class MeshHubTests
     /// fanning it out to the members. Proved by a direct message sent immediately afterwards on the same
     /// connection — it arrives, and the group message it was queued behind never does.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task SendToGroup_SenderIsNotAMember_MessageIsNotDelivered()
     {
         var fixture = new MeshHubFixture();
@@ -2656,7 +3341,7 @@ public sealed class MeshHubTests
     /// counterpart to the non-member case above, so the membership gate cannot pass by rejecting
     /// everything.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task SendToGroup_SenderIsAMember_MessageIsDeliveredToOtherMembers()
     {
         var fixture = new MeshHubFixture();
@@ -2684,10 +3369,69 @@ public sealed class MeshHubTests
     }
 
     /// <summary>
+    /// A header-bearing group message fans out with the frame shape each member's own negotiated
+    /// protocol version can understand: a member negotiated at the header-envelope's minimum version
+    /// gets DeliverGroupMessageWithHeaders with the header block intact, while a member negotiated
+    /// below it gets the plain DeliverGroupMessage frame with the headers stripped — built once each,
+    /// not per recipient.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task SendToGroupWithHeaders_MixedNegotiatedVersionMembers_EachGetsItsOwnFrameShape()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        var currentVersionMember = await fixture.RegisterMultiMessageClientAsync(
+            "CurrentVersionMember", versionMin: 5, versionMax: 5);
+        var oldVersionMember = await fixture.RegisterMultiMessageClientAsync(
+            "OldVersionMember", versionMin: 4, versionMax: 4);
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+
+        var currentVersionFrames = new FrameRecorder(currentVersionMember.Transport);
+        var oldVersionFrames = new FrameRecorder(oldVersionMember.Transport);
+
+        currentVersionMember.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        await ApplyPendingFramesAsync(currentVersionMember, currentVersionFrames, "Sender");
+
+        oldVersionMember.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        await ApplyPendingFramesAsync(oldVersionMember, oldVersionFrames, "Sender");
+
+        // The sender must itself be a member to send to the group at all; queued on its own connection,
+        // ahead of the group message, so it is guaranteed to have been applied first.
+        var headers = new MessageHeaders([new("priority", "high")]);
+        sender.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("team"));
+        sender.EnqueueMessage(MeshHubFixture.CreateGroupMessageWithHeaders("team", headers, [1, 2, 3]));
+
+        byte[] withHeadersFrame = await currentVersionFrames.WaitForAsync(f => f[0] == 0x14)
+            .WaitAsync(WaitTimeout); // DeliverGroupMessageWithHeaders
+        byte[] strippedFrame = await oldVersionFrames.WaitForAsync(f => f[0] == 0x0F)
+            .WaitAsync(WaitTimeout); // DeliverGroupMessage
+
+        Assert.Equal(sender.Id, new Guid(withHeadersFrame.AsSpan(1, 16)));
+        int withHeadersNameLength = BinaryPrimitives.ReadUInt16BigEndian(withHeadersFrame.AsSpan(17, 2));
+        Assert.Equal("team", Encoding.UTF8.GetString(withHeadersFrame.AsSpan(19, withHeadersNameLength)));
+        int headerLengthOffset = 19 + withHeadersNameLength;
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(withHeadersFrame.AsSpan(headerLengthOffset, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(withHeadersFrame.AsSpan(headerLengthOffset + 2), headerLength);
+        Assert.Equal("high", decoded["priority"]);
+        Assert.Equal(new byte[] { 1, 2, 3 }, withHeadersFrame[(headerLengthOffset + 2 + headerLength)..]);
+
+        Assert.Equal(sender.Id, new Guid(strippedFrame.AsSpan(1, 16)));
+        int strippedNameLength = BinaryPrimitives.ReadUInt16BigEndian(strippedFrame.AsSpan(17, 2));
+        Assert.Equal("team", Encoding.UTF8.GetString(strippedFrame.AsSpan(19, strippedNameLength)));
+        Assert.Equal(new byte[] { 1, 2, 3 }, strippedFrame[(19 + strippedNameLength)..]);
+
+        currentVersionMember.Disconnect();
+        oldVersionMember.Disconnect();
+        sender.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
     /// When a group authoriser refuses a join, the client is told so, is not admitted to the group, and
     /// therefore receives none of its traffic.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserRefuses_ClientIsToldAndReceivesNoGroupMessages()
     {
         var fixture = new MeshHubFixture(
@@ -2721,7 +3465,7 @@ public sealed class MeshHubTests
     /// An authorised join admits the client to the group, and the authoriser is given the joining
     /// client's hub-assigned id, its registered name, and the group it asked for.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserAllows_AdmitsClientAndSeesItsIdentity()
     {
         GroupJoinContext? seen = null;
@@ -2759,7 +3503,7 @@ public sealed class MeshHubTests
     /// An authoriser that throws refuses the join rather than faulting the client handler — the decision
     /// fails closed, and the connection survives.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserThrows_JoinIsRefused()
     {
         var fixture = new MeshHubFixture(
@@ -2786,7 +3530,7 @@ public sealed class MeshHubTests
     /// An authoriser that cancels of its own accord — an external policy lookup timing out is the usual
     /// cause — refuses the join rather than unwinding into the receive loop and dropping the connection.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserCancels_JoinIsRefused()
     {
         var fixture = new MeshHubFixture(
@@ -2811,7 +3555,7 @@ public sealed class MeshHubTests
     /// An authoriser that never returns refuses the join once the group authorisation timeout elapses,
     /// so a hanging integrator callback cannot wedge the calling client's receive loop indefinitely.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserHangs_JoinIsRefusedAtTheTimeout()
     {
         var neverCompletes = new TaskCompletionSource<bool>();
@@ -2840,7 +3584,7 @@ public sealed class MeshHubTests
     /// is exactly what MeshClientReconnector's membership restoration does — is authorised again on its
     /// own merits, so a restore cannot reinstate a membership the authoriser would now refuse.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
     public async Task JoinGroup_AfterReconnect_IsAuthorisedAgainRatherThanRestored()
     {
         int memberJoinAttempts = 0;
@@ -2915,7 +3659,7 @@ public sealed class MeshHubTests
     /// it would breach the 1 MiB one, which is what makes the invariant worth pinning.
     /// </para>
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserRefusesAnInvalidUtf8Name_RefusalEchoesTheNameWithoutGrowingIt()
     {
         var fixture = new MeshHubFixture(groupAuthoriser: (_, _) => ValueTask.FromResult(false));
@@ -2947,7 +3691,7 @@ public sealed class MeshHubTests
     /// its mind must be able to use it to revoke: leaving the earlier membership in place would mean a
     /// deliberate refusal left the client still receiving the group's traffic.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_AuthoriserRefusesAnExistingMember_RevokesTheMembership()
     {
         bool allowJoins = true;
@@ -2984,7 +3728,7 @@ public sealed class MeshHubTests
     /// <summary>
     /// With no group authoriser configured, joins are unrestricted — the default behaviour is unchanged.
     /// </summary>
-    [Fact(Timeout = 5000)]
+    [Fact(Timeout = TestTimeouts.Harness)]
     public async Task JoinGroup_NoAuthoriser_AdmitsAnyClient()
     {
         var fixture = new MeshHubFixture();

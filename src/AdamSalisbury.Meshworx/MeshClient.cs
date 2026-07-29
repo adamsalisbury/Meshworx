@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net.Sockets;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
@@ -38,6 +40,33 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private PendingLookup? _pendingLookup;
     private int _lookupCorrelationId;
 
+    // Concurrent, unlike the single-slot lookup above: multiple RequestAsync calls may be in flight
+    // together, each tracked independently by its own correlation id until its reply arrives, it times
+    // out, or the connection tears down.
+    private readonly ConcurrentDictionary<long, PendingRequest> _pendingRequests = new();
+    private long _requestCorrelationId;
+
+    // As _pendingRequests above, but for outstanding SendAsync(..., DeliveryOptions.RequireAck(...))
+    // calls awaiting the recipient's acknowledgement rather than a reply payload.
+    private readonly ConcurrentDictionary<long, PendingAck> _pendingAcks = new();
+    private long _ackCorrelationId;
+
+    // The resumption token the hub last issued, and the name it was issued to. Deliberately *not*
+    // cleared when the connection ends — surviving the disconnect is the entire point of it, since it is
+    // what the next ConnectAsync presents to reclaim this identity. It is cleared only when it is spent,
+    // when the hub refuses it, or when connecting under a different name, for which it is meaningless.
+    private byte[]? _sessionToken;
+    private string? _sessionTokenName;
+
+    // Completed by the receive loop when the hub answers a resume attempt: true for
+    // SessionResumed, false for SessionResumeRefused. Guarded by _stateLock.
+    private TaskCompletionSource<bool>? _pendingResume;
+
+    // How long ConnectAsync waits for the hub to answer a resume attempt before giving up and keeping
+    // the fresh identity it was just assigned. Short deliberately: the hub answers from the same receive
+    // loop that just registered this client, so anything beyond a round trip means it is not going to.
+    private static readonly TimeSpan SessionResumeTimeout = TimeSpan.FromSeconds(10);
+
     private readonly Lock _groupMembershipLock = new();
     private readonly HashSet<string> _joinedGroups = new(StringComparer.Ordinal);
 
@@ -57,8 +86,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// <param name="sendTimeout">
     /// The maximum time a single message send may take before it is cancelled and fails with a
     /// <see cref="TimeoutException"/>. Cancelling releases the transport so a stalled send does not block
-    /// the connection. Applies to <see cref="SendAsync"/>, <see cref="BroadcastAsync"/> and
-    /// <see cref="SendToGroupAsync"/>. A timed-out send is not retried. Defaults to <see langword="null"/>
+    /// the connection. Applies to <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, CancellationToken)"/>,
+    /// <see cref="BroadcastAsync"/> and
+    /// <see cref="SendToGroupAsync(string, ReadOnlyMemory{byte}, CancellationToken)"/>.
+    /// A timed-out send is not retried. Defaults to <see langword="null"/>
     /// (no timeout).
     /// </param>
     /// <param name="maxSendAttempts">
@@ -119,6 +150,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public string Name { get; private set; } = string.Empty;
 
     /// <inheritdoc/>
+    public byte NegotiatedProtocolVersion { get; private set; }
+
+    /// <inheritdoc/>
+    public bool SessionResumed { get; private set; }
+
+    /// <inheritdoc/>
     public bool IsConnected
     {
         get
@@ -153,6 +190,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
     /// <inheritdoc/>
     public event EventHandler<DisconnectedEventArgs>? Disconnected;
+
+    /// <inheritdoc/>
+    public event EventHandler<SendRejectedEventArgs>? SendRejected;
 
     /// <inheritdoc/>
     public async Task ConnectAsync(
@@ -190,14 +230,22 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         try
         {
-            // Registration frame: [type][version][name length (2, big-endian)][name][credential].
+            // Captured before registration replaces it: the token that reclaims the *previous* session is
+            // the one to present, and the reply to this registration carries a new one that overwrites it.
+            // A token issued to a different name is meaningless here, so it is not carried across.
+            byte[]? resumptionToken = string.Equals(_sessionTokenName, clientName, StringComparison.Ordinal)
+                ? _sessionToken
+                : null;
+
+            // Registration frame: [type][versionMin][versionMax][name length (2, big-endian)][name][credential].
             byte[] nameBytes = Encoding.UTF8.GetBytes(clientName);
-            var requestPayload = new byte[2 + 2 + nameBytes.Length + credential.Length];
+            var requestPayload = new byte[3 + 2 + nameBytes.Length + credential.Length];
             requestPayload[0] = (byte)MessageType.RegistrationRequest;
-            requestPayload[1] = Protocol.Version;
-            BinaryPrimitives.WriteUInt16BigEndian(requestPayload.AsSpan(2, 2), (ushort)nameBytes.Length);
-            nameBytes.CopyTo(requestPayload, 4);
-            credential.Span.CopyTo(requestPayload.AsSpan(4 + nameBytes.Length));
+            requestPayload[1] = Protocol.MinSupportedVersion;
+            requestPayload[2] = Protocol.MaxSupportedVersion;
+            BinaryPrimitives.WriteUInt16BigEndian(requestPayload.AsSpan(3, 2), (ushort)nameBytes.Length);
+            nameBytes.CopyTo(requestPayload, 5);
+            credential.Span.CopyTo(requestPayload.AsSpan(5 + nameBytes.Length));
             await _transport.SendAsync(requestPayload, cancellationToken).ConfigureAwait(false);
 
             byte[]? responseData = await _transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
@@ -210,7 +258,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             }
 
             if (responseData is null
-                || responseData.Length != 17
+                || responseData.Length < 18
                 || (MessageType)responseData[0] != MessageType.RegistrationComplete)
             {
                 throw new InvalidOperationException("Failed to register with the hub.");
@@ -218,7 +266,18 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
             Id = new Guid(responseData.AsSpan(1, 16));
             Name = clientName;
-            _logger.LogInformation("Connected to hub with id {ClientId}", Id);
+            NegotiatedProtocolVersion = responseData[17];
+            SessionResumed = false;
+
+            // A hub with session resumption enabled appends the token that reclaims this identity. The
+            // reply is exactly 18 bytes without one, which is every reply from a hub built before
+            // version 6 and every reply on a connection negotiated below it — so the trailing fields are
+            // read only when they are actually there.
+            ReadSessionToken(responseData, clientName);
+            _logger.LogInformation(
+                "Connected to hub with id {ClientId} on protocol version {ProtocolVersion}",
+                Id,
+                NegotiatedProtocolVersion);
 
             var cts = new CancellationTokenSource();
             _cts = cts;
@@ -244,6 +303,16 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     _receiveLoopTask = loopTask;
                 }
             }
+
+            // Attempted only once the receive loop is running, because the hub's answer is not the next
+            // frame on the wire: registration may already have queued messages held for this name while
+            // it was away, and those arrive first. Handling the reply in the loop rather than with a
+            // second blocking read is what makes the interleaving a non-event.
+            if (resumptionToken is not null
+                && NegotiatedProtocolVersion >= Protocol.SessionResumptionMinVersion)
+            {
+                await TryResumeSessionAsync(resumptionToken, cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (Exception exception)
         {
@@ -265,6 +334,115 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
             throw;
         }
+    }
+
+    /// <summary>
+    /// Reads the resumption token a version-6 hub appends to its registration reply, and remembers which
+    /// name it belongs to.
+    /// </summary>
+    /// <remarks>
+    /// A reply with no token — the 18-byte form — clears whatever was held rather than leaving it: a hub
+    /// that has stopped issuing tokens, or one that has just refused this client's own, must not leave
+    /// the client trying to spend a credential that no longer means anything.
+    /// </remarks>
+    private void ReadSessionToken(byte[] responseData, string clientName)
+    {
+        if (responseData.Length < 20)
+        {
+            _sessionToken = null;
+            _sessionTokenName = null;
+            return;
+        }
+
+        int tokenLength = BinaryPrimitives.ReadUInt16BigEndian(responseData.AsSpan(18, 2));
+        if (tokenLength == 0 || responseData.Length < 20 + tokenLength)
+        {
+            _sessionToken = null;
+            _sessionTokenName = null;
+            return;
+        }
+
+        _sessionToken = responseData.AsSpan(20, tokenLength).ToArray();
+        _sessionTokenName = clientName;
+    }
+
+    /// <summary>
+    /// Presents a resumption token to the hub and waits for it to accept or refuse, leaving the client on
+    /// the identity it just registered with if anything at all goes wrong.
+    /// </summary>
+    /// <remarks>
+    /// Every failure here — a refusal, a timeout, a hub that does not recognise the opcode, a transport
+    /// error on the way out — resolves to the same outcome: the connection is up, on the fresh identity,
+    /// and <see cref="SessionResumed"/> stays <see langword="false"/>. Resumption is an optimisation over
+    /// reconnecting, never a precondition for it, so it must never be able to fail a connect that has
+    /// already succeeded.
+    /// </remarks>
+    private async Task TryResumeSessionAsync(byte[] resumptionToken, CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        lock (_stateLock)
+        {
+            _pendingResume = completion;
+        }
+
+        try
+        {
+            var payload = new byte[1 + resumptionToken.Length];
+            payload[0] = (byte)MessageType.ResumeSession;
+            resumptionToken.CopyTo(payload, 1);
+
+            await _transport!.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+
+            bool resumed = await completion.Task
+                .WaitAsync(SessionResumeTimeout, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (resumed)
+            {
+                _logger.LogInformation("Resumed previous session as {ClientId}", Id);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "The hub refused session resumption; continuing as {ClientId}", Id);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException
+            || !cancellationToken.IsCancellationRequested)
+        {
+            // Includes the timeout. Swallowed rather than rethrown: the connection itself is up and
+            // usable, and failing it here would turn an optimisation into a reason not to connect at
+            // all. The token registration just issued is left in place — it belongs to *this* identity,
+            // not the one that was refused, so the next reconnect still has something to present.
+            _logger.LogDebug(ex, "Session resumption did not complete; continuing as {ClientId}", Id);
+        }
+        finally
+        {
+            lock (_stateLock)
+            {
+                if (ReferenceEquals(_pendingResume, completion))
+                {
+                    _pendingResume = null;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Completes a pending resume attempt, if one is outstanding.
+    /// </summary>
+    private void CompletePendingResume(bool resumed)
+    {
+        TaskCompletionSource<bool>? completion;
+
+        lock (_stateLock)
+        {
+            completion = _pendingResume;
+            _pendingResume = null;
+        }
+
+        completion?.TrySetResult(resumed);
     }
 
     /// <inheritdoc/>
@@ -336,7 +514,121 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             Id = Guid.Empty;
             Name = string.Empty;
+            NegotiatedProtocolVersion = 0;
+            SessionResumed = false;
             _state = ConnectionState.Disconnected;
+        }
+    }
+
+    /// <inheritdoc/>
+    public Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        CancellationToken cancellationToken = default)
+    {
+        return SendAsync(recipientId, message, MessageHeaders.Empty, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public async Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(headers);
+        ThrowIfReservedHeaderKeyPresent(headers);
+
+        await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async Task SendAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        DeliveryOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        if (!options.RequireAcknowledgement)
+        {
+            if (!options.AwaitCapacity && options.Priority == MessagePriority.Normal)
+            {
+                await SendAsync(recipientId, message, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            List<KeyValuePair<string, string>> plainHeaderEntries = [];
+
+            if (options.AwaitCapacity)
+            {
+                plainHeaderEntries.Add(new KeyValuePair<string, string>(BackpressureHeaderKeys.AwaitCapacity, "1"));
+            }
+
+            if (options.Priority != MessagePriority.Normal)
+            {
+                plainHeaderEntries.Add(new KeyValuePair<string, string>(
+                    MessagePriorityHeaderKeys.Priority, MessagePriorityHeaderKeys.ToHeaderValue(options.Priority)));
+            }
+
+            var plainHeaders = new MessageHeaders(plainHeaderEntries);
+
+            await SendCoreAsync(recipientId, message, plainHeaders, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        long ackId = Interlocked.Increment(ref _ackCorrelationId);
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // As RequestAsync's PendingRequest: the expected acknowledger is recorded so a forged
+        // acknowledgement from a client other than the one this message was addressed to cannot
+        // convince the sender delivery succeeded when it did not.
+        _pendingAcks[ackId] = new PendingAck(recipientId, completion);
+
+        try
+        {
+            List<KeyValuePair<string, string>> headerEntries =
+            [
+                new(
+                    DeliveryAcknowledgementHeaderKeys.CorrelationId,
+                    ackId.ToString(CultureInfo.InvariantCulture)),
+                new(DeliveryAcknowledgementHeaderKeys.Request, "1"),
+            ];
+
+            if (options.AwaitCapacity)
+            {
+                headerEntries.Add(new KeyValuePair<string, string>(BackpressureHeaderKeys.AwaitCapacity, "1"));
+            }
+
+            if (options.Priority != MessagePriority.Normal)
+            {
+                headerEntries.Add(new KeyValuePair<string, string>(
+                    MessagePriorityHeaderKeys.Priority, MessagePriorityHeaderKeys.ToHeaderValue(options.Priority)));
+            }
+
+            var headers = new MessageHeaders(headerEntries);
+
+            await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(options.AcknowledgementTimeout!.Value);
+
+            try
+            {
+                await completion.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"No delivery acknowledgement was received within {options.AcknowledgementTimeout}.");
+            }
+        }
+        finally
+        {
+            // Whether the acknowledgement arrived, the call timed out, or it was cancelled, this id is
+            // no longer awaited — a late acknowledgement for it is discarded rather than resolving a
+            // future send that happens to reuse it.
+            _pendingAcks.TryRemove(ackId, out _);
         }
     }
 
@@ -344,7 +636,41 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public async Task SendAsync(
         Guid recipientId,
         ReadOnlyMemory<byte> message,
+        TimeSpan timeToLive,
         CancellationToken cancellationToken = default)
+    {
+        if (timeToLive <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeToLive), "The time-to-live must be positive.");
+        }
+
+        long expiresAtUnixMilliseconds = DateTimeOffset.UtcNow.Add(timeToLive).ToUnixTimeMilliseconds();
+        var headers = new MessageHeaders(
+        [
+            new KeyValuePair<string, string>(
+                MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+                expiresAtUnixMilliseconds.ToString(CultureInfo.InvariantCulture)),
+        ]);
+
+        await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Builds and sends a direct message frame, with or without a header block. Shared by the public
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, MessageHeaders, CancellationToken)"/> and by
+    /// <see cref="RequestAsync"/>, <see cref="ReplyAsync"/>,
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, DeliveryOptions, CancellationToken)"/>,
+    /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/> and the
+    /// acknowledgement send in the receive loop, all of which construct
+    /// <see cref="RequestReplyHeaderKeys"/>, <see cref="DeliveryAcknowledgementHeaderKeys"/> or
+    /// <see cref="MessageExpiryHeaderKeys"/> headers themselves and so must bypass the public overload's
+    /// <see cref="ThrowIfReservedHeaderKeyPresent"/> guard rather than trip over their own headers.
+    /// </summary>
+    private async Task SendCoreAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken)
     {
         ITransport transport;
 
@@ -358,12 +684,67 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             transport = _transport!;
         }
 
-        var payload = new byte[1 + 16 + message.Length];
-        payload[0] = (byte)MessageType.SendMessage;
-        recipientId.TryWriteBytes(payload.AsSpan(1));
-        message.CopyTo(payload.AsMemory(17));
+        byte[] payload;
+        if (headers.Count == 0)
+        {
+            // No header block is written at all when there is nothing to carry, so this remains
+            // byte-for-byte identical to the frame a header-unaware peer already understands.
+            payload = new byte[1 + 16 + message.Length];
+            payload[0] = (byte)MessageType.SendMessage;
+            recipientId.TryWriteBytes(payload.AsSpan(1));
+            message.CopyTo(payload.AsMemory(17));
+        }
+        else
+        {
+            RequireHeaderEnvelopeSupport(NegotiatedProtocolVersion);
+
+            int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+            payload = new byte[1 + 16 + 2 + headerLength + message.Length];
+            payload[0] = (byte)MessageType.SendMessageWithHeaders;
+            recipientId.TryWriteBytes(payload.AsSpan(1));
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(17, 2), (ushort)headerLength);
+            HeaderEnvelope.Write(headers, payload.AsSpan(19, headerLength));
+            message.CopyTo(payload.AsMemory(19 + headerLength));
+        }
 
         await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    // Every header key a built-in helper (request/response, delivery acknowledgement, time-to-live, and
+    // any future one following the same pattern) reserves for its own use. Kept as a single list rather
+    // than a growing chain of ContainsKey checks, so ThrowIfReservedHeaderKeyPresent stays a fixed shape
+    // as more helpers are added.
+    private static readonly string[] ReservedHeaderKeys =
+    [
+        RequestReplyHeaderKeys.CorrelationId,
+        RequestReplyHeaderKeys.Reply,
+        DeliveryAcknowledgementHeaderKeys.CorrelationId,
+        DeliveryAcknowledgementHeaderKeys.Request,
+        DeliveryAcknowledgementHeaderKeys.Ack,
+        MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
+        BackpressureHeaderKeys.AwaitCapacity,
+        MessagePriorityHeaderKeys.Priority,
+    ];
+
+    /// <summary>
+    /// Guards against an application header colliding with one of <see cref="ReservedHeaderKeys"/>.
+    /// Without this, a message that happened to carry a header literally named, for example,
+    /// <c>mesh.reply</c> with value <c>"1"</c> would be silently intercepted by the receive loop as if
+    /// it were answering a request, and never raised through <see cref="MessageReceived"/> at all.
+    /// </summary>
+    private static void ThrowIfReservedHeaderKeyPresent(MessageHeaders headers)
+    {
+        foreach (string reservedKey in ReservedHeaderKeys)
+        {
+            if (headers.ContainsKey(reservedKey))
+            {
+                throw new ArgumentException(
+                    $"The header key '{reservedKey}' is reserved for a built-in helper (request/response, "
+                    + "delivery acknowledgement, time-to-live, backpressure, or priority) and cannot be set "
+                    + "directly.",
+                    nameof(headers));
+            }
+        }
     }
 
     /// <inheritdoc/>
@@ -446,12 +827,23 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
-    public async Task SendToGroupAsync(
+    public Task SendToGroupAsync(
         string groupName,
         ReadOnlyMemory<byte> message,
         CancellationToken cancellationToken = default)
     {
+        return SendToGroupAsync(groupName, message, MessageHeaders.Empty, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public async Task SendToGroupAsync(
+        string groupName,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default)
+    {
         ArgumentException.ThrowIfNullOrEmpty(groupName);
+        ArgumentNullException.ThrowIfNull(headers);
 
         ITransport transport = GetConnectedTransport();
 
@@ -461,13 +853,69 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             throw new ArgumentException("The group name is too long.", nameof(groupName));
         }
 
-        var payload = new byte[1 + 2 + nameBytes.Length + message.Length];
-        payload[0] = (byte)MessageType.GroupMessage;
-        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)nameBytes.Length);
-        nameBytes.CopyTo(payload, 3);
-        message.CopyTo(payload.AsMemory(3 + nameBytes.Length));
+        byte[] payload;
+        if (headers.Count == 0)
+        {
+            // No header block is written at all when there is nothing to carry, so this remains
+            // byte-for-byte identical to the frame a header-unaware peer already understands.
+            payload = new byte[1 + 2 + nameBytes.Length + message.Length];
+            payload[0] = (byte)MessageType.GroupMessage;
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)nameBytes.Length);
+            nameBytes.CopyTo(payload, 3);
+            message.CopyTo(payload.AsMemory(3 + nameBytes.Length));
+        }
+        else
+        {
+            RequireHeaderEnvelopeSupport(NegotiatedProtocolVersion);
+
+            int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+            int headerLengthOffset = 3 + nameBytes.Length;
+            payload = new byte[headerLengthOffset + 2 + headerLength + message.Length];
+            payload[0] = (byte)MessageType.GroupMessageWithHeaders;
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)nameBytes.Length);
+            nameBytes.CopyTo(payload, 3);
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(headerLengthOffset, 2), (ushort)headerLength);
+            HeaderEnvelope.Write(headers, payload.AsSpan(headerLengthOffset + 2, headerLength));
+            message.CopyTo(payload.AsMemory(headerLengthOffset + 2 + headerLength));
+        }
 
         await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public Task SendToGroupAsync(
+        string groupName,
+        ReadOnlyMemory<byte> message,
+        MessagePriority priority,
+        CancellationToken cancellationToken = default)
+    {
+        if (priority == MessagePriority.Normal)
+        {
+            // No header block is written at all — byte-for-byte identical to the headerless overload.
+            return SendToGroupAsync(groupName, message, cancellationToken);
+        }
+
+        var headers = new MessageHeaders(
+        [
+            new KeyValuePair<string, string>(MessagePriorityHeaderKeys.Priority, MessagePriorityHeaderKeys.ToHeaderValue(priority)),
+        ]);
+
+        return SendToGroupAsync(groupName, message, headers, cancellationToken);
+    }
+
+    /// <summary>
+    /// Guards a header-bearing send against a connection that negotiated a protocol version predating
+    /// the header envelope, so headers the caller supplied are never silently dropped on the wire.
+    /// </summary>
+    private static void RequireHeaderEnvelopeSupport(byte negotiatedProtocolVersion)
+    {
+        if (negotiatedProtocolVersion < Protocol.HeaderEnvelopeMinVersion)
+        {
+            throw new NotSupportedException(
+                $"Message headers require a negotiated protocol version of at least "
+                + $"{Protocol.HeaderEnvelopeMinVersion}; this connection negotiated version "
+                + $"{negotiatedProtocolVersion}.");
+        }
     }
 
     /// <summary>
@@ -607,6 +1055,87 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 // The semaphore was disposed during a concurrent DisposeAsync call.
             }
         }
+    }
+
+    /// <inheritdoc/>
+    public async Task<ReadOnlyMemory<byte>> RequestAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default)
+    {
+        if (timeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout), "The request timeout must be positive.");
+        }
+
+        long correlationId = Interlocked.Increment(ref _requestCorrelationId);
+        var completion = new TaskCompletionSource<ReadOnlyMemory<byte>>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // The expected responder is recorded alongside the completion source so a reply is only ever
+        // accepted from the client this request was actually addressed to. Without this, any other
+        // client connected to the same hub could forge a DeliverMessageWithHeaders frame guessing (or
+        // brute-forcing) this correlation id and resolve the request with attacker-controlled bytes.
+        _pendingRequests[correlationId] = new PendingRequest(recipientId, completion);
+
+        try
+        {
+            var headers = new MessageHeaders(
+            [
+                new KeyValuePair<string, string>(
+                    RequestReplyHeaderKeys.CorrelationId,
+                    correlationId.ToString(CultureInfo.InvariantCulture)),
+            ]);
+
+            await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+
+            // Bound the wait by cancelling it, matching the pattern SendOnceAsync uses for its own
+            // timeout: cancelling releases the wait rather than abandoning it, so a request that never
+            // gets a reply does not leak a continuation waiting on the completion source forever.
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(timeout);
+
+            try
+            {
+                return await completion.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException($"The request did not receive a reply within {timeout}.");
+            }
+        }
+        finally
+        {
+            // Whether the reply arrived, the call timed out, or it was cancelled, this correlation id is
+            // no longer awaited — a late reply for it is discarded by TryCompletePendingRequest rather
+            // than resolving a future request that happens to reuse the id.
+            _pendingRequests.TryRemove(correlationId, out _);
+        }
+    }
+
+    /// <inheritdoc/>
+    public Task ReplyAsync(
+        MessageReceivedEventArgs request,
+        ReadOnlyMemory<byte> message,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        if (request.CorrelationId is not { } correlationId)
+        {
+            throw new InvalidOperationException(
+                "The supplied message was not a request and cannot be replied to.");
+        }
+
+        var headers = new MessageHeaders(
+        [
+            new KeyValuePair<string, string>(
+                RequestReplyHeaderKeys.CorrelationId, correlationId.ToString(CultureInfo.InvariantCulture)),
+            new KeyValuePair<string, string>(RequestReplyHeaderKeys.Reply, "1"),
+        ]);
+
+        return SendCoreAsync(request.SenderId, message, headers, cancellationToken);
     }
 
     /// <inheritdoc/>
@@ -765,6 +1294,96 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         }
                     }
                 }
+                else if (data.Length >= 19
+                    && (MessageType)data[0] == MessageType.DeliverMessageWithHeaders)
+                {
+                    var senderId = new Guid(data.AsSpan(1, 16));
+                    int headerBlockLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(17, 2));
+
+                    if (data.Length >= 19 + headerBlockLength)
+                    {
+                        MessageHeaders? headers = TryReadHeaderBlock(data.AsSpan(19), headerBlockLength, senderId);
+                        if (headers is not null)
+                        {
+                            ReadOnlyMemory<byte> messageData = data.AsMemory(19 + headerBlockLength);
+
+                            if (!TryCompletePendingAck(senderId, headers)
+                                && !TryCompletePendingRequest(senderId, headers, messageData)
+                                && !IsExpired(headers, senderId))
+                            {
+                                try
+                                {
+                                    MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                                    {
+                                        SenderId = senderId,
+                                        Data = messageData,
+                                        Headers = headers,
+                                        CorrelationId = TryGetRequestCorrelationId(headers),
+                                    });
+                                }
+                                catch (Exception ex)
+                                {
+                                    // A throwing subscriber must not tear down the receive loop and
+                                    // silently halt all further delivery. This is a callback boundary.
+                                    _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                                }
+
+                                // The acknowledgement is sent once the message has been handed to the
+                                // application (the event above has been raised, successfully or not),
+                                // matching the "delivered-to-application receipt" contract — not merely
+                                // that the frame arrived on the wire. Fired and forgotten rather than
+                                // awaited: a slow or blocked write back to the peer (write-side
+                                // backpressure, a stalled socket) must not head-of-line-block this
+                                // connection's own inbound frame processing — including its Ping/Pong
+                                // keepalive — behind it. TrySendAcknowledgementAsync handles every
+                                // failure internally, so nothing here needs to observe the result.
+                                _ = TrySendAcknowledgementAsync(senderId, headers, cancellationToken);
+                            }
+                        }
+                    }
+                }
+                else if (data.Length >= 21
+                    && (MessageType)data[0] == MessageType.DeliverGroupMessageWithHeaders)
+                {
+                    var senderId = new Guid(data.AsSpan(1, 16));
+                    int nameLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(17, 2));
+                    int headerLengthOffset = 19 + nameLength;
+
+                    if (data.Length >= headerLengthOffset + 2)
+                    {
+                        int headerBlockLength = BinaryPrimitives.ReadUInt16BigEndian(
+                            data.AsSpan(headerLengthOffset, 2));
+                        int bodyOffset = headerLengthOffset + 2 + headerBlockLength;
+
+                        if (data.Length >= bodyOffset)
+                        {
+                            string groupName = Encoding.UTF8.GetString(data.AsSpan(19, nameLength));
+                            MessageHeaders? headers = TryReadHeaderBlock(
+                                data.AsSpan(headerLengthOffset + 2), headerBlockLength, senderId);
+
+                            if (headers is not null && !IsExpired(headers, senderId))
+                            {
+                                ReadOnlyMemory<byte> messageData = data.AsMemory(bodyOffset);
+
+                                try
+                                {
+                                    GroupMessageReceived?.Invoke(this, new GroupMessageReceivedEventArgs
+                                    {
+                                        SenderId = senderId,
+                                        GroupName = groupName,
+                                        Data = messageData,
+                                        Headers = headers,
+                                    });
+                                }
+                                catch (Exception ex)
+                                {
+                                    // Callback boundary — a throwing subscriber must not halt the loop.
+                                    _logger.LogError(ex, "A GroupMessageReceived handler threw an exception");
+                                }
+                            }
+                        }
+                    }
+                }
                 else if (data.Length > 1
                     && (MessageType)data[0] == MessageType.GroupJoinRefused)
                 {
@@ -812,6 +1431,49 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     {
                         pending.Completion.TrySetResult(null);
                     }
+                }
+                else if (data.Length >= 17
+                    && (MessageType)data[0] == MessageType.QueueSaturated)
+                {
+                    var saturatedRecipientId = new Guid(data.AsSpan(1, 16));
+
+                    try
+                    {
+                        SendRejected?.Invoke(
+                            this, new SendRejectedEventArgs { RecipientId = saturatedRecipientId });
+                    }
+                    catch (Exception ex)
+                    {
+                        // Callback boundary — a throwing subscriber must not halt the loop.
+                        _logger.LogError(ex, "A SendRejected handler threw an exception");
+                    }
+                }
+                else if (data.Length >= 19
+                    && (MessageType)data[0] == MessageType.SessionResumed)
+                {
+                    var resumedId = new Guid(data.AsSpan(1, 16));
+                    int tokenLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(17, 2));
+
+                    if (data.Length >= 19 + tokenLength && tokenLength > 0)
+                    {
+                        lock (_stateLock)
+                        {
+                            Id = resumedId;
+                            SessionResumed = true;
+                            _sessionToken = data.AsSpan(19, tokenLength).ToArray();
+                            _sessionTokenName = Name;
+                        }
+
+                        CompletePendingResume(true);
+                    }
+                }
+                else if ((MessageType)data[0] == MessageType.SessionResumeRefused)
+                {
+                    // The old identity is gone for good — expired, already reclaimed, or never this
+                    // hub's to give. The token held now is not that one: registration replaced it with a
+                    // fresh token for the identity this connection *does* have, so there is nothing to
+                    // clear and the next reconnect has something valid to present.
+                    CompletePendingResume(false);
                 }
                 else if ((MessageType)data[0] == MessageType.Ping)
                 {
@@ -870,6 +1532,27 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             _pendingLookup?.Completion.TrySetException(
                 new InvalidOperationException("The connection was closed before the lookup completed."));
 
+            // Likewise the only thing that completes a pending RequestAsync call: fault every
+            // still-outstanding request so a caller awaiting with a non-cancellable token is not left
+            // hanging, then clear the table so nothing here is mistaken for a match on the next connection.
+            foreach (KeyValuePair<long, PendingRequest> pending in _pendingRequests)
+            {
+                pending.Value.Completion.TrySetException(
+                    new InvalidOperationException("The connection was closed before a reply arrived."));
+            }
+
+            _pendingRequests.Clear();
+
+            // Likewise the only thing that completes a pending SendAsync(..., DeliveryOptions.RequireAck)
+            // call.
+            foreach (KeyValuePair<long, PendingAck> pendingAck in _pendingAcks)
+            {
+                pendingAck.Value.Completion.TrySetException(
+                    new InvalidOperationException("The connection was closed before an acknowledgement arrived."));
+            }
+
+            _pendingAcks.Clear();
+
             await HandleReceiveLoopTerminationAsync(reason).ConfigureAwait(false);
         }
     }
@@ -914,6 +1597,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         {
             Id = Guid.Empty;
             Name = string.Empty;
+            NegotiatedProtocolVersion = 0;
+            SessionResumed = false;
             _state = ConnectionState.Disconnected;
 
             // Take the decision to raise under the same lock that publishes the disconnected state,
@@ -940,6 +1625,250 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Decodes a header block, returning <see langword="null"/> instead of throwing if it is internally
+    /// malformed.
+    /// </summary>
+    /// <remarks>
+    /// The hub relays a header block byte-for-byte without decoding it, so a peer sending a
+    /// well-formed outer frame with an internally corrupt header block reaches this decoder unfiltered.
+    /// A single bad frame must not tear down the receive loop and disconnect an otherwise healthy
+    /// connection — the same reasoning already applied to a throwing event handler at every call site
+    /// below applies here too, just one step earlier.
+    /// </remarks>
+    private MessageHeaders? TryReadHeaderBlock(ReadOnlySpan<byte> source, int blockLength, Guid senderId)
+    {
+        try
+        {
+            return HeaderEnvelope.Read(source, blockLength);
+        }
+        catch (FormatException ex)
+        {
+            _logger.LogWarning(
+                ex, "Discarding a message from {SenderId} with a malformed header block", senderId);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Determines whether an incoming direct or group message has already passed the expiry its sender
+    /// attached via <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/>, so
+    /// it can be dropped before being handed to the application rather than delivered stale.
+    /// </summary>
+    /// <remarks>
+    /// Absent, unparseable or out-of-range expiry data means "does not expire" — identical to a message
+    /// with no time-to-live at all — mirroring <see cref="TryReadHeaderBlock"/>'s own tolerant treatment
+    /// of a malformed header block: a bad expiry value is not treated as a reason to fail delivery, and
+    /// critically must never itself throw and crash the receive loop over one hostile or malformed frame.
+    /// See <see cref="MessageExpiryHeaderKeys.TryParseExpiry"/>.
+    /// </remarks>
+    private bool IsExpired(MessageHeaders headers, Guid senderId)
+    {
+        if (!headers.TryGetValue(MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds, out string? value)
+            || !MessageExpiryHeaderKeys.TryParseExpiry(value, out DateTimeOffset expiry))
+        {
+            return false;
+        }
+
+        if (DateTimeOffset.UtcNow <= expiry)
+        {
+            return false;
+        }
+
+        _logger.LogDebug("Discarding an expired message from {SenderId}", senderId);
+        return true;
+    }
+
+    /// <summary>
+    /// Completes a pending <see cref="RequestAsync"/> call if <paramref name="headers"/> mark this frame
+    /// as a reply, so it is resolved internally rather than surfaced through <see cref="MessageReceived"/>.
+    /// </summary>
+    /// <param name="senderId">
+    /// The actual sender of the frame, as stamped by the hub. Checked against the pending request's
+    /// recorded <see cref="PendingRequest.ExpectedResponderId"/> before completion, so a reply cannot be
+    /// forged by a client other than the one the request was addressed to.
+    /// </param>
+    /// <param name="headers">The frame's decoded headers.</param>
+    /// <param name="messageData">The frame's body, used as the reply payload if this frame is a match.</param>
+    /// <returns>
+    /// <see langword="true"/> if the frame was a reply (whether or not it matched a still-pending
+    /// request from the expected responder), so the caller must not raise it as an ordinary message.
+    /// </returns>
+    private bool TryCompletePendingRequest(Guid senderId, MessageHeaders headers, ReadOnlyMemory<byte> messageData)
+    {
+        if (!headers.TryGetValue(RequestReplyHeaderKeys.Reply, out string? replyFlag)
+            || !string.Equals(replyFlag, "1", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!headers.TryGetValue(RequestReplyHeaderKeys.CorrelationId, out string? correlationText)
+            || !long.TryParse(
+                correlationText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long correlationId))
+        {
+            _logger.LogWarning("Discarding a reply frame with a missing or malformed correlation id");
+            return true;
+        }
+
+        if (!_pendingRequests.TryGetValue(correlationId, out PendingRequest? pending))
+        {
+            // The request this reply answers has already timed out, been cancelled, or never existed
+            // on this connection; discard rather than misrouting it to an unrelated later request.
+            _logger.LogDebug(
+                "Discarding a reply with an unmatched or expired correlation id {CorrelationId}",
+                correlationId);
+        }
+        else if (pending.ExpectedResponderId != senderId)
+        {
+            // This frame claims to answer a request addressed elsewhere. Left in place rather than
+            // removed, so a forged reply cannot be used to strand the real request — the genuine
+            // responder's reply can still arrive and complete it.
+            _logger.LogWarning(
+                "Discarding a reply for correlation id {CorrelationId} from {SenderId}, which does not "
+                + "match the expected responder {ExpectedResponderId}",
+                correlationId,
+                senderId,
+                pending.ExpectedResponderId);
+        }
+        else if (_pendingRequests.TryRemove(new KeyValuePair<long, PendingRequest>(correlationId, pending)))
+        {
+            // The compare-remove above only succeeds against the exact instance just matched, so a
+            // concurrent RequestAsync that has already claimed this id for a new call (having removed
+            // and replaced the entry itself) cannot have its fresh request stolen by a stale reply.
+            pending.Completion.TrySetResult(messageData);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Completes a pending <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, DeliveryOptions, CancellationToken)"/>
+    /// call if <paramref name="headers"/> mark this frame as a delivery acknowledgement, so it is
+    /// resolved internally rather than surfaced through <see cref="MessageReceived"/>.
+    /// </summary>
+    /// <param name="senderId">
+    /// The actual sender of the frame, as stamped by the hub. Checked against the pending
+    /// acknowledgement's recorded <see cref="PendingAck.ExpectedAcknowledgerId"/> before completion, so
+    /// an acknowledgement cannot be forged by a client other than the one the message was addressed to.
+    /// </param>
+    /// <param name="headers">The frame's decoded headers.</param>
+    /// <returns>
+    /// <see langword="true"/> if the frame was an acknowledgement (whether or not it matched a
+    /// still-pending send from the expected acknowledger), so the caller must not raise it as an
+    /// ordinary message.
+    /// </returns>
+    private bool TryCompletePendingAck(Guid senderId, MessageHeaders headers)
+    {
+        if (!headers.TryGetValue(DeliveryAcknowledgementHeaderKeys.Ack, out string? ackFlag)
+            || !string.Equals(ackFlag, "1", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!headers.TryGetValue(DeliveryAcknowledgementHeaderKeys.CorrelationId, out string? correlationText)
+            || !long.TryParse(
+                correlationText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long correlationId))
+        {
+            _logger.LogWarning("Discarding an acknowledgement frame with a missing or malformed correlation id");
+            return true;
+        }
+
+        if (!_pendingAcks.TryGetValue(correlationId, out PendingAck? pending))
+        {
+            // The send this acknowledges has already timed out, been cancelled, or never existed on
+            // this connection; discard rather than misrouting it to an unrelated later send.
+            _logger.LogDebug(
+                "Discarding an acknowledgement with an unmatched or expired correlation id {CorrelationId}",
+                correlationId);
+        }
+        else if (pending.ExpectedAcknowledgerId != senderId)
+        {
+            // This frame claims to acknowledge a message addressed elsewhere. Left in place rather than
+            // removed, so a forged acknowledgement cannot be used to strand the real send — the
+            // genuinely addressed recipient's acknowledgement can still arrive and complete it.
+            _logger.LogWarning(
+                "Discarding an acknowledgement for correlation id {CorrelationId} from {SenderId}, which "
+                + "does not match the expected recipient {ExpectedAcknowledgerId}",
+                correlationId,
+                senderId,
+                pending.ExpectedAcknowledgerId);
+        }
+        else if (_pendingAcks.TryRemove(new KeyValuePair<long, PendingAck>(correlationId, pending)))
+        {
+            // As TryCompletePendingRequest's compare-remove: only succeeds against the exact instance
+            // just matched, so a forged acknowledgement cannot steal a slot a concurrent send has
+            // already claimed for itself.
+            pending.Completion.TrySetResult();
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Sends a delivery acknowledgement back to the sender if <paramref name="headers"/> requested one,
+    /// once the message has been handed to the application.
+    /// </summary>
+    /// <remarks>
+    /// Called fire-and-forget from <see cref="ReceiveLoopAsync"/> — nothing awaits this task's
+    /// completion or observes its exception, so every failure must be handled inside it. The catch
+    /// below is deliberately broad (a callback/detached-task boundary, matching the pattern already used
+    /// for a throwing <see cref="MessageReceived"/> subscriber): a transport-specific exception
+    /// (<see cref="System.Net.WebSockets.WebSocketException"/> included), a send timeout, or
+    /// cancellation from the connection tearing down must all be swallowed here rather than becoming an
+    /// unobserved task exception or, had this still been awaited inline, tearing down the receive loop
+    /// over what is always a best-effort courtesy send.
+    /// </remarks>
+    private async Task TrySendAcknowledgementAsync(
+        Guid senderId, MessageHeaders headers, CancellationToken cancellationToken)
+    {
+        if (!headers.TryGetValue(DeliveryAcknowledgementHeaderKeys.Request, out string? requestFlag)
+            || !string.Equals(requestFlag, "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        if (!headers.TryGetValue(DeliveryAcknowledgementHeaderKeys.CorrelationId, out string? correlationText))
+        {
+            _logger.LogWarning("Discarding an acknowledgement request with a missing correlation id");
+            return;
+        }
+
+        var ackHeaders = new MessageHeaders(
+        [
+            new KeyValuePair<string, string>(DeliveryAcknowledgementHeaderKeys.CorrelationId, correlationText),
+            new KeyValuePair<string, string>(DeliveryAcknowledgementHeaderKeys.Ack, "1"),
+        ]);
+
+        try
+        {
+            await SendCoreAsync(senderId, ReadOnlyMemory<byte>.Empty, ackHeaders, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Best-effort: if the connection is already gone or tearing down, the send timed out, or
+            // some transport-specific fault occurred, there is nothing further to do here — the
+            // sender's own pending acknowledgement wait will simply time out on its side.
+            _logger.LogDebug(ex, "Failed to send a delivery acknowledgement to {SenderId}", senderId);
+        }
+    }
+
+    /// <summary>
+    /// Reads the request correlation id from an incoming (non-reply) frame's headers, for exposure on
+    /// <see cref="MessageReceivedEventArgs.CorrelationId"/>.
+    /// </summary>
+    private static long? TryGetRequestCorrelationId(MessageHeaders headers)
+    {
+        if (headers.TryGetValue(RequestReplyHeaderKeys.CorrelationId, out string? correlationText)
+            && long.TryParse(
+                correlationText, NumberStyles.Integer, CultureInfo.InvariantCulture, out long correlationId))
+        {
+            return correlationId;
+        }
+
+        return null;
+    }
+
     private enum ConnectionState
     {
         Disconnected,
@@ -949,4 +1878,19 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     private sealed record PendingLookup(int CorrelationId, TaskCompletionSource<Guid?> Completion);
+
+    /// <summary>
+    /// A <see cref="RequestAsync"/> call awaiting a reply. <see cref="ExpectedResponderId"/> is checked
+    /// against the actual sender of an incoming reply frame before <see cref="Completion"/> is resolved,
+    /// so a client other than the one this request was addressed to cannot forge a reply and resolve it.
+    /// </summary>
+    private sealed record PendingRequest(Guid ExpectedResponderId, TaskCompletionSource<ReadOnlyMemory<byte>> Completion);
+
+    /// <summary>
+    /// A <c>SendAsync(..., DeliveryOptions.RequireAck(...))</c> call awaiting acknowledgement.
+    /// <see cref="ExpectedAcknowledgerId"/> is checked against the actual sender of an incoming
+    /// acknowledgement frame before <see cref="Completion"/> is resolved, so a client other than the one
+    /// the message was addressed to cannot forge an acknowledgement and resolve it.
+    /// </summary>
+    private sealed record PendingAck(Guid ExpectedAcknowledgerId, TaskCompletionSource Completion);
 }

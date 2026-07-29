@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using System.Threading.Channels;
+using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -27,6 +28,11 @@ internal sealed class MeshHubFixture
         GroupAuthoriser? groupAuthoriser = null,
         TimeSpan? groupAuthorisationTimeout = null,
         int? maxConnectionsPerRemoteEndpoint = null,
+        bool notifyOnQueueSaturation = false,
+        TimeSpan? backpressureAwaitTimeout = null,
+        IOfflineStore? offlineStore = null,
+        TimeSpan? offlineStoreTimeout = null,
+        TimeSpan? sessionResumptionWindow = null,
         int? maxInboundMessagesPerSecond = null,
         int? maxInboundBytesPerSecond = null,
         int? maxFanOutMessagesPerSecond = null,
@@ -57,6 +63,11 @@ internal sealed class MeshHubFixture
             groupAuthoriser,
             groupAuthorisationTimeout,
             maxConnectionsPerRemoteEndpoint,
+            notifyOnQueueSaturation,
+            backpressureAwaitTimeout,
+            offlineStore,
+            offlineStoreTimeout,
+            sessionResumptionWindow,
             maxInboundMessagesPerSecond,
             maxInboundBytesPerSecond,
             maxFanOutMessagesPerSecond,
@@ -100,6 +111,52 @@ internal sealed class MeshHubFixture
     }
 
     /// <summary>
+    /// Builds a SendMessageWithHeaders frame:
+    /// [type][recipient id (16)][headerBlockLength(2)][headerBlock][message].
+    /// </summary>
+    public static byte[] CreateDirectMessageWithHeaders(Guid recipientId, MessageHeaders headers, byte[] message)
+    {
+        int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+        var payload = new byte[1 + 16 + 2 + headerLength + message.Length];
+        payload[0] = 0x11; // SendMessageWithHeaders
+        recipientId.TryWriteBytes(payload.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(17, 2), (ushort)headerLength);
+        HeaderEnvelope.Write(headers, payload.AsSpan(19, headerLength));
+        message.CopyTo(payload, 19 + headerLength);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a GroupMessageWithHeaders frame: [type][name length (2, big-endian)][UTF-8 group name]
+    /// [headerBlockLength(2)][headerBlock][message].
+    /// </summary>
+    public static byte[] CreateGroupMessageWithHeaders(string groupName, MessageHeaders headers, byte[] message)
+    {
+        byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
+        int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+        int headerLengthOffset = 3 + nameBytes.Length;
+        var payload = new byte[headerLengthOffset + 2 + headerLength + message.Length];
+        payload[0] = 0x13; // GroupMessageWithHeaders
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(payload, 3);
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(headerLengthOffset, 2), (ushort)headerLength);
+        HeaderEnvelope.Write(headers, payload.AsSpan(headerLengthOffset + 2, headerLength));
+        message.CopyTo(payload, headerLengthOffset + 2 + headerLength);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a ResumeSession frame: [type][token].
+    /// </summary>
+    public static byte[] CreateResumeSessionRequest(byte[] token)
+    {
+        var payload = new byte[1 + token.Length];
+        payload[0] = 0x16; // ResumeSession
+        token.CopyTo(payload, 1);
+        return payload;
+    }
+
+    /// <summary>
     /// Builds a JoinGroup frame: [type][UTF-8 group name].
     /// </summary>
     public static byte[] CreateJoinGroupRequest(string groupName)
@@ -134,17 +191,19 @@ internal sealed class MeshHubFixture
         _acceptFailures.Enqueue(exception);
     }
 
-    public static byte[] CreateRegistrationRequest(string name = "TestClient", byte[]? credential = null)
+    public static byte[] CreateRegistrationRequest(
+        string name = "TestClient", byte[]? credential = null, byte versionMin = 0x04, byte versionMax = 0x04)
     {
-        // Registration frame: [type][version][name length (2, big-endian)][name][credential].
+        // Registration frame: [type][versionMin][versionMax][name length (2, big-endian)][name][credential].
         credential ??= [];
         byte[] nameBytes = Encoding.UTF8.GetBytes(name);
-        var payload = new byte[2 + 2 + nameBytes.Length + credential.Length];
+        var payload = new byte[3 + 2 + nameBytes.Length + credential.Length];
         payload[0] = 0x04; // RegistrationRequest
-        payload[1] = 0x03; // Protocol version
-        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(2, 2), (ushort)nameBytes.Length);
-        nameBytes.CopyTo(payload, 4);
-        credential.CopyTo(payload, 4 + nameBytes.Length);
+        payload[1] = versionMin;
+        payload[2] = versionMax;
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(3, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(payload, 5);
+        credential.CopyTo(payload, 5 + nameBytes.Length);
         return payload;
     }
 
@@ -174,14 +233,17 @@ internal sealed class MeshHubFixture
     }
 
     public async Task<RegisteredClient> RegisterClientAsync(
-        string name = "TestClient", IPEndPoint? remoteEndPoint = null)
+        string name = "TestClient",
+        IPEndPoint? remoteEndPoint = null,
+        byte versionMin = 0x04,
+        byte versionMax = 0x04)
     {
         var transport = CreateMockTransport(remoteEndPoint);
         var registrationCompleteTcs = new TaskCompletionSource<byte[]>();
         var disconnectTcs = new TaskCompletionSource<byte[]?>();
 
         transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
-            .ReturnsAsync(CreateRegistrationRequest(name))
+            .ReturnsAsync(CreateRegistrationRequest(name, versionMin: versionMin, versionMax: versionMax))
             .Returns(disconnectTcs.Task);
 
         transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
@@ -201,14 +263,54 @@ internal sealed class MeshHubFixture
         return new RegisteredClient(clientId, transport, disconnectTcs, responseData);
     }
 
-    public async Task<MultiMessageRegisteredClient> RegisterMultiMessageClientAsync(string name = "TestClient")
+    /// <summary>
+    /// Registers a client with a <see cref="FrameRecorder"/> attached <em>before</em> the connection is
+    /// accepted, so frames the hub sends of its own accord the moment registration completes are
+    /// captured rather than raced.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="RegisterClientAsync"/> installs its own <c>SendAsync</c> callback and a test that
+    /// attaches a recorder afterwards replaces it — fine for frames provoked later by the test itself,
+    /// but not for the offline store's drain, which the hub queues between sending
+    /// <c>RegistrationComplete</c> and reading the client's first frame.
+    /// </remarks>
+    public async Task<(RegisteredClient Client, FrameRecorder Frames)> RegisterClientWithRecorderAsync(
+        string name = "TestClient", byte versionMin = 0x04, byte versionMax = 0x04)
+    {
+        var transport = CreateMockTransport();
+        var disconnectTcs = new TaskCompletionSource<byte[]?>();
+        var recorder = new FrameRecorder(transport);
+
+        transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(CreateRegistrationRequest(name, versionMin: versionMin, versionMax: versionMax))
+            .Returns(disconnectTcs.Task);
+
+        EnqueueClient(transport.Object);
+
+        byte[] responseData = await recorder
+            .WaitForAsync(frame => frame.Length >= 18 && frame[0] == 0x01)
+            .WaitAsync(TestTimeouts.Wait)
+            .ConfigureAwait(false);
+        var clientId = new Guid(responseData.AsSpan(1, 16));
+
+        while (!Hub.IsClientRegistered(clientId))
+        {
+            await Task.Yield();
+        }
+
+        return (new RegisteredClient(clientId, transport, disconnectTcs, responseData), recorder);
+    }
+
+    public async Task<MultiMessageRegisteredClient> RegisterMultiMessageClientAsync(
+        string name = "TestClient", byte versionMin = 0x04, byte versionMax = 0x04)
     {
         var transport = CreateMockTransport();
         var registrationCompleteTcs = new TaskCompletionSource<byte[]>();
         var messageChannel = Channel.CreateUnbounded<byte[]?>();
 
         // Queue the registration request as the first message.
-        await messageChannel.Writer.WriteAsync(CreateRegistrationRequest(name)).ConfigureAwait(false);
+        await messageChannel.Writer.WriteAsync(
+            CreateRegistrationRequest(name, versionMin: versionMin, versionMax: versionMax)).ConfigureAwait(false);
 
         transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
             .Returns<CancellationToken>(async ct => await messageChannel.Reader.ReadAsync(ct).ConfigureAwait(false));
@@ -317,6 +419,33 @@ internal sealed class RegisteredClient(
     public Mock<ITransport> Transport { get; } = transport;
     public TaskCompletionSource<byte[]?> DisconnectTcs { get; } = disconnectTcs;
     public byte[] RegistrationResponse { get; } = registrationResponse;
+
+    /// <summary>
+    /// The protocol version the hub echoed back in <see cref="RegistrationResponse"/>.
+    /// </summary>
+    public byte NegotiatedProtocolVersion => RegistrationResponse[17];
+
+    /// <summary>
+    /// The session resumption token the hub appended to <see cref="RegistrationResponse"/>, or
+    /// <see langword="null"/> when it issued none — resumption switched off, the connection negotiated
+    /// below version 6, or the hub's session table full.
+    /// </summary>
+    public byte[]? SessionToken
+    {
+        get
+        {
+            if (RegistrationResponse.Length < 20)
+            {
+                return null;
+            }
+
+            int tokenLength = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(
+                RegistrationResponse.AsSpan(18, 2));
+            return RegistrationResponse.Length < 20 + tokenLength
+                ? null
+                : RegistrationResponse.AsSpan(20, tokenLength).ToArray();
+        }
+    }
 
     public void Disconnect() => DisconnectTcs.TrySetResult(null);
 }

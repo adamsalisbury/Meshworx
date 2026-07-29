@@ -1,4 +1,6 @@
+using System.Buffers.Binary;
 using System.Threading.Channels;
+using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -18,13 +20,47 @@ internal sealed class MeshClientFixture
         Transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
     }
 
-    public byte[] CreateRegistrationResponse()
+    /// <param name="negotiatedVersion">The protocol version the hub echoes back.</param>
+    /// <param name="sessionToken">
+    /// The resumption token a hub with session resumption enabled appends. Omit it for the 18-byte form
+    /// every hub below protocol version 6 produces.
+    /// </param>
+    public byte[] CreateRegistrationResponse(
+        byte negotiatedVersion = Protocol.MaxSupportedVersion, byte[]? sessionToken = null)
     {
-        var response = new byte[17];
+        // RegistrationComplete frame: [type][clientId (16)][negotiated version], plus, from version 6,
+        // [tokenLength (2, big-endian)][token].
+        var response = new byte[sessionToken is null ? 18 : 20 + sessionToken.Length];
         response[0] = 0x01; // RegistrationComplete
-        AssignedId.TryWriteBytes(response.AsSpan(1));
+        AssignedId.TryWriteBytes(response.AsSpan(1, 16));
+        response[17] = negotiatedVersion;
+
+        if (sessionToken is not null)
+        {
+            BinaryPrimitives.WriteUInt16BigEndian(response.AsSpan(18, 2), (ushort)sessionToken.Length);
+            sessionToken.CopyTo(response, 20);
+        }
+
         return response;
     }
+
+    /// <summary>
+    /// Builds a SessionResumed frame: [type][resumed client id (16)][tokenLength (2)][renewed token].
+    /// </summary>
+    public static byte[] CreateSessionResumedFrame(Guid resumedId, byte[] renewedToken)
+    {
+        var payload = new byte[1 + 16 + 2 + renewedToken.Length];
+        payload[0] = 0x17; // SessionResumed
+        resumedId.TryWriteBytes(payload.AsSpan(1, 16));
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(17, 2), (ushort)renewedToken.Length);
+        renewedToken.CopyTo(payload, 19);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a SessionResumeRefused frame: [type], no payload.
+    /// </summary>
+    public static byte[] CreateSessionResumeRefusedFrame() => [0x18];
 
     public byte[] CreateDeliverMessagePayload(Guid senderId, byte[] messageContent)
     {
@@ -35,7 +71,55 @@ internal sealed class MeshClientFixture
         return payload;
     }
 
+    /// <summary>
+    /// Builds a DeliverMessageWithHeaders frame:
+    /// [type][senderId(16)][headerBlockLength(2)][headerBlock][message].
+    /// </summary>
+    public static byte[] CreateDeliverMessageWithHeadersPayload(
+        Guid senderId, MessageHeaders headers, byte[] messageContent)
+    {
+        int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+        var payload = new byte[1 + 16 + 2 + headerLength + messageContent.Length];
+        payload[0] = 0x12; // DeliverMessageWithHeaders
+        senderId.TryWriteBytes(payload.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(17, 2), (ushort)headerLength);
+        HeaderEnvelope.Write(headers, payload.AsSpan(19, headerLength));
+        messageContent.CopyTo(payload, 19 + headerLength);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a DeliverGroupMessageWithHeaders frame: [type][senderId(16)][groupNameLength(2)]
+    /// [groupName][headerBlockLength(2)][headerBlock][message].
+    /// </summary>
+    public static byte[] CreateDeliverGroupMessageWithHeadersPayload(
+        Guid senderId, string groupName, MessageHeaders headers, byte[] messageContent)
+    {
+        byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(groupName);
+        int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+        int headerLengthOffset = 19 + nameBytes.Length;
+        var payload = new byte[headerLengthOffset + 2 + headerLength + messageContent.Length];
+        payload[0] = 0x14; // DeliverGroupMessageWithHeaders
+        senderId.TryWriteBytes(payload.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(17, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(payload, 19);
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(headerLengthOffset, 2), (ushort)headerLength);
+        HeaderEnvelope.Write(headers, payload.AsSpan(headerLengthOffset + 2, headerLength));
+        messageContent.CopyTo(payload, headerLengthOffset + 2 + headerLength);
+        return payload;
+    }
+
     public void SetupSuccessfulRegistration(params byte[][] receiveLoopMessages)
+    {
+        SetupSuccessfulRegistrationWithNegotiatedVersion(Protocol.MaxSupportedVersion, receiveLoopMessages);
+    }
+
+    /// <summary>
+    /// As <see cref="SetupSuccessfulRegistration"/>, but lets the test control the protocol version the
+    /// hub echoes back, so a negotiated-down version can be modelled.
+    /// </summary>
+    public void SetupSuccessfulRegistrationWithNegotiatedVersion(
+        byte negotiatedVersion, params byte[][] receiveLoopMessages)
     {
         Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
@@ -47,7 +131,7 @@ internal sealed class MeshClientFixture
         // uncompleted deliberately: returning null would now be interpreted as a lost
         // connection and trigger teardown.
         var channel = Channel.CreateUnbounded<byte[]?>();
-        channel.Writer.TryWrite(CreateRegistrationResponse());
+        channel.Writer.TryWrite(CreateRegistrationResponse(negotiatedVersion));
 
         foreach (byte[] message in receiveLoopMessages)
         {

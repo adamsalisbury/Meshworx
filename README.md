@@ -10,7 +10,10 @@ substituted.
 
 - **Target framework:** .NET 10
 - **Namespaces:** `AdamSalisbury.Meshworx`, `AdamSalisbury.Meshworx.Messages`,
-  `AdamSalisbury.Meshworx.Transport`, `AdamSalisbury.Meshworx.Transport.Tcp`
+  `AdamSalisbury.Meshworx.Transport`, `AdamSalisbury.Meshworx.Transport.Tcp`,
+  `AdamSalisbury.Meshworx.Transport.WebSocket`, `AdamSalisbury.Meshworx.Transport.Unix`,
+  `AdamSalisbury.Meshworx.Transport.NamedPipes`, `AdamSalisbury.Meshworx.Transport.Quic`,
+  `AdamSalisbury.Meshworx.Transport.Framing`, `AdamSalisbury.Meshworx.Extensions.DependencyInjection`
 
 ## Architecture
 
@@ -21,7 +24,12 @@ substituted.
 | `ITransport` | A bidirectional, message-oriented channel. Implementations own their framing. |
 | `ITransportListener` | Accepts inbound transport connections for the hub. |
 | `TcpTransport` / `TcpTransportListener` | TCP implementation using a 4-byte big-endian length prefix per frame. |
+| `WebSocketTransport` / `WebSocketTransportListener` | WebSocket implementation reachable from a browser and through proxies and firewalls that block arbitrary TCP ports; one WebSocket binary message carries one Meshworx frame. |
+| `UnixSocketTransport` / `UnixSocketTransportListener` | Unix domain socket implementation for fast, local, same-host inter-process communication on Linux and macOS; shares the same length-prefixed framing as TCP. |
+| `NamedPipeTransport` / `NamedPipeTransportListener` | Windows named-pipe implementation for the same same-host inter-process case on Windows; also shares the length-prefixed framing. |
+| `QuicTransport` / `QuicTransportListener` | QUIC implementation (`System.Net.Quic`) using one bidirectional stream per connection; TLS 1.3 is mandatory rather than optional, and the same length-prefixed framing runs over the stream. |
 | `InMemoryTransport` / `InMemoryTransportListener` | In-process implementation backed by channels, for hosting a hub and clients in one process and for fast, deterministic testing. |
+| `AddMeshHub` / `AddMeshClient` | `IServiceCollection` extension methods, in the `AdamSalisbury.Meshworx.Extensions.DependencyInjection` package, that register a hub or client for dependency injection and the generic host. |
 
 The hub never interprets message payloads — it only reads the routing header and forwards the
 body. Delivery is best-effort and fire-and-forget.
@@ -96,6 +104,29 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
   group requires membership of it**: the hub drops a group message from a client that has not joined.
   Who may join is the hub's decision — see [Security](#security) for the authorisation seam; without
   one, any client may join any group.
+- **Message headers.** `SendAsync(recipientId, payload, headers)` and
+  `SendToGroupAsync(name, payload, headers)` accept a `MessageHeaders` — a small, string-keyed bag of
+  metadata (a correlation id, a content-type hint, and the like) that travels alongside the payload
+  without the hub ever inspecting it. `MessageReceivedEventArgs.Headers` and
+  `GroupMessageReceivedEventArgs.Headers` expose what the sender attached, defaulting to
+  `MessageHeaders.Empty` when there were none. Requires both ends to have negotiated protocol version
+  5 or higher — see [Wire protocol](#wire-protocol) for the frame layout and the fallback behaviour
+  when a group has members on different negotiated versions.
+- **Session resumption.** Off by default. Give the hub a `sessionResumptionWindow` and each registering
+  client is issued an opaque resumption token; presenting it on a later connect reclaims the same
+  `Guid` and the group memberships that identity held, so peers holding the id from before the drop go
+  on reaching it. `IMeshClient.SessionResumed` reports whether the last connect reclaimed an identity.
+  Everything about it degrades to an ordinary fresh registration — an expired token, a hub with the
+  feature off, a connection negotiated below protocol version 6. Requires version 6. See
+  [Session resumption](#session-resumption).
+- **Offline delivery (store and forward).** Off by default: a message to a recipient the hub does not
+  recognise is dropped. Give the hub an `IOfflineStore` and a **direct** message addressed to a client
+  that has disconnected is held against that client's *name* instead, and delivered in arrival order
+  when that name next registers. `InMemoryOfflineStore` is the bounded, process-local default;
+  implement the interface yourself to back it with something durable. Broadcast and group sends never
+  store — a disconnected client is not a member of anything to fan out to. See
+  [Offline delivery](#offline-delivery) for the bounds and the limits of how long a departed client's
+  id keeps resolving.
 - **Disconnect.** Calling `DisconnectAsync` is graceful and does not raise `Disconnected`. The
   `Disconnected` event fires only for unexpected endings — the hub closing the connection
   (`RemoteDisconnect`) or the transport failing (`ConnectionLost`). After it fires the client
@@ -188,11 +219,16 @@ new MeshHub(
     maxConcurrentAuthentications: 64,               // cap concurrent authenticator calls (default: 64)
     groupAuthoriser: groupAuthoriser,               // decide who may join a group (default: none — see Security)
     groupAuthorisationTimeout: TimeSpan.FromSeconds(10), // refuse a join whose authoriser hangs (default: 10s)
-    maxConnectionsPerRemoteEndpoint: 100,            // cap connections from one address (default: 100)
-    maxInboundMessagesPerSecond: 200,                // per-client frame-rate budget (default: 200)
-    maxInboundBytesPerSecond: 4 * 1024 * 1024,        // per-client byte-volume budget (default: 4 MiB)
-    maxFanOutMessagesPerSecond: 20,                  // how often a client may broadcast/group-send (default: 20)
-    maxFanOutDeliveriesPerSecond: 20_000);           // total deliveries those sends may cause (default: 20,000)
+    maxConnectionsPerRemoteEndpoint: 100,           // cap connections from one address (default: 100)
+    notifyOnQueueSaturation: false,                 // tell a direct sender its message was dropped (default: false)
+    backpressureAwaitTimeout: TimeSpan.FromSeconds(30), // bound an AwaitCapacity park (default: 30s)
+    offlineStore: null,                             // hold messages for disconnected clients (default: none)
+    offlineStoreTimeout: TimeSpan.FromSeconds(10),  // bound a single offline store call (default: 10s)
+    sessionResumptionWindow: null,                  // how long an identity may be reclaimed (default: off)
+    maxInboundMessagesPerSecond: 200,               // per-client frame-rate budget (default: 200)
+    maxInboundBytesPerSecond: 4 * 1024 * 1024,      // per-client byte-volume budget (default: 4 MiB)
+    maxFanOutMessagesPerSecond: 20,                 // how often a client may broadcast/group-send (default: 20)
+    maxFanOutDeliveriesPerSecond: 20_000);          // total deliveries those sends may cause (default: 20,000)
 ```
 
 Every one of these has a finite default, so a hub constructed with no arguments at all is still
@@ -257,6 +293,86 @@ Observability:
 - `ConnectedClientCount` — current number of registered clients.
 - `IsClientRegistered(id)` — whether a specific client is registered.
 - `ClientConnected` / `ClientDisconnected` — raised as clients register and leave.
+
+### Session resumption
+
+Every `ConnectAsync` mints a brand-new `Guid`, so after a drop every peer holding the old one is
+addressing nothing, and the client's group memberships are gone. Session resumption fixes both — it is
+off until you give the hub a window:
+
+```csharp
+await using var hub = new MeshHub(
+    logger,
+    listener,
+    sessionResumptionWindow: TimeSpan.FromMinutes(5));
+```
+
+With it on, the hub issues each registering client an opaque 32-byte token alongside its id. On a later
+connect the client presents the token, and if the identity is still reclaimable the hub gives it back:
+same `Guid`, same group memberships, and a fresh token for next time. `MeshClient` does all of this
+itself — there is nothing to call — and reports the outcome on `IMeshClient.SessionResumed`.
+
+- **It never fails a connect.** An expired window, a token already spent, a hub with the feature off, a
+  connection negotiated below version 6, or no answer at all: every one of them leaves the client
+  connected on the fresh identity it just registered with, with `SessionResumed` false. Resumption is
+  an optimisation over reconnecting, never a precondition for it.
+- **Restored groups are re-authorised, not reinstated.** If you have a `GroupAuthoriser`, it is asked
+  again for every group being restored and may refuse — a resumption cannot resurrect a membership you
+  would now decline. A refused group is simply not restored.
+- **The token is a bearer credential for an identity.** Anyone holding it can reclaim the `Guid` and
+  group memberships of the name it was issued to (and only that name — a token presented by a client
+  registered under a different name is refused). It goes over the wire once, in the registration reply,
+  so **use an encrypted transport** if the network is not trusted; the same applies to the credential
+  your `ClientAuthenticator` checks. The hub retains only a SHA-256 hash of each token, and each token
+  is single-use — a successful resumption issues a new one and invalidates the old.
+- **A live session cannot be taken over.** A token reclaims an identity nobody is currently using; it
+  is refused while the connection that holds it is still up.
+- **The window starts when the client disconnects**, and the session table is bounded by `maxClients`.
+  If it is full, further clients are simply not issued tokens rather than evicting somebody else's
+  reclaimable session.
+- **Nothing survives a hub restart**, and a resumption is only meaningful on the hub that issued the
+  token — there is no shared session state across hubs.
+
+### Offline delivery
+
+Store-and-forward is off unless you give the hub somewhere to put things:
+
+```csharp
+await using var hub = new MeshHub(
+    logger,
+    listener,
+    offlineStore: new InMemoryOfflineStore(
+        maxMessagesPerClient: 100,                  // per name (default: 100)
+        maxBytesPerClient: 1024 * 1024,             // per name, body + headers (default: 1 MiB)
+        timeToLive: TimeSpan.FromMinutes(5),        // discard undelivered after this (default: 5 minutes)
+        maxClients: 1000));                         // distinct names holding messages (default: 1000)
+```
+
+A direct message addressed to a client the hub does not currently have connected is offered to the
+store, keyed by the name that client last registered under, and everything held for that name is
+delivered — oldest first — the next time it registers. What you need to know before relying on it:
+
+- **Direct sends only.** Broadcast and group sends never store. Group membership is dropped when a
+  client disconnects, so there is nothing to fan out to.
+- **A departed client's id keeps resolving only until its name comes back.** Senders address a
+  recipient by the `Guid` they looked up, so the hub remembers which name last held each id. That
+  association is dropped the moment the name registers again — under a new id, which the old sender
+  does not know — after which messages to the stale id are dropped as unknown-recipient rather than
+  held for a client that is sitting there connected. The retention table is itself bounded by
+  `maxClients`; past that, further disconnects are not retained.
+- **A full store refuses rather than evicting.** `InMemoryOfflineStore` keeps what it already accepted
+  and turns the new message away, which the hub counts as a drop. Implement `IOfflineStore` if you want
+  the opposite policy.
+- **Per-message time-to-live still applies on top.** A message sent with a TTL that lapses while it is
+  held is dropped on its way out, exactly as it would have been had the recipient been connected and
+  slow.
+- **More may be held than a returning client's outbound queue can take at once** (it holds 1024
+  frames). The overflow is dropped and counted, not held back for later.
+- **Nothing survives a hub restart** with the in-memory store. Back it with a durable `IOfflineStore`
+  if it must.
+- **The store sits on a live connection's path.** It is called from the sending client's receive loop
+  and from the returning client's registration, so a slow implementation delays those; each call is
+  bounded by `offlineStoreTimeout`, after which the message takes the ordinary drop.
 
 ### `MeshClient`
 
@@ -384,6 +500,32 @@ must make deliberately.
   public interface, pass an explicit `IPEndPoint` — and only do so behind an authenticator, a
   network boundary, or both.
 
+- **Local IPC access control.** `UnixSocketTransportListener` and `NamedPipeTransportListener`
+  never cross the network at all, so their access boundary is the operating system's own filesystem
+  permissions on the socket path or pipe name, not anything Meshworx enforces at the wire level. Both
+  default to the tightest sensible permission for that boundary rather than leaving it to chance:
+  `UnixSocketTransportListener` hardens its socket file to owner read/write only immediately after
+  binding (an optional `socketFileMode` constructor parameter widens this if you genuinely need
+  another local account to connect), and `NamedPipeTransportListener` creates its pipe with a security
+  descriptor restricted to the current user (an optional `pipeSecurity` constructor parameter
+  overrides this) — Windows' own unrestricted default for a named pipe additionally grants read access
+  to the Everyone group and the anonymous account, which the explicit default here avoids. Neither
+  transport offers a TLS option, since encrypting traffic that never leaves the host adds nothing.
+
+- **QUIC is TLS-only.** Unlike TCP and WebSocket, `QuicTransportListener` and `QuicTransport.ConnectAsync`
+  cannot be used cleartext at all — QUIC mandates TLS 1.3 at the protocol level, so both always take
+  TLS options. Because it is a genuine network transport (unlike the two local-IPC ones above), it also
+  reports a real `RemoteEndPoint` and so participates in `MeshHub`'s per-remote-endpoint connection cap
+  the same way TCP and WebSocket do.
+
+- **QUIC's negotiation pool has its own, separate per-source cap.** `QuicTransportListener` waits for
+  each connection's first stream off the accept path, bounded by `maxConcurrentNegotiations` (default
+  64) — but unlike the TCP and WebSocket listeners, there is no cheap way to tell a QUIC peer that will
+  eventually open a stream apart from one that never will before actually waiting for it, so a single
+  source completing real handshakes and never sending anything could otherwise occupy that entire pool
+  alone. `maxConcurrentNegotiationsPerSource` (default one eighth of `maxConcurrentNegotiations`) caps
+  how much of it any one source may hold, independently of the global limit.
+
 - **Transport encryption (TLS).** The TCP transport runs cleartext by default and secured when you
   give it TLS options. Pass `SslServerAuthenticationOptions` to the listener and
   `SslClientAuthenticationOptions` to `TcpTransport.ConnectAsync`; the framing is identical either
@@ -453,34 +595,81 @@ must make deliberately.
 
 The TCP transport frames every message as a **4-byte big-endian length prefix** followed by the
 payload (maximum 1 MiB). The first payload byte is the message type. Enabling TLS does not change
-any of this — the same frames simply travel inside the TLS record layer.
+any of this — the same frames simply travel inside the TLS record layer. The Unix domain socket,
+named-pipe and QUIC transports use the identical framing — each runs over a stream-oriented channel
+exactly as TCP does (QUIC's single bidirectional stream included), so all four share one internal
+`StreamFramer` helper rather than reimplementing the length prefix and its bounds checking four
+times. The WebSocket transport is the exception: one WebSocket binary message already delimits one
+Meshworx frame, so it needs no length prefix of its own.
 
-Protocol version: **3**.
+Protocol version: negotiated between **4** (minimum) and **6** (maximum). Registration advertises a
+range rather than a single value — `[versionMin, versionMax]` — and the hub picks the highest version
+common to its own supported range and the client's, so a newer client connecting to an older hub (or
+vice versa) negotiates down instead of being refused outright. Only the shared feature set of the
+negotiated version is guaranteed to work; `IMeshClient.NegotiatedProtocolVersion` reports what was
+agreed for the current connection.
 
 | Type | Byte | Direction | Payload after the type byte |
 |---|---|---|---|
-| `RegistrationRequest` | `0x04` | client → hub | version (1 byte), name length (2 bytes, big-endian), UTF-8 name, opaque credential (remaining bytes) |
-| `RegistrationComplete` | `0x01` | hub → client | assigned client id (16 bytes) |
+| `RegistrationRequest` | `0x04` | client → hub | version min (1 byte), version max (1 byte), name length (2 bytes, big-endian), UTF-8 name, opaque credential (remaining bytes) |
+| `RegistrationComplete` | `0x01` | hub → client | assigned client id (16 bytes), negotiated version (1 byte), and — only when the negotiated version is 6 or higher and the hub has session resumption enabled — token length (2 bytes, big-endian) and the resumption token |
 | `Error` | `0x05` | hub → client | registration error code (1 byte) |
 | `SendMessage` | `0x02` | client → hub | recipient id (16 bytes), message bytes |
+| `SendMessageWithHeaders` | `0x11` | client → hub | recipient id (16 bytes), header-block length (2 bytes, big-endian), header block, message bytes |
 | `BroadcastMessage` | `0x0B` | client → hub | message bytes |
 | `JoinGroup` | `0x0C` | client → hub | UTF-8 group name |
 | `LeaveGroup` | `0x0D` | client → hub | UTF-8 group name |
 | `GroupMessage` | `0x0E` | client → hub | group-name length (2 bytes, big-endian), UTF-8 group name, message bytes |
+| `GroupMessageWithHeaders` | `0x13` | client → hub | group-name length (2 bytes, big-endian), UTF-8 group name, header-block length (2 bytes, big-endian), header block, message bytes |
 | `DeliverMessage` | `0x03` | hub → client | sender id (16 bytes), message bytes |
+| `DeliverMessageWithHeaders` | `0x12` | hub → client | sender id (16 bytes), header-block length (2 bytes, big-endian), header block, message bytes |
 | `DeliverGroupMessage` | `0x0F` | hub → client | sender id (16 bytes), group-name length (2 bytes, big-endian), UTF-8 group name, message bytes |
+| `DeliverGroupMessageWithHeaders` | `0x14` | hub → client | sender id (16 bytes), group-name length (2 bytes, big-endian), UTF-8 group name, header-block length (2 bytes, big-endian), header block, message bytes |
 | `GroupJoinRefused` | `0x10` | hub → client | UTF-8 group name |
 | `ClientLookupRequest` | `0x06` | client → hub | correlation id (4 bytes, big-endian), UTF-8 name |
 | `ClientLookupResponse` | `0x07` | hub → client | correlation id (4 bytes), found flag (1 byte), id (16 bytes if found) |
 | `Disconnect` | `0x08` | either | none |
 | `Ping` | `0x09` | hub → client | none |
 | `Pong` | `0x0A` | client → hub | none |
+| `QueueSaturated` | `0x15` | hub → client | recipient id (16 bytes) — the direct-send recipient whose queue was full |
+| `ResumeSession` | `0x16` | client → hub | resumption token |
+| `SessionResumed` | `0x17` | hub → client | reclaimed client id (16 bytes), token length (2 bytes, big-endian), renewed resumption token |
+| `SessionResumeRefused` | `0x18` | hub → client | none |
 
-`GroupJoinRefused` is an addition within version 3 rather than a new protocol version: it travels only
-from hub to client, and a client that does not recognise it ignores it, so it changes nothing for a peer
-that never sees one. A hub drops a `GroupMessage` from a client that is not a member of the target group,
-and does so silently — a correct client only sends to groups it has joined, and it learns of a refused
-join from `GroupJoinRefused`.
+`GroupJoinRefused` and `QueueSaturated` are additions within an existing protocol version rather than new
+ones: they travel only from hub to client, and a client that does not recognise them ignores them, so
+they change nothing for a peer that never sees one. Session resumption could not take that route —
+`ResumeSession` travels client to hub, where an older hub would silently drop it — so it is gated on
+**version 6** instead, and both ends check the negotiated version before using any of the three opcodes.
+It is deliberately a *post*-registration exchange: the client has to send its registration frame before
+it knows what version was negotiated, so a token spliced into that frame would have been misparsed as
+credential bytes by any hub that predates the feature. A hub drops a `GroupMessage` from a client that is not a member of the target
+group, and does so silently — a correct client only sends to groups it has joined, and it learns of a
+refused join from `GroupJoinRefused`.
+
+### Header block format
+
+A header block (used by `SendMessageWithHeaders`, `DeliverMessageWithHeaders`,
+`GroupMessageWithHeaders` and `DeliverGroupMessageWithHeaders`) is a flat, back-to-back run of entries
+— `[keyLength(1 byte)][UTF-8 key][valueLength(2 bytes, big-endian)][UTF-8 value]` — read until exactly
+as many bytes as the preceding block-length field declared have been consumed. There is no entry count:
+the block's own length is the only thing bounding it. A key longer than 255 bytes once UTF-8 encoded,
+or a value longer than 65535 bytes, cannot be represented.
+
+Headers exist so cross-cutting metadata (a correlation id, a content-type hint, trace context, and the
+like) can travel with a message without the hub ever parsing the message body: the hub reads only the
+header block's length, never its contents, and forwards the body untouched. A message with no headers
+uses the plain frame (`SendMessage`/`DeliverMessage`/`GroupMessage`/`DeliverGroupMessage`) exactly as
+before, so it costs nothing extra on the wire — the header-bearing opcodes and their length-prefixed
+block are only ever used when there is at least one header to carry.
+
+Headers require both ends of a connection to have negotiated protocol version 5 or higher. On a
+connection negotiated below that, `MeshClient.SendAsync`/`SendToGroupAsync` throw
+`NotSupportedException` if called with a non-empty `MessageHeaders` rather than silently dropping them.
+For a group message, each member's own negotiated version decides what it receives: a member on version
+5 or higher gets the header-bearing frame with the header block intact, while a member still on an
+older version gets the plain frame with the header block stripped, since it would not recognise the
+header-bearing opcode.
 
 Registration error codes (`RegistrationErrorCode`): `DuplicateClientName` (`0x01`),
 `UnsupportedProtocolVersion` (`0x02`), `ClientNameTooLong` (`0x03`), `HubAtCapacity` (`0x04`),
@@ -507,6 +696,229 @@ await hub.StartAsync();
 await using var client = new MeshClient(clientLogger);
 await client.ConnectAsync(listener.Connect(), "Alice");
 ```
+
+The bundled `WebSocketTransport`/`WebSocketTransportListener` reaches a hub over `ws://` or
+`wss://` — the only way to connect from a browser, and one that traverses proxies and firewalls
+that block arbitrary TCP ports. One WebSocket binary message carries exactly one Meshworx frame,
+so no separate length prefix is needed; the 1 MiB payload cap and the wire protocol above are
+otherwise unchanged:
+
+```csharp
+// Hub
+var listener = new WebSocketTransportListener(port: 22002);
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client
+await using var client = new MeshClient(clientLogger);
+await client.ConnectAsync(
+    await WebSocketTransport.ConnectAsync(new Uri("ws://localhost:22002/")), "Alice");
+```
+
+Securing it with TLS (`wss://`) follows the same shape as the TCP transport — pass
+`SslServerAuthenticationOptions` to the listener, and configure the client's
+`ClientWebSocketOptions` (for a certificate validation callback or a client certificate) through
+`WebSocketTransport.ConnectAsync`'s `configureOptions` callback:
+
+```csharp
+// Hub
+var listener = new WebSocketTransportListener(
+    new IPEndPoint(IPAddress.Any, 22002),
+    tlsOptions: new SslServerAuthenticationOptions { ServerCertificate = hubCertificate });
+
+// Client
+await WebSocketTransport.ConnectAsync(
+    new Uri("wss://hub.example.com:22002/"),
+    options => options.RemoteCertificateValidationCallback = MyValidationCallback);
+```
+
+Negotiation — the TLS handshake where configured, then parsing the HTTP upgrade request — runs
+off the accept path, exactly as the TCP transport's TLS handshake does, so one slow or hostile
+peer cannot head-of-line block every other client waiting to connect.
+
+When a hub and its clients all run on the same host — a sidecar process, or a multi-process
+desktop or daemon layout — `UnixSocketTransport`/`UnixSocketTransportListener` (Linux and macOS)
+and `NamedPipeTransport`/`NamedPipeTransportListener` (Windows) avoid the network stack overhead
+and open port a loopback TCP listener would otherwise cost. Both share the same length-prefixed
+framing as TCP:
+
+```csharp
+// Hub (Linux/macOS)
+var listener = new UnixSocketTransportListener("/tmp/meshworx.sock");
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client (Linux/macOS)
+await using var client = new MeshClient(clientLogger);
+await client.ConnectAsync(await UnixSocketTransport.ConnectAsync("/tmp/meshworx.sock"), "Alice");
+```
+
+```csharp
+// Hub (Windows)
+var listener = new NamedPipeTransportListener("meshworx");
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client (Windows)
+await using var client = new MeshClient(clientLogger);
+await client.ConnectAsync(await NamedPipeTransport.ConnectAsync("meshworx"), "Alice");
+```
+
+`UnixSocketTransportListener` deletes a stale socket file left behind by a previous instance
+before binding (and its own file on clean disposal), so restarting a crashed hub does not fail
+with "address already in use". `NamedPipeTransportListener.StartAsync` and
+`NamedPipeTransport.ConnectAsync` throw `PlatformNotSupportedException` on any operating system
+other than the one each is built for — check `OperatingSystem.IsWindows()` before choosing between
+the two at run time if the same binary needs to run cross-platform. Neither transport has a TLS
+option: access is controlled by filesystem permissions on the socket path or pipe name, not by
+encryption, which is appropriate only when every peer that can reach the path is already trusted —
+exactly the same trust boundary the operating system itself enforces for local IPC.
+
+`QuicTransport`/`QuicTransportListener` reach a hub over QUIC (`System.Net.Quic`), giving TLS 1.3,
+faster connection setup, and head-of-line-blocking resistance versus TCP. Unlike the TCP and
+WebSocket transports, TLS is mandatory rather than optional — QUIC requires it at the protocol
+level — so both ends always take TLS options:
+
+```csharp
+// Hub
+var listener = new QuicTransportListener(
+    new IPEndPoint(IPAddress.Any, 22003),
+    new SslServerAuthenticationOptions { ServerCertificate = hubCertificate });
+await using var hub = new MeshHub(logger, listener);
+await hub.StartAsync();
+
+// Client
+await using var client = new MeshClient(clientLogger);
+await client.ConnectAsync(
+    await QuicTransport.ConnectAsync("hub.example.com", 22003, new SslClientAuthenticationOptions()),
+    "Alice");
+```
+
+**Platform requirements.** Both `QuicTransportListener.StartAsync` and `QuicTransport.ConnectAsync`
+throw `PlatformNotSupportedException` unless `QuicListener.IsSupported`/`QuicConnection.IsSupported`
+are `true` — check either before relying on this transport. That typically means the native
+`msquic` library is present and the platform's TLS stack supports TLS 1.3: on Debian/Ubuntu, install
+it with `apt install libmsquic`; it is not guaranteed to be preinstalled on every runner or host, so
+CI and deployment images should install it explicitly rather than assume it.
+
+Meshworx uses exactly one bidirectional QUIC stream per connection — matching the one-channel-per-
+client shape `ITransport` models — rather than the several concurrent streams a single QUIC
+connection can multiplex; that capability is what makes QUIC a natural fit for a future large-message
+or multi-channel feature, not something this transport itself needs yet. One consequence worth
+knowing: a QUIC stream is not visible to the receiving end until data actually arrives on it —
+opening one is a purely local operation — so `QuicTransportListener.AcceptAsync` will not return a
+connection until the client has sent at least one frame. This is never an issue in the normal
+Meshworx flow, since `MeshClient.ConnectAsync` sends the registration frame immediately once handed
+a transport, but it matters if you drive `QuicTransport`/`QuicTransportListener` directly: call
+`SendAsync` before waiting on the listener's `AcceptAsync`, not after, or the two ends deadlock
+waiting on each other.
+
+## Dependency injection and hosting
+
+The `AdamSalisbury.Meshworx.Extensions.DependencyInjection` package registers a hub or client
+with `Microsoft.Extensions.DependencyInjection` and runs it alongside a generic host or ASP.NET
+Core application, instead of the application managing `StartAsync`/`StopAsync` and disposal by
+hand.
+
+### Hosting a hub
+
+```csharp
+using AdamSalisbury.Meshworx;
+
+builder.Services.AddMeshHub(options =>
+{
+    options.Port = 22001;
+    options.MaxClients = 1000;
+});
+```
+
+`AddMeshHub` registers a singleton `IMeshHub` — built from a `TcpTransportListener` on
+`MeshHubOptions.Port` by default, or from `MeshHubOptions.Listener` when one is supplied — and a
+hosted service that calls `StartAsync` when the host starts and `StopAsync` when it begins a
+graceful shutdown, draining connected clients before the process exits. An overload binds
+`MeshHubOptions` from an `IConfiguration` section:
+
+```csharp
+builder.Services.AddMeshHub(builder.Configuration.GetSection("MeshHub"));
+```
+
+Every `MeshHubOptions` property mirrors a `MeshHub` constructor parameter and carries the same
+default — see [Configuration](#configuration) above. An out-of-range `Port` fails host start
+with an `OptionsValidationException` rather than surfacing later as a socket error.
+
+### Hosting a client
+
+```csharp
+using AdamSalisbury.Meshworx;
+
+builder.Services.AddMeshClient("Alice", options =>
+{
+    options.Host = "localhost";
+    options.Port = 22001;
+    options.UseReconnector = true;
+});
+```
+
+`AddMeshClient` registers the client as a keyed `IMeshClient`, resolved by the name it was added
+with (`serviceProvider.GetRequiredKeyedService<IMeshClient>("Alice")`), and a hosted service that
+connects it when the host starts and disconnects it on shutdown. Setting
+`MeshClientOptions.UseReconnector` wraps the client in a `MeshClientReconnector` instead — the
+keyed `IMeshClient` is then the reconnector's managed client, so callers use the same API either
+way, and the reconnector (also resolvable by the same key, as `MeshClientReconnector`) is what
+starts on host start and stops on host stop. By default the client connects over TCP to
+`MeshClientOptions.Host`/`Port`; set `MeshClientOptions.TransportFactory` to use TLS or another
+transport. As with the hub, an `IConfiguration` overload binds `MeshClientOptions` from a section,
+and options are validated the same way on host start.
+
+### Health checks
+
+The same package registers health checks against `Microsoft.Extensions.Diagnostics.HealthChecks`,
+so orchestrators and load balancers get a liveness/readiness signal without any glue code:
+
+```csharp
+builder.Services.AddHealthChecks()
+    .AddMeshHub()
+    .AddMeshClient("Alice");
+```
+
+`AddMeshHub` reports `Unhealthy` while the hub is not running, `Degraded` once it has reached
+`MeshHubOptions.MaxClients` — still serving existing clients but refusing new ones — and `Healthy`
+otherwise. `AddMeshClient` reports `Healthy` while the named client is connected and `Unhealthy`
+otherwise, including while a `MeshClientReconnector` is still retrying. Both require the
+corresponding `AddMeshHub`/`AddMeshClient` call to have registered the hub or client first, and
+both accept an optional `name` — `AddMeshHub` defaults to `"meshhub"`, `AddMeshClient` to
+`"meshclient:{clientName}"`.
+
+## Observability
+
+`AdamSalisbury.Meshworx` publishes first-class metrics through a `System.Diagnostics.Metrics.Meter`
+named `AdamSalisbury.Meshworx`, so any OpenTelemetry, Prometheus or other exporter that already knows
+how to collect from a named meter picks them up with no glue code:
+
+```csharp
+using OpenTelemetry.Metrics;
+
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(metrics => metrics.AddMeter("AdamSalisbury.Meshworx"));
+```
+
+Each `MeshHub` and each `MeshClientReconnector` owns its own `Meter` instance, disposed alongside it,
+so instruments stop reporting the moment the component they describe is torn down rather than going on
+publishing stale data. Every instrument below is under that one meter name regardless of which
+component recorded it:
+
+| Instrument | Kind | Tags | Description |
+|---|---|---|---|
+| `meshworx.hub.clients.connected` | up/down counter | — | Clients currently registered with the hub. |
+| `meshworx.hub.messages.routed` | counter | `direction`: `direct`, `broadcast`, `group` | Messages the hub has routed. A broadcast or group send counts once per call that reaches at least one recipient, not once per recipient — it is the message the hub routed, not the number of deliveries it fanned out to — and not at all when there was nobody to receive it (the sender was the only client, or the group's only member). |
+| `meshworx.hub.bytes.routed` | counter | `direction`: `direct`, `broadcast`, `group` | Message payload bytes the hub has routed, tagged the same way. |
+| `meshworx.hub.messages.dropped` | counter | `reason`: `unknown-recipient`, `queue-full`, `expired`, `offline-queue-full` | Messages the hub could not deliver: a direct send to a Guid nobody is registered under, a write to a recipient's outbound queue that was already full, a frame whose time-to-live had lapsed by the time it was dequeued for sending, or a message the configured offline store refused to hold. |
+| `meshworx.hub.messages.offline_queued` | counter | — | Messages held in the offline store for a disconnected client instead of being dropped. They are counted as `routed` (`direction=direct`) later, when the client returns and they are queued for it. |
+| `meshworx.hub.outbound_queue.depth` | observable gauge | — | The total number of frames currently queued for delivery, summed across every connected client's outbound queue. A single aggregate rather than one series per client, since tagging by client id would give the gauge unbounded cardinality over the hub's lifetime. |
+| `meshworx.client.reconnects` | counter | — | The number of times a `MeshClientReconnector` has re-established a connection after an unexpected drop. Does not count the initial connection `StartAsync` makes. |
+
+No protocol or payload change accompanies any of this — the instruments only observe routing and
+connection lifecycle events that already happen.
 
 ## Building and testing
 
