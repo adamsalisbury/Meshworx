@@ -1085,6 +1085,381 @@ public sealed class MeshHubTests
             logger.Object, listener.Object, maxConnectionsPerRemoteEndpoint: 0));
     }
 
+    /// <summary>
+    /// When the hub is constructed with a non-positive maximum inbound messages-per-second budget, an
+    /// ArgumentOutOfRangeException is thrown.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_NonPositiveMaxInboundMessagesPerSecond_ThrowsArgumentOutOfRangeException()
+    {
+        await Task.CompletedTask;
+        var logger = new Mock<ILogger<MeshHub>>();
+        var listener = new Mock<ITransportListener>();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => new MeshHub(
+            logger.Object, listener.Object, maxInboundMessagesPerSecond: 0));
+    }
+
+    /// <summary>
+    /// When the hub is constructed with a non-positive maximum inbound bytes-per-second budget, an
+    /// ArgumentOutOfRangeException is thrown.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_NonPositiveMaxInboundBytesPerSecond_ThrowsArgumentOutOfRangeException()
+    {
+        await Task.CompletedTask;
+        var logger = new Mock<ILogger<MeshHub>>();
+        var listener = new Mock<ITransportListener>();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => new MeshHub(
+            logger.Object, listener.Object, maxInboundBytesPerSecond: 0));
+    }
+
+    /// <summary>
+    /// When the hub is constructed with a non-positive maximum fan-out messages-per-second budget, an
+    /// ArgumentOutOfRangeException is thrown.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_NonPositiveMaxFanOutMessagesPerSecond_ThrowsArgumentOutOfRangeException()
+    {
+        await Task.CompletedTask;
+        var logger = new Mock<ILogger<MeshHub>>();
+        var listener = new Mock<ITransportListener>();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => new MeshHub(
+            logger.Object, listener.Object, maxFanOutMessagesPerSecond: 0));
+    }
+
+    /// <summary>
+    /// When the hub is constructed with a non-positive maximum fan-out deliveries-per-second budget, an
+    /// ArgumentOutOfRangeException is thrown.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task Constructor_NonPositiveMaxFanOutDeliveriesPerSecond_ThrowsArgumentOutOfRangeException()
+    {
+        await Task.CompletedTask;
+        var logger = new Mock<ILogger<MeshHub>>();
+        var listener = new Mock<ITransportListener>();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => new MeshHub(
+            logger.Object, listener.Object, maxFanOutDeliveriesPerSecond: 0));
+    }
+
+    // HandleClient — inbound rate limiting
+
+    /// <summary>
+    /// When a client sends more frames in a burst than its general messages-per-second budget allows,
+    /// the excess is dropped rather than delivered. Proved by a marker message sent after the budget has
+    /// had time to refill: because the recipient's frames are delivered in order, the marker's arrival
+    /// proves every frame recorded before it is everything the hub actually admitted.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_BurstBeyondMessageRateBudget_ExcessFramesAreDropped()
+    {
+        var fixture = new MeshHubFixture(
+            maxInboundMessagesPerSecond: 2,
+            maxInboundBytesPerSecond: int.MaxValue,
+            maxFanOutMessagesPerSecond: int.MaxValue);
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient");
+        var recipientFrames = new FrameRecorder(recipient.Transport);
+
+        // A burst of four, sent with no delay between them, against a budget of two: only the first two
+        // may be admitted from the burst allowance, and the rest are dropped before ever reaching
+        // RouteMessage.
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [1]));
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [2]));
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [3]));
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [4]));
+
+        // Give the budget time to refill fully before the marker, so the marker's admission says
+        // nothing about whether the budget recovers — only about what the burst above left behind.
+        await Task.Delay(TimeSpan.FromSeconds(1.1));
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [99]));
+
+        await recipientFrames.WaitForAsync(f => f[0] == 0x03 && f[17] == 99).WaitAsync(WaitTimeout);
+
+        byte[] deliveredMarkers = [.. recipientFrames.Frames.Where(f => f[0] == 0x03).Select(f => f[17])];
+        Assert.Equal(new byte[] { 1, 2, 99 }, deliveredMarkers);
+
+        sender.Disconnect();
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// The general inbound budget also bounds byte volume, independently of message count: two frames
+    /// that together exceed the byte budget are throttled even though neither alone, nor the pair by
+    /// count, would trip a message-count limit.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_BurstBeyondByteVolumeBudget_ExcessFramesAreDropped()
+    {
+        var fixture = new MeshHubFixture(
+            maxInboundMessagesPerSecond: int.MaxValue,
+            maxInboundBytesPerSecond: 50,
+            maxFanOutMessagesPerSecond: int.MaxValue);
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient");
+        var recipientFrames = new FrameRecorder(recipient.Transport);
+
+        // Each SendMessage frame is 1 + 16 + 10 = 27 bytes. The budget of 50 admits the first (23
+        // tokens left over) but not the second (27 > 23).
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, Enumerable.Repeat((byte)1, 10).ToArray()));
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, Enumerable.Repeat((byte)2, 10).ToArray()));
+
+        await Task.Delay(TimeSpan.FromSeconds(1.1));
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [99]));
+
+        await recipientFrames.WaitForAsync(f => f[0] == 0x03 && f[17] == 99).WaitAsync(WaitTimeout);
+
+        byte[] deliveredMarkers = [.. recipientFrames.Frames.Where(f => f[0] == 0x03).Select(f => f[17])];
+        Assert.Equal(new byte[] { 1, 99 }, deliveredMarkers);
+
+        sender.Disconnect();
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// Broadcast and group-send frames are additionally bound by the stricter fan-out budget, on top of
+    /// the general one: a burst well within the general message-count and byte budgets is still
+    /// throttled once it exceeds the fan-out-specific ceiling.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_BurstBeyondFanOutBudget_ExcessBroadcastsAreDropped()
+    {
+        var fixture = new MeshHubFixture(
+            maxInboundMessagesPerSecond: int.MaxValue,
+            maxInboundBytesPerSecond: int.MaxValue,
+            maxFanOutMessagesPerSecond: 2);
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient");
+        var recipientFrames = new FrameRecorder(recipient.Transport);
+
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage([1]));
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage([2]));
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage([3]));
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage([4]));
+
+        await Task.Delay(TimeSpan.FromSeconds(1.1));
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage([99]));
+
+        await recipientFrames.WaitForAsync(f => f[0] == 0x03 && f[17] == 99).WaitAsync(WaitTimeout);
+
+        byte[] deliveredMarkers = [.. recipientFrames.Frames.Where(f => f[0] == 0x03).Select(f => f[17])];
+        Assert.Equal(new byte[] { 1, 2, 99 }, deliveredMarkers);
+
+        sender.Disconnect();
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A client throttled by the fan-out budget is not disconnected or otherwise penalised beyond the
+    /// dropped frames: an ordinary direct message sent immediately afterwards, on the same connection,
+    /// is still delivered.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_ThrottledByFanOutBudget_SubsequentDirectMessageStillDelivered()
+    {
+        var fixture = new MeshHubFixture(
+            maxInboundMessagesPerSecond: int.MaxValue,
+            maxInboundBytesPerSecond: int.MaxValue,
+            maxFanOutMessagesPerSecond: 1);
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient");
+        var recipientFrames = new FrameRecorder(recipient.Transport);
+
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage([1]));
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage([2]));
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [77]));
+
+        await recipientFrames.WaitForAsync(f => f[0] == 0x03 && f[17] == 77).WaitAsync(WaitTimeout);
+
+        byte[] deliveredMarkers = [.. recipientFrames.Frames.Where(f => f[0] == 0x03).Select(f => f[17])];
+        Assert.Equal(new byte[] { 1, 77 }, deliveredMarkers);
+
+        sender.Disconnect();
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// An empty frame is charged against the general inbound budget exactly like any other, before it
+    /// is ignored — so a burst of them cannot spend a client's budget for free and leave a full budget
+    /// behind for a real message sent immediately afterwards.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_EmptyFrameBurst_StillChargedAgainstGeneralBudget()
+    {
+        var fixture = new MeshHubFixture(
+            maxInboundMessagesPerSecond: 2,
+            maxInboundBytesPerSecond: int.MaxValue,
+            maxFanOutMessagesPerSecond: int.MaxValue,
+            maxFanOutDeliveriesPerSecond: int.MaxValue);
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient");
+        var recipientFrames = new FrameRecorder(recipient.Transport);
+
+        // Two empty frames spend the entire two-message budget, if and only if an empty frame is
+        // charged like any other. A real message sent immediately afterwards, with no budget left, is
+        // then dropped rather than delivered.
+        sender.EnqueueMessage([]);
+        sender.EnqueueMessage([]);
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [5]));
+
+        // Give the budget time to refill before the marker, so its admission says nothing about
+        // whether the message above was ever charged for.
+        await Task.Delay(TimeSpan.FromSeconds(1.1));
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, [99]));
+
+        await recipientFrames.WaitForAsync(f => f[0] == 0x03 && f[17] == 99).WaitAsync(WaitTimeout);
+
+        byte[] deliveredMarkers = [.. recipientFrames.Frames.Where(f => f[0] == 0x03).Select(f => f[17])];
+        Assert.Equal(new byte[] { 99 }, deliveredMarkers);
+
+        sender.Disconnect();
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// The general message-count and byte-volume budgets are checked before either is charged, so a
+    /// frame refused by the byte budget alone leaves the message-count budget untouched: the very next
+    /// frame, small enough to fit the byte budget on its own, is admitted immediately rather than
+    /// finding the message-count budget already spent on the frame that was refused.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_ByteBudgetDeniesFrame_MessageCountBudgetIsNotConsumed()
+    {
+        var fixture = new MeshHubFixture(
+            maxInboundMessagesPerSecond: 1,
+            maxInboundBytesPerSecond: 20,
+            maxFanOutMessagesPerSecond: int.MaxValue,
+            maxFanOutDeliveriesPerSecond: int.MaxValue);
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterClientAsync("Recipient");
+        var recipientFrames = new FrameRecorder(recipient.Transport);
+
+        // Frame length 1 + 16 + 10 = 27, over the 20-byte budget: refused by the byte budget alone.
+        sender.EnqueueMessage(
+            MeshHubFixture.CreateDirectMessage(recipient.Id, Enumerable.Repeat((byte)1, 10).ToArray()));
+
+        // Frame length 1 + 16 + 0 = 17, within the byte budget, and needs the message-count budget's
+        // only token. Sent with no delay: if it arrives, the frame above did not spend that token.
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(recipient.Id, []));
+
+        byte[] delivered = await recipientFrames.WaitForAsync(f => f[0] == 0x03).WaitAsync(WaitTimeout);
+
+        Assert.Equal(17, delivered.Length);
+        Assert.Single(recipientFrames.Frames, f => f[0] == 0x03);
+
+        sender.Disconnect();
+        recipient.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// The fan-out delivery-volume budget throttles by the actual number of recipients a broadcast
+    /// reaches, catching a client that stays comfortably within the fan-out frequency budget but whose
+    /// broadcasts, multiplied across the client population, would otherwise cause unbounded delivery
+    /// volume.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task BroadcastMessage_ExceedsDeliveryVolumeBudget_ExcessBroadcastsAreDropped()
+    {
+        var fixture = new MeshHubFixture(
+            maxInboundMessagesPerSecond: int.MaxValue,
+            maxInboundBytesPerSecond: int.MaxValue,
+            maxFanOutMessagesPerSecond: int.MaxValue,
+            maxFanOutDeliveriesPerSecond: 4);
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var first = await fixture.RegisterClientAsync("First");
+        var second = await fixture.RegisterClientAsync("Second");
+        var firstFrames = new FrameRecorder(first.Transport);
+
+        // Three registered clients means every broadcast reaches two recipients (First and Second), so
+        // a delivery-volume budget of four admits exactly two broadcasts before it is spent — no matter
+        // how generous the frequency budget is.
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage([1]));
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage([2]));
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage([3]));
+
+        await Task.Delay(TimeSpan.FromSeconds(1.1));
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage([99]));
+
+        await firstFrames.WaitForAsync(f => f[0] == 0x03 && f[17] == 99).WaitAsync(WaitTimeout);
+
+        byte[] deliveredMarkers = [.. firstFrames.Frames.Where(f => f[0] == 0x03).Select(f => f[17])];
+        Assert.Equal(new byte[] { 1, 2, 99 }, deliveredMarkers);
+
+        sender.Disconnect();
+        first.Disconnect();
+        second.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A header-carrying group send is charged against the fan-out frequency budget exactly like the
+    /// header-less one. The two frame types reach the same members and cost the hub the same deliveries,
+    /// so a client must not be able to opt out of the fan-out budget simply by attaching a header block.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task HandleClient_GroupMessageWithHeadersExceedsFanOutBudget_ExcessSendsAreDropped()
+    {
+        var fixture = new MeshHubFixture(
+            maxInboundMessagesPerSecond: int.MaxValue,
+            maxInboundBytesPerSecond: int.MaxValue,
+            maxFanOutMessagesPerSecond: 1);
+        await fixture.Hub.StartAsync();
+
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender", versionMax: 0x06);
+        var member = await fixture.RegisterMultiMessageClientAsync("Member", versionMax: 0x06);
+        var memberFrames = new FrameRecorder(member.Transport);
+
+        member.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("news"));
+        sender.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("news"));
+
+        // A lookup on the member's own connection is a barrier: frames from one client are processed in
+        // order, so its reply proves the join above has already been applied and the sender's group
+        // messages below cannot arrive at a group the member has not yet joined. Recorded through the
+        // same FrameRecorder — a second one would replace this transport's send setup and silence the
+        // first.
+        member.EnqueueMessage(MeshHubFixture.CreateLookupRequest(1234, "Sender"));
+        await memberFrames.WaitForAsync(f => f[0] == 0x07).WaitAsync(WaitTimeout);
+
+        var headers = new MessageHeaders(new Dictionary<string, string> { ["trace"] = "abc" });
+        sender.EnqueueMessage(MeshHubFixture.CreateGroupMessageWithHeaders("news", headers, [1]));
+        sender.EnqueueMessage(MeshHubFixture.CreateGroupMessageWithHeaders("news", headers, [2]));
+
+        // A direct message on the same connection, ordered after both group sends, proves the hub has
+        // finished with them — so a second delivery that never arrives is genuinely dropped rather than
+        // merely still in flight.
+        sender.EnqueueMessage(MeshHubFixture.CreateDirectMessage(member.Id, [77]));
+        await memberFrames.WaitForAsync(f => f[0] == 0x03 && f[17] == 77).WaitAsync(WaitTimeout);
+
+        Assert.Single(memberFrames.Frames, f => f[0] == 0x14);
+
+        sender.Disconnect();
+        member.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
     // AcceptLoop — per-remote-endpoint connection cap
 
     /// <summary>

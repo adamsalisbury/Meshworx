@@ -32,7 +32,11 @@ internal sealed class MeshHubFixture
         TimeSpan? backpressureAwaitTimeout = null,
         IOfflineStore? offlineStore = null,
         TimeSpan? offlineStoreTimeout = null,
-        TimeSpan? sessionResumptionWindow = null)
+        TimeSpan? sessionResumptionWindow = null,
+        int? maxInboundMessagesPerSecond = null,
+        int? maxInboundBytesPerSecond = null,
+        int? maxFanOutMessagesPerSecond = null,
+        int? maxFanOutDeliveriesPerSecond = null)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -63,7 +67,11 @@ internal sealed class MeshHubFixture
             backpressureAwaitTimeout,
             offlineStore,
             offlineStoreTimeout,
-            sessionResumptionWindow);
+            sessionResumptionWindow,
+            maxInboundMessagesPerSecond,
+            maxInboundBytesPerSecond,
+            maxFanOutMessagesPerSecond,
+            maxFanOutDeliveriesPerSecond);
     }
 
     /// <summary>
@@ -88,6 +96,17 @@ internal sealed class MeshHubFixture
         payload[0] = 0x02; // SendMessage
         recipientId.TryWriteBytes(payload.AsSpan(1));
         message.CopyTo(payload, 17);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a BroadcastMessage frame: [type][message].
+    /// </summary>
+    public static byte[] CreateBroadcastMessage(byte[] message)
+    {
+        var payload = new byte[1 + message.Length];
+        payload[0] = 0x0B; // BroadcastMessage
+        message.CopyTo(payload, 1);
         return payload;
     }
 

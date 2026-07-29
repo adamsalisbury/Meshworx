@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text;
 using AdamSalisbury.Meshworx.Diagnostics;
 using AdamSalisbury.Meshworx.Messages;
+using AdamSalisbury.Meshworx.RateLimiting;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
 
@@ -39,6 +40,37 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // handshake. Pass int.MaxValue explicitly to opt out.
     private const int DefaultMaxConnectionsPerRemoteEndpoint = 100;
 
+    // A registered client is trusted to have completed the handshake, but "registered" is not
+    // "well-behaved": nothing before this stops it streaming frames as fast as the transport accepts
+    // them. 200 messages/second is generous for anything a real client legitimately sends — the
+    // library has no built-in notion of a message rate higher than a person or a typical background
+    // sync could produce — while still giving a hot loop a firm ceiling. Pass int.MaxValue to opt out.
+    private const int DefaultMaxInboundMessagesPerSecond = 200;
+
+    // Every inbound frame is also charged against a byte-volume budget, independently of how many
+    // frames it took to spend it: a client sending few but maximum-size (1 MiB) frames is exactly as
+    // capable of saturating hub egress as one sending many small ones. 4 MiB/second allows four
+    // full-size frames a second at the steady state, which comfortably covers real traffic while
+    // still bounding it. Pass int.MaxValue to opt out.
+    private const int DefaultMaxInboundBytesPerSecond = 4 * 1024 * 1024;
+
+    // BroadcastMessage and GroupMessage are not like other frames: one inbound frame becomes a send to
+    // every recipient, so the cost of admitting it scales with the size of the hub's client population
+    // rather than staying fixed. This budget bounds how often a client may trigger one of the two at
+    // all, on top of the two general budgets above. 20/second is a fraction of the general message
+    // budget, reflecting that fan-out traffic is inherently less frequent in legitimate use than
+    // one-to-one messaging. Pass int.MaxValue to opt out.
+    private const int DefaultMaxFanOutMessagesPerSecond = 20;
+
+    // A frequency budget alone does not bound the amplification that results from it: at the frequency
+    // above, a hub with a population of 1,000 still sees up to 20,000 deliveries a second from one
+    // client, and that grows without limit as the population — or the frequency budget itself — grows.
+    // This charges by the actual number of recipients a fan-out reaches rather than by the frame, so
+    // the hub's worst-case fan-out cost stays bounded by a figure that does not move with either of
+    // those. 20,000 matches the worst case the two defaults above already implied, so a hub built with
+    // every default unchanged sees no new limit in practice. Pass int.MaxValue to opt out.
+    private const int DefaultMaxFanOutDeliveriesPerSecond = 20_000;
+
     // How long RouteMessageWithHeaders awaits free capacity on a saturated recipient queue before giving
     // up and falling back to the drop-on-full behaviour, for a sender that opted into
     // DeliveryOptions.AwaitCapacity. Bounds the worst case so a recipient that never drains cannot stall
@@ -63,6 +95,16 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly GroupAuthoriser? _groupAuthoriser;
     private readonly TimeSpan _groupAuthorisationTimeout;
     private readonly int _maxConnectionsPerRemoteEndpoint;
+    private readonly int _maxInboundMessagesPerSecond;
+    private readonly int _maxInboundBytesPerSecond;
+    private readonly int _maxFanOutMessagesPerSecond;
+    private readonly int _maxFanOutDeliveriesPerSecond;
+
+    // Shared by every connection's receive loop, unlike a client's own ClientRateLimiter — see
+    // SharedLogThrottle's own remarks for why a rate-limit warning needs a hub-wide gate rather than
+    // one gate per connection.
+    private readonly SharedLogThrottle _rateLimitLogThrottle = new();
+
     private readonly bool _notifyOnQueueSaturation;
     private readonly TimeSpan _backpressureAwaitTimeout;
 
@@ -286,6 +328,42 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// <see cref="MessageType.RegistrationComplete"/> reply carries none. Requires the connection to
     /// negotiate protocol version <see cref="Protocol.SessionResumptionMinVersion"/> or higher.
     /// </param>
+    /// <param name="maxInboundMessagesPerSecond">
+    /// The maximum number of frames of any type a single registered client may send per second, with a
+    /// burst allowance of one second's own budget. A frame beyond the budget is dropped rather than
+    /// processed or queued; the sender is not told, matching how a full outbound queue is already
+    /// handled elsewhere in the hub. Defaults to 200. Pass <see cref="int.MaxValue"/> to opt out.
+    /// </param>
+    /// <param name="maxInboundBytesPerSecond">
+    /// The maximum number of bytes across every inbound frame a single registered client may send per
+    /// second, with a burst allowance of one second's own budget, charged independently of
+    /// <paramref name="maxInboundMessagesPerSecond"/> — a client sending fewer but larger frames is
+    /// bound by this even when it never approaches the message-count budget. Defaults to 4 MiB. Pass
+    /// <see cref="int.MaxValue"/> to opt out.
+    /// </param>
+    /// <param name="maxFanOutMessagesPerSecond">
+    /// The maximum number of broadcast or group-send frames a single registered client may send per
+    /// second, with a burst allowance of one second's own budget, enforced in addition to — not instead
+    /// of — <paramref name="maxInboundMessagesPerSecond"/> and <paramref name="maxInboundBytesPerSecond"/>.
+    /// Broadcast and group sends fan out to every recipient, so one inbound frame costs the hub far more
+    /// than an ordinary send, and this keeps that cost from being driven by a single client. This bounds
+    /// how often a client may trigger a fan-out; it does not by itself bound how large each one is — see
+    /// <paramref name="maxFanOutDeliveriesPerSecond"/> for that. Defaults to 20. Pass
+    /// <see cref="int.MaxValue"/> to opt out.
+    /// </param>
+    /// <param name="maxFanOutDeliveriesPerSecond">
+    /// The maximum number of individual deliveries a single registered client's broadcast and
+    /// group-send frames may cause per second, with a burst allowance of one second's own budget,
+    /// charged by the actual number of recipients each fan-out reaches rather than by the frame, and
+    /// enforced in addition to <paramref name="maxFanOutMessagesPerSecond"/>. A frequency budget alone
+    /// does not bound the amplification a fan-out causes — at a given frequency, the number of
+    /// deliveries it produces grows with the size of the client population, without limit, unless
+    /// something else catches it. This is that something else: it keeps the hub's actual worst-case
+    /// fan-out cost bounded by a figure that does not move just because the population, or
+    /// <paramref name="maxFanOutMessagesPerSecond"/> itself, does. Defaults to 20,000 — the worst case
+    /// the other defaults already implied, so a hub built with every default unchanged sees no new
+    /// limit in practice. Pass <see cref="int.MaxValue"/> to opt out.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
@@ -302,7 +380,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         TimeSpan? backpressureAwaitTimeout = null,
         IOfflineStore? offlineStore = null,
         TimeSpan? offlineStoreTimeout = null,
-        TimeSpan? sessionResumptionWindow = null)
+        TimeSpan? sessionResumptionWindow = null,
+        int? maxInboundMessagesPerSecond = null,
+        int? maxInboundBytesPerSecond = null,
+        int? maxFanOutMessagesPerSecond = null,
+        int? maxFanOutDeliveriesPerSecond = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -382,6 +464,34 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 "The session resumption window must be positive, or null to disable resumption.");
         }
 
+        if (maxInboundMessagesPerSecond is { } maxMessages && maxMessages <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxInboundMessagesPerSecond),
+                "The maximum inbound messages per second must be positive.");
+        }
+
+        if (maxInboundBytesPerSecond is { } maxBytes && maxBytes <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxInboundBytesPerSecond),
+                "The maximum inbound bytes per second must be positive.");
+        }
+
+        if (maxFanOutMessagesPerSecond is { } maxFanOut && maxFanOut <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxFanOutMessagesPerSecond),
+                "The maximum fan-out messages per second must be positive.");
+        }
+
+        if (maxFanOutDeliveriesPerSecond is { } maxFanOutDeliveries && maxFanOutDeliveries <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxFanOutDeliveriesPerSecond),
+                "The maximum fan-out deliveries per second must be positive.");
+        }
+
         _logger = logger;
         _listener = listener;
         _registrationTimeout = registrationTimeout ?? DefaultRegistrationTimeout;
@@ -403,6 +513,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _offlineStore = offlineStore;
         _offlineStoreTimeout = offlineStoreTimeout ?? DefaultOfflineStoreTimeout;
         _sessionResumptionWindow = sessionResumptionWindow;
+        _maxInboundMessagesPerSecond = maxInboundMessagesPerSecond ?? DefaultMaxInboundMessagesPerSecond;
+        _maxInboundBytesPerSecond = maxInboundBytesPerSecond ?? DefaultMaxInboundBytesPerSecond;
+        _maxFanOutMessagesPerSecond = maxFanOutMessagesPerSecond ?? DefaultMaxFanOutMessagesPerSecond;
+        _maxFanOutDeliveriesPerSecond = maxFanOutDeliveriesPerSecond ?? DefaultMaxFanOutDeliveriesPerSecond;
 
         if (authenticator is not null)
         {
@@ -1121,7 +1235,16 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 return;
             }
 
-            connection = new ClientConnection(clientId, clientName, transport, negotiatedVersion);
+            connection = new ClientConnection(
+                clientId,
+                clientName,
+                transport,
+                negotiatedVersion,
+                new ClientRateLimiter(
+                    _maxInboundMessagesPerSecond,
+                    _maxInboundBytesPerSecond,
+                    _maxFanOutMessagesPerSecond,
+                    _maxFanOutDeliveriesPerSecond));
             _clients.TryAdd(clientId, connection);
             _connectedClientsCounter.Add(1);
 
@@ -1181,9 +1304,51 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 // Any received frame proves the client is alive; the heartbeat monitor observes this.
                 connection.RecordActivity();
 
+                // Charge every frame against the general per-client budgets before it is looked at any
+                // further — including an empty one. A zero-length frame carries no opcode and is cheaper
+                // for the sender than any real message, so if the check below ran only after the
+                // data.Length == 0 guard, a flood of empty frames would cost the hub processing time
+                // while spending no budget at all, bypassing the very limit this exists to enforce.
+                // Refused here, the frame is dropped silently — the sender is not told, matching how a
+                // full outbound queue is already handled below.
+                if (!connection.RateLimiter.TryAdmitFrame(data.Length))
+                {
+                    if (_rateLimitLogThrottle.ShouldLog())
+                    {
+                        _logger.LogWarning(
+                            "Client {ClientId} exceeded its inbound rate limit; frame dropped", clientId);
+                    }
+
+                    continue;
+                }
+
                 if (data.Length == 0)
                 {
                     // Empty frames carry no opcode; ignore rather than indexing data[0].
+                    continue;
+                }
+
+                var messageType = (MessageType)data[0];
+
+                // Broadcast and group sends fan out to every recipient, so admitting one costs the hub
+                // far more than an ordinary send. This second, stricter budget applies only to those
+                // message types, on top of the general one just above. GroupMessageWithHeaders belongs
+                // here for exactly the same reason as GroupMessage — the header block changes what each
+                // recipient's copy carries, not how many recipients there are — so leaving it out would
+                // let a client opt out of the fan-out budget simply by attaching an empty header.
+                if (messageType is MessageType.BroadcastMessage
+                        or MessageType.GroupMessage
+                        or MessageType.GroupMessageWithHeaders
+                    && !connection.RateLimiter.TryAdmitFanOut())
+                {
+                    if (_rateLimitLogThrottle.ShouldLog())
+                    {
+                        _logger.LogWarning(
+                            "Client {ClientId} exceeded its fan-out rate limit; broadcast or group message "
+                            + "dropped",
+                            clientId);
+                    }
+
                     continue;
                 }
 
@@ -2677,6 +2842,31 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
     private void BroadcastMessage(Guid senderId, ReadOnlyMemory<byte> messageData)
     {
+        // Charged by the actual number of recipients this reaches — every other registered client —
+        // on top of the per-frame fan-out frequency budget the receive loop already applied. See
+        // ClientRateLimiter.TryAdmitFanOutDelivery for why a frequency budget alone does not bound the
+        // amplification a broadcast causes. The lookup fails only if the sender's own connection has
+        // already been torn down by the time this runs, in which case there is no budget left to
+        // charge against and the broadcast is let through rather than refused for a reason that has
+        // nothing to do with its own behaviour.
+        if (_clients.TryGetValue(senderId, out ClientConnection? senderConnection))
+        {
+            int recipientCount = Math.Max(0, _clients.Count - 1);
+
+            if (!senderConnection.RateLimiter.TryAdmitFanOutDelivery(recipientCount))
+            {
+                if (_rateLimitLogThrottle.ShouldLog())
+                {
+                    _logger.LogWarning(
+                        "Client {SenderId} exceeded its fan-out delivery-volume rate limit; broadcast "
+                        + "dropped",
+                        senderId);
+                }
+
+                return;
+            }
+        }
+
         // Build the delivery frame once and share it across every recipient's queue. The send
         // loops only read the array, so concurrent reads of this never-mutated buffer are safe.
         var deliveryPayload = new byte[1 + 16 + messageData.Length];
@@ -3024,6 +3214,28 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return;
         }
 
+        // Charged by the actual number of recipients this reaches — every other member — on top of the
+        // per-frame fan-out frequency budget the receive loop already applied. See BroadcastMessage and
+        // ClientRateLimiter.TryAdmitFanOutDelivery for the reasoning; the sender is confirmed a member
+        // above, so recipients.Length always includes it and is at least 2 by this point.
+        if (_clients.TryGetValue(senderId, out ClientConnection? senderConnection))
+        {
+            int recipientCount = recipients.Length - 1;
+
+            if (!senderConnection.RateLimiter.TryAdmitFanOutDelivery(recipientCount))
+            {
+                if (_rateLimitLogThrottle.ShouldLog())
+                {
+                    _logger.LogWarning(
+                        "Client {SenderId} exceeded its fan-out delivery-volume rate limit; group "
+                        + "message dropped",
+                        senderId);
+                }
+
+                return;
+            }
+        }
+
         // One shared, never-mutated delivery frame across every recipient's queue (see
         // BroadcastMessage). The frame carries the group name so recipients know its origin. The
         // name bytes are copied straight from the inbound frame rather than re-encoding the string.
@@ -3111,6 +3323,29 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             // The sender is the only member; nothing to deliver and no frame to build.
             return;
+        }
+
+        // Charged by the actual number of recipients this reaches, exactly as SendToGroup charges its
+        // own fan-out — a header-carrying group send reaches the same members and costs the hub the
+        // same deliveries, so it must spend the same budget. See ClientRateLimiter.TryAdmitFanOutDelivery
+        // for why the frequency budget alone does not bound the amplification. The sender is confirmed a
+        // member above, so recipients.Length always includes it and is at least 2 by this point.
+        if (_clients.TryGetValue(senderId, out ClientConnection? senderConnection))
+        {
+            int recipientCount = recipients.Length - 1;
+
+            if (!senderConnection.RateLimiter.TryAdmitFanOutDelivery(recipientCount))
+            {
+                if (_rateLimitLogThrottle.ShouldLog())
+                {
+                    _logger.LogWarning(
+                        "Client {SenderId} exceeded its fan-out delivery-volume rate limit; group "
+                        + "message dropped",
+                        senderId);
+                }
+
+                return;
+            }
         }
 
         _messagesRoutedCounter.Add(1, GroupDirectionTag);
@@ -3205,7 +3440,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         public bool Removed { get; set; }
     }
 
-    private sealed class ClientConnection(Guid id, string name, ITransport transport, byte negotiatedProtocolVersion)
+    private sealed class ClientConnection(
+        Guid id,
+        string name,
+        ITransport transport,
+        byte negotiatedProtocolVersion,
+        ClientRateLimiter rateLimiter)
         : IAsyncDisposable
     {
         // Internal rather than private so MeshHub.OutboundQueueCapacityForTesting can expose it to a
@@ -3253,6 +3493,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         /// block stripped because this connection predates <see cref="Protocol.HeaderEnvelopeMinVersion"/>.
         /// </summary>
         public byte NegotiatedProtocolVersion { get; } = negotiatedProtocolVersion;
+
+        /// <summary>
+        /// Bounds this client's inbound frame rate and volume. Only ever consulted from this
+        /// connection's own receive loop, so — like <see cref="Groups"/> — it needs no lock.
+        /// </summary>
+        public ClientRateLimiter RateLimiter { get; } = rateLimiter;
 
         /// <summary>
         /// A monotonically increasing counter bumped once for every frame received from the client.
