@@ -4,9 +4,34 @@ using Moq;
 
 namespace AdamSalisbury.Meshworx.UnitTests;
 
+/// <summary>
+/// Isolates the chunking tests from every other test class.
+/// </summary>
+/// <remarks>
+/// These tests exist to move multi-megabyte payloads, so they allocate and copy far more than any
+/// other class here. Run in parallel on a loaded two-core CI runner that pressure is enough to push a
+/// test with a sub-second timeout — the WebSocket listener tests allow 1000 ms — past its budget for
+/// reasons that have nothing to do with what it is testing. Serialising them keeps this class's cost
+/// to itself.
+/// </remarks>
+[CollectionDefinition(ChunkingCollectionDefinition.Name, DisableParallelization = true)]
+public sealed class ChunkingCollectionDefinition
+{
+    public const string Name = "Chunking";
+}
+
+[Collection(ChunkingCollectionDefinition.Name)]
 public class MeshClientChunkingTests
 {
     private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Sizes chosen to exercise multi-chunk paths at the least allocation that still does so.
+    /// </summary>
+    private static class MeshClientTestSizes
+    {
+        internal const int JustOverOneChunk = (1024 * 1024) + 1;
+    }
 
     /// <summary>
     /// Acceptance criterion: a payload beyond the 1 MiB frame cap round-trips correctly. The sender
@@ -133,7 +158,7 @@ public class MeshClientChunkingTests
     [Fact(Timeout = 10000)]
     public async Task SendLargeAsync_WithCallerHeaders_DeliversThemWithTheWholeMessage()
     {
-        var payload = new byte[2 * 1024 * 1024];
+        var payload = new byte[MeshClientTestSizes.JustOverOneChunk];
         var senderFixture = new MeshClientFixture();
         var sentFrames = new List<byte[]>();
 
