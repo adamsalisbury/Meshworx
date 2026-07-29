@@ -7,6 +7,26 @@ using Moq;
 
 namespace AdamSalisbury.Meshworx.UnitTests;
 
+/// <summary>
+/// Isolates the tracing tests from every other test class.
+/// </summary>
+/// <remarks>
+/// An <see cref="ActivityListener"/> is process-wide: attaching one to the
+/// <see cref="MeshworxActivitySource.Name"/> source switches span creation on for <em>every</em>
+/// client in the process, not only the one under test. Left running in parallel with the rest of the
+/// suite that cuts both ways — spans from other classes land in this class's recorder, and those
+/// classes start paying for span allocation they were not written to expect. The second of those is
+/// the one that bites: several hub tests assert against eviction budgets measured in tens of
+/// milliseconds, and extra allocation across a loaded two-core CI runner is enough to make them
+/// intermittently miss.
+/// </remarks>
+[CollectionDefinition(TracingCollectionDefinition.Name, DisableParallelization = true)]
+public sealed class TracingCollectionDefinition
+{
+    public const string Name = "Tracing";
+}
+
+[Collection(TracingCollectionDefinition.Name)]
 public class MeshClientTracingTests
 {
     private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
