@@ -51,6 +51,22 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private readonly ConcurrentDictionary<long, PendingAck> _pendingAcks = new();
     private long _ackCorrelationId;
 
+    // The resumption token the hub last issued, and the name it was issued to. Deliberately *not*
+    // cleared when the connection ends — surviving the disconnect is the entire point of it, since it is
+    // what the next ConnectAsync presents to reclaim this identity. It is cleared only when it is spent,
+    // when the hub refuses it, or when connecting under a different name, for which it is meaningless.
+    private byte[]? _sessionToken;
+    private string? _sessionTokenName;
+
+    // Completed by the receive loop when the hub answers a resume attempt: true for
+    // SessionResumed, false for SessionResumeRefused. Guarded by _stateLock.
+    private TaskCompletionSource<bool>? _pendingResume;
+
+    // How long ConnectAsync waits for the hub to answer a resume attempt before giving up and keeping
+    // the fresh identity it was just assigned. Short deliberately: the hub answers from the same receive
+    // loop that just registered this client, so anything beyond a round trip means it is not going to.
+    private static readonly TimeSpan SessionResumeTimeout = TimeSpan.FromSeconds(10);
+
     private readonly Lock _groupMembershipLock = new();
     private readonly HashSet<string> _joinedGroups = new(StringComparer.Ordinal);
 
@@ -137,6 +153,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public byte NegotiatedProtocolVersion { get; private set; }
 
     /// <inheritdoc/>
+    public bool SessionResumed { get; private set; }
+
+    /// <inheritdoc/>
     public bool IsConnected
     {
         get
@@ -211,6 +230,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         try
         {
+            // Captured before registration replaces it: the token that reclaims the *previous* session is
+            // the one to present, and the reply to this registration carries a new one that overwrites it.
+            // A token issued to a different name is meaningless here, so it is not carried across.
+            byte[]? resumptionToken = string.Equals(_sessionTokenName, clientName, StringComparison.Ordinal)
+                ? _sessionToken
+                : null;
+
             // Registration frame: [type][versionMin][versionMax][name length (2, big-endian)][name][credential].
             byte[] nameBytes = Encoding.UTF8.GetBytes(clientName);
             var requestPayload = new byte[3 + 2 + nameBytes.Length + credential.Length];
@@ -232,7 +258,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             }
 
             if (responseData is null
-                || responseData.Length != 18
+                || responseData.Length < 18
                 || (MessageType)responseData[0] != MessageType.RegistrationComplete)
             {
                 throw new InvalidOperationException("Failed to register with the hub.");
@@ -241,6 +267,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             Id = new Guid(responseData.AsSpan(1, 16));
             Name = clientName;
             NegotiatedProtocolVersion = responseData[17];
+            SessionResumed = false;
+
+            // A hub with session resumption enabled appends the token that reclaims this identity. The
+            // reply is exactly 18 bytes without one, which is every reply from a hub built before
+            // version 6 and every reply on a connection negotiated below it — so the trailing fields are
+            // read only when they are actually there.
+            ReadSessionToken(responseData, clientName);
             _logger.LogInformation(
                 "Connected to hub with id {ClientId} on protocol version {ProtocolVersion}",
                 Id,
@@ -270,6 +303,16 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     _receiveLoopTask = loopTask;
                 }
             }
+
+            // Attempted only once the receive loop is running, because the hub's answer is not the next
+            // frame on the wire: registration may already have queued messages held for this name while
+            // it was away, and those arrive first. Handling the reply in the loop rather than with a
+            // second blocking read is what makes the interleaving a non-event.
+            if (resumptionToken is not null
+                && NegotiatedProtocolVersion >= Protocol.SessionResumptionMinVersion)
+            {
+                await TryResumeSessionAsync(resumptionToken, cancellationToken).ConfigureAwait(false);
+            }
         }
         catch (Exception exception)
         {
@@ -291,6 +334,115 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
             throw;
         }
+    }
+
+    /// <summary>
+    /// Reads the resumption token a version-6 hub appends to its registration reply, and remembers which
+    /// name it belongs to.
+    /// </summary>
+    /// <remarks>
+    /// A reply with no token — the 18-byte form — clears whatever was held rather than leaving it: a hub
+    /// that has stopped issuing tokens, or one that has just refused this client's own, must not leave
+    /// the client trying to spend a credential that no longer means anything.
+    /// </remarks>
+    private void ReadSessionToken(byte[] responseData, string clientName)
+    {
+        if (responseData.Length < 20)
+        {
+            _sessionToken = null;
+            _sessionTokenName = null;
+            return;
+        }
+
+        int tokenLength = BinaryPrimitives.ReadUInt16BigEndian(responseData.AsSpan(18, 2));
+        if (tokenLength == 0 || responseData.Length < 20 + tokenLength)
+        {
+            _sessionToken = null;
+            _sessionTokenName = null;
+            return;
+        }
+
+        _sessionToken = responseData.AsSpan(20, tokenLength).ToArray();
+        _sessionTokenName = clientName;
+    }
+
+    /// <summary>
+    /// Presents a resumption token to the hub and waits for it to accept or refuse, leaving the client on
+    /// the identity it just registered with if anything at all goes wrong.
+    /// </summary>
+    /// <remarks>
+    /// Every failure here — a refusal, a timeout, a hub that does not recognise the opcode, a transport
+    /// error on the way out — resolves to the same outcome: the connection is up, on the fresh identity,
+    /// and <see cref="SessionResumed"/> stays <see langword="false"/>. Resumption is an optimisation over
+    /// reconnecting, never a precondition for it, so it must never be able to fail a connect that has
+    /// already succeeded.
+    /// </remarks>
+    private async Task TryResumeSessionAsync(byte[] resumptionToken, CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        lock (_stateLock)
+        {
+            _pendingResume = completion;
+        }
+
+        try
+        {
+            var payload = new byte[1 + resumptionToken.Length];
+            payload[0] = (byte)MessageType.ResumeSession;
+            resumptionToken.CopyTo(payload, 1);
+
+            await _transport!.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+
+            bool resumed = await completion.Task
+                .WaitAsync(SessionResumeTimeout, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (resumed)
+            {
+                _logger.LogInformation("Resumed previous session as {ClientId}", Id);
+            }
+            else
+            {
+                _logger.LogInformation(
+                    "The hub refused session resumption; continuing as {ClientId}", Id);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException
+            || !cancellationToken.IsCancellationRequested)
+        {
+            // Includes the timeout. Swallowed rather than rethrown: the connection itself is up and
+            // usable, and failing it here would turn an optimisation into a reason not to connect at
+            // all. The token registration just issued is left in place — it belongs to *this* identity,
+            // not the one that was refused, so the next reconnect still has something to present.
+            _logger.LogDebug(ex, "Session resumption did not complete; continuing as {ClientId}", Id);
+        }
+        finally
+        {
+            lock (_stateLock)
+            {
+                if (ReferenceEquals(_pendingResume, completion))
+                {
+                    _pendingResume = null;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Completes a pending resume attempt, if one is outstanding.
+    /// </summary>
+    private void CompletePendingResume(bool resumed)
+    {
+        TaskCompletionSource<bool>? completion;
+
+        lock (_stateLock)
+        {
+            completion = _pendingResume;
+            _pendingResume = null;
+        }
+
+        completion?.TrySetResult(resumed);
     }
 
     /// <inheritdoc/>
@@ -363,6 +515,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             Id = Guid.Empty;
             Name = string.Empty;
             NegotiatedProtocolVersion = 0;
+            SessionResumed = false;
             _state = ConnectionState.Disconnected;
         }
     }
@@ -1295,6 +1448,33 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         _logger.LogError(ex, "A SendRejected handler threw an exception");
                     }
                 }
+                else if (data.Length >= 19
+                    && (MessageType)data[0] == MessageType.SessionResumed)
+                {
+                    var resumedId = new Guid(data.AsSpan(1, 16));
+                    int tokenLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(17, 2));
+
+                    if (data.Length >= 19 + tokenLength && tokenLength > 0)
+                    {
+                        lock (_stateLock)
+                        {
+                            Id = resumedId;
+                            SessionResumed = true;
+                            _sessionToken = data.AsSpan(19, tokenLength).ToArray();
+                            _sessionTokenName = Name;
+                        }
+
+                        CompletePendingResume(true);
+                    }
+                }
+                else if ((MessageType)data[0] == MessageType.SessionResumeRefused)
+                {
+                    // The old identity is gone for good — expired, already reclaimed, or never this
+                    // hub's to give. The token held now is not that one: registration replaced it with a
+                    // fresh token for the identity this connection *does* have, so there is nothing to
+                    // clear and the next reconnect has something valid to present.
+                    CompletePendingResume(false);
+                }
                 else if ((MessageType)data[0] == MessageType.Ping)
                 {
                     // The hub is probing liveness; reply so it knows we are still here. Best-effort:
@@ -1418,6 +1598,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             Id = Guid.Empty;
             Name = string.Empty;
             NegotiatedProtocolVersion = 0;
+            SessionResumed = false;
             _state = ConnectionState.Disconnected;
 
             // Take the decision to raise under the same lock that publishes the disconnected state,

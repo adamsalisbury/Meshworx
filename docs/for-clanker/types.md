@@ -310,16 +310,19 @@ catch (RegistrationRefusedException ex) { /* ex.ErrorCode tells you why */ }
 ## Internal types (not visible outside the assembly, listed for orientation)
 
 - `enum MessageType : byte` (`Messages/MessageType.cs`) — the opcodes; see [protocol.md](protocol.md).
-- `static class Protocol` (`Messages/Protocol.cs`) — `MinSupportedVersion = 4`, `MaxSupportedVersion = 5`
-  (raised from `4` by PR #74, issue #32, to admit the header envelope; replaced the single `Version = 3`
-  constant in PR #73; see [protocol.md](protocol.md#versioning)), `HeaderEnvelopeMinVersion = 5` (added by
-  PR #74 — the lowest negotiated version at which `MessageHeaders` may be used), `MaxClientNameLength = 256`.
+- `static class Protocol` (`Messages/Protocol.cs`) — `MinSupportedVersion = 4`, `MaxSupportedVersion = 6`
+  (raised from `4` to `5` by PR #74, issue #32, to admit the header envelope, and from `5` to `6` by
+  issue #43 to admit session resumption; replaced the single `Version = 3` constant in PR #73; see
+  [protocol.md](protocol.md#versioning)), `HeaderEnvelopeMinVersion = 5` (added by PR #74 — the lowest
+  negotiated version at which `MessageHeaders` may be used), `SessionResumptionMinVersion = 6` and
+  `SessionTokenLength = 32` (issue #43), `MaxClientNameLength = 256`.
 - `static class HeaderEnvelope` (`Messages/HeaderEnvelope.cs`, added by PR #74) — encodes/decodes the
   header-block wire format for the four header-bearing opcodes; see
   [protocol.md](protocol.md#message-headers).
-- `MeshHub.ClientConnection` (carries `NegotiatedProtocolVersion`, PR #74; and, since PR #87,
+- `MeshHub.ClientConnection` (carries `NegotiatedProtocolVersion`, PR #74; since PR #87,
   `IsAwaitingCapacity`/`BeginAwaitingCapacity()`/`CapacityWaitScope` for the backpressure-parking
-  mechanism), `MeshHub.Group`, `MeshClient.ConnectionState`, `MeshClient.PendingLookup` — nested private
+  mechanism; and, since issue #43, a **settable** `Id` via `Rebind` plus `SessionTokenHash`),
+  `MeshHub.ResumableSession` (issue #43), `MeshHub.Group`, `MeshClient.ConnectionState`, `MeshClient.PendingLookup` — nested private
   helpers documented in [hub.md](hub.md) / [client.md](client.md).
 
 Tests reach internals via `<InternalsVisibleTo Include="AdamSalisbury.Meshworx.UnitTests" />`

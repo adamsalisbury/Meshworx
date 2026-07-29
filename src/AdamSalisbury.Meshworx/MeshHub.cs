@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics.Metrics;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using AdamSalisbury.Meshworx.Diagnostics;
 using AdamSalisbury.Meshworx.Messages;
@@ -78,6 +79,16 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // name has re-registered" into the one id that needs forgetting.
     private readonly ConcurrentDictionary<Guid, string> _offlineNamesById = new();
     private readonly ConcurrentDictionary<string, Guid> _offlineIdsByName = new();
+
+    // How long a dormant session may be reclaimed for, or null when session resumption is switched off —
+    // in which case no token is ever issued, the table below stays empty, and a RegistrationComplete
+    // reply is byte-for-byte what it was before the feature existed.
+    private readonly TimeSpan? _sessionResumptionWindow;
+
+    // Resumable sessions, keyed by the hex SHA-256 hash of the token that reclaims them rather than by
+    // the token itself: the table is then not a bag of live bearer credentials, so a hub's memory — a
+    // dump, a debugger, a log of the wrong object — does not hand out identities.
+    private readonly ConcurrentDictionary<string, ResumableSession> _sessions = new(StringComparer.Ordinal);
 
     // How many connections are currently open from each remote address, counting from acceptance
     // until the handler that owns that connection finishes — including the pre-registration window,
@@ -268,6 +279,13 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// slow or hanging store cannot park a sender's receive loop or hold up a registration. Defaults to
     /// 10 seconds. Ignored when no store is configured.
     /// </param>
+    /// <param name="sessionResumptionWindow">
+    /// How long after a client disconnects it may reconnect and reclaim the same id and group
+    /// memberships by presenting the resumption token it was issued. <see langword="null"/> — the
+    /// default — switches session resumption off entirely: no token is issued, and a
+    /// <see cref="MessageType.RegistrationComplete"/> reply carries none. Requires the connection to
+    /// negotiate protocol version <see cref="Protocol.SessionResumptionMinVersion"/> or higher.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
@@ -283,7 +301,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         bool notifyOnQueueSaturation = false,
         TimeSpan? backpressureAwaitTimeout = null,
         IOfflineStore? offlineStore = null,
-        TimeSpan? offlineStoreTimeout = null)
+        TimeSpan? offlineStoreTimeout = null,
+        TimeSpan? sessionResumptionWindow = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -356,6 +375,13 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 nameof(offlineStoreTimeout), "The offline store timeout must be positive.");
         }
 
+        if (sessionResumptionWindow is { } resumptionWindow && resumptionWindow <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(sessionResumptionWindow),
+                "The session resumption window must be positive, or null to disable resumption.");
+        }
+
         _logger = logger;
         _listener = listener;
         _registrationTimeout = registrationTimeout ?? DefaultRegistrationTimeout;
@@ -376,6 +402,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _backpressureAwaitTimeout = backpressureAwaitTimeout ?? DefaultBackpressureAwaitTimeout;
         _offlineStore = offlineStore;
         _offlineStoreTimeout = offlineStoreTimeout ?? DefaultOfflineStoreTimeout;
+        _sessionResumptionWindow = sessionResumptionWindow;
 
         if (authenticator is not null)
         {
@@ -671,6 +698,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             _clientNames.Clear();
             _clients.Clear();
             _groups.Clear();
+
+            // Nothing outlives the hub that held it: a session's whole point is reclaiming an identity on
+            // *this* hub, and the offline identity map only means anything alongside the store it feeds.
+            // Dropping the session table also means a stopped hub is not still holding material that
+            // reclaims identities on it.
+            _sessions.Clear();
+            _offlineNamesById.Clear();
+            _offlineIdsByName.Clear();
 
             cts.Dispose();
         }
@@ -1095,10 +1130,24 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             // messages held for a client that is sitting right here connected.
             ForgetOfflineIdentity(clientName);
 
-            var responsePayload = new byte[18];
+            // A resumption token, when the feature is on and this connection negotiated high enough for
+            // it, rides along on the registration reply — the only frame on which it is ever sent. A
+            // connection that gets none produces the identical 18-byte reply every version before 6
+            // produced.
+            byte[]? sessionToken = IssueSessionToken(connection);
+            byte[] responsePayload = sessionToken is null
+                ? new byte[18]
+                : new byte[18 + 2 + sessionToken.Length];
             responsePayload[0] = (byte)MessageType.RegistrationComplete;
             clientId.TryWriteBytes(responsePayload.AsSpan(1, 16));
             responsePayload[17] = negotiatedVersion;
+
+            if (sessionToken is not null)
+            {
+                BinaryPrimitives.WriteUInt16BigEndian(responsePayload.AsSpan(18, 2), (ushort)sessionToken.Length);
+                sessionToken.CopyTo(responsePayload.AsSpan(20));
+            }
+
             await transport.SendAsync(responsePayload, cancellationToken).ConfigureAwait(false);
 
             _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
@@ -1248,6 +1297,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
                     await transport.SendAsync(lookupResponse, clientCts.Token).ConfigureAwait(false);
                 }
+                else if (data.Length > 1
+                    && (MessageType)data[0] == MessageType.ResumeSession)
+                {
+                    // Reassigns the loop's own notion of who this client is, so everything downstream —
+                    // the sender id on routed frames, and the registry keys this handler's finally
+                    // removes — follows the reclaimed identity rather than the discarded one.
+                    clientId = await ResumeSessionAsync(connection, data.AsMemory(1), clientCts.Token)
+                        .ConfigureAwait(false);
+                }
                 else if ((MessageType)data[0] == MessageType.Pong)
                 {
                     // Liveness reply to a heartbeat ping; RecordActivity above already noted it.
@@ -1304,6 +1362,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
             if (connection is not null)
             {
+                // Before RemoveFromAllGroups, which is what empties the set this needs to capture.
+                MakeSessionDormant(connection);
+
                 RemoveFromAllGroups(connection);
                 _clientNames.TryRemove(connection.Name, out _);
                 _clients.TryRemove(clientId, out _);
@@ -2258,6 +2319,248 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     }
 
     /// <summary>
+    /// Mints a resumption token for a newly registered connection and records the session it reclaims,
+    /// or returns <see langword="null"/> when resumption is switched off, the connection negotiated too
+    /// low a version for it, or the session table is full.
+    /// </summary>
+    /// <remarks>
+    /// The token is returned to the caller — to be put on the wire exactly once, in the
+    /// <see cref="MessageType.RegistrationComplete"/> reply — while only its hash is retained here.
+    /// </remarks>
+    private byte[]? IssueSessionToken(ClientConnection connection)
+    {
+        if (_sessionResumptionWindow is null
+            || connection.NegotiatedProtocolVersion < Protocol.SessionResumptionMinVersion)
+        {
+            return null;
+        }
+
+        if (_sessions.Count >= MaxClients)
+        {
+            PurgeExpiredSessions();
+
+            if (_sessions.Count >= MaxClients)
+            {
+                // Refusing a token rather than evicting somebody else's session: a client that is not
+                // issued one simply cannot resume, which is the pre-feature behaviour, whereas evicting
+                // would silently break a resumption another client is entitled to.
+                _logger.LogDebug(
+                    "Session table is full; {ClientName} was not issued a resumption token", connection.Name);
+                return null;
+            }
+        }
+
+        byte[] token = RandomNumberGenerator.GetBytes(Protocol.SessionTokenLength);
+        string tokenHash = HashSessionToken(token);
+
+        _sessions[tokenHash] = new ResumableSession(connection.Name, connection.Id);
+        connection.SessionTokenHash = tokenHash;
+
+        return token;
+    }
+
+    /// <summary>
+    /// Marks a departing connection's session dormant — capturing the groups it was in and the instant
+    /// its resumption window closes — so a reconnect within that window can reclaim it.
+    /// </summary>
+    private void MakeSessionDormant(ClientConnection connection)
+    {
+        if (_sessionResumptionWindow is not { } window
+            || connection.SessionTokenHash is not { } tokenHash)
+        {
+            return;
+        }
+
+        if (_sessions.TryGetValue(tokenHash, out ResumableSession? session))
+        {
+            // Captured here rather than read live at resume time, because by then the connection has
+            // been removed from every group it was in — this teardown is what removes it.
+            session.Groups = [.. connection.Groups];
+            session.DormantUntil = DateTimeOffset.UtcNow + window;
+        }
+    }
+
+    /// <summary>
+    /// Handles a <see cref="MessageType.ResumeSession"/> frame: reclaims the id, group memberships and
+    /// resumption token of a previous session, or refuses and leaves the client on the fresh identity it
+    /// registered with.
+    /// </summary>
+    /// <returns>
+    /// The id this connection is known by after the attempt — the reclaimed one on success, the one that
+    /// was passed in otherwise.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// Runs after an ordinary registration has already completed, which is what makes the whole feature
+    /// degrade cleanly: a hub that does not know this opcode ignores it, and the client simply keeps the
+    /// identity it was just assigned. That is also why the token could not be carried in the registration
+    /// frame itself — the client has to send that before it knows what version was negotiated, so an
+    /// older hub would have misparsed a token field as credential bytes.
+    /// </para>
+    /// <para>
+    /// The token is single-use: the winning <c>TryRemove</c> is what makes two connections racing the
+    /// same token resolve to exactly one resumption, and a fresh token is issued in the reply.
+    /// </para>
+    /// </remarks>
+    private async Task<Guid> ResumeSessionAsync(
+        ClientConnection connection, ReadOnlyMemory<byte> token, CancellationToken cancellationToken)
+    {
+        if (_sessionResumptionWindow is null
+            || connection.NegotiatedProtocolVersion < Protocol.SessionResumptionMinVersion
+            || token.Length != Protocol.SessionTokenLength)
+        {
+            await RefuseSessionResumeAsync(connection, cancellationToken).ConfigureAwait(false);
+            return connection.Id;
+        }
+
+        string tokenHash = HashSessionToken(token.Span);
+
+        // Looked up before it is claimed, so a token that fails validation — one whose session is still
+        // held by a live connection, notably — is left in place for its rightful owner rather than being
+        // burnt by anyone who can present it once.
+        if (!_sessions.TryGetValue(tokenHash, out ResumableSession? session)
+            || session.DormantUntil is not { } dormantUntil
+            || dormantUntil <= DateTimeOffset.UtcNow
+            || !string.Equals(session.Name, connection.Name, StringComparison.Ordinal)
+            || _clients.ContainsKey(session.ClientId))
+        {
+            _logger.LogDebug(
+                "Session resumption refused for {ClientName}: no live session matched the token",
+                connection.Name);
+            await RefuseSessionResumeAsync(connection, cancellationToken).ConfigureAwait(false);
+            return connection.Id;
+        }
+
+        // Claiming the entry is what enforces single use: of two connections presenting the same token at
+        // once, exactly one gets true here and the other is refused.
+        if (!_sessions.TryRemove(new KeyValuePair<string, ResumableSession>(tokenHash, session)))
+        {
+            await RefuseSessionResumeAsync(connection, cancellationToken).ConfigureAwait(false);
+            return connection.Id;
+        }
+
+        Guid freshId = connection.Id;
+        Guid resumedId = session.ClientId;
+
+        // Published under the reclaimed id before the fresh one is withdrawn, so a peer addressing either
+        // reaches the connection throughout the swap rather than falling into a gap where neither
+        // resolves. Both mapping to one connection for an instant is harmless; neither doing so is not.
+        _clients[resumedId] = connection;
+        connection.Rebind(resumedId);
+        _clientNames[connection.Name] = resumedId;
+        _clients.TryRemove(freshId, out _);
+
+        await RestoreGroupMembershipAsync(connection, session.Groups, cancellationToken).ConfigureAwait(false);
+
+        byte[] renewedToken = RandomNumberGenerator.GetBytes(Protocol.SessionTokenLength);
+        string renewedHash = HashSessionToken(renewedToken);
+        _sessions[renewedHash] = new ResumableSession(connection.Name, resumedId);
+        connection.SessionTokenHash = renewedHash;
+
+        var reply = new byte[1 + 16 + 2 + renewedToken.Length];
+        reply[0] = (byte)MessageType.SessionResumed;
+        resumedId.TryWriteBytes(reply.AsSpan(1, 16));
+        BinaryPrimitives.WriteUInt16BigEndian(reply.AsSpan(17, 2), (ushort)renewedToken.Length);
+        renewedToken.CopyTo(reply.AsSpan(19));
+        await connection.Transport.SendAsync(reply, cancellationToken).ConfigureAwait(false);
+
+        _logger.LogInformation(
+            "Client {ClientName} resumed session {ResumedId}, replacing {FreshId}",
+            connection.Name,
+            resumedId,
+            freshId);
+
+        return resumedId;
+    }
+
+    /// <summary>
+    /// Re-establishes the group memberships a resumed session held, running each one back through the
+    /// group authoriser rather than reinstating it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A restore that bypassed the authoriser would make the first <see langword="true"/> permanent: an
+    /// authoriser that has since changed its mind would find the client still receiving that group's
+    /// traffic and still entitled to send to it. The hub already refuses to let
+    /// <see cref="MeshClientReconnector"/>'s own restore do that (it re-joins over the wire, and every
+    /// join is authorised on its own merits), and resumption must not become the back door.
+    /// </para>
+    /// <para>
+    /// A refused group is simply not restored, with no <see cref="MessageType.GroupJoinRefused"/> frame:
+    /// the client did not ask to join anything on this connection, so there is no join to refuse, and
+    /// re-encoding a stored name to echo it could not preserve the size guarantee that frame relies on.
+    /// </para>
+    /// </remarks>
+    private async Task RestoreGroupMembershipAsync(
+        ClientConnection connection, IReadOnlyList<string> groups, CancellationToken cancellationToken)
+    {
+        foreach (string groupName in groups)
+        {
+            if (_groupAuthoriser is not null
+                && !await AuthoriseGroupJoinAsync(connection, groupName, cancellationToken).ConfigureAwait(false))
+            {
+                _logger.LogWarning(
+                    "Group {GroupName} was not restored for resumed client {ClientId}: the authoriser refused it",
+                    ForLog(groupName),
+                    connection.Id);
+                continue;
+            }
+
+            AddToGroup(connection, groupName);
+        }
+    }
+
+    private async Task RefuseSessionResumeAsync(ClientConnection connection, CancellationToken cancellationToken)
+    {
+        byte[] refusal = [(byte)MessageType.SessionResumeRefused];
+        await connection.Transport.SendAsync(refusal, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Drops every session whose resumption window has closed. Only called when the table is at its
+    /// bound, since a hub below it has nothing to gain from the sweep.
+    /// </summary>
+    private void PurgeExpiredSessions()
+    {
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+
+        foreach (KeyValuePair<string, ResumableSession> entry in _sessions)
+        {
+            if (entry.Value.DormantUntil is { } dormantUntil && dormantUntil <= now)
+            {
+                _sessions.TryRemove(entry);
+            }
+        }
+    }
+
+    private static string HashSessionToken(ReadOnlySpan<byte> token)
+    {
+        Span<byte> hash = stackalloc byte[SHA256.HashSizeInBytes];
+        SHA256.HashData(token, hash);
+        return Convert.ToHexString(hash);
+    }
+
+    /// <summary>
+    /// A registered identity that outlives the connection that held it, so a reconnect within the
+    /// resumption window can reclaim the same id and group memberships rather than starting afresh.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="DormantUntil"/> being <see langword="null"/> means the session's connection is still
+    /// live, and that is exactly what makes it unresumable — a token is a way to reclaim an identity
+    /// nobody is currently using, never a way to take one off somebody who is.
+    /// </remarks>
+    private sealed class ResumableSession(string name, Guid clientId)
+    {
+        public string Name { get; } = name;
+
+        public Guid ClientId { get; } = clientId;
+
+        public IReadOnlyList<string> Groups { get; set; } = [];
+
+        public DateTimeOffset? DormantUntil { get; set; }
+    }
+
+    /// <summary>
     /// Remembers which name held <paramref name="clientId"/>, so a message addressed to that id after the
     /// client has gone can still be stored under its name.
     /// </summary>
@@ -2912,9 +3215,37 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         private long _activitySequence;
         private int _awaitingCapacityDepth;
 
-        public Guid Id { get; } = id;
+        /// <summary>
+        /// The id this connection is registered under. Assigned fresh at registration and, for a
+        /// connection that goes on to resume a previous session, replaced once by the reclaimed id —
+        /// see <see cref="Rebind"/>.
+        /// </summary>
+        public Guid Id { get; private set; } = id;
+
         public string Name { get; } = name;
         public ITransport Transport { get; } = transport;
+
+        /// <summary>
+        /// The hash of the resumption token currently outstanding for this connection, or
+        /// <see langword="null"/> when session resumption is off or this connection negotiated below
+        /// <see cref="Protocol.SessionResumptionMinVersion"/>. Replaced when a resume issues a fresh
+        /// token, and read at teardown to find the session to make dormant.
+        /// </summary>
+        public string? SessionTokenHash { get; set; }
+
+        /// <summary>
+        /// Takes over a reclaimed id when this connection resumes a previous session.
+        /// </summary>
+        /// <remarks>
+        /// Mutable for this one purpose only, and only ever from the connection's own receive loop while
+        /// it is dispatching the resume — nothing else writes it, and nothing reads it concurrently
+        /// except routing, which is looking the connection up by whichever id it holds and reaches the
+        /// same object either way.
+        /// </remarks>
+        public void Rebind(Guid resumedId)
+        {
+            Id = resumedId;
+        }
 
         /// <summary>
         /// The protocol version negotiated with this client during registration. Used to decide whether

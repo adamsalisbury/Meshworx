@@ -8,7 +8,7 @@ document/verify carefully when you touch it. Everything here is read from
 sites in `MeshHub.cs` / `MeshClient.cs`.
 
 - **Protocol version is a negotiated range** (`Protocol.MinSupportedVersion` = `4`,
-  `Protocol.MaxSupportedVersion` = `5`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
+  `Protocol.MaxSupportedVersion` = `6`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
   it can speak; the hub picks the highest version common to both sides — see
   [Registration handshake](#registration-handshake). Negotiation itself was introduced by PR #73
   (issue #47); PR #74 (issue #32) is the **first thing to actually widen the range and branch on the
@@ -22,7 +22,10 @@ sites in `MeshHub.cs` / `MeshClient.cs`.
   **not** bump the version — see [Additive opcodes](#additive-opcodes-within-a-version) for why that is
   sound and when it is not (the four header-bearing opcodes below did **not** qualify for that route and
   bumped the version instead — see the note after the opcode table). `QueueSaturated` (`0x15`, PR #87,
-  issue #30) is a second opcode added the same way, within version 5, no bump needed.
+  issue #30) is a second opcode added the same way, within version 5, no bump needed. **Issue #43 is the
+  second widening**, raising `MaxSupportedVersion` from `5` to `6` to gate session resumption
+  (`Protocol.SessionResumptionMinVersion = 6`): one of its three opcodes travels client → hub, which
+  rules out the additive route — see [Session resumption](#session-resumption) below.
 - **`MessageType` and `Protocol` are `internal`** — opcodes are not visible outside the assembly.
 - **Byte order:** big-endian for all multi-byte integers (`BinaryPrimitives.*BigEndian`). Ids are
   16-byte `Guid`s written with `Guid.TryWriteBytes` / read with `new Guid(span)`.
@@ -56,7 +59,7 @@ Everything in the tables below is the **message payload** (i.e. after the transp
 
 | Name | Byte | Direction | Payload after the opcode byte |
 |---|---|---|---|
-| `RegistrationComplete` | `0x01` | hub → client | assigned client id (16), negotiated protocol version (1) |
+| `RegistrationComplete` | `0x01` | hub → client | assigned client id (16), negotiated protocol version (1), and — version 6+ with resumption enabled only — token length (2, BE) and the resumption token |
 | `SendMessage` | `0x02` | client → hub | recipient id (16), message bytes |
 | `DeliverMessage` | `0x03` | hub → client | sender id (16), message bytes |
 | `RegistrationRequest` | `0x04` | client → hub | version min (1), version max (1), name length (2, BE), UTF-8 name, opaque credential (rest of frame) |
@@ -77,8 +80,11 @@ Everything in the tables below is the **message payload** (i.e. after the transp
 | `GroupMessageWithHeaders` | `0x13` | client → hub | name length (2, BE), UTF-8 group name, header-block length (2, BE), header block, message bytes |
 | `DeliverGroupMessageWithHeaders` | `0x14` | hub → client | sender id (16), name length (2, BE), UTF-8 group name, header-block length (2, BE), header block, message bytes |
 | `QueueSaturated` | `0x15` | hub → client | recipient id (16) — the direct-send recipient whose queue was full |
+| `ResumeSession` | `0x16` | client → hub | resumption token (rest of frame; 32 bytes in practice) |
+| `SessionResumed` | `0x17` | hub → client | reclaimed client id (16), token length (2, BE), renewed token |
+| `SessionResumeRefused` | `0x18` | hub → client | none |
 
-`0x15` is the highest opcode in use; the next new one is `0x16`. The four header-bearing opcodes
+`0x18` is the highest opcode in use; the next new one is `0x19`. The four header-bearing opcodes
 (`0x11`–`0x14`, PR #74, issue #32) are each the existing opcode's frame with one extra
 `[headerBlockLength(2, BE)][headerBlock]` pair spliced in right after the fields that address the
 message (recipient id / group name) and before the opaque message body — see
@@ -110,9 +116,19 @@ well-known keys. See [Delivery acknowledgement headers](#delivery-acknowledgemen
 
 ```
 client → hub : [0x04 RegistrationRequest][versionMin][versionMax][nameLen u16 BE][utf8 clientName][credential...]
-hub → client : [0x01 RegistrationComplete][clientId (16 bytes)][negotiatedVersion]  # success
+hub → client : [0x01 RegistrationComplete][clientId (16 bytes)][negotiatedVersion]  # success, 18 bytes
+             | [0x01 RegistrationComplete][clientId (16)][negotiatedVersion][tokenLen u16 BE][token]
+                                                                                   # success, version 6+ with resumption on
              | [0x05 Error][errorCode]                                             # refused
 ```
+
+**The registration frame itself has never changed shape, and issue #43 deliberately did not change it
+either** — see [Session resumption](#session-resumption) for why a resumption token could not be spliced
+into it. The *reply* grew a conditional tail, which is safe in the one direction it matters: the hub
+knows the negotiated version before it builds the reply, and the client reads that version from a fixed
+offset (byte 17) before deciding whether to read anything after it. A reply is exactly 18 bytes whenever
+the negotiated version is below 6 or the hub has resumption switched off, which is every reply any
+earlier build produced.
 
 `versionMin`/`versionMax` is the client's supported range; `MeshClient` always sends
 `Protocol.MinSupportedVersion`/`Protocol.MaxSupportedVersion` (`4`/`5` as of PR #74), so a hub and client
@@ -378,6 +394,52 @@ handling). **Only `RouteMessageWithHeaders` calls it** — `RouteMessage` (the h
 and the three fan-out routing methods never do, since only a direct send with headers can have its
 capacity wait honoured; see [hub.md](hub.md#backpressure-signalling-and-awaiting-capacity).
 
+<a id="session-resumption"></a>
+
+### Session resumption (issue #43)
+
+Three opcodes and one conditional field, gated on `Protocol.SessionResumptionMinVersion` (`6`). This is
+the second capability to widen `MaxSupportedVersion`, and the shape of the exchange is the interesting
+part.
+
+```
+hub → client : [0x01 RegistrationComplete][clientId 16][negotiatedVersion][tokenLen u16 BE][token]
+client → hub : [0x16 ResumeSession][token...]
+hub → client : [0x17 SessionResumed][reclaimedClientId 16][tokenLen u16 BE][renewedToken]   # accepted
+             | [0x18 SessionResumeRefused]                                                  # refused
+```
+
+**Resumption happens *after* registration, not inside it, and that is forced by the handshake's own
+ordering.** The obvious design — carry the token in the `RegistrationRequest` frame — cannot work: the
+client must send that frame **before** it knows what version was negotiated, so it cannot know whether
+to use the old layout or a new one. A client that always sent the new layout would have its token
+length field and token read as **credential bytes** by any hub that predates the feature, silently
+corrupting authentication. Making it a post-registration exchange removes the problem entirely:
+
+- The client checks `NegotiatedProtocolVersion` — a number it now has — before sending `0x16` at all.
+- A hub that does not know the opcode falls off its dispatch ladder and ignores it, and the client's
+  bounded wait for a reply expires leaving it on the identity it already has. That is precisely the
+  required "expired/invalid tokens fall back to a fresh registration" behaviour, reached without a
+  special case.
+- Nothing in the registration frame moved, so no older peer can misparse anything.
+
+**The reply is not necessarily the next frame on the wire.** The hub drains any offline store (issue
+#28) onto the client's queue at registration, so `DeliverMessage` frames can arrive before `0x17`. The
+client therefore handles the reply **in its receive loop**, completing a pending-resume
+`TaskCompletionSource` that `ConnectAsync` awaits, rather than with a second blocking read that would
+consume the wrong frame.
+
+**Token rules** (hub side, `MeshHub.ResumeSessionAsync`):
+
+| Rule | Why |
+|---|---|
+| 32 bytes from `RandomNumberGenerator` | it is a bearer credential for an identity |
+| Only the **SHA-256 hash** is retained | the session table is then not a bag of live secrets |
+| **Single use** — a successful resume issues a fresh token and invalidates the old | a token captured off the wire cannot be replayed later |
+| The session must be **dormant** (its connection gone) | a token reclaims an unused identity, never takes a live one |
+| The session's **name must match** the resuming connection's registered name | otherwise any token holder could take over any identity |
+| Validated by `TryGetValue` **then** claimed by `TryRemove` | a token that fails validation is left in place for its rightful owner; the winning `TryRemove` is what makes two racing resumes resolve to one |
+
 <a id="additive-opcodes-within-a-version"></a>
 
 ### Additive opcodes within a version
@@ -393,6 +455,11 @@ time; `Protocol.MaxSupportedVersion` today), and the reasoning is the rule to ap
 
 An opcode that fails any of those three — one a client may *send*, one that changes an existing layout,
 or one whose absence changes behaviour a peer depends on — **must** bump `Protocol.MaxSupportedVersion`.
+**`ResumeSession` (`0x16`, issue #43) is the clearest case of the first**: it travels client → hub, so
+an older hub would drop it silently rather than degrade, which is why session resumption bumped the
+version to `6` instead of taking this route. Its two siblings (`0x17`, `0x18`) travel hub → client and
+would each have qualified on their own — but they only ever answer a `0x16`, so gating them separately
+would mean nothing.
 
 Note the membership requirement on group sends shipped in the same change and is **not** covered by
 that reasoning: it is a behavioural change to `GroupMessage` (`0x0E`) handling with no version bump, so a
@@ -481,8 +548,9 @@ Version negotiation gates the handshake only; there is no per-message version ta
 version-gated capability is instead gated by **opcode** (does this peer even send/recognise it) plus, on
 the hub, by **`ClientConnection.NegotiatedProtocolVersion`** (does *this* peer's own negotiated version
 support it). `Protocol.cs` (`Messages/Protocol.cs`) declares `MinSupportedVersion` (`4`) and
-`MaxSupportedVersion` (`5`) bounding the range this build of the hub/client will speak, plus
-`HeaderEnvelopeMinVersion` (`5`) marking the version at which the header envelope became available.
+`MaxSupportedVersion` (`6`) bounding the range this build of the hub/client will speak, plus
+`HeaderEnvelopeMinVersion` (`5`) marking the version at which the header envelope became available and
+`SessionResumptionMinVersion` (`6`) marking the same for session resumption.
 `MeshClient.ConnectAsync` always advertises its own `[MinSupportedVersion, MaxSupportedVersion]`;
 `MeshHub.TryNegotiateProtocolVersion` (`MeshHub.cs:1381-1403`) intersects that with its own range and, on
 overlap, picks the **highest** version common to both — a peer never has to downgrade further than
@@ -511,6 +579,10 @@ This is the pattern to imitate for the next optional capability: widen `MaxSuppo
 `Protocol.XyzMinVersion` marking where it becomes available, and have **both** hub and client consult
 `NegotiatedProtocolVersion` before doing anything the other side might not understand — do not assume a
 version bump alone makes a change safe; something on both sides has to actually read the number.
+**Issue #43 is the second capability to follow it**, and adds one further lesson: the gate only works
+for something sent *after* the negotiated version is known. Anything that would have to travel in the
+registration frame itself cannot be version-gated at all, because neither end knows the version yet —
+restructure it into a later exchange rather than trying to make the frame conditional.
 
 Any backward-incompatible change to the frames above must still bump `MaxSupportedVersion` (and, if the
 old shape can no longer be produced or understood at all, `MinSupportedVersion` too)

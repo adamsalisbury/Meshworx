@@ -112,6 +112,13 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
   `MessageHeaders.Empty` when there were none. Requires both ends to have negotiated protocol version
   5 or higher — see [Wire protocol](#wire-protocol) for the frame layout and the fallback behaviour
   when a group has members on different negotiated versions.
+- **Session resumption.** Off by default. Give the hub a `sessionResumptionWindow` and each registering
+  client is issued an opaque resumption token; presenting it on a later connect reclaims the same
+  `Guid` and the group memberships that identity held, so peers holding the id from before the drop go
+  on reaching it. `IMeshClient.SessionResumed` reports whether the last connect reclaimed an identity.
+  Everything about it degrades to an ordinary fresh registration — an expired token, a hub with the
+  feature off, a connection negotiated below protocol version 6. Requires version 6. See
+  [Session resumption](#session-resumption).
 - **Offline delivery (store and forward).** Off by default: a message to a recipient the hub does not
   recognise is dropped. Give the hub an `IOfflineStore` and a **direct** message addressed to a client
   that has disconnected is held against that client's *name* instead, and delivered in arrival order
@@ -216,7 +223,8 @@ new MeshHub(
     notifyOnQueueSaturation: false,                 // tell a direct sender its message was dropped (default: false)
     backpressureAwaitTimeout: TimeSpan.FromSeconds(30), // bound an AwaitCapacity park (default: 30s)
     offlineStore: null,                             // hold messages for disconnected clients (default: none)
-    offlineStoreTimeout: TimeSpan.FromSeconds(10)); // bound a single offline store call (default: 10s)
+    offlineStoreTimeout: TimeSpan.FromSeconds(10),  // bound a single offline store call (default: 10s)
+    sessionResumptionWindow: null);                 // how long an identity may be reclaimed (default: off)
 ```
 
 Every one of these has a finite default, so a hub constructed with no arguments at all is still
@@ -251,6 +259,45 @@ Observability:
 - `ConnectedClientCount` — current number of registered clients.
 - `IsClientRegistered(id)` — whether a specific client is registered.
 - `ClientConnected` / `ClientDisconnected` — raised as clients register and leave.
+
+### Session resumption
+
+Every `ConnectAsync` mints a brand-new `Guid`, so after a drop every peer holding the old one is
+addressing nothing, and the client's group memberships are gone. Session resumption fixes both — it is
+off until you give the hub a window:
+
+```csharp
+await using var hub = new MeshHub(
+    logger,
+    listener,
+    sessionResumptionWindow: TimeSpan.FromMinutes(5));
+```
+
+With it on, the hub issues each registering client an opaque 32-byte token alongside its id. On a later
+connect the client presents the token, and if the identity is still reclaimable the hub gives it back:
+same `Guid`, same group memberships, and a fresh token for next time. `MeshClient` does all of this
+itself — there is nothing to call — and reports the outcome on `IMeshClient.SessionResumed`.
+
+- **It never fails a connect.** An expired window, a token already spent, a hub with the feature off, a
+  connection negotiated below version 6, or no answer at all: every one of them leaves the client
+  connected on the fresh identity it just registered with, with `SessionResumed` false. Resumption is
+  an optimisation over reconnecting, never a precondition for it.
+- **Restored groups are re-authorised, not reinstated.** If you have a `GroupAuthoriser`, it is asked
+  again for every group being restored and may refuse — a resumption cannot resurrect a membership you
+  would now decline. A refused group is simply not restored.
+- **The token is a bearer credential for an identity.** Anyone holding it can reclaim the `Guid` and
+  group memberships of the name it was issued to (and only that name — a token presented by a client
+  registered under a different name is refused). It goes over the wire once, in the registration reply,
+  so **use an encrypted transport** if the network is not trusted; the same applies to the credential
+  your `ClientAuthenticator` checks. The hub retains only a SHA-256 hash of each token, and each token
+  is single-use — a successful resumption issues a new one and invalidates the old.
+- **A live session cannot be taken over.** A token reclaims an identity nobody is currently using; it
+  is refused while the connection that holds it is still up.
+- **The window starts when the client disconnects**, and the session table is bounded by `maxClients`.
+  If it is full, further clients are simply not issued tokens rather than evicting somebody else's
+  reclaimable session.
+- **Nothing survives a hub restart**, and a resumption is only meaningful on the hub that issued the
+  token — there is no shared session state across hubs.
 
 ### Offline delivery
 
@@ -501,7 +548,7 @@ exactly as TCP does (QUIC's single bidirectional stream included), so all four s
 times. The WebSocket transport is the exception: one WebSocket binary message already delimits one
 Meshworx frame, so it needs no length prefix of its own.
 
-Protocol version: negotiated between **4** (minimum) and **5** (maximum). Registration advertises a
+Protocol version: negotiated between **4** (minimum) and **6** (maximum). Registration advertises a
 range rather than a single value — `[versionMin, versionMax]` — and the hub picks the highest version
 common to its own supported range and the client's, so a newer client connecting to an older hub (or
 vice versa) negotiates down instead of being refused outright. Only the shared feature set of the
@@ -511,7 +558,7 @@ agreed for the current connection.
 | Type | Byte | Direction | Payload after the type byte |
 |---|---|---|---|
 | `RegistrationRequest` | `0x04` | client → hub | version min (1 byte), version max (1 byte), name length (2 bytes, big-endian), UTF-8 name, opaque credential (remaining bytes) |
-| `RegistrationComplete` | `0x01` | hub → client | assigned client id (16 bytes), negotiated version (1 byte) |
+| `RegistrationComplete` | `0x01` | hub → client | assigned client id (16 bytes), negotiated version (1 byte), and — only when the negotiated version is 6 or higher and the hub has session resumption enabled — token length (2 bytes, big-endian) and the resumption token |
 | `Error` | `0x05` | hub → client | registration error code (1 byte) |
 | `SendMessage` | `0x02` | client → hub | recipient id (16 bytes), message bytes |
 | `SendMessageWithHeaders` | `0x11` | client → hub | recipient id (16 bytes), header-block length (2 bytes, big-endian), header block, message bytes |
@@ -530,10 +577,19 @@ agreed for the current connection.
 | `Disconnect` | `0x08` | either | none |
 | `Ping` | `0x09` | hub → client | none |
 | `Pong` | `0x0A` | client → hub | none |
+| `QueueSaturated` | `0x15` | hub → client | recipient id (16 bytes) — the direct-send recipient whose queue was full |
+| `ResumeSession` | `0x16` | client → hub | resumption token |
+| `SessionResumed` | `0x17` | hub → client | reclaimed client id (16 bytes), token length (2 bytes, big-endian), renewed resumption token |
+| `SessionResumeRefused` | `0x18` | hub → client | none |
 
-`GroupJoinRefused` is an addition within an existing protocol version rather than a new one: it travels
-only from hub to client, and a client that does not recognise it ignores it, so it changes nothing for a
-peer that never sees one. A hub drops a `GroupMessage` from a client that is not a member of the target
+`GroupJoinRefused` and `QueueSaturated` are additions within an existing protocol version rather than new
+ones: they travel only from hub to client, and a client that does not recognise them ignores them, so
+they change nothing for a peer that never sees one. Session resumption could not take that route —
+`ResumeSession` travels client to hub, where an older hub would silently drop it — so it is gated on
+**version 6** instead, and both ends check the negotiated version before using any of the three opcodes.
+It is deliberately a *post*-registration exchange: the client has to send its registration frame before
+it knows what version was negotiated, so a token spliced into that frame would have been misparsed as
+credential bytes by any hub that predates the feature. A hub drops a `GroupMessage` from a client that is not a member of the target
 group, and does so silently — a correct client only sends to groups it has joined, and it learns of a
 refused join from `GroupJoinRefused`.
 

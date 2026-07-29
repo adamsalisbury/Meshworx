@@ -28,6 +28,25 @@ public interface IMeshClient : IAsyncDisposable
     byte NegotiatedProtocolVersion { get; }
 
     /// <summary>
+    /// Gets a value indicating whether the most recent <see cref="ConnectAsync"/> reclaimed the identity
+    /// this client held before its previous connection ended, rather than being assigned a fresh one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see langword="true"/> means <see cref="Id"/> is the same value peers were holding before the
+    /// drop, and any group memberships the hub had recorded have been re-established — subject to the
+    /// hub's <c>GroupAuthoriser</c>, which is consulted afresh for each one and may refuse.
+    /// </para>
+    /// <para>
+    /// <see langword="false"/> is the ordinary case and is never an error: the hub may have resumption
+    /// switched off, the connection may have negotiated below the version that supports it, the window
+    /// may have closed, or this may simply be a first connection. The client is connected and usable
+    /// either way; only <see cref="Id"/> differs.
+    /// </para>
+    /// </remarks>
+    bool SessionResumed { get; }
+
+    /// <summary>
     /// Gets a value indicating whether the client is currently connected to a hub.
     /// </summary>
     bool IsConnected { get; }

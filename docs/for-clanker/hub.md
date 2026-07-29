@@ -15,7 +15,7 @@ between them. It never interprets payloads — it reads the one-byte opcode and 
 
 | Member | Signature | Source |
 |---|---|---|
-| ctor | `MeshHub(ILogger<MeshHub>, ITransportListener, TimeSpan? registrationTimeout=null, int? maxClients=null, TimeSpan? heartbeatInterval=null, int maxMissedHeartbeats=2, ClientAuthenticator? authenticator=null, int? maxConcurrentAuthentications=null, GroupAuthoriser? groupAuthoriser=null, TimeSpan? groupAuthorisationTimeout=null, int? maxConnectionsPerRemoteEndpoint=null, bool notifyOnQueueSaturation=false, TimeSpan? backpressureAwaitTimeout=null, IOfflineStore? offlineStore=null, TimeSpan? offlineStoreTimeout=null)` | `MeshHub.cs:255` |
+| ctor | `MeshHub(ILogger<MeshHub>, ITransportListener, TimeSpan? registrationTimeout=null, int? maxClients=null, TimeSpan? heartbeatInterval=null, int maxMissedHeartbeats=2, ClientAuthenticator? authenticator=null, int? maxConcurrentAuthentications=null, GroupAuthoriser? groupAuthoriser=null, TimeSpan? groupAuthorisationTimeout=null, int? maxConnectionsPerRemoteEndpoint=null, bool notifyOnQueueSaturation=false, TimeSpan? backpressureAwaitTimeout=null, IOfflineStore? offlineStore=null, TimeSpan? offlineStoreTimeout=null, TimeSpan? sessionResumptionWindow=null)` | `MeshHub.cs:255` |
 | `StartAsync` | `Task StartAsync(CancellationToken=default)` — binds listener, starts accept loop. Refuses a second concurrent start, a start during shutdown, and a start after disposal | `MeshHub.cs:446` |
 | `StopAsync` | `Task StopAsync(CancellationToken=default)` — best-effort disconnect all, drain, reset. **Not `async`** — returns the shared shutdown task | `MeshHub.cs:517` |
 | `DisposeAsync` | `ValueTask` — `StopAsync`, disposes the listener, then the authentication semaphore. Memoised; disposal is terminal | `MeshHub.cs:709` |
@@ -29,7 +29,9 @@ between them. It never interprets payloads — it reads the one-byte opcode and 
 | `QueueSaturated` | `event EventHandler<QueueSaturatedEventArgs>` — a message was dropped because the recipient's outbound queue was full. **Always raised, for every send shape**, independently of the constructor's `notifyOnQueueSaturation` flag. Added by PR #87 (issue #30) — see [Backpressure signalling](#backpressure-signalling-and-awaiting-capacity) | `MeshHub.cs:646` |
 
 The constructor carries **three independent integrator seams**, all optional and all defaulting to "not
-configured":
+configured" — plus one further opt-in switch, `sessionResumptionWindow`, which is not a seam (there is
+no callback to supply) but follows the same "null means the feature does not exist" rule; see
+[Session resumption](#session-resumption).
 
 | Seam | Params | Question it answers | Section |
 |---|---|---|---|
@@ -150,6 +152,12 @@ optional and applies with or without an authoriser: sending to a group requires 
   _offlineIdsByName` — which name last held each id, populated at teardown and **only when a store is
   configured**. Two maps rather than one so a returning name's stale id can be forgotten in constant
   time. Bounded by `MaxClients`.
+- `TimeSpan? _sessionResumptionWindow` + `ConcurrentDictionary<string, ResumableSession> _sessions`
+  (issue #43) — resumable identities, **keyed by the hex SHA-256 hash of the token that reclaims them**
+  rather than by the token, so the table is not a bag of live bearer credentials. Null window = the
+  feature does not exist: no token is issued and the table stays empty. Bounded by `MaxClients`, with a
+  lazy expiry sweep run only when the table is at that bound. See
+  [Session resumption](#session-resumption) below.
 
 `ClientConnection` (nested, `MeshHub.cs:2541`) holds the id, name, transport, a bounded outbound
 `Channel<byte[]>` (capacity **1024**, single-reader/multi-writer), an `ActivitySequence` counter
@@ -454,8 +462,10 @@ Inside `HandleClientAsync` (`MeshHub.cs:934-1050`), in order. The frame layout i
 8. `_clientNames.TryAdd(name, id)` — if it fails, name is taken → `Error(DuplicateClientName)` and drop
    (`:1032-1037`). The slot claimed at step 7 is given back on the way out by the `finally`.
 9. Create `ClientConnection`, add to `_clients`, send `RegistrationComplete` — assigned 16-byte id plus
-   the `negotiatedVersion` byte from step 3 (`:1043-1047`) — raise `ClientConnected`, start the send loop
-   (+ heartbeat monitor), enter the receive loop (`:1039-1061`).
+   the `negotiatedVersion` byte from step 3, plus (issue #43) a resumption token when
+   `sessionResumptionWindow` is set and the negotiated version is 6 or higher — raise `ClientConnected`,
+   start the send loop (+ heartbeat monitor), drain the offline store (issue #28), enter the receive
+   loop. The reply is byte-identical to the pre-#43 18-byte frame whenever no token is issued.
 
 The assigned id is a fresh `Guid.NewGuid()` generated at handler start (`MeshHub.cs:927`).
 
@@ -635,6 +645,77 @@ waiting; if the wait then succeeds, the message is delivered anyway, and a calle
 acknowledgement timeout would duplicate it. See [known-issues.md](known-issues.md) for the full
 register entry, and [client.md](client.md#backpressure-signalling) for the client-side contract.
 
+<a id="session-resumption"></a>
+
+### Session resumption
+
+Added for issue #43, and the fix for the cliff [Offline delivery](#offline-delivery) leaves behind
+(KI-50): every `ConnectAsync` used to mint a fresh `Guid`, so after a drop every peer holding the old
+one was addressing nothing, and the client's group memberships were gone. Setting
+`sessionResumptionWindow` lets a returning client reclaim both.
+
+**The whole feature is behind `_sessionResumptionWindow is not null`.** With it off no token is minted,
+`RegistrationComplete` is the same 18 bytes it always was, and the two resume opcodes are refused.
+
+**The exchange is post-registration and that is not a style choice** — see
+[protocol.md](protocol.md#session-resumption) for why a token in the registration frame would have been
+misparsed as credential bytes by any older hub. The consequences for this file: the resume arrives as
+an ordinary frame in the client's dispatch ladder, *after* the connection is fully registered, and its
+handler reassigns `HandleClientAsync`'s own `clientId` local so everything downstream — the sender id on
+routed frames, and the registry keys the `finally` removes — follows the reclaimed identity.
+
+**Four methods, in lifecycle order:**
+
+1. **`IssueSessionToken(connection)`** — at registration. 32 bytes from `RandomNumberGenerator`;
+   only `HashSessionToken` of it is retained, on the connection (`SessionTokenHash`) and as the
+   `_sessions` key. Returns null (no token, 18-byte reply) when the feature is off, the connection
+   negotiated below `SessionResumptionMinVersion`, or the table is full — **refusing rather than
+   evicting**, since a client with no token simply cannot resume, whereas eviction would silently break
+   a resumption somebody else is entitled to.
+2. **`MakeSessionDormant(connection)`** — in `HandleClientAsync`'s `finally`, **before
+   `RemoveFromAllGroups`**, which is what empties the group set it has to capture. Get that order wrong
+   and resumption restores nothing, silently. Stamps `DormantUntil`, which is what makes the session
+   resumable at all.
+3. **`ResumeSessionAsync(connection, token, ct)`** — validates, then rebinds. The ordering of the swap
+   is deliberate: publish under the reclaimed id, `Rebind`, update `_clientNames`, *then* withdraw the
+   fresh id — so a peer addressing either reaches the connection throughout, rather than falling into a
+   gap where neither resolves. Both resolving for an instant is harmless; neither is not.
+4. **`RestoreGroupMembershipAsync(connection, groups, ct)`** — **re-authorises, never reinstates.**
+
+> **The re-authorisation is the load-bearing part, and it is why this is not a two-line state restore.**
+> `JoinGroup_AfterReconnect_IsAuthorisedAgainRatherThanRestored` pins that a reconnect cannot bypass a
+> `GroupAuthoriser` — `MeshClientReconnector` restores membership by re-joining over the wire precisely
+> so it goes through the decision again. Resumption is exactly the sort of state-reinstating shortcut
+> that would have become the back door around that rule, so it asks the authoriser for every group it
+> restores and drops the ones now refused. A refused group gets **no `GroupJoinRefused` frame**: the
+> client did not ask to join anything on this connection, and re-encoding a stored name to echo it
+> could not preserve the size property that frame's echo depends on (see
+> [protocol.md](protocol.md#message-headers)).
+
+**Validation rules, and the reasoning behind the two that are easy to get wrong:**
+
+- **`TryGetValue` to validate, `TryRemove` to claim** — in that order. Claiming first would let anyone
+  presenting a token burn the session even when validation then fails, so a token that is (say) still
+  held by a live connection would destroy the resumption its rightful owner is entitled to. The winning
+  `TryRemove` is separately what makes two connections racing the same token resolve to exactly one
+  resumption.
+- **The session's name must match the resuming connection's registered name.** Without it, any token
+  holder could take over any identity. With it, a token is only as strong as the name it was issued to —
+  which, on a hub with no `ClientAuthenticator`, is self-asserted; see
+  [known-issues.md](known-issues.md) KI-52 for the trust model in full.
+- Dormant only (a live session is never resumable), within the window, and the reclaimed id must not
+  currently be in `_clients`.
+
+**Gotchas:**
+- **`ClientConnection.Id` is mutable for this one purpose.** Only the connection's own receive loop
+  writes it, while dispatching the resume; routing only ever looks the connection up by whichever id it
+  holds and reaches the same object either way.
+- **The offline store's drain is not part of resumption** and needs no integration with it: the store is
+  keyed by name, so registration has already drained it before the resume frame arrives.
+- **`StopAsync` clears `_sessions`** along with the registries — a session only means anything on the hub
+  that issued its token, and a stopped hub should not still be holding material that reclaims identities
+  on it.
+
 <a id="offline-delivery"></a>
 
 ### Offline delivery (store and forward)
@@ -670,8 +751,10 @@ identities, does not build an `OfflineMessage`, and does not await anything it d
 registration, and again lazily from `TryStoreForOfflineDeliveryAsync` if it finds the name in
 `_clientNames`. Without this, a peer holding the pre-disconnect id would go on filling a queue that only
 the *next* reconnect would drain, while the recipient sat connected — strictly worse than the ordinary
-unknown-recipient drop, which at least tells the truth. **This is the gap issue #43 closes**: with
-session resumption the returning client keeps its id, so the stale-id problem does not arise.
+unknown-recipient drop, which at least tells the truth. **Issue #43 closes this gap** — see
+[Session resumption](#session-resumption): a resumed client keeps its id, so a peer's cached id stays
+correct across the reconnect and the stale-id problem never arises. It only closes it for hubs that
+*enable* resumption and clients that reconnect inside the window; with resumption off, KI-50 stands.
 
 **Frame shape is decided at drain time, not at storage time**, which is why `OfflineMessage` holds
 `(senderId, headerBlock, body)` rather than a built frame — the shape depends on the version the
