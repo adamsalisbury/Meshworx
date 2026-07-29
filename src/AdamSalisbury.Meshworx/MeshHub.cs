@@ -45,6 +45,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // authorisation timeouts' own default.
     private static readonly TimeSpan DefaultBackpressureAwaitTimeout = TimeSpan.FromSeconds(30);
 
+    // How long the hub waits on the configured IOfflineStore before giving up on a single call. Every
+    // other integrator seam on this hub is time-bounded for the same reason: the store is called from a
+    // sender's receive loop and from a registration, so a durable one that hangs would park a live
+    // connection — and a parked connection looks idle to the heartbeat monitor, which would then evict
+    // the very client the store exists to serve. 10 seconds matches the registration and group
+    // authorisation timeouts.
+    private static readonly TimeSpan DefaultOfflineStoreTimeout = TimeSpan.FromSeconds(10);
+
     private readonly ILogger<MeshHub> _logger;
     private readonly ITransportListener _listener;
     private readonly TimeSpan _registrationTimeout;
@@ -56,6 +64,20 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly int _maxConnectionsPerRemoteEndpoint;
     private readonly bool _notifyOnQueueSaturation;
     private readonly TimeSpan _backpressureAwaitTimeout;
+
+    // Store-and-forward is off unless an integrator supplies a store; null is the whole "disabled"
+    // switch, and every path that touches the feature is behind a null check on this field, so a hub
+    // without one does exactly what it did before the feature existed.
+    private readonly IOfflineStore? _offlineStore;
+    private readonly TimeSpan _offlineStoreTimeout;
+
+    // The name that last held each id, retained past disconnect so a sender addressing the id it looked
+    // up before the recipient went away can still have its message stored under that recipient's name.
+    // Only populated when an offline store is configured. Two maps rather than one so the stale entry
+    // can be dropped in constant time when the name comes back — the reverse map is what turns "this
+    // name has re-registered" into the one id that needs forgetting.
+    private readonly ConcurrentDictionary<Guid, string> _offlineNamesById = new();
+    private readonly ConcurrentDictionary<string, Guid> _offlineIdsByName = new();
 
     // How many connections are currently open from each remote address, counting from acceptance
     // until the handler that owns that connection finishes — including the pre-registration window,
@@ -83,6 +105,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly Counter<long> _messagesRoutedCounter;
     private readonly Counter<long> _bytesRoutedCounter;
     private readonly Counter<long> _messagesDroppedCounter;
+    private readonly Counter<long> _messagesOfflineQueuedCounter;
     private readonly ObservableGauge<int> _outboundQueueDepthGauge;
 
     // Single-tag KeyValuePairs, reused across every call site rather than built inline. Counter<T>.Add has
@@ -95,6 +118,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private static readonly KeyValuePair<string, object?> UnknownRecipientDropTag = new("reason", "unknown-recipient");
     private static readonly KeyValuePair<string, object?> QueueFullDropTag = new("reason", "queue-full");
     private static readonly KeyValuePair<string, object?> ExpiredDropTag = new("reason", "expired");
+    private static readonly KeyValuePair<string, object?> OfflineQueueFullDropTag = new("reason", "offline-queue-full");
 
     // How many client slots are currently claimed. This, rather than _clients.Count, is what maxClients
     // is enforced against: a slot is claimed by a single atomic operation before the client is put into
@@ -232,6 +256,18 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// that a parked sender is deliberately exempt from idle eviction, so an infinite timeout removes
     /// the only bound on how long a connection can sit parked.
     /// </param>
+    /// <param name="offlineStore">
+    /// Where to hold direct messages addressed to a client that is not currently connected, so they can
+    /// be delivered when that name next registers. Supplying a store is what switches store-and-forward
+    /// on; leaving it <see langword="null"/> — the default — keeps the hub's original behaviour of
+    /// dropping a message to an unknown recipient outright. Use <see cref="InMemoryOfflineStore"/> for
+    /// the bounded, process-local default, or any <see cref="IOfflineStore"/> for a durable one.
+    /// </param>
+    /// <param name="offlineStoreTimeout">
+    /// How long to wait on a single <paramref name="offlineStore"/> call before giving up on it, so a
+    /// slow or hanging store cannot park a sender's receive loop or hold up a registration. Defaults to
+    /// 10 seconds. Ignored when no store is configured.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
@@ -245,7 +281,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         TimeSpan? groupAuthorisationTimeout = null,
         int? maxConnectionsPerRemoteEndpoint = null,
         bool notifyOnQueueSaturation = false,
-        TimeSpan? backpressureAwaitTimeout = null)
+        TimeSpan? backpressureAwaitTimeout = null,
+        IOfflineStore? offlineStore = null,
+        TimeSpan? offlineStoreTimeout = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -312,6 +350,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 + "indefinitely.");
         }
 
+        if (offlineStoreTimeout is { } storeTimeout && storeTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(offlineStoreTimeout), "The offline store timeout must be positive.");
+        }
+
         _logger = logger;
         _listener = listener;
         _registrationTimeout = registrationTimeout ?? DefaultRegistrationTimeout;
@@ -330,6 +374,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _maxConnectionsPerRemoteEndpoint = maxConnectionsPerRemoteEndpoint ?? DefaultMaxConnectionsPerRemoteEndpoint;
         _notifyOnQueueSaturation = notifyOnQueueSaturation;
         _backpressureAwaitTimeout = backpressureAwaitTimeout ?? DefaultBackpressureAwaitTimeout;
+        _offlineStore = offlineStore;
+        _offlineStoreTimeout = offlineStoreTimeout ?? DefaultOfflineStoreTimeout;
 
         if (authenticator is not null)
         {
@@ -410,7 +456,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             "meshworx.hub.messages.dropped",
             unit: "{message}",
             description: "The number of messages the hub has dropped, tagged by reason "
-                + "(unknown-recipient or queue-full).");
+                + "(unknown-recipient, queue-full, expired or offline-queue-full).");
+        _messagesOfflineQueuedCounter = _meter.CreateCounter<long>(
+            "meshworx.hub.messages.offline_queued",
+            unit: "{message}",
+            description: "The number of messages the hub has held in the offline store for a "
+                + "disconnected client rather than dropping them.");
         _outboundQueueDepthGauge = _meter.CreateObservableGauge(
             "meshworx.hub.outbound_queue.depth",
             ObserveOutboundQueueDepth,
@@ -1039,6 +1090,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             _clients.TryAdd(clientId, connection);
             _connectedClientsCounter.Add(1);
 
+            // This name is reachable again, under a new id. Forget the id it was last reachable by, so a
+            // peer still holding the old one is told the recipient is unknown rather than having its
+            // messages held for a client that is sitting right here connected.
+            ForgetOfflineIdentity(clientName);
+
             var responsePayload = new byte[18];
             responsePayload[0] = (byte)MessageType.RegistrationComplete;
             clientId.TryWriteBytes(responsePayload.AsSpan(1, 16));
@@ -1058,6 +1114,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             {
                 heartbeatMonitorTask = MonitorHeartbeatAsync(connection, clientCts, heartbeatInterval, clientId);
             }
+
+            // Drained after the send loop is running, so the held messages are written out as they are
+            // queued rather than sitting until the first live frame, and before the receive loop starts,
+            // so anything this client is sent from here on queues behind what it missed.
+            await DeliverStoredMessagesAsync(connection, clientCts.Token).ConfigureAwait(false);
 
             while (!clientCts.Token.IsCancellationRequested)
             {
@@ -1083,7 +1144,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     var recipientId = new Guid(data.AsSpan(1, 16));
                     ReadOnlyMemory<byte> messageData = data.AsMemory(17);
 
-                    RouteMessage(clientId, recipientId, messageData);
+                    await RouteMessage(clientId, recipientId, messageData, clientCts.Token)
+                        .ConfigureAwait(false);
                 }
                 else if (data.Length >= 19
                     && (MessageType)data[0] == MessageType.SendMessageWithHeaders)
@@ -1246,6 +1308,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 _clientNames.TryRemove(connection.Name, out _);
                 _clients.TryRemove(clientId, out _);
                 _connectedClientsCounter.Add(-1);
+
+                // Retained only after the client is out of both registries, so a sender racing this
+                // teardown either finds it still connected and routes normally, or finds it gone and
+                // resolves the id to a name — never sees it as both at once.
+                if (_offlineStore is not null)
+                {
+                    RetainOfflineIdentity(connection.Id, connection.Name);
+                }
             }
 
             // Give the slot back on every path that claimed one — a client that was admitted and has now
@@ -1869,13 +1939,28 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
     }
 
-    private void RouteMessage(
+    /// <remarks>
+    /// <c>async</c> since the offline store (issue #28) was added, and named without the <c>Async</c>
+    /// suffix to match its sibling <see cref="RouteMessageWithHeaders"/> rather than the general
+    /// convention. Nothing on the delivered path awaits: a recipient that is connected — every message
+    /// on a hub with no store configured, and the overwhelming majority on one that has — runs to
+    /// completion synchronously and returns the cached completed task.
+    /// </remarks>
+    private async Task RouteMessage(
         Guid senderId,
         Guid recipientId,
-        ReadOnlyMemory<byte> messageData)
+        ReadOnlyMemory<byte> messageData,
+        CancellationToken cancellationToken)
     {
         if (!_clients.TryGetValue(recipientId, out ClientConnection? recipient))
         {
+            if (await TryStoreForOfflineDeliveryAsync(
+                    senderId, recipientId, ReadOnlyMemory<byte>.Empty, messageData, cancellationToken)
+                .ConfigureAwait(false))
+            {
+                return;
+            }
+
             _logger.LogDebug(
                 "Message from {SenderId} dropped: recipient {RecipientId} not found",
                 senderId,
@@ -1932,6 +2017,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     {
         if (!_clients.TryGetValue(recipientId, out ClientConnection? recipient))
         {
+            if (await TryStoreForOfflineDeliveryAsync(
+                    senderId, recipientId, headerBlock, body, cancellationToken).ConfigureAwait(false))
+            {
+                return;
+            }
+
             _logger.LogDebug(
                 "Message from {SenderId} dropped: recipient {RecipientId} not found",
                 senderId,
@@ -1971,6 +2062,241 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         _messagesRoutedCounter.Add(1, DirectDirectionTag);
         _bytesRoutedCounter.Add(body.Length, DirectDirectionTag);
+    }
+
+    /// <summary>
+    /// Offers a direct message whose recipient is not connected to the configured offline store, so it
+    /// can be delivered when that recipient's name next registers.
+    /// </summary>
+    /// <returns>
+    /// <see langword="true"/> if the offline path took ownership of the message — either storing it, or
+    /// having it refused by a store that was full and counting that refusal itself; <see langword="false"/>
+    /// if store-and-forward does not apply, in which case the caller drops the message the way it always
+    /// did.
+    /// </returns>
+    /// <remarks>
+    /// <para>
+    /// A sender addresses a recipient by the id it looked up, so the first thing this has to do is turn
+    /// that id back into the name the offline store is keyed by. Only ids the hub retained at disconnect
+    /// resolve; an id that never existed, or one whose name has since come back under a <em>different</em>
+    /// id, does not — the latter is forgotten on the spot, so a stale id stops resolving the moment its
+    /// owner is reachable again rather than quietly accruing messages nobody will ever drain.
+    /// </para>
+    /// <para>
+    /// Both byte ranges are copied out of the inbound frame before they are handed over: the receive
+    /// buffer is reused, and a store may hold what it is given for minutes.
+    /// </para>
+    /// </remarks>
+    private async Task<bool> TryStoreForOfflineDeliveryAsync(
+        Guid senderId,
+        Guid recipientId,
+        ReadOnlyMemory<byte> headerBlock,
+        ReadOnlyMemory<byte> body,
+        CancellationToken cancellationToken)
+    {
+        if (_offlineStore is null)
+        {
+            return false;
+        }
+
+        if (!_offlineNamesById.TryGetValue(recipientId, out string? recipientName))
+        {
+            return false;
+        }
+
+        if (_clientNames.ContainsKey(recipientName))
+        {
+            // The name is registered again under an id this sender does not know. Storing here would put
+            // the message somewhere only the *next* reconnect would drain, while the recipient sits
+            // connected — a worse outcome than the ordinary unknown-recipient drop, which at least tells
+            // the truth about the id being stale.
+            ForgetOfflineIdentity(recipientName);
+            return false;
+        }
+
+        var message = new OfflineMessage(
+            senderId, headerBlock.ToArray(), body.ToArray(), DateTimeOffset.UtcNow);
+
+        bool stored;
+        try
+        {
+            stored = await _offlineStore
+                .TryEnqueueAsync(recipientName, message, cancellationToken)
+                .AsTask()
+                .WaitAsync(_offlineStoreTimeout, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // The store took longer than the bound, or cancelled itself. Either way this message is not
+            // stored; fall back to the ordinary drop rather than holding the sender's receive loop.
+            _logger.LogWarning(
+                "Offline store did not accept a message for {RecipientName} within {Timeout}",
+                recipientName,
+                _offlineStoreTimeout);
+            return false;
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning(
+                "Offline store did not accept a message for {RecipientName} within {Timeout}",
+                recipientName,
+                _offlineStoreTimeout);
+            return false;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Callback boundary: an integrator's store must not fault the sender's receive loop.
+            _logger.LogError(ex, "Offline store threw while storing a message for {RecipientName}", recipientName);
+            return false;
+        }
+
+        if (!stored)
+        {
+            _logger.LogWarning(
+                "Offline store refused a message from {SenderId} for {RecipientName}; dropped",
+                senderId,
+                recipientName);
+            _messagesDroppedCounter.Add(1, OfflineQueueFullDropTag);
+            return true;
+        }
+
+        _messagesOfflineQueuedCounter.Add(1);
+        _logger.LogDebug(
+            "Message from {SenderId} for disconnected {RecipientName} held for later delivery",
+            senderId,
+            recipientName);
+        return true;
+    }
+
+    /// <summary>
+    /// Hands a newly registered client everything the offline store was holding for its name, oldest
+    /// first, before its receive loop starts.
+    /// </summary>
+    /// <remarks>
+    /// Queued straight onto the connection's outbound queue rather than routed, because routing would
+    /// look the sender up and these messages outlive their senders routinely. The frame shape is chosen
+    /// from <em>this</em> connection's negotiated version, exactly as live routing does — which is the
+    /// whole reason the store holds message parts rather than built frames. The stored priority header is
+    /// honoured too, so a high-priority message that arrived while the client was away still overtakes
+    /// the backlog it was stored behind.
+    /// </remarks>
+    private async Task DeliverStoredMessagesAsync(ClientConnection connection, CancellationToken cancellationToken)
+    {
+        if (_offlineStore is null)
+        {
+            return;
+        }
+
+        IReadOnlyList<OfflineMessage> pending;
+        try
+        {
+            pending = await _offlineStore
+                .TakeAllAsync(connection.Name, cancellationToken)
+                .AsTask()
+                .WaitAsync(_offlineStoreTimeout, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                "Offline store did not return {ClientName}'s held messages within {Timeout}",
+                connection.Name,
+                _offlineStoreTimeout);
+            return;
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning(
+                "Offline store did not return {ClientName}'s held messages within {Timeout}",
+                connection.Name,
+                _offlineStoreTimeout);
+            return;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Callback boundary: a throwing store must not stop the client from connecting.
+            _logger.LogError(ex, "Offline store threw while draining {ClientName}", connection.Name);
+            return;
+        }
+
+        if (pending.Count == 0)
+        {
+            return;
+        }
+
+        foreach (OfflineMessage message in pending)
+        {
+            byte[] deliveryPayload =
+                !message.HeaderBlock.IsEmpty
+                && connection.NegotiatedProtocolVersion >= Protocol.HeaderEnvelopeMinVersion
+                    ? BuildDeliverMessageWithHeaders(message.SenderId, message.HeaderBlock, message.Body)
+                    : BuildDeliverMessage(message.SenderId, message.Body);
+
+            if (!connection.OutboundQueue.TryEnqueue(ReadPriority(message.HeaderBlock), deliveryPayload))
+            {
+                // More was held than the outbound queue can take at once. The rest of the drain is
+                // attempted anyway rather than abandoned: the queue is drained concurrently by the send
+                // loop that is already running, so a later message may well still fit.
+                _logger.LogWarning(
+                    "Outbound queue for {ClientId} is full, held message from {SenderId} dropped",
+                    connection.Id,
+                    message.SenderId);
+                _messagesDroppedCounter.Add(1, QueueFullDropTag);
+                RaiseQueueSaturated(message.SenderId, connection.Id);
+                continue;
+            }
+
+            _messagesRoutedCounter.Add(1, DirectDirectionTag);
+            _bytesRoutedCounter.Add(message.Body.Length, DirectDirectionTag);
+        }
+
+        _logger.LogInformation(
+            "Delivered {MessageCount} held message(s) to {ClientName} on registration",
+            pending.Count,
+            connection.Name);
+    }
+
+    /// <summary>
+    /// Remembers which name held <paramref name="clientId"/>, so a message addressed to that id after the
+    /// client has gone can still be stored under its name.
+    /// </summary>
+    /// <remarks>
+    /// Bounded by <see cref="MaxClients"/>: a hub that sees a long tail of one-shot names must not
+    /// accumulate an entry for every name it has ever admitted. Once the retention map is full, further
+    /// disconnects are simply not retained — their messages take the ordinary unknown-recipient drop —
+    /// rather than evicting an identity that may be about to be reclaimed.
+    /// </remarks>
+    private void RetainOfflineIdentity(Guid clientId, string clientName)
+    {
+        if (_offlineNamesById.Count >= MaxClients)
+        {
+            _logger.LogDebug(
+                "Offline identity retention is full; {ClientName} will not be reachable by its previous id",
+                clientName);
+            return;
+        }
+
+        // A name that reconnected and left again leaves its earlier id behind; drop it as the new one is
+        // recorded, so the reverse map holds exactly one id per name.
+        if (_offlineIdsByName.TryGetValue(clientName, out Guid previousId) && previousId != clientId)
+        {
+            _offlineNamesById.TryRemove(previousId, out _);
+        }
+
+        _offlineIdsByName[clientName] = clientId;
+        _offlineNamesById[clientId] = clientName;
+    }
+
+    /// <summary>
+    /// Forgets the id a name was last reachable by, so it stops resolving to that name.
+    /// </summary>
+    private void ForgetOfflineIdentity(string clientName)
+    {
+        if (_offlineIdsByName.TryRemove(clientName, out Guid previousId))
+        {
+            _offlineNamesById.TryRemove(previousId, out _);
+        }
     }
 
     /// <summary>

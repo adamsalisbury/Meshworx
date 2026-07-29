@@ -15,7 +15,7 @@ between them. It never interprets payloads — it reads the one-byte opcode and 
 
 | Member | Signature | Source |
 |---|---|---|
-| ctor | `MeshHub(ILogger<MeshHub>, ITransportListener, TimeSpan? registrationTimeout=null, int? maxClients=null, TimeSpan? heartbeatInterval=null, int maxMissedHeartbeats=2, ClientAuthenticator? authenticator=null, int? maxConcurrentAuthentications=null, GroupAuthoriser? groupAuthoriser=null, TimeSpan? groupAuthorisationTimeout=null, int? maxConnectionsPerRemoteEndpoint=null, bool notifyOnQueueSaturation=false, TimeSpan? backpressureAwaitTimeout=null)` | `MeshHub.cs:236` |
+| ctor | `MeshHub(ILogger<MeshHub>, ITransportListener, TimeSpan? registrationTimeout=null, int? maxClients=null, TimeSpan? heartbeatInterval=null, int maxMissedHeartbeats=2, ClientAuthenticator? authenticator=null, int? maxConcurrentAuthentications=null, GroupAuthoriser? groupAuthoriser=null, TimeSpan? groupAuthorisationTimeout=null, int? maxConnectionsPerRemoteEndpoint=null, bool notifyOnQueueSaturation=false, TimeSpan? backpressureAwaitTimeout=null, IOfflineStore? offlineStore=null, TimeSpan? offlineStoreTimeout=null)` | `MeshHub.cs:255` |
 | `StartAsync` | `Task StartAsync(CancellationToken=default)` — binds listener, starts accept loop. Refuses a second concurrent start, a start during shutdown, and a start after disposal | `MeshHub.cs:446` |
 | `StopAsync` | `Task StopAsync(CancellationToken=default)` — best-effort disconnect all, drain, reset. **Not `async`** — returns the shared shutdown task | `MeshHub.cs:517` |
 | `DisposeAsync` | `ValueTask` — `StopAsync`, disposes the listener, then the authentication semaphore. Memoised; disposal is terminal | `MeshHub.cs:709` |
@@ -28,15 +28,17 @@ between them. It never interprets payloads — it reads the one-byte opcode and 
 | `ClientDisconnected` | `event EventHandler<ClientConnectionEventArgs>` — after a client is removed | `MeshHub.cs:643` |
 | `QueueSaturated` | `event EventHandler<QueueSaturatedEventArgs>` — a message was dropped because the recipient's outbound queue was full. **Always raised, for every send shape**, independently of the constructor's `notifyOnQueueSaturation` flag. Added by PR #87 (issue #30) — see [Backpressure signalling](#backpressure-signalling-and-awaiting-capacity) | `MeshHub.cs:646` |
 
-The constructor carries **two independent integrator seams**, both optional and both defaulting to "not
+The constructor carries **three independent integrator seams**, all optional and all defaulting to "not
 configured":
 
 | Seam | Params | Question it answers | Section |
 |---|---|---|---|
 | Authentication | `authenticator`, `maxConcurrentAuthentications` | may this peer **register at all**? | [Authentication](#authentication) |
 | Authorisation | `groupAuthoriser`, `groupAuthorisationTimeout` | may this registered client **join this group**? | [Group authorisation](#group-authorisation) |
+| Offline delivery | `offlineStore`, `offlineStoreTimeout` | where does a message for a client that **is not here** go? | [Offline delivery](#offline-delivery) |
 
-Defaulting both to `null` preserves the pre-v3 open-admission behaviour. **One group rule is not
+Defaulting all three to `null` preserves the pre-v3 open-admission behaviour, and — for the third —
+the original drop-on-unknown-recipient behaviour. **One group rule is not
 optional and applies with or without an authoriser: sending to a group requires membership of it** — see
 [Routing helpers](#routing-helpers).
 
@@ -140,6 +142,14 @@ optional and applies with or without an authoriser: sending to a group requires 
   `DeliveryOptions.AwaitCapacity` is parked waiting for room (`_backpressureAwaitTimeout`, default 30 s,
   `DefaultBackpressureAwaitTimeout` at `:47`). See
   [Backpressure signalling](#backpressure-signalling-and-awaiting-capacity) below.
+- `IOfflineStore? _offlineStore` + `TimeSpan _offlineStoreTimeout` (PR for issue #28) — the
+  store-and-forward seam. **`_offlineStore` being null is the entire "disabled" switch**: every path
+  that touches the feature is behind a null check on it, so a hub without one does exactly what it did
+  before the feature existed. See [Offline delivery](#offline-delivery) below.
+- `ConcurrentDictionary<Guid, string> _offlineNamesById` + `ConcurrentDictionary<string, Guid>
+  _offlineIdsByName` — which name last held each id, populated at teardown and **only when a store is
+  configured**. Two maps rather than one so a returning name's stale id can be forgotten in constant
+  time. Bounded by `MaxClients`.
 
 `ClientConnection` (nested, `MeshHub.cs:2541`) holds the id, name, transport, a bounded outbound
 `Channel<byte[]>` (capacity **1024**, single-reader/multi-writer), an `ActivitySequence` counter
@@ -534,8 +544,8 @@ Gotchas when writing an authenticator:
 
 | Method | Opcode in | Behaviour | Source |
 |---|---|---|---|
-| `RouteMessage` | `SendMessage` | Look up recipient; build `DeliverMessage`; `TryWrite` to its queue. Unknown recipient → logged `Debug`, **dropped**. Full queue → logged `Warning`, **dropped**, raises `QueueSaturated`, and — since PR #87 (issue #30) — best-effort sends the sender the `0x15 QueueSaturated` wire frame if the hub was constructed with `notifyOnQueueSaturation`. | `MeshHub.cs:1872` |
-| `RouteMessageWithHeaders` | `SendMessageWithHeaders` | As `RouteMessage`, but the outgoing frame shape is chosen from **the recipient's own** `NegotiatedProtocolVersion`: `DeliverMessageWithHeaders` (header block forwarded unchanged) if `>= Protocol.HeaderEnvelopeMinVersion`, else the plain `DeliverMessage` with the header block stripped. The header block is never decoded beyond one well-known key. **`async` since PR #87** (issue #30): if the initial `TryWrite` fails and the sender set `BackpressureHeaderKeys.AwaitCapacity` (via `DeliveryOptions.AwaitCapacity`), it awaits free capacity on the recipient's queue, bounded by `backpressureAwaitTimeout`, before falling back to the same drop/notify/`QueueSaturated` path as `RouteMessage`. | `MeshHub.cs:1924` |
+| `RouteMessage` | `SendMessage` | Look up recipient; build `DeliverMessage`; `TryWrite` to its queue. Unknown recipient → offered to the offline store if one is configured (see [Offline delivery](#offline-delivery)), else logged `Debug`, **dropped**. **`async Task` since issue #28** — deliberately still named without the `Async` suffix, to match its sibling below; nothing on the delivered path awaits, so a connected recipient returns the cached completed task. Full queue → logged `Warning`, **dropped**, raises `QueueSaturated`, and — since PR #87 (issue #30) — best-effort sends the sender the `0x15 QueueSaturated` wire frame if the hub was constructed with `notifyOnQueueSaturation`. | `MeshHub.cs:1872` |
+| `RouteMessageWithHeaders` | `SendMessageWithHeaders` | As `RouteMessage` — including the offline-store offer on an unknown recipient, which carries the header block through so it survives the wait — but the outgoing frame shape is chosen from **the recipient's own** `NegotiatedProtocolVersion`: `DeliverMessageWithHeaders` (header block forwarded unchanged) if `>= Protocol.HeaderEnvelopeMinVersion`, else the plain `DeliverMessage` with the header block stripped. The header block is never decoded beyond one well-known key. **`async` since PR #87** (issue #30): if the initial `TryWrite` fails and the sender set `BackpressureHeaderKeys.AwaitCapacity` (via `DeliveryOptions.AwaitCapacity`), it awaits free capacity on the recipient's queue, bounded by `backpressureAwaitTimeout`, before falling back to the same drop/notify/`QueueSaturated` path as `RouteMessage`. | `MeshHub.cs:1924` |
 | `BroadcastMessage` | `BroadcastMessage` | Build one shared `DeliverMessage` frame; `TryWrite` to every client **except the sender**. Each full-queue drop raises `QueueSaturated`, but — deliberately, since PR #87 — sends **no** wire frame: the dropped recipient's id comes from the hub's own client registry, not from the sender, so echoing it back would let a sender enumerate every connected client's id by broadcasting until somebody's queue filled. | `MeshHub.cs:2021` |
 | `JoinGroupAsync` | `JoinGroup` | **`async`, and awaited by the receive loop.** Empty name ignored. With a `groupAuthoriser`: copies the inbound name bytes, asks the authoriser, and on refusal calls `LeaveGroup` then `RefuseGroupJoin`. Otherwise, or on approval, calls `AddToGroup`. | `MeshHub.cs:2079` |
 | `AddToGroup` | — | The former `JoinGroup` body: `GetOrAdd` the `Group`, add member under its lock. Retries if the group was concurrently removed (`Removed` flag). | `MeshHub.cs:2255` |
@@ -624,6 +634,66 @@ timeout shorter than `backpressureAwaitTimeout` can report the send as failed wh
 waiting; if the wait then succeeds, the message is delivered anyway, and a caller that retries on the
 acknowledgement timeout would duplicate it. See [known-issues.md](known-issues.md) for the full
 register entry, and [client.md](client.md#backpressure-signalling) for the client-side contract.
+
+<a id="offline-delivery"></a>
+
+### Offline delivery (store and forward)
+
+Added for issue #28. Before it, a direct message to a recipient the hub had no entry for was dropped
+with a `Debug` log — fine for a mesh where everything is online at once, lossy for an intermittently
+connected one. Supplying an `IOfflineStore` holds those messages against the recipient's **name** and
+delivers them when that name registers again.
+
+**The whole feature is behind `_offlineStore is not null`.** A hub with no store does not retain
+identities, does not build an `OfflineMessage`, and does not await anything it did not await before.
+
+**Three pieces, in the order a message meets them:**
+
+1. **`RetainOfflineIdentity(id, name)`** — called from `HandleClientAsync`'s `finally`, **after** the
+   connection is out of `_clients` and `_clientNames`. That ordering is load-bearing: a sender racing
+   the teardown either finds the recipient still connected and routes to it, or finds it gone and
+   resolves the id to a name — it can never see both at once. Bounded by `MaxClients`; once the
+   retention table is full, further disconnects are simply not retained rather than evicting an
+   identity that may be about to be reclaimed.
+2. **`TryStoreForOfflineDeliveryAsync(senderId, recipientId, headerBlock, body, ct)`** — called from
+   both direct-routing methods' unknown-recipient branch, and only there. It resolves the id to a name,
+   copies both byte ranges out of the receive buffer (the buffer is reused; a store may hold them for
+   minutes), and offers the result to the store. Returns whether the offline path took ownership: a
+   store that *refuses* still counts as owned, because the refusal is counted here as
+   `reason=offline-queue-full` rather than falling through to `unknown-recipient`.
+3. **`DeliverStoredMessagesAsync(connection, ct)`** — called once per registration, **after** the send
+   loop is started and **before** the receive loop begins. After, so held frames are written out as
+   they are queued rather than waiting for the client's first frame; before, so anything sent to the
+   client from that moment queues behind what it missed.
+
+**A stale id stops resolving the moment its name comes back.** `ForgetOfflineIdentity(name)` runs at
+registration, and again lazily from `TryStoreForOfflineDeliveryAsync` if it finds the name in
+`_clientNames`. Without this, a peer holding the pre-disconnect id would go on filling a queue that only
+the *next* reconnect would drain, while the recipient sat connected — strictly worse than the ordinary
+unknown-recipient drop, which at least tells the truth. **This is the gap issue #43 closes**: with
+session resumption the returning client keeps its id, so the stale-id problem does not arise.
+
+**Frame shape is decided at drain time, not at storage time**, which is why `OfflineMessage` holds
+`(senderId, headerBlock, body)` rather than a built frame — the shape depends on the version the
+*returning* connection negotiates, which is unknowable when the message is stored. The drain reuses
+`BuildDeliverMessage`/`BuildDeliverMessageWithHeaders` and `ReadPriority`, so a held message lands on
+the same lane, in the same shape, as it would have live.
+
+**Gotchas:**
+- **Direct sends only.** `BroadcastMessage`, `SendToGroup` and `SendToGroupWithHeaders` never store —
+  a disconnected client has already been removed from every group, so there is nothing to fan out to.
+- **The store is on a live connection's path**, called from a sender's receive loop and from a
+  registration. Both calls are bounded by `offlineStoreTimeout` (default 10 s) for the same reason
+  every other integrator callback here is bounded: a parked receive loop looks idle to the heartbeat
+  monitor, which would evict the very client the store exists to serve.
+- **Callback boundary.** A throwing store is logged and treated as a refusal on the store path, and as
+  "nothing held" on the drain path — it never faults a receive loop or fails a registration.
+- **A drain can overflow the outbound queue** (1024 frames). Overflow is dropped and counted
+  `queue-full`, and the drain carries on through the rest rather than abandoning it — the send loop is
+  already running concurrently, so a later message may still fit.
+- **Per-message expiry composes with it for free.** A held frame carrying `mesh.expires-at` that
+  lapsed while stored is dropped by `SendLoopAsync`'s existing `IsExpiredFrame` check on the way out —
+  see [dropping expired frames](#dropping-expired-frames).
 
 ### Group locking model
 
@@ -735,7 +805,8 @@ name). See `MetricsCapture<T>` in [testing.md](testing.md#metrics-tests).
 | `meshworx.hub.clients.connected` | `UpDownCounter<int>` | — | created `:396`; `+1` on registration (`:1041`), `-1` on removal (`:1249`) |
 | `meshworx.hub.messages.routed` | `Counter<long>` | `direction`: `direct` / `broadcast` / `group` | created `:400`; recorded in `RouteMessage` (`:1906`), `RouteMessageWithHeaders` (`:1969`), `BroadcastMessage` (`:2066`), `SendToGroup` (`:2380`), `SendToGroupWithHeaders` (`:2453`) |
 | `meshworx.hub.bytes.routed` | `Counter<long>` | `direction`: `direct` / `broadcast` / `group` | created `:405`; recorded alongside each `messages.routed` add, with the body's length |
-| `meshworx.hub.messages.dropped` | `Counter<long>` | `reason`: `unknown-recipient` / `queue-full` / `expired` (PR #85) | created `:410`; recorded at every drop site — `RouteMessage` unknown-recipient (`:1883`) and queue-full (`:1898`), `RouteMessageWithHeaders` the same pair (`:1937`, `:1964`), `BroadcastMessage` queue-full (`:2055`), `SendToGroup` queue-full (`:2398`), `SendToGroupWithHeaders` queue-full (`:2482`), `SendLoopAsync` expired (`:1666`, via `IsExpiredFrame` — see [dropping expired frames](#dropping-expired-frames)). **Every one of the five queue-full sites also raises `QueueSaturated` immediately alongside this counter add (PR #87) — see [Backpressure signalling](#backpressure-signalling-and-awaiting-capacity) below; the counter itself gained no new tag** |
+| `meshworx.hub.messages.dropped` | `Counter<long>` | `reason`: `unknown-recipient` / `queue-full` / `expired` (PR #85) / `offline-queue-full` (issue #28) | created `:410`; recorded at every drop site — `RouteMessage` unknown-recipient (`:1883`) and queue-full (`:1898`), `RouteMessageWithHeaders` the same pair (`:1937`, `:1964`), `BroadcastMessage` queue-full (`:2055`), `SendToGroup` queue-full (`:2398`), `SendToGroupWithHeaders` queue-full (`:2482`), `SendLoopAsync` expired (`:1666`, via `IsExpiredFrame` — see [dropping expired frames](#dropping-expired-frames)). **Every one of the five queue-full sites also raises `QueueSaturated` immediately alongside this counter add (PR #87) — see [Backpressure signalling](#backpressure-signalling-and-awaiting-capacity) below; the counter itself gained no new tag** |
+| `meshworx.hub.messages.offline_queued` | `Counter<long>` | — | issue #28; incremented in `TryStoreForOfflineDeliveryAsync` once a store has accepted a message. The same message is counted on `messages.routed` (`direction=direct`) **later**, when the recipient returns and `DeliverStoredMessagesAsync` queues it — so a held message is counted once here and once there, never twice on the same instrument |
 | `meshworx.hub.outbound_queue.depth` | `ObservableGauge<int>` | — | created `:415`; callback `ObserveOutboundQueueDepth` (`:433-442`) sums `ClientConnection.OutboundQueue.Reader.Count` across every entry in `_clients` on each collection pass |
 
 > **Several of this table's own citations, and the bullets below it, were found to be stale by roughly

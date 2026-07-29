@@ -40,7 +40,9 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
 
 | File | Lines | Covers |
 |---|---|---|
-| `Fixtures/MeshHubFixture.cs` | 371 | Hub test harness (mock listener/transport, register helpers, **authenticator and group-authoriser pass-throughs**, group/lookup/direct frame builders, `FrameRecorder`, `CreateRegistrationRequest`'s `versionMin`/`versionMax` parameters (PR #73), **header-bearing frame builders and a `remoteEndPointTransport` negotiated-version overload on `RegisterClientAsync`, PR #74**, **`notifyOnQueueSaturation`/`backpressureAwaitTimeout` constructor pass-throughs, PR #87**) |
+| `Fixtures/MeshHubFixture.cs` | 371 | Hub test harness (mock listener/transport, register helpers, **authenticator and group-authoriser pass-throughs**, group/lookup/direct frame builders, `FrameRecorder`, `CreateRegistrationRequest`'s `versionMin`/`versionMax` parameters (PR #73), **header-bearing frame builders and a `remoteEndPointTransport` negotiated-version overload on `RegisterClientAsync`, PR #74**, **`notifyOnQueueSaturation`/`backpressureAwaitTimeout` constructor pass-throughs, PR #87**, **`offlineStore`/`offlineStoreTimeout` pass-throughs and `RegisterClientWithRecorderAsync`, issue #28**) |
+| `InMemoryOfflineStoreTests.cs` | 213 | **New for issue #28.** `InMemoryOfflineStore` in isolation: arrival-order drain, take-removes, all four bounds (per-name message count, byte count including headers, distinct-name cap, retention window), the refuse-not-evict policy, a full-of-expired queue accepting again, concurrent writers, and the constructor guards. **The retention window is pinned without waiting real time** — the test supplies the message's own `QueuedAt`, which is why that is a constructor parameter of `OfflineMessage` rather than stamped by the store |
+| `MeshHubOfflineDeliveryTests.cs` | 405 | **New for issue #28.** Store-and-forward through the hub: held-and-delivered-on-reconnect, arrival order across a reconnect, header block kept for a version-5 return and stripped for a version-4 one, the stale-id-after-reconnect drop, the disabled-by-default path, and the refusing/throwing store paths. Carries three `IOfflineStore` doubles — `ObservableOfflineStore` (wraps a real store and signals each accepted message, so a test reconnects only once the hub has actually stored something), `RefusingOfflineStore`, `ThrowingOfflineStore` |
 | `Fixtures/MeshClientFixture.cs` | 170 | Client test harness (mock transport, scripted receive, `CreateGroupJoinRefusal`, an 18-byte `RegistrationComplete` builder taking a negotiated-version byte (PR #73), **header-bearing `DeliverMessage`/`DeliverGroupMessage` frame builders, PR #74**) |
 | `Fixtures/MetricsCapture.cs` | 88 | **Metrics test harness (PR #72):** a `MeterListener` filtered to one `Meter` reference plus one instrument name, capturing every measurement and its tags in recording order |
 | `Messages/MessageHeadersTests.cs` | 62 | **New in PR #74.** `MessageHeaders.Empty`, constructor null-guard and copy-not-alias semantics, indexer/`TryGetValue`, `GetEnumerator` — does **not** cover the duplicate-key throw (see [known-issues.md](known-issues.md) KI-34) |
@@ -500,6 +502,25 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
     exclusion in one run: `capture.Values` is empty immediately after `StartAsync`'s initial connect, then
     reads exactly `[1L]` after a real hub-initiated drop and reconnect to a second, freshly stood-up hub.
     Asserting only the second half would miss a regression that counted the initial connect too.
+
+### Frames the hub sends unprompted at registration
+
+**`RegisterClientAsync` cannot capture them, and a recorder attached afterwards races them.** It installs
+its own `SendAsync` callback to grab the `RegistrationComplete` reply; a test that then constructs a
+`FrameRecorder` over the same transport *replaces* that callback — fine for frames the test provokes
+later, but the offline store's drain (issue #28) is queued by the hub between sending
+`RegistrationComplete` and reading the client's first frame, so it can land in the gap and vanish.
+
+`RegisterClientWithRecorderAsync` (`Fixtures/MeshHubFixture.cs`) exists for exactly this: it attaches the
+recorder **before** the connection is enqueued for acceptance, and derives the registration response from
+the recorder rather than a separate callback. Reach for it whenever you are asserting on something the
+hub emits of its own accord at registration time; use the plain `RegisterClientAsync` otherwise.
+
+The offline tests' second synchronisation point is worth copying too. `ObservableOfflineStore` wraps a
+real store and signals each accepted message, so a test reconnects the recipient only once the hub has
+genuinely stored what it is about to drain — without it, the reconnect can win the race, drain an empty
+store, and the test hangs on a frame that was never going to arrive. **The same principle as
+`FrameRecorder`'s pairing: find the event that proves the state you need, rather than sleeping.**
 
 ### Minimal end-to-end pattern (integration style)
 

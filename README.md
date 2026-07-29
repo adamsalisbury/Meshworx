@@ -112,6 +112,14 @@ A runnable hub and client are provided under `src/AdamSalisbury.Meshworx.TestApp
   `MessageHeaders.Empty` when there were none. Requires both ends to have negotiated protocol version
   5 or higher — see [Wire protocol](#wire-protocol) for the frame layout and the fallback behaviour
   when a group has members on different negotiated versions.
+- **Offline delivery (store and forward).** Off by default: a message to a recipient the hub does not
+  recognise is dropped. Give the hub an `IOfflineStore` and a **direct** message addressed to a client
+  that has disconnected is held against that client's *name* instead, and delivered in arrival order
+  when that name next registers. `InMemoryOfflineStore` is the bounded, process-local default;
+  implement the interface yourself to back it with something durable. Broadcast and group sends never
+  store — a disconnected client is not a member of anything to fan out to. See
+  [Offline delivery](#offline-delivery) for the bounds and the limits of how long a departed client's
+  id keeps resolving.
 - **Disconnect.** Calling `DisconnectAsync` is graceful and does not raise `Disconnected`. The
   `Disconnected` event fires only for unexpected endings — the hub closing the connection
   (`RemoteDisconnect`) or the transport failing (`ConnectionLost`). After it fires the client
@@ -204,7 +212,11 @@ new MeshHub(
     maxConcurrentAuthentications: 64,               // cap concurrent authenticator calls (default: 64)
     groupAuthoriser: groupAuthoriser,               // decide who may join a group (default: none — see Security)
     groupAuthorisationTimeout: TimeSpan.FromSeconds(10), // refuse a join whose authoriser hangs (default: 10s)
-    maxConnectionsPerRemoteEndpoint: 100);          // cap connections from one address (default: 100)
+    maxConnectionsPerRemoteEndpoint: 100,           // cap connections from one address (default: 100)
+    notifyOnQueueSaturation: false,                 // tell a direct sender its message was dropped (default: false)
+    backpressureAwaitTimeout: TimeSpan.FromSeconds(30), // bound an AwaitCapacity park (default: 30s)
+    offlineStore: null,                             // hold messages for disconnected clients (default: none)
+    offlineStoreTimeout: TimeSpan.FromSeconds(10)); // bound a single offline store call (default: 10s)
 ```
 
 Every one of these has a finite default, so a hub constructed with no arguments at all is still
@@ -239,6 +251,47 @@ Observability:
 - `ConnectedClientCount` — current number of registered clients.
 - `IsClientRegistered(id)` — whether a specific client is registered.
 - `ClientConnected` / `ClientDisconnected` — raised as clients register and leave.
+
+### Offline delivery
+
+Store-and-forward is off unless you give the hub somewhere to put things:
+
+```csharp
+await using var hub = new MeshHub(
+    logger,
+    listener,
+    offlineStore: new InMemoryOfflineStore(
+        maxMessagesPerClient: 100,                  // per name (default: 100)
+        maxBytesPerClient: 1024 * 1024,             // per name, body + headers (default: 1 MiB)
+        timeToLive: TimeSpan.FromMinutes(5),        // discard undelivered after this (default: 5 minutes)
+        maxClients: 1000));                         // distinct names holding messages (default: 1000)
+```
+
+A direct message addressed to a client the hub does not currently have connected is offered to the
+store, keyed by the name that client last registered under, and everything held for that name is
+delivered — oldest first — the next time it registers. What you need to know before relying on it:
+
+- **Direct sends only.** Broadcast and group sends never store. Group membership is dropped when a
+  client disconnects, so there is nothing to fan out to.
+- **A departed client's id keeps resolving only until its name comes back.** Senders address a
+  recipient by the `Guid` they looked up, so the hub remembers which name last held each id. That
+  association is dropped the moment the name registers again — under a new id, which the old sender
+  does not know — after which messages to the stale id are dropped as unknown-recipient rather than
+  held for a client that is sitting there connected. The retention table is itself bounded by
+  `maxClients`; past that, further disconnects are not retained.
+- **A full store refuses rather than evicting.** `InMemoryOfflineStore` keeps what it already accepted
+  and turns the new message away, which the hub counts as a drop. Implement `IOfflineStore` if you want
+  the opposite policy.
+- **Per-message time-to-live still applies on top.** A message sent with a TTL that lapses while it is
+  held is dropped on its way out, exactly as it would have been had the recipient been connected and
+  slow.
+- **More may be held than a returning client's outbound queue can take at once** (it holds 1024
+  frames). The overflow is dropped and counted, not held back for later.
+- **Nothing survives a hub restart** with the in-memory store. Back it with a durable `IOfflineStore`
+  if it must.
+- **The store sits on a live connection's path.** It is called from the sending client's receive loop
+  and from the returning client's registration, so a slow implementation delays those; each call is
+  bounded by `offlineStoreTimeout`, after which the message takes the ordinary drop.
 
 ### `MeshClient`
 
@@ -749,7 +802,8 @@ component recorded it:
 | `meshworx.hub.clients.connected` | up/down counter | — | Clients currently registered with the hub. |
 | `meshworx.hub.messages.routed` | counter | `direction`: `direct`, `broadcast`, `group` | Messages the hub has routed. A broadcast or group send counts once per call that reaches at least one recipient, not once per recipient — it is the message the hub routed, not the number of deliveries it fanned out to — and not at all when there was nobody to receive it (the sender was the only client, or the group's only member). |
 | `meshworx.hub.bytes.routed` | counter | `direction`: `direct`, `broadcast`, `group` | Message payload bytes the hub has routed, tagged the same way. |
-| `meshworx.hub.messages.dropped` | counter | `reason`: `unknown-recipient`, `queue-full` | Messages the hub could not deliver: a direct send to a Guid nobody is registered under, or a write to a recipient's outbound queue that was already full. |
+| `meshworx.hub.messages.dropped` | counter | `reason`: `unknown-recipient`, `queue-full`, `expired`, `offline-queue-full` | Messages the hub could not deliver: a direct send to a Guid nobody is registered under, a write to a recipient's outbound queue that was already full, a frame whose time-to-live had lapsed by the time it was dequeued for sending, or a message the configured offline store refused to hold. |
+| `meshworx.hub.messages.offline_queued` | counter | — | Messages held in the offline store for a disconnected client instead of being dropped. They are counted as `routed` (`direction=direct`) later, when the client returns and they are queued for it. |
 | `meshworx.hub.outbound_queue.depth` | observable gauge | — | The total number of frames currently queued for delivery, summed across every connected client's outbound queue. A single aggregate rather than one series per client, since tagging by client id would give the gauge unbounded cardinality over the hub's lifetime. |
 | `meshworx.client.reconnects` | counter | — | The number of times a `MeshClientReconnector` has re-established a connection after an unexpected drop. Does not count the initial connection `StartAsync` makes. |
 

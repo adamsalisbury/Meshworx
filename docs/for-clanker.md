@@ -757,8 +757,12 @@ The model in one paragraph: a **hub** (`MeshHub`) listens on a pluggable transpo
 **clients** (`MeshClient`). Each client registers under a **unique name** and is assigned a `Guid` id.
 Clients then exchange **opaque byte payloads** — addressed directly by recipient id, broadcast to
 everyone, or sent to a named **group**. The hub never interprets payloads; it reads a one-byte routing
-opcode and forwards the body. Delivery is **best-effort, fire-and-forget** — there are no acks, no
-retries, no ordering guarantees beyond a single connection's stream, and no persistence.
+opcode and forwards the body. Delivery is **best-effort, fire-and-forget by default** — no ordering
+guarantees beyond a single connection's stream, and no persistence. Each of those defaults now has an
+opt-in escape hatch bolted alongside it rather than replacing it: acknowledgements (PR #84), retries
+(PR #83's request/response, `MeshClient`'s send retry policy), and — since issue #28 — an optional
+`IOfflineStore` that holds a direct message for a **disconnected** recipient instead of dropping it.
+None of them is on unless configured.
 
 Since protocol version 3 the hub has an **authentication seam**: an optional `ClientAuthenticator`
 callback decides whether a registering client may join, given its name and an opaque credential it
@@ -944,6 +948,7 @@ receive loops never block on a slow recipient's socket; they just enqueue. See
 | Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `IRemoteEndPointTransport`, `StreamFramer` (PR #81), `TcpTransport(Listener)`, `WebSocketTransport(Listener)` (PR #78), `UnixSocketTransport(Listener)` (PR #81), `NamedPipeTransport(Listener)` (PR #81), `QuicTransport(Listener)` (PR #82, open), `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
 | Wire protocol & framing | `MessageType`, `Protocol`, handshake, opcode payloads | [protocol.md](for-clanker/protocol.md) |
 | Public value types | event args, `MessageHeaders`, `DisconnectReason`, `RegistrationErrorCode`, `ClientAuthenticator`, `RegistrationContext`, `GroupAuthoriser`, `GroupJoinContext`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
+| Offline delivery (store and forward) | `IOfflineStore`, `OfflineMessage`, `InMemoryOfflineStore` (issue #28) | [hub.md](for-clanker/hub.md#offline-delivery), [types.md](for-clanker/types.md#offline-delivery-types) |
 | DI & generic-host integration | `AddMeshHub`, `AddMeshClient`, `MeshHubOptions`, `MeshClientOptions` | [dependency-injection.md](for-clanker/dependency-injection.md) |
 | Tests, fixtures, build/CI | xUnit + Moq suite, `MeshHubFixture`, `MeshClientFixture`, `MetricsCapture` | [testing.md](for-clanker/testing.md) |
 | **Known issues register** | consolidated foot-guns and limitations | [known-issues.md](for-clanker/known-issues.md) |
