@@ -652,4 +652,61 @@ public sealed class MeshIntegrationTests
         Assert.Equal(alice.Id, received.SenderId);
         Assert.Equal(payload, received.Data.ToArray());
     }
+
+    /// <summary>
+    /// End-to-end session resumption (issue #43): a client that reconnects within the hub's resumption
+    /// window keeps the id its peers already hold and the group memberships it had, so a peer that cached
+    /// the id before the drop goes on reaching it without ever looking it up again — the whole point of
+    /// the feature, and the thing a fresh registration cannot give.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task EndToEnd_ClientReconnectsWithinTheWindow_KeepsItsIdentityAndGroups()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = new MeshHub(
+            new Mock<ILogger<MeshHub>>().Object, listener, sessionResumptionWindow: TimeSpan.FromMinutes(5));
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var bob = CreateClient();
+        await using var alice = CreateClient();
+
+        await bob.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Bob");
+        await alice.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Alice");
+        await alice.JoinGroupAsync("news");
+        await bob.JoinGroupAsync("news");
+
+        // The id Bob would have cached, and which must survive the reconnect.
+        Guid aliceIdBeforeDrop = alice.Id;
+
+        await alice.DisconnectAsync();
+        while (hub.IsClientRegistered(aliceIdBeforeDrop))
+        {
+            await Task.Yield();
+        }
+
+        await alice.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Alice");
+
+        Assert.True(alice.SessionResumed);
+        Assert.Equal(aliceIdBeforeDrop, alice.Id);
+
+        // Bob's cached id still delivers.
+        var directTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        alice.MessageReceived += (_, e) => directTcs.TrySetResult(e);
+        await bob.SendAsync(aliceIdBeforeDrop, Encoding.UTF8.GetBytes("still you"));
+
+        MessageReceivedEventArgs direct = await directTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(bob.Id, direct.SenderId);
+        Assert.Equal("still you", Encoding.UTF8.GetString(direct.Data.Span));
+
+        // And the membership came back with the identity: Alice never re-joined "news" on this
+        // connection, and her own JoinedGroups was reset by the disconnect.
+        var groupTcs = new TaskCompletionSource<GroupMessageReceivedEventArgs>();
+        alice.GroupMessageReceived += (_, e) => groupTcs.TrySetResult(e);
+        await bob.SendToGroupAsync("news", Encoding.UTF8.GetBytes("group news"));
+
+        GroupMessageReceivedEventArgs group = await groupTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal("news", group.GroupName);
+        Assert.Equal("group news", Encoding.UTF8.GetString(group.Data.Span));
+    }
 }

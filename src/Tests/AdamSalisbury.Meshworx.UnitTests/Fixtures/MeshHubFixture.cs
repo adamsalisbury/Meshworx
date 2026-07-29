@@ -31,7 +31,8 @@ internal sealed class MeshHubFixture
         bool notifyOnQueueSaturation = false,
         TimeSpan? backpressureAwaitTimeout = null,
         IOfflineStore? offlineStore = null,
-        TimeSpan? offlineStoreTimeout = null)
+        TimeSpan? offlineStoreTimeout = null,
+        TimeSpan? sessionResumptionWindow = null)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -61,7 +62,8 @@ internal sealed class MeshHubFixture
             notifyOnQueueSaturation,
             backpressureAwaitTimeout,
             offlineStore,
-            offlineStoreTimeout);
+            offlineStoreTimeout,
+            sessionResumptionWindow);
     }
 
     /// <summary>
@@ -121,6 +123,17 @@ internal sealed class MeshHubFixture
         BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(headerLengthOffset, 2), (ushort)headerLength);
         HeaderEnvelope.Write(headers, payload.AsSpan(headerLengthOffset + 2, headerLength));
         message.CopyTo(payload, headerLengthOffset + 2 + headerLength);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a ResumeSession frame: [type][token].
+    /// </summary>
+    public static byte[] CreateResumeSessionRequest(byte[] token)
+    {
+        var payload = new byte[1 + token.Length];
+        payload[0] = 0x16; // ResumeSession
+        token.CopyTo(payload, 1);
         return payload;
     }
 
@@ -256,7 +269,7 @@ internal sealed class MeshHubFixture
         EnqueueClient(transport.Object);
 
         byte[] responseData = await recorder
-            .WaitForAsync(frame => frame.Length == 18 && frame[0] == 0x01)
+            .WaitForAsync(frame => frame.Length >= 18 && frame[0] == 0x01)
             .WaitAsync(TestTimeouts.Wait)
             .ConfigureAwait(false);
         var clientId = new Guid(responseData.AsSpan(1, 16));
@@ -392,6 +405,28 @@ internal sealed class RegisteredClient(
     /// The protocol version the hub echoed back in <see cref="RegistrationResponse"/>.
     /// </summary>
     public byte NegotiatedProtocolVersion => RegistrationResponse[17];
+
+    /// <summary>
+    /// The session resumption token the hub appended to <see cref="RegistrationResponse"/>, or
+    /// <see langword="null"/> when it issued none — resumption switched off, the connection negotiated
+    /// below version 6, or the hub's session table full.
+    /// </summary>
+    public byte[]? SessionToken
+    {
+        get
+        {
+            if (RegistrationResponse.Length < 20)
+            {
+                return null;
+            }
+
+            int tokenLength = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(
+                RegistrationResponse.AsSpan(18, 2));
+            return RegistrationResponse.Length < 20 + tokenLength
+                ? null
+                : RegistrationResponse.AsSpan(20, tokenLength).ToArray();
+        }
+    }
 
     public void Disconnect() => DisconnectTcs.TrySetResult(null);
 }

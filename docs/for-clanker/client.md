@@ -25,6 +25,7 @@ up peers, manages group membership, and raises events for inbound traffic and di
 | `JoinedGroups` | `IReadOnlyCollection<string>` — **snapshot** of client-side membership | `MeshClient.cs:152` |
 | `ConnectAsync` | `Task ConnectAsync(ITransport, string clientName, ReadOnlyMemory<byte> credential=default, CancellationToken=default)` | `MeshClient.cs:179` |
 | `NegotiatedProtocolVersion` | `byte` — the wire-protocol version agreed with the hub during the last successful `ConnectAsync`; `0` when not connected | `MeshClient.cs:137` |
+| `SessionResumed` | `bool` (issue #43) — whether the last `ConnectAsync` reclaimed the identity this client held before its previous connection, rather than being assigned a fresh one. `false` is the ordinary case and never an error | `MeshClient.cs:156` |
 | `DisconnectAsync` | `Task DisconnectAsync(CancellationToken=default)` — graceful; no `Disconnected` event | `MeshClient.cs:297` |
 | `SendAsync` | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, CancellationToken=default)` — compatibility overload, forwards to the headers overload with `MessageHeaders.Empty` | `MeshClient.cs:371` |
 | `SendAsync` (headers) | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); **throws `ArgumentException` if `headers` contains any of the seven reserved request/reply/acknowledgement/expiry/backpressure keys** (PR #83, extended by PR #84, PR #85 and PR #87); see [Sending headers](#sending-headers) | `MeshClient.cs:380` |
@@ -108,16 +109,38 @@ throw `InvalidOperationException("Not connected to a hub.")` unless `Connected`.
    unless currently `Disconnected` (state-specific message otherwise).
 2. Sends `RegistrationRequest` (`[0x04][versionMin][versionMax][nameLen u16 BE][utf8 name][credential]`,
    `MeshClient.cs:214-222`), always advertising `Protocol.MinSupportedVersion`/`MaxSupportedVersion`
-   (`4`/`5` as of PR #74), then awaits one frame.
+   (`4`/`6` as of issue #43), then awaits one frame.
 3. If the reply is `Error`, throws `RegistrationRefusedException` carrying the
    `RegistrationErrorCode` — which now includes `AuthenticationFailed` if the hub's authenticator
    rejected the credential, and (unchanged) `UnsupportedProtocolVersion` if the hub could not negotiate a
-   version in this client's range. If the reply is not a well-formed `RegistrationComplete` (exactly
-   18 bytes as of PR #73, was 17), throws `InvalidOperationException`.
+   version in this client's range. If the reply is not a well-formed `RegistrationComplete` (**at least**
+   18 bytes — the check was an exact `!= 18` until issue #43 made the reply's tail conditional), throws
+   `InvalidOperationException`.
 4. Records `Id` and `NegotiatedProtocolVersion` (the hub's reply's trailing byte, `MeshClient.cs:241-243`
    — `0` until a successful connect), sets `Connected`, and starts `ReceiveLoopAsync`.
-5. On **any** failure it cleans up (disposes the transport), resets to `Disconnected` (and
+5. Reads any session resumption token off the reply's tail (`ReadSessionToken`, issue #43) and, if it
+   was already holding one **for this same name** and the negotiated version is at least
+   `Protocol.SessionResumptionMinVersion`, attempts to reclaim the previous identity —
+   `TryResumeSessionAsync`, step 6 below.
+6. On **any** failure it cleans up (disposes the transport), resets to `Disconnected` (and
    `NegotiatedProtocolVersion` to `0`), logs, and rethrows.
+
+> **Session resumption is attempted *after* the receive loop is started, and never fails a connect
+> (issue #43).** Two things follow from where it sits:
+> - **It cannot be a second blocking read.** The hub's `SessionResumed` reply is not necessarily the
+>   next frame on the wire — registration may have already queued offline-store messages (issue #28) for
+>   this name, and those arrive first. So the reply is handled in the dispatch ladder like any other
+>   frame, completing a `_pendingResume` `TaskCompletionSource` that `ConnectAsync` awaits with a
+>   10-second bound.
+> - **Every failure resolves to "connected, on the fresh identity".** A refusal, a timeout, a hub that
+>   ignores the opcode, a transport error on the way out — all are swallowed and logged, leaving
+>   `SessionResumed` false. Resumption is an optimisation over reconnecting, never a precondition for
+>   it, so it must not be able to fail a connect that has already succeeded.
+>
+> The token itself is deliberately **not** cleared when the connection ends — surviving the disconnect is
+> the whole point of it. It is dropped only when it is spent, or when connecting under a different name,
+> for which it is meaningless. Note the ordering trap: the token to *present* is captured before the
+> registration reply overwrites it with the newly issued one.
 
 > **`NegotiatedProtocolVersion` is read by the send path since PR #74 (issue #32), not just logged.**
 > `SendAsync`'s headers overload — and, since PR #83, `RequestAsync`/`ReplyAsync`, and since PR #84 the

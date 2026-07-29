@@ -23,4 +23,7 @@ internal enum MessageType : byte
     GroupMessageWithHeaders = 0x13,
     DeliverGroupMessageWithHeaders = 0x14,
     QueueSaturated = 0x15,
+    ResumeSession = 0x16,
+    SessionResumed = 0x17,
+    SessionResumeRefused = 0x18,
 }

@@ -41,6 +41,8 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
 | File | Lines | Covers |
 |---|---|---|
 | `Fixtures/MeshHubFixture.cs` | 371 | Hub test harness (mock listener/transport, register helpers, **authenticator and group-authoriser pass-throughs**, group/lookup/direct frame builders, `FrameRecorder`, `CreateRegistrationRequest`'s `versionMin`/`versionMax` parameters (PR #73), **header-bearing frame builders and a `remoteEndPointTransport` negotiated-version overload on `RegisterClientAsync`, PR #74**, **`notifyOnQueueSaturation`/`backpressureAwaitTimeout` constructor pass-throughs, PR #87**, **`offlineStore`/`offlineStoreTimeout` pass-throughs and `RegisterClientWithRecorderAsync`, issue #28**) |
+| `MeshHubSessionResumptionTests.cs` | 383 | **New for issue #43.** The hub's half of session resumption, driven straight against the wire through the mock transport: token issued only when the feature is on *and* version 6 was negotiated, the reclaimed id routing for a peer's cached id, group membership restored, the authoriser consulted again on restore (the resumption-shaped counterpart to `JoinGroup_AfterReconnect_IsAuthorisedAgainRatherThanRestored`), and the five refusal paths — token replayed, wrong name, unknown, session still live, window closed. Uses a **one-tick window** to pin expiry rather than waiting out a realistic one |
+| `MeshClientSessionResumptionTests.cs` | 216 | **New for issue #43.** The client's half: the token is retained across a disconnect and presented on the next connect, the reclaimed id is adopted, a refusal leaves the client connected on the fresh identity, and no attempt is made under a different name, with no token, or below version 6. Its harness scripts the hub's reply **in response to observing the `ResumeSession` send** rather than queueing it — see the note below |
 | `InMemoryOfflineStoreTests.cs` | 213 | **New for issue #28.** `InMemoryOfflineStore` in isolation: arrival-order drain, take-removes, all four bounds (per-name message count, byte count including headers, distinct-name cap, retention window), the refuse-not-evict policy, a full-of-expired queue accepting again, concurrent writers, and the constructor guards. **The retention window is pinned without waiting real time** — the test supplies the message's own `QueuedAt`, which is why that is a constructor parameter of `OfflineMessage` rather than stamped by the store |
 | `MeshHubOfflineDeliveryTests.cs` | 405 | **New for issue #28.** Store-and-forward through the hub: held-and-delivered-on-reconnect, arrival order across a reconnect, header block kept for a version-5 return and stripped for a version-4 one, the stale-id-after-reconnect drop, the disabled-by-default path, and the refusing/throwing store paths. Carries three `IOfflineStore` doubles — `ObservableOfflineStore` (wraps a real store and signals each accepted message, so a test reconnects only once the hub has actually stored something), `RefusingOfflineStore`, `ThrowingOfflineStore` |
 | `Fixtures/MeshClientFixture.cs` | 170 | Client test harness (mock transport, scripted receive, `CreateGroupJoinRefusal`, an 18-byte `RegistrationComplete` builder taking a negotiated-version byte (PR #73), **header-bearing `DeliverMessage`/`DeliverGroupMessage` frame builders, PR #74**) |
@@ -502,6 +504,15 @@ issue #23 — rather than trusting a mocked `IsRunning`/`IsConnected` to stand i
     exclusion in one run: `capture.Values` is empty immediately after `StartAsync`'s initial connect, then
     reads exactly `[1L]` after a real hub-initiated drop and reconnect to a second, freshly stood-up hub.
     Asserting only the second half would miss a regression that counted the initial connect too.
+
+### Scripting a reply to something the client sends
+
+`MeshClientSessionResumptionTests`'s harness answers the `ResumeSession` frame from the transport's
+**`SendAsync` callback**, writing the reply into the inbound channel at the moment it sees the frame go
+out. Queueing the reply up front alongside the registration response would be simpler and is wrong: the
+receive loop could read it before `ConnectAsync` has registered the completion it is waiting on, which
+no real hub can do — it has not been asked yet — so the test would be pinning an interleaving the
+production code is not required to survive. **When a frame is a *response*, script it as one.**
 
 ### Frames the hub sends unprompted at registration
 

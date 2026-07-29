@@ -783,7 +783,7 @@ direct-send to any id it holds. Treat the transport boundary as the trust bounda
 | Target framework | `net10.0` | `AdamSalisbury.Meshworx.csproj:4` |
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
-| Wire protocol version | Negotiated range, currently `4`–`5` (was a fixed `3`, then a `4`–`4` range from PR #73; widened to `5` by PR #74 for the header envelope) | `Messages/Protocol.cs:8`, `:14`, `:21` |
+| Wire protocol version | Negotiated range, currently `4`–`6` (was a fixed `3`, then a `4`–`4` range from PR #73; widened to `5` by PR #74 for the header envelope, and to `6` by issue #43 for session resumption) | `Messages/Protocol.cs:8`, `:14`, `:21` |
 | Max frame payload | 1 MiB (`1024*1024`). `TcpTransport`/`UnixSocketTransport`/`NamedPipeTransport`/`QuicTransport` share **one** constant (`StreamFramer.MaxPayloadSize`, PR #81, extended to `QuicTransport` by PR #82); `WebSocketTransport` keeps its own independent constant of the same value | `Transport/Framing/StreamFramer.cs:28`, `Transport/WebSocket/WebSocketTransport.cs:25` |
 | Transport encryption | TCP/WebSocket: optional TLS, **off by default**. `UnixSocketTransport`/`NamedPipeTransport` (PR #81): **no TLS option at all** — local-only, access controlled by filesystem/ACL permissions instead. `QuicTransport` (PR #82): TLS **mandatory** — QUIC requires it at the protocol level, so there is no cleartext mode | `Transport/Tcp/TcpTransport.cs:142`, `TcpTransportListener.cs:110`, `Transport/WebSocket/WebSocketTransportListener.cs:112`, `Transport/Quic/QuicTransport.cs:126-141` |
 | Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:23` |
@@ -949,6 +949,7 @@ receive loops never block on a slow recipient's socket; they just enqueue. See
 | Wire protocol & framing | `MessageType`, `Protocol`, handshake, opcode payloads | [protocol.md](for-clanker/protocol.md) |
 | Public value types | event args, `MessageHeaders`, `DisconnectReason`, `RegistrationErrorCode`, `ClientAuthenticator`, `RegistrationContext`, `GroupAuthoriser`, `GroupJoinContext`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
 | Offline delivery (store and forward) | `IOfflineStore`, `OfflineMessage`, `InMemoryOfflineStore` (issue #28) | [hub.md](for-clanker/hub.md#offline-delivery), [types.md](for-clanker/types.md#offline-delivery-types) |
+| Session resumption | `sessionResumptionWindow`, `IMeshClient.SessionResumed`, opcodes `0x16`–`0x18` (issue #43) | [hub.md](for-clanker/hub.md#session-resumption), [protocol.md](for-clanker/protocol.md#session-resumption) |
 | DI & generic-host integration | `AddMeshHub`, `AddMeshClient`, `MeshHubOptions`, `MeshClientOptions` | [dependency-injection.md](for-clanker/dependency-injection.md) |
 | Tests, fixtures, build/CI | xUnit + Moq suite, `MeshHubFixture`, `MeshClientFixture`, `MetricsCapture` | [testing.md](for-clanker/testing.md) |
 | **Known issues register** | consolidated foot-guns and limitations | [known-issues.md](for-clanker/known-issues.md) |

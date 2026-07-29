@@ -1470,7 +1470,7 @@ the risk to a change, not a claim that the code is defective.
   of non-delivery — the same caveat KI-45 already makes for `RequireAck` alone — and design retries to
   be idempotent rather than relying on the timeout to mean "definitely not delivered".
 
-### KI-50 — A held message's recipient id stops resolving as soon as its name reconnects, so store-and-forward only bridges the gap once
+### KI-50 — A held message's recipient id stops resolving as soon as its name reconnects, so store-and-forward only bridges the gap once — **MITIGATED (issue #43)**
 - **Where:** `MeshHub.TryStoreForOfflineDeliveryAsync` / `ForgetOfflineIdentity`, called from
   `HandleClientAsync`'s registration path and from the unknown-recipient branch of both direct-routing
   methods.
@@ -1483,11 +1483,13 @@ the risk to a change, not a claim that the code is defective.
   than held. So a peer that never re-runs `GetClientIdByNameAsync` gets its traffic bridged across
   exactly one absence and then silently stops reaching the recipient, even though the recipient is
   connected. There is no signal to the sender that its id has gone stale.
-- **What to do:** treat a looked-up id as valid only for as long as the peer stays connected, and
-  re-resolve on the hub's `ClientDisconnected`, on a `SendRejected`, or simply before each send if the
-  cost is acceptable. **Issue #43 (session resumption) is what closes this properly** — a resumed
-  client keeps its `Guid`, so a peer's cached id stays correct across the reconnect and the "held once,
-  then dropped" cliff disappears.
+- **What to do:** **turn session resumption on** (`sessionResumptionWindow`) — issue #43 landed exactly
+  for this. A resumed client keeps its `Guid`, so a peer's cached id stays correct across the reconnect
+  and the "held once, then dropped" cliff never arrives. It is not a total fix: resumption is opt-in,
+  needs protocol version 6 at both ends, and lapses once the window closes, and in any of those cases
+  the cliff is still there. Where it applies, also treat a looked-up id as valid only while the peer
+  stays connected — re-resolve on the hub's `ClientDisconnected`, on a `SendRejected`, or before each
+  send if the cost is acceptable.
 
 ### KI-51 — The offline store runs on a live connection's path, and a slow one is felt by clients
 - **Where:** `MeshHub.TryStoreForOfflineDeliveryAsync` (called from the sending client's receive loop)
@@ -1503,6 +1505,44 @@ the risk to a change, not a claim that the code is defective.
 - **What to do:** keep the implementation fast and bound your own concurrency inside it. Note the
   timeout bounds how long the *hub waits*, not how long your call *runs* — an abandoned call carries on
   executing. `InMemoryOfflineStore` never blocks, so a hub using the default is unaffected.
+
+### KI-52 — A resumption token is a bearer credential for an identity, and the name behind it is only as strong as your authenticator
+- **Where:** `MeshHub.IssueSessionToken` / `ResumeSessionAsync`, and the token appended to
+  `RegistrationComplete` (issue #43).
+- **Severity:** medium (security, by design), and only for a hub with `sessionResumptionWindow` set.
+- **Why it bites:** anyone holding the token can reclaim the `Guid` and group memberships of the name it
+  was issued to. Four things bound that, and it is worth knowing exactly what each does *not* cover:
+  - It is **32 bytes of `RandomNumberGenerator` output**, so guessing is not an attack.
+  - Only its **SHA-256 hash** is retained by the hub, so the session table is not a bag of live secrets —
+    but the token itself is on the wire once, in the registration reply, in the clear on a cleartext
+    transport. **Use TLS if the network is not trusted** — the same advice the credential your
+    `ClientAuthenticator` checks already needs.
+  - It is **single-use** — a successful resume issues a fresh token and invalidates the old — so a token
+    captured off the wire cannot be replayed *after* its owner has next reconnected. It can be replayed
+    before that.
+  - It only reclaims **its own name's** session. But on a hub with no `ClientAuthenticator` the name is
+    self-asserted (KI-2), so an attacker holding a token can simply register under that name and then
+    present it. **Session resumption does not add an authentication boundary and must not be read as
+    one**; it preserves an identity, it does not prove one.
+- **What to do:** treat the token exactly as you treat the registration credential. Use an encrypted
+  transport, configure a `ClientAuthenticator` if the name is meant to mean anything, and keep the
+  window as short as your reconnect behaviour tolerates — it bounds how long a stolen token is worth
+  anything.
+
+### KI-53 — A resumed client's restored groups are re-authorised, which can double a mass-reconnect's authoriser load
+- **Where:** `MeshHub.RestoreGroupMembershipAsync` (issue #43), and `MeshClientReconnector`'s own group
+  restoration.
+- **Severity:** low (performance), only with a `GroupAuthoriser` configured.
+- **Why it bites:** resumption restores membership by asking the authoriser for each group (correctly —
+  see [hub.md](hub.md#session-resumption) for why it must). `MeshClientReconnector` then re-joins the
+  groups it snapshotted before the drop, which asks the authoriser *again* for the same groups. The
+  result is correct — joins are idempotent and each decision is honoured — but a mass reconnect of
+  resuming clients drives roughly twice the authoriser calls it used to. KI-28's advice about bounding
+  your own concurrency inside the callback applies with double the force.
+- **What to do:** nothing is broken, but if authoriser load matters, either pass
+  `restoreGroupMembership: false` to `MeshClientReconnector` when the hub has resumption enabled and let
+  the hub's restore do the work, or make the authoriser cheap for a repeat decision on the same
+  (client, group) pair.
 
 ---
 

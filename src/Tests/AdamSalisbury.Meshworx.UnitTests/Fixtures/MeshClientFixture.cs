@@ -20,15 +20,47 @@ internal sealed class MeshClientFixture
         Transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
     }
 
-    public byte[] CreateRegistrationResponse(byte negotiatedVersion = Protocol.MaxSupportedVersion)
+    /// <param name="negotiatedVersion">The protocol version the hub echoes back.</param>
+    /// <param name="sessionToken">
+    /// The resumption token a hub with session resumption enabled appends. Omit it for the 18-byte form
+    /// every hub below protocol version 6 produces.
+    /// </param>
+    public byte[] CreateRegistrationResponse(
+        byte negotiatedVersion = Protocol.MaxSupportedVersion, byte[]? sessionToken = null)
     {
-        // RegistrationComplete frame: [type][clientId (16)][negotiated version].
-        var response = new byte[18];
+        // RegistrationComplete frame: [type][clientId (16)][negotiated version], plus, from version 6,
+        // [tokenLength (2, big-endian)][token].
+        var response = new byte[sessionToken is null ? 18 : 20 + sessionToken.Length];
         response[0] = 0x01; // RegistrationComplete
         AssignedId.TryWriteBytes(response.AsSpan(1, 16));
         response[17] = negotiatedVersion;
+
+        if (sessionToken is not null)
+        {
+            BinaryPrimitives.WriteUInt16BigEndian(response.AsSpan(18, 2), (ushort)sessionToken.Length);
+            sessionToken.CopyTo(response, 20);
+        }
+
         return response;
     }
+
+    /// <summary>
+    /// Builds a SessionResumed frame: [type][resumed client id (16)][tokenLength (2)][renewed token].
+    /// </summary>
+    public static byte[] CreateSessionResumedFrame(Guid resumedId, byte[] renewedToken)
+    {
+        var payload = new byte[1 + 16 + 2 + renewedToken.Length];
+        payload[0] = 0x17; // SessionResumed
+        resumedId.TryWriteBytes(payload.AsSpan(1, 16));
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(17, 2), (ushort)renewedToken.Length);
+        renewedToken.CopyTo(payload, 19);
+        return payload;
+    }
+
+    /// <summary>
+    /// Builds a SessionResumeRefused frame: [type], no payload.
+    /// </summary>
+    public static byte[] CreateSessionResumeRefusedFrame() => [0x18];
 
     public byte[] CreateDeliverMessagePayload(Guid senderId, byte[] messageContent)
     {
