@@ -1470,6 +1470,40 @@ the risk to a change, not a claim that the code is defective.
   of non-delivery — the same caveat KI-45 already makes for `RequireAck` alone — and design retries to
   be idempotent rather than relying on the timeout to mean "definitely not delivered".
 
+### KI-50 — A held message's recipient id stops resolving as soon as its name reconnects, so store-and-forward only bridges the gap once
+- **Where:** `MeshHub.TryStoreForOfflineDeliveryAsync` / `ForgetOfflineIdentity`, called from
+  `HandleClientAsync`'s registration path and from the unknown-recipient branch of both direct-routing
+  methods.
+- **Severity:** medium (correctness, by design). Issue #28 keys the store by client **name**, but
+  senders address by the per-connection `Guid` they looked up, and a reconnecting client is minted a
+  brand new one.
+- **Why it bites:** while the recipient is away, a peer's cached id resolves to its name and messages
+  are held. The moment that name registers again — under an id the peer does not know — the hub forgets
+  the old id, and every further message the peer sends to it is dropped as `unknown-recipient` rather
+  than held. So a peer that never re-runs `GetClientIdByNameAsync` gets its traffic bridged across
+  exactly one absence and then silently stops reaching the recipient, even though the recipient is
+  connected. There is no signal to the sender that its id has gone stale.
+- **What to do:** treat a looked-up id as valid only for as long as the peer stays connected, and
+  re-resolve on the hub's `ClientDisconnected`, on a `SendRejected`, or simply before each send if the
+  cost is acceptable. **Issue #43 (session resumption) is what closes this properly** — a resumed
+  client keeps its `Guid`, so a peer's cached id stays correct across the reconnect and the "held once,
+  then dropped" cliff disappears.
+
+### KI-51 — The offline store runs on a live connection's path, and a slow one is felt by clients
+- **Where:** `MeshHub.TryStoreForOfflineDeliveryAsync` (called from the sending client's receive loop)
+  and `MeshHub.DeliverStoredMessagesAsync` (called during the returning client's registration), both
+  bounded by `offlineStoreTimeout` (default 10 s).
+- **Severity:** low–medium (availability), only for a hub with a custom, non-in-memory store.
+- **Why it bites:** this is the same hazard class as a slow `GroupAuthoriser` (KI-28). A durable store
+  that does I/O adds that latency to the *sender's* receive loop for every message it holds — and,
+  because one connection's frames are routed in order, everything else that sender is sending queues
+  behind it. On the drain side it delays the returning client's transition into its receive loop.
+  Unlike the group authoriser, there is no concurrency cap: every connection may have one store call in
+  flight at once, so a store must expect `maxClients`-way concurrency.
+- **What to do:** keep the implementation fast and bound your own concurrency inside it. Note the
+  timeout bounds how long the *hub waits*, not how long your call *runs* — an abandoned call carries on
+  executing. `InMemoryOfflineStore` never blocks, so a hub using the default is unaffected.
+
 ---
 
 ## Also worth knowing (not defects)

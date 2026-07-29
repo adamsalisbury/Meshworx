@@ -29,7 +29,9 @@ internal sealed class MeshHubFixture
         TimeSpan? groupAuthorisationTimeout = null,
         int? maxConnectionsPerRemoteEndpoint = null,
         bool notifyOnQueueSaturation = false,
-        TimeSpan? backpressureAwaitTimeout = null)
+        TimeSpan? backpressureAwaitTimeout = null,
+        IOfflineStore? offlineStore = null,
+        TimeSpan? offlineStoreTimeout = null)
     {
         var logger = new Mock<ILogger<MeshHub>>();
         Listener.Setup(l => l.StartAsync(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
@@ -57,7 +59,9 @@ internal sealed class MeshHubFixture
             groupAuthorisationTimeout,
             maxConnectionsPerRemoteEndpoint,
             notifyOnQueueSaturation,
-            backpressureAwaitTimeout);
+            backpressureAwaitTimeout,
+            offlineStore,
+            offlineStoreTimeout);
     }
 
     /// <summary>
@@ -225,6 +229,44 @@ internal sealed class MeshHubFixture
         }
 
         return new RegisteredClient(clientId, transport, disconnectTcs, responseData);
+    }
+
+    /// <summary>
+    /// Registers a client with a <see cref="FrameRecorder"/> attached <em>before</em> the connection is
+    /// accepted, so frames the hub sends of its own accord the moment registration completes are
+    /// captured rather than raced.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="RegisterClientAsync"/> installs its own <c>SendAsync</c> callback and a test that
+    /// attaches a recorder afterwards replaces it — fine for frames provoked later by the test itself,
+    /// but not for the offline store's drain, which the hub queues between sending
+    /// <c>RegistrationComplete</c> and reading the client's first frame.
+    /// </remarks>
+    public async Task<(RegisteredClient Client, FrameRecorder Frames)> RegisterClientWithRecorderAsync(
+        string name = "TestClient", byte versionMin = 0x04, byte versionMax = 0x04)
+    {
+        var transport = CreateMockTransport();
+        var disconnectTcs = new TaskCompletionSource<byte[]?>();
+        var recorder = new FrameRecorder(transport);
+
+        transport.SetupSequence(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(CreateRegistrationRequest(name, versionMin: versionMin, versionMax: versionMax))
+            .Returns(disconnectTcs.Task);
+
+        EnqueueClient(transport.Object);
+
+        byte[] responseData = await recorder
+            .WaitForAsync(frame => frame.Length == 18 && frame[0] == 0x01)
+            .WaitAsync(TestTimeouts.Wait)
+            .ConfigureAwait(false);
+        var clientId = new Guid(responseData.AsSpan(1, 16));
+
+        while (!Hub.IsClientRegistered(clientId))
+        {
+            await Task.Yield();
+        }
+
+        return (new RegisteredClient(clientId, transport, disconnectTcs, responseData), recorder);
     }
 
     public async Task<MultiMessageRegisteredClient> RegisterMultiMessageClientAsync(

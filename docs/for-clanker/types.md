@@ -243,6 +243,54 @@ does, at `MeshHub.cs:1912`). Trivially constructible in tests.
   meaning out of it. It is also unbounded in length (KI-8), so do not use it as a key in anything you
   cannot afford a client to grow.
 
+## Offline delivery types
+
+Added for issue #28. The seam that turns store-and-forward on, plus the shape of what is stored. See
+[hub.md](hub.md#offline-delivery) for how the hub drives them.
+
+### `IOfflineStore` — `IOfflineStore.cs`
+
+Two methods, both keyed by **client name** rather than id — the id is minted per connection, so it is
+the name that survives a client going away and coming back.
+
+| Member | Signature | Contract |
+|---|---|---|
+| `TryEnqueueAsync` | `ValueTask<bool>(string clientName, OfflineMessage message, CancellationToken = default)` | `true` = stored, `false` = refused (the hub then drops the message as if the feature were off). An implementation that *evicts* to make room still returns `true` — the result describes this message, not what it displaced |
+| `TakeAllAsync` | `ValueTask<IReadOnlyList<OfflineMessage>>(string clientName, CancellationToken = default)` | Removes and returns everything held, **oldest first**. Called once per successful registration, so make "this name holds nothing" cheap. Discard anything past its window here rather than returning it |
+
+**Implementations must be thread-safe** — both methods are called from per-connection handler tasks that
+run concurrently, and one name can be enqueued to by many senders while its owner is reconnecting.
+
+### `OfflineMessage` — `OfflineMessage.cs`
+
+`public sealed record OfflineMessage(Guid SenderId, ReadOnlyMemory<byte> HeaderBlock,
+ReadOnlyMemory<byte> Body, DateTimeOffset QueuedAt)`, plus `int ByteCount => Body.Length +
+HeaderBlock.Length`.
+
+**It holds the message's parts, not a built delivery frame, and that is the design point** — the frame's
+shape depends on the version the *returning* connection negotiates, which is unknowable at storage time.
+The hub copies both byte ranges out of the receive buffer before constructing one, so neither aliases a
+buffer that is about to be reused; an implementation may hold them indefinitely.
+
+### `InMemoryOfflineStore` — `InMemoryOfflineStore.cs`
+
+`public sealed class InMemoryOfflineStore : IOfflineStore`, the bounded process-local default.
+Constructor: `(int? maxMessagesPerClient = null, int? maxBytesPerClient = null, TimeSpan? timeToLive =
+null, int? maxClients = null)`, defaulting to 100 messages, 1 MiB, 5 minutes and 1000 names —
+each exposed as a `Default*` constant. Non-positive values throw `ArgumentOutOfRangeException`.
+
+- **A full queue refuses the new message rather than evicting the oldest.** That keeps "accepted means
+  it will be delivered unless it expires" true, and makes the loss visible where it happens (the hub
+  counts `reason=offline-queue-full`). Implement the interface for the opposite policy.
+- **Expiry is purged lazily**, on the next call touching that name, not by a timer — a store nobody is
+  using does no work, and a queue whose messages have all aged out accepts new ones rather than staying
+  nominally full. Because the queue is in arrival order, the expired messages are always a prefix.
+- **One lock per name**, with the same `Removed`-flag retire-and-retry dance the hub uses for groups
+  (`MeshHub.RemoveMemberFromGroup`) — including doing the `TryRemove` *inside* the lock, which is what
+  makes the enqueue-side retry terminate rather than spin against a queue that is dead but still mapped.
+- **The name cap counts distinct names holding something**, checked only when a genuinely new name is
+  about to be added; a name already in the store is never refused by it. Draining a name frees its slot.
+
 ## Exception
 
 `RegistrationRefusedException : Exception` (`sealed`, namespace `AdamSalisbury.Meshworx`,
