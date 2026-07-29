@@ -1,8 +1,10 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net.Sockets;
 using System.Text;
+using AdamSalisbury.Meshworx.Diagnostics;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
@@ -684,6 +686,17 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             transport = _transport!;
         }
 
+        using Activity? activity = MeshworxActivitySource.Instance.StartActivity(
+            MeshworxActivitySource.SendActivityName, ActivityKind.Producer);
+
+        if (activity is not null)
+        {
+            activity.SetTag("meshworx.recipient_id", recipientId);
+            activity.SetTag("meshworx.message_size", message.Length);
+        }
+
+        headers = WithTraceContext(headers, activity);
+
         byte[] payload;
         if (headers.Count == 0)
         {
@@ -724,6 +737,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds,
         BackpressureHeaderKeys.AwaitCapacity,
         MessagePriorityHeaderKeys.Priority,
+
+        // Reserved for the same reason as the rest: these are written from the ambient Activity on
+        // every traced send, so an application setting them by hand would have its value silently
+        // replaced — or, worse, kept on a send that happened not to be traced, putting a stale trace id
+        // on a message that belongs to a different operation entirely.
+        TraceContextHeaderKeys.TraceParent,
+        TraceContextHeaderKeys.TraceState,
     ];
 
     /// <summary>
@@ -847,6 +867,17 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         ITransport transport = GetConnectedTransport();
 
+        using Activity? activity = MeshworxActivitySource.Instance.StartActivity(
+            MeshworxActivitySource.SendActivityName, ActivityKind.Producer);
+
+        if (activity is not null)
+        {
+            activity.SetTag("meshworx.group_name", groupName);
+            activity.SetTag("meshworx.message_size", message.Length);
+        }
+
+        headers = WithTraceContext(headers, activity);
+
         byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
         if (nameBytes.Length > ushort.MaxValue)
         {
@@ -907,6 +938,83 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// Guards a header-bearing send against a connection that negotiated a protocol version predating
     /// the header envelope, so headers the caller supplied are never silently dropped on the wire.
     /// </summary>
+    /// <summary>
+    /// Starts the consumer span for a received message, continuing the sender's trace when the message
+    /// carries one.
+    /// </summary>
+    /// <remarks>
+    /// Returns <see langword="null"/> when nothing is listening, which is the ordinary case and costs
+    /// nothing. A message with no trace context still gets a span when a listener is attached — it
+    /// simply starts a new trace rather than continuing one, which is the honest representation of a
+    /// message that arrived from an untraced sender.
+    /// </remarks>
+    private static Activity? StartReceiveActivity(MessageHeaders headers, Guid senderId)
+    {
+        Activity? activity = TraceContextHeaderKeys.TryExtractTraceContext(headers, out ActivityContext parent)
+            ? MeshworxActivitySource.Instance.StartActivity(
+                MeshworxActivitySource.ReceiveActivityName, ActivityKind.Consumer, parent)
+            : MeshworxActivitySource.Instance.StartActivity(
+                MeshworxActivitySource.ReceiveActivityName, ActivityKind.Consumer);
+
+        activity?.SetTag("meshworx.sender_id", senderId);
+        return activity;
+    }
+
+    /// <summary>
+    /// Returns the caller's headers with W3C trace context added, when there is context to propagate
+    /// and this connection can carry it.
+    /// </summary>
+    /// <remarks>
+    /// The context comes from this library's own send span when a listener created one, and otherwise
+    /// from the ambient <see cref="Activity.Current"/> — a message sent inside an application's existing
+    /// span should join that trace whether or not anyone is listening to <em>this</em> library
+    /// specifically. When neither exists, which is the case for every send in a process with no tracing
+    /// at all, this returns the caller's headers untouched and the frame is byte-for-byte what it was
+    /// before tracing existed.
+    /// <para>
+    /// The version gate is the important part. Adding a header to a previously header-free send turns it
+    /// into a header-bearing frame, and
+    /// <see cref="RequireHeaderEnvelopeSupport(byte)"/> throws for a connection that negotiated below
+    /// <see cref="Protocol.HeaderEnvelopeMinVersion"/>. Without this check, merely attaching a tracing
+    /// listener would start throwing on sends to an older peer that worked perfectly a moment earlier —
+    /// observability breaking delivery, which is precisely backwards. Tracing degrades instead: the
+    /// context is dropped, the message goes out exactly as it always did.
+    /// </para>
+    /// <para>
+    /// The caller's <see cref="MessageHeaders"/> is immutable and routinely reused across sends, so the
+    /// trace context is added to a copy rather than written into it.
+    /// </para>
+    /// </remarks>
+    private MessageHeaders WithTraceContext(MessageHeaders headers, Activity? activity)
+    {
+        if (NegotiatedProtocolVersion < Protocol.HeaderEnvelopeMinVersion)
+        {
+            return headers;
+        }
+
+        if (!TraceContextHeaderKeys.TryGetTraceContext(
+                activity ?? Activity.Current, out string traceParent, out string? traceState))
+        {
+            return headers;
+        }
+
+        var merged = new Dictionary<string, string>(headers.Count + 2, StringComparer.Ordinal);
+
+        foreach (KeyValuePair<string, string> header in headers)
+        {
+            merged[header.Key] = header.Value;
+        }
+
+        merged[TraceContextHeaderKeys.TraceParent] = traceParent;
+
+        if (!string.IsNullOrEmpty(traceState))
+        {
+            merged[TraceContextHeaderKeys.TraceState] = traceState;
+        }
+
+        return MessageHeaders.FromOwnedDictionary(merged);
+    }
+
     private static void RequireHeaderEnvelopeSupport(byte negotiatedProtocolVersion)
     {
         if (negotiatedProtocolVersion < Protocol.HeaderEnvelopeMinVersion)
@@ -1311,21 +1419,28 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                                 && !TryCompletePendingRequest(senderId, headers, messageData)
                                 && !IsExpired(headers, senderId))
                             {
-                                try
+                                // The consumer span covers the handler, not just the frame's arrival:
+                                // what a trace is being read to answer is how long the application took
+                                // to deal with the message, and that is the subscriber's work below.
+                                using (Activity? receiveActivity = StartReceiveActivity(headers, senderId))
                                 {
-                                    MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                                    try
                                     {
-                                        SenderId = senderId,
-                                        Data = messageData,
-                                        Headers = headers,
-                                        CorrelationId = TryGetRequestCorrelationId(headers),
-                                    });
-                                }
-                                catch (Exception ex)
-                                {
-                                    // A throwing subscriber must not tear down the receive loop and
-                                    // silently halt all further delivery. This is a callback boundary.
-                                    _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                                        MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+                                        {
+                                            SenderId = senderId,
+                                            Data = messageData,
+                                            Headers = headers,
+                                            CorrelationId = TryGetRequestCorrelationId(headers),
+                                        });
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        // A throwing subscriber must not tear down the receive loop and
+                                        // silently halt all further delivery. This is a callback boundary.
+                                        _logger.LogError(ex, "A MessageReceived handler threw an exception");
+                                        receiveActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                                    }
                                 }
 
                                 // The acknowledgement is sent once the message has been handed to the
@@ -1365,20 +1480,26 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                             {
                                 ReadOnlyMemory<byte> messageData = data.AsMemory(bodyOffset);
 
-                                try
+                                using (Activity? receiveActivity = StartReceiveActivity(headers, senderId))
                                 {
-                                    GroupMessageReceived?.Invoke(this, new GroupMessageReceivedEventArgs
+                                    receiveActivity?.SetTag("meshworx.group_name", groupName);
+
+                                    try
                                     {
-                                        SenderId = senderId,
-                                        GroupName = groupName,
-                                        Data = messageData,
-                                        Headers = headers,
-                                    });
-                                }
-                                catch (Exception ex)
-                                {
-                                    // Callback boundary — a throwing subscriber must not halt the loop.
-                                    _logger.LogError(ex, "A GroupMessageReceived handler threw an exception");
+                                        GroupMessageReceived?.Invoke(this, new GroupMessageReceivedEventArgs
+                                        {
+                                            SenderId = senderId,
+                                            GroupName = groupName,
+                                            Data = messageData,
+                                            Headers = headers,
+                                        });
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        // Callback boundary — a throwing subscriber must not halt the loop.
+                                        _logger.LogError(ex, "A GroupMessageReceived handler threw an exception");
+                                        receiveActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                                    }
                                 }
                             }
                         }

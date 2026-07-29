@@ -957,6 +957,46 @@ component recorded it:
 No protocol or payload change accompanies any of this — the instruments only observe routing and
 connection lifecycle events that already happen.
 
+### Distributed tracing
+
+Clients propagate [W3C Trace Context](https://www.w3.org/TR/trace-context/) so a logical operation
+stays traceable as it hops client → hub → client. Spans come from an `ActivitySource` named
+`AdamSalisbury.Meshworx`:
+
+```csharp
+using OpenTelemetry.Trace;
+
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracing => tracing.AddSource("AdamSalisbury.Meshworx"));
+```
+
+That registration *is* the opt-in. Until something listens to the source, `StartActivity` returns
+`null`, no `Activity` is allocated, no trace headers are written, and every frame is byte-for-byte
+what it was before tracing existed. There is no flag to set and nothing to switch on in the hub.
+
+| Span | Kind | Raised by |
+|---|---|---|
+| `Meshworx.Send` | `Producer` | The sending client, around handing a message to the transport. Tagged with `meshworx.recipient_id` or `meshworx.group_name`, and `meshworx.message_size`. |
+| `Meshworx.Receive` | `Consumer` | The receiving client, around delivery to the application — so the span covers the handler's own work, which is usually what the trace is being read to explain. Tagged with `meshworx.sender_id`, and `meshworx.group_name` for a group message. |
+
+Context travels in the header envelope under the standard `traceparent` and `tracestate` keys — the
+W3C names verbatim, not `mesh.`-prefixed ones, so a peer bridging Meshworx to HTTP, gRPC or a broker
+finds the names it already knows. Both are reserved: setting either by hand throws, as with every
+other header a built-in helper writes.
+
+**The hub does not participate in the trace.** It passes the header block through unchanged, as it
+does for every header it has no behaviour for, so context survives the routing hop without the hub
+reading it. A send made inside your own `Activity` joins that trace whether or not anything is
+listening to this library's source specifically.
+
+Two deliberate degradations, both chosen so observability can never break delivery:
+
+- A connection that negotiated below protocol version 5 cannot carry a header block at all. Trace
+  context is dropped and the message goes out exactly as it always did, rather than the send starting
+  to throw the moment a listener is attached.
+- A malformed `traceparent` from a peer costs the causal link, not the delivery. The message is still
+  raised, under a span that starts a new trace.
+
 ## Building and testing
 
 ```sh
