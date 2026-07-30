@@ -1,9 +1,12 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace AdamSalisbury.Meshworx.Serialization.UnitTests;
 
-public class JsonMessageSerializerTests
+// Partial so AnimalOnlyJsonContext, nested below, can be a source-generated JsonSerializerContext — the
+// generator requires every type enclosing one to be partial too.
+public partial class JsonMessageSerializerTests
 {
     /// <summary>
     /// The acceptance criterion for the codec layer: an ordinary POCO survives a round trip through the
@@ -152,6 +155,26 @@ public class JsonMessageSerializerTests
 
         Assert.Throws<NotSupportedException>(() => serializer.Deserialize<IAnimal>(body));
     }
+
+    /// <summary>
+    /// The documented AOT/trimming caveat on <see cref="JsonMessageSerializer.Serialize{TValue}"/>: a
+    /// source-generated <see cref="JsonSerializerContext"/> that registers only the declared interface —
+    /// a reasonable posture for a caller who cannot enumerate every implementer up front — has no metadata
+    /// for the concrete runtime type this fix now resolves against, so the call throws rather than falling
+    /// back to the pre-fix (silently lossy) behaviour.
+    /// </summary>
+    [Fact]
+    public void Serialize_InterfaceDeclaredValue_WithASourceGeneratedContextMissingTheConcreteType_Throws()
+    {
+        var serializer = new JsonMessageSerializer(
+            new JsonSerializerOptions { TypeInfoResolver = AnimalOnlyJsonContext.Default });
+        IAnimal value = new Dog("Rex", 3);
+
+        Assert.Throws<NotSupportedException>(() => serializer.Serialize(value));
+    }
+
+    [JsonSerializable(typeof(IAnimal))]
+    private sealed partial class AnimalOnlyJsonContext : JsonSerializerContext;
 
     private interface IAnimal
     {
