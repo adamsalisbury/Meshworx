@@ -11,7 +11,7 @@ internal static class Protocol
     /// The highest wire-protocol version this build of the hub and client supports, and the version
     /// advertised when there is no reason to negotiate down.
     /// </summary>
-    internal const byte MaxSupportedVersion = 7;
+    internal const byte MaxSupportedVersion = 8;
 
     /// <summary>
     /// The lowest negotiated protocol version at which the structured message-header envelope
@@ -36,6 +36,16 @@ internal static class Protocol
     /// reply itself, so the reply stays byte-identical to what version 6 produces.
     /// </summary>
     internal const byte SessionResumedGroupsMinVersion = 7;
+
+    /// <summary>
+    /// The lowest negotiated protocol version at which topic pub/sub (<see cref="MessageType.SubscribeTopic"/>,
+    /// <see cref="MessageType.UnsubscribeTopic"/>, <see cref="MessageType.PublishTopicMessage"/> and their
+    /// header-bearing and delivery counterparts) may be used. A connection negotiated below this version
+    /// has never had the opcodes defined at its end, on either side, so both <see cref="MeshClient"/> and
+    /// <see cref="MeshHub"/> refuse to send or act on them rather than risk a peer silently discarding an
+    /// opcode it does not recognise.
+    /// </summary>
+    internal const byte TopicPubSubMinVersion = 8;
 
     /// <summary>
     /// The length, in bytes, of a session resumption token. 32 bytes of cryptographically secure

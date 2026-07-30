@@ -1481,6 +1481,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     }
                 }
                 else if (data.Length > 1
+                    && connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion
                     && (MessageType)data[0] == MessageType.SubscribeTopic)
                 {
                     string pattern = Encoding.UTF8.GetString(data.AsSpan(1));
@@ -1497,12 +1498,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     }
                 }
                 else if (data.Length > 1
+                    && connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion
                     && (MessageType)data[0] == MessageType.UnsubscribeTopic)
                 {
                     string pattern = Encoding.UTF8.GetString(data.AsSpan(1));
                     UnsubscribeTopic(connection, pattern);
                 }
                 else if (data.Length >= 3
+                    && connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion
                     && (MessageType)data[0] == MessageType.PublishTopicMessage)
                 {
                     int topicLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(1, 2));
@@ -1517,6 +1520,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     }
                 }
                 else if (data.Length >= 5
+                    && connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion
                     && (MessageType)data[0] == MessageType.PublishTopicMessageWithHeaders)
                 {
                     int topicLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(1, 2));

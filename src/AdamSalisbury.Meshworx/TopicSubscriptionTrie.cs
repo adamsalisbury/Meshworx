@@ -49,7 +49,7 @@ internal sealed class TopicSubscriptionTrie : IDisposable
     /// <exception cref="ArgumentException"><paramref name="pattern"/> is not a valid pattern.</exception>
     public void Subscribe(string pattern, Guid clientId)
     {
-        string[] segments = SplitAndValidate(pattern, isPattern: true);
+        string[] segments = SplitAndValidate(pattern, isPattern: true, nameof(pattern));
 
         _lock.EnterWriteLock();
         try
@@ -85,7 +85,7 @@ internal sealed class TopicSubscriptionTrie : IDisposable
         string[] segments;
         try
         {
-            segments = SplitAndValidate(pattern, isPattern: true);
+            segments = SplitAndValidate(pattern, isPattern: true, nameof(pattern));
         }
         catch (ArgumentException)
         {
@@ -121,7 +121,7 @@ internal sealed class TopicSubscriptionTrie : IDisposable
     /// <exception cref="ArgumentException"><paramref name="topic"/> is not a valid concrete topic.</exception>
     public IReadOnlySet<Guid> Match(string topic)
     {
-        string[] segments = SplitAndValidate(topic, isPattern: false);
+        string[] segments = SplitAndValidate(topic, isPattern: false, nameof(topic));
         var results = new HashSet<Guid>();
 
         _lock.EnterReadLock();
@@ -254,9 +254,9 @@ internal sealed class TopicSubscriptionTrie : IDisposable
     /// Splits a topic or pattern into its dot-separated segments, validating it is well formed for the
     /// role it is being used in.
     /// </summary>
-    private static string[] SplitAndValidate(string value, bool isPattern)
+    private static string[] SplitAndValidate(string value, bool isPattern, string paramName)
     {
-        ArgumentException.ThrowIfNullOrEmpty(value);
+        ArgumentException.ThrowIfNullOrEmpty(value, paramName);
 
         string[] segments = value.Split('.');
 
@@ -264,7 +264,7 @@ internal sealed class TopicSubscriptionTrie : IDisposable
         {
             throw new ArgumentException(
                 $"A topic or pattern cannot have more than {MaxSegmentCount} dot-separated segments.",
-                nameof(value));
+                paramName);
         }
 
         for (int i = 0; i < segments.Length; i++)
@@ -275,24 +275,49 @@ internal sealed class TopicSubscriptionTrie : IDisposable
             {
                 throw new ArgumentException(
                     "A topic segment cannot be empty; check for a leading, trailing or repeated '.'.",
-                    nameof(value));
+                    paramName);
             }
 
             if (!isPattern && (segment == SingleSegmentWildcard || segment == MultiSegmentWildcard))
             {
                 throw new ArgumentException(
-                    $"A concrete topic cannot contain the '{segment}' wildcard segment.", nameof(value));
+                    $"A concrete topic cannot contain the '{segment}' wildcard segment.", paramName);
             }
 
             if (segment == MultiSegmentWildcard && i != segments.Length - 1)
             {
                 throw new ArgumentException(
                     "The '#' wildcard segment may only appear as the final segment of a pattern.",
-                    nameof(value));
+                    paramName);
             }
         }
 
         return segments;
+    }
+
+    /// <summary>
+    /// Validates that <paramref name="pattern"/> is well formed as a subscription pattern, without
+    /// registering it anywhere. Lets a caller — <see cref="MeshClient"/>, notably — surface the same
+    /// <see cref="ArgumentException"/> <see cref="Subscribe"/> and <see cref="Unsubscribe"/> would
+    /// eventually throw, immediately and locally, rather than as a hub-side rejection the caller has no
+    /// way to observe.
+    /// </summary>
+    /// <param name="pattern">The pattern to validate.</param>
+    /// <exception cref="ArgumentException"><paramref name="pattern"/> is not a valid pattern.</exception>
+    internal static void ValidatePattern(string pattern)
+    {
+        SplitAndValidate(pattern, isPattern: true, nameof(pattern));
+    }
+
+    /// <summary>
+    /// Validates that <paramref name="topic"/> is well formed as a concrete topic, without publishing
+    /// anything. Mirrors <see cref="ValidatePattern"/> for the same reason.
+    /// </summary>
+    /// <param name="topic">The topic to validate.</param>
+    /// <exception cref="ArgumentException"><paramref name="topic"/> is not a valid concrete topic.</exception>
+    internal static void ValidateTopic(string topic)
+    {
+        SplitAndValidate(topic, isPattern: false, nameof(topic));
     }
 
     /// <summary>

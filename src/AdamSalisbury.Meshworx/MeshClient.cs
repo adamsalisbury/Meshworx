@@ -1132,9 +1132,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// <inheritdoc/>
     public async Task SubscribeAsync(string pattern, CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrEmpty(pattern);
+        TopicSubscriptionTrie.ValidatePattern(pattern);
 
         ITransport transport = GetConnectedTransport();
+        RequireTopicPubSubSupport(NegotiatedProtocolVersion);
 
         // Recorded before the frame goes out, mirroring JoinGroupAsync — there is no authorisation hook
         // for a subscription that could refuse it after the fact, but recording first keeps the two
@@ -1168,9 +1169,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// <inheritdoc/>
     public async Task UnsubscribeAsync(string pattern, CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrEmpty(pattern);
+        TopicSubscriptionTrie.ValidatePattern(pattern);
 
         ITransport transport = GetConnectedTransport();
+        RequireTopicPubSubSupport(NegotiatedProtocolVersion);
 
         await SendTopicSubscriptionAsync(transport, MessageType.UnsubscribeTopic, pattern, cancellationToken)
             .ConfigureAwait(false);
@@ -1195,10 +1197,22 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         MessageHeaders headers,
         CancellationToken cancellationToken = default)
     {
-        ArgumentException.ThrowIfNullOrEmpty(topic);
+        TopicSubscriptionTrie.ValidateTopic(topic);
         ArgumentNullException.ThrowIfNull(headers);
 
         ITransport transport = GetConnectedTransport();
+        RequireTopicPubSubSupport(NegotiatedProtocolVersion);
+
+        using Activity? activity = MeshworxActivitySource.Instance.StartActivity(
+            MeshworxActivitySource.SendActivityName, ActivityKind.Producer);
+
+        if (activity is not null)
+        {
+            activity.SetTag("meshworx.topic", topic);
+            activity.SetTag("meshworx.message_size", message.Length);
+        }
+
+        headers = WithTraceContext(headers, activity);
 
         byte[] topicBytes = Encoding.UTF8.GetBytes(topic);
         if (topicBytes.Length > ushort.MaxValue)
@@ -1337,6 +1351,23 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             throw new NotSupportedException(
                 $"Message headers require a negotiated protocol version of at least "
                 + $"{Protocol.HeaderEnvelopeMinVersion}; this connection negotiated version "
+                + $"{negotiatedProtocolVersion}.");
+        }
+    }
+
+    /// <summary>
+    /// Guards every topic pub/sub call against a connection that negotiated a protocol version predating
+    /// the feature, so a client built with topic support talking to an older hub fails fast and audibly
+    /// rather than having its subscribe or publish frame silently go unrecognised by a peer that has never
+    /// heard of the opcode.
+    /// </summary>
+    private static void RequireTopicPubSubSupport(byte negotiatedProtocolVersion)
+    {
+        if (negotiatedProtocolVersion < Protocol.TopicPubSubMinVersion)
+        {
+            throw new NotSupportedException(
+                $"Topic pub/sub requires a negotiated protocol version of at least "
+                + $"{Protocol.TopicPubSubMinVersion}; this connection negotiated version "
                 + $"{negotiatedProtocolVersion}.");
         }
     }
