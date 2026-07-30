@@ -216,6 +216,46 @@ public sealed class MeshClientSessionResumptionTests
     }
 
     /// <summary>
+    /// A group block truncated mid-name — the kind of malformed frame a well-behaved hub never sends, but
+    /// nothing on the wire between them guarantees — is not acted on at all: the resume itself still
+    /// succeeds, and <see cref="IMeshClient.JoinedGroups"/> is left exactly as it was rather than being
+    /// partially populated from a read that ran off the end of the frame.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task ConnectAsync_ResumeAcceptedWithATruncatedGroupBlock_LeavesJoinedGroupsUntouched()
+    {
+        var client = new MeshClient(new Mock<ILogger<MeshClient>>().Object);
+        var first = new ResumptionHarness(issuedToken: IssuedToken, client: client);
+
+        await client.ConnectAsync(first.Transport.Object, "Worker");
+        await client.DisconnectAsync();
+
+        // A well-formed SessionResumed reply — id, token length, token — followed by a group block that
+        // claims two entries but supplies only one, and that one truncated before its own name bytes end.
+        byte[] renewedToken = RenewedToken;
+        var truncated = new byte[1 + 16 + 2 + renewedToken.Length + 2 + 2 + 3];
+        truncated[0] = 0x17; // SessionResumed
+        Guid.NewGuid().TryWriteBytes(truncated.AsSpan(1, 16));
+        BinaryPrimitives.WriteUInt16BigEndian(truncated.AsSpan(17, 2), (ushort)renewedToken.Length);
+        renewedToken.CopyTo(truncated, 19);
+
+        int groupsOffset = 19 + renewedToken.Length;
+        BinaryPrimitives.WriteUInt16BigEndian(truncated.AsSpan(groupsOffset, 2), 2); // claims two groups
+        BinaryPrimitives.WriteUInt16BigEndian(truncated.AsSpan(groupsOffset + 2, 2), 10); // first name is 10 bytes
+        // ...but only 3 bytes of that name, and no second entry, actually follow.
+        Encoding.UTF8.GetBytes("abc").CopyTo(truncated, groupsOffset + 4);
+
+        var second = new ResumptionHarness(issuedToken: IssuedToken, client: client, rawResumeReply: truncated);
+
+        await client.ConnectAsync(second.Transport.Object, "Worker");
+
+        Assert.True(client.SessionResumed);
+        Assert.Empty(client.JoinedGroups);
+
+        await client.DisposeAsync();
+    }
+
+    /// <summary>
     /// A hub that only negotiated version 6 sends the reply shape version 6 always produced — no group
     /// block at all. <see cref="IMeshClient.JoinedGroups"/> is left exactly as it was, which is empty:
     /// the pre-#109 behaviour for a peer this old, not a regression this fix introduces for it.
@@ -282,7 +322,8 @@ public sealed class MeshClientSessionResumptionTests
             byte[]? issuedToken,
             MeshClient? client = null,
             ResumeReply? resumeReply = null,
-            byte negotiatedVersion = Protocol.MaxSupportedVersion)
+            byte negotiatedVersion = Protocol.MaxSupportedVersion,
+            byte[]? rawResumeReply = null)
         {
             Client = client ?? new MeshClient(new Mock<ILogger<MeshClient>>().Object);
 
@@ -313,6 +354,12 @@ public sealed class MeshClientSessionResumptionTests
                     lock (_lock)
                     {
                         _resumeAttempts.Add(data.Span[1..].ToArray());
+                    }
+
+                    if (rawResumeReply is not null)
+                    {
+                        _inbound.Writer.TryWrite(rawResumeReply);
+                        return;
                     }
 
                     if (resumeReply is null)

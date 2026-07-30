@@ -332,6 +332,53 @@ public sealed class MeshHubSessionResumptionTests
     }
 
     /// <summary>
+    /// A group name too long to fit this block's <see cref="ushort"/> length prefix is dropped from the
+    /// reply rather than corrupting it via a truncated cast — the membership is still genuinely restored
+    /// on the hub, this reply simply cannot name it.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task ResumeSession_VersionSevenClient_OversizedGroupNameIsDroppedRatherThanCorruptingTheReply()
+    {
+        var fixture = new MeshHubFixture(sessionResumptionWindow: Window);
+        await fixture.Hub.StartAsync();
+
+        string oversizedGroupName = new('a', ushort.MaxValue + 1);
+
+        var worker = await fixture.RegisterMultiMessageClientAsync("Worker", versionMax: 0x07);
+        byte[] token = ExtractToken(worker.RegistrationResponse);
+        worker.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest(oversizedGroupName));
+        worker.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("news"));
+        await AwaitLookupBarrierAsync(fixture, worker, "Worker");
+
+        var disconnected = new TaskCompletionSource();
+        void OnDisconnected(object? _, ClientConnectionEventArgs e)
+        {
+            if (e.ClientName == "Worker")
+            {
+                disconnected.TrySetResult();
+            }
+        }
+
+        fixture.Hub.ClientDisconnected += OnDisconnected;
+        worker.Disconnect();
+        await disconnected.Task.WaitAsync(WaitTimeout);
+        fixture.Hub.ClientDisconnected -= OnDisconnected;
+
+        var returning = await fixture.RegisterMultiMessageClientAsync("Worker", versionMax: 0x07);
+        var frames = new FrameRecorder(returning.Transport);
+        returning.EnqueueMessage(MeshHubFixture.CreateResumeSessionRequest(token));
+
+        byte[] resumed = await frames.WaitForAsync(f => f[0] == 0x17).WaitAsync(WaitTimeout);
+
+        // The oversized name is left out, but the one that follows it decodes cleanly — the reply is not
+        // corrupted or desynchronised by the one it could not report.
+        Assert.Equal(["news"], ExtractRestoredGroups(resumed));
+
+        returning.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
     /// The token is single-use: the fresh one issued alongside the resumption is the only one that works
     /// afterwards, so a token captured off the wire cannot be replayed to steal the identity later.
     /// </summary>

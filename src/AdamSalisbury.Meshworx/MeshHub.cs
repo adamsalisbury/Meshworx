@@ -2752,7 +2752,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// nothing more. The group block is appended, never inserted, so an older client's fixed reads of the
     /// leading fields are unaffected by its presence and it costs a version-6 connection nothing.
     /// </remarks>
-    private static byte[] BuildSessionResumedReply(
+    private byte[] BuildSessionResumedReply(
         ClientConnection connection, Guid resumedId, byte[] renewedToken, IReadOnlyList<string> restoredGroups)
     {
         if (connection.NegotiatedProtocolVersion < Protocol.SessionResumedGroupsMinVersion)
@@ -2765,7 +2765,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return replyWithoutGroups;
         }
 
-        byte[][] groupNameBytes = [.. restoredGroups.Select(Encoding.UTF8.GetBytes)];
+        byte[][] groupNameBytes = BuildReportableGroupNameBytes(connection, restoredGroups);
         int groupsBlockLength = 2 + groupNameBytes.Sum(nameBytes => 2 + nameBytes.Length);
 
         var reply = new byte[1 + 16 + 2 + renewedToken.Length + groupsBlockLength];
@@ -2787,6 +2787,51 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
 
         return reply;
+    }
+
+    /// <summary>
+    /// Encodes the group names a <see cref="MessageType.SessionResumed"/> reply can actually name, dropping
+    /// any that cannot be represented in this block's <see cref="ushort"/>-prefixed wire format rather than
+    /// letting a bare cast silently truncate the length prefix out of step with the bytes that follow it.
+    /// </summary>
+    /// <remarks>
+    /// Nothing today caps a group name's length or a connection's membership count, so both bounds are
+    /// reachable in principle even though ordinary use never gets near them. A dropped name is not an
+    /// unrestored membership — the join already succeeded in <see cref="RestoreGroupMembershipAsync"/> — it
+    /// is only left out of what this particular reply can report, exactly like the version-6 case above.
+    /// </remarks>
+    private byte[][] BuildReportableGroupNameBytes(ClientConnection connection, IReadOnlyList<string> restoredGroups)
+    {
+        var groupNameBytes = new List<byte[]>();
+
+        foreach (string groupName in restoredGroups)
+        {
+            byte[] nameBytes = Encoding.UTF8.GetBytes(groupName);
+
+            if (nameBytes.Length > ushort.MaxValue)
+            {
+                _logger.LogWarning(
+                    "Group {GroupName} restored for resumed client {ClientId} is too long to report in the " +
+                    "SessionResumed reply; the membership is real, but this reply cannot name it",
+                    ForLog(groupName),
+                    connection.Id);
+                continue;
+            }
+
+            if (groupNameBytes.Count == ushort.MaxValue)
+            {
+                _logger.LogWarning(
+                    "Resumed client {ClientId} restored more group memberships than the SessionResumed " +
+                    "reply's {MaxReportableGroups} group cap; the remainder are not reported",
+                    connection.Id,
+                    ushort.MaxValue);
+                break;
+            }
+
+            groupNameBytes.Add(nameBytes);
+        }
+
+        return [.. groupNameBytes];
     }
 
     private async Task RefuseSessionResumeAsync(ClientConnection connection, CancellationToken cancellationToken)
