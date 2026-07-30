@@ -2,6 +2,7 @@ using System.Collections;
 using System.Reflection;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.UnitTests.Fixtures;
+using Moq;
 
 namespace AdamSalisbury.Meshworx.UnitTests;
 
@@ -414,6 +415,55 @@ public sealed class MeshHubSessionResumptionTests
         Assert.Equal(1, GetSessionCount(fixture.Hub));
 
         returning.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A resume that rebinds the connection onto the reclaimed identity, but then fails to send its
+    /// <see cref="MessageType.SessionResumed"/> reply, must still tear the connection down under the
+    /// identity it actually ended up holding (issue #106) — not the discarded fresh id the receive loop
+    /// never got the chance to record, which by then has already been dropped from the registry by the
+    /// resume itself and would leave the reclaimed id's entry behind for ever, pointing at a connection
+    /// that is about to be disposed.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task ResumeSession_ReplySendFails_TearsDownUnderTheReclaimedId()
+    {
+        var fixture = new MeshHubFixture(sessionResumptionWindow: Window);
+        await fixture.Hub.StartAsync();
+
+        (Guid originalId, byte[] token) = await RegisterThenDisconnectAsync(fixture, "Worker");
+
+        var returning = await fixture.RegisterMultiMessageClientAsync("Worker", versionMax: 0x06);
+        Guid freshId = returning.Id;
+
+        // Only the SessionResumed reply fails — everything else the mock sent already (the registration
+        // reply) keeps working, matching a peer whose socket drops at exactly the wrong instant rather
+        // than one that was never reachable at all.
+        returning.Transport
+            .Setup(t => t.SendAsync(
+                It.Is<ReadOnlyMemory<byte>>(m => m.ToArray()[0] == (byte)MessageType.SessionResumed),
+                It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IOException("simulated send failure"));
+
+        var disconnected = new TaskCompletionSource();
+        void OnDisconnected(object? _, ClientConnectionEventArgs e)
+        {
+            if (e.ClientName == "Worker")
+            {
+                disconnected.TrySetResult();
+            }
+        }
+
+        fixture.Hub.ClientDisconnected += OnDisconnected;
+        returning.EnqueueMessage(MeshHubFixture.CreateResumeSessionRequest(token));
+        await disconnected.Task.WaitAsync(WaitTimeout);
+        fixture.Hub.ClientDisconnected -= OnDisconnected;
+
+        Assert.False(fixture.Hub.IsClientRegistered(originalId));
+        Assert.False(fixture.Hub.IsClientRegistered(freshId));
+        Assert.Equal(0, fixture.Hub.ConnectedClientCount);
+
         await fixture.Hub.StopAsync();
     }
 

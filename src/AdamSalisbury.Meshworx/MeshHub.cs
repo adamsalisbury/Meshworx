@@ -1532,7 +1532,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
                 RemoveFromAllGroups(connection);
                 _clientNames.TryRemove(connection.Name, out _);
-                _clients.TryRemove(clientId, out _);
+
+                // connection.Id, not the local clientId: a resume that rebinds the connection and
+                // republishes the registries but then throws before ResumeSessionAsync returns leaves
+                // clientId holding the discarded fresh id, which is already gone from _clients. Removing
+                // by that stale id would leave the reclaimed entry — pointing at the connection about to
+                // be disposed below — behind for ever. connection.Id always names the current registry
+                // key; ClientDisconnected is raised with it a few lines below for the same reason.
+                _clients.TryRemove(connection.Id, out _);
                 _connectedClientsCounter.Add(-1);
 
                 // Retained only after the client is out of both registries, so a sender racing this
