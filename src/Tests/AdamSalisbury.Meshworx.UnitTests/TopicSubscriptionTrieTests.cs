@@ -178,6 +178,26 @@ public sealed class TopicSubscriptionTrieTests
     }
 
     [Fact]
+    public void Subscribe_PatternWithTooManySegments_ThrowsArgumentExceptionRatherThanOverflowingTheStack()
+    {
+        var trie = new TopicSubscriptionTrie();
+        string pattern = string.Join('.', Enumerable.Repeat("a", 10_000));
+
+        // A StackOverflowException cannot be caught, so the only way to prove this is bounded is to
+        // observe the graceful ArgumentException the segment-count cap is meant to produce instead.
+        Assert.Throws<ArgumentException>(() => trie.Subscribe(pattern, Guid.NewGuid()));
+    }
+
+    [Fact]
+    public void Match_TopicWithTooManySegments_ThrowsArgumentExceptionRatherThanOverflowingTheStack()
+    {
+        var trie = new TopicSubscriptionTrie();
+        string topic = string.Join('.', Enumerable.Repeat("a", 10_000));
+
+        Assert.Throws<ArgumentException>(() => trie.Match(topic));
+    }
+
+    [Fact]
     public void Unsubscribe_LastSubscriberOnABranch_PrunesTheNowEmptyNodes()
     {
         // There is no public way to observe the trie's internal node count, so this proves pruning

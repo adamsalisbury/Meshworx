@@ -960,6 +960,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         await StopAsync().ConfigureAwait(false);
         await _listener.DisposeAsync().ConfigureAwait(false);
         _authenticationSlots?.Dispose();
+        _topics.Dispose();
         _meter.Dispose();
     }
 

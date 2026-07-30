@@ -19,12 +19,14 @@ namespace AdamSalisbury.Meshworx;
 /// Matching walks one trie node per topic segment, so its cost is proportional to the topic's depth and
 /// the branching factor actually subscribed at each level — never to the total number of subscribers the
 /// trie holds, which is what keeps it sub-linear in subscriber count for a typical, shallow tree. A
-/// single lock guards every read and write: subscriptions change far less often than topics are
-/// published, but a published match still has to be a consistent snapshot of the tree, so the lock is
-/// held only for the traversal itself, never while messages are being delivered.
+/// <see cref="ReaderWriterLockSlim"/> guards the tree rather than a plain mutual-exclusion lock: matching
+/// is on the publish hot path and is read-only with respect to the tree's shape, so any number of
+/// publishes can traverse it at once, while <see cref="Subscribe"/> and <see cref="Unsubscribe"/> — far
+/// rarer, and the only operations that mutate it — take the exclusive write lock. Neither lock is ever
+/// held while a message is actually being delivered; only the traversal itself is covered.
 /// </para>
 /// </remarks>
-internal sealed class TopicSubscriptionTrie
+internal sealed class TopicSubscriptionTrie : IDisposable
 {
     /// <summary>The wildcard segment that matches exactly one topic segment.</summary>
     internal const string SingleSegmentWildcard = "+";
@@ -33,7 +35,8 @@ internal sealed class TopicSubscriptionTrie
     internal const string MultiSegmentWildcard = "#";
 
     private readonly Node _root = new();
-    private readonly Lock _lock = new();
+    private readonly ReaderWriterLockSlim _lock = new(LockRecursionPolicy.NoRecursion);
+    private int _disposed;
 
     /// <summary>
     /// Registers <paramref name="clientId"/> as a subscriber of <paramref name="pattern"/>.
@@ -48,7 +51,8 @@ internal sealed class TopicSubscriptionTrie
     {
         string[] segments = SplitAndValidate(pattern, isPattern: true);
 
-        lock (_lock)
+        _lock.EnterWriteLock();
+        try
         {
             Node node = _root;
             foreach (string segment in segments)
@@ -62,6 +66,10 @@ internal sealed class TopicSubscriptionTrie
             }
 
             (node.Subscribers ??= new HashSet<Guid>()).Add(clientId);
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
         }
     }
 
@@ -85,9 +93,14 @@ internal sealed class TopicSubscriptionTrie
             return false;
         }
 
-        lock (_lock)
+        _lock.EnterWriteLock();
+        try
         {
             return RemovePath(_root, segments, 0, clientId);
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
         }
     }
 
@@ -105,12 +118,28 @@ internal sealed class TopicSubscriptionTrie
         string[] segments = SplitAndValidate(topic, isPattern: false);
         var results = new HashSet<Guid>();
 
-        lock (_lock)
+        _lock.EnterReadLock();
+        try
         {
             Collect(_root, segments, 0, results);
         }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
 
         return results.Count == 0 ? [] : [.. results];
+    }
+
+    /// <summary>
+    /// Releases the underlying <see cref="ReaderWriterLockSlim"/>. Safe to call more than once.
+    /// </summary>
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 0)
+        {
+            _lock.Dispose();
+        }
     }
 
     private static void Collect(Node node, string[] segments, int index, HashSet<Guid> results)
@@ -206,6 +235,15 @@ internal sealed class TopicSubscriptionTrie
         return child;
     }
 
+    // Collect and RemovePath recurse once per segment, so this is also the effective cap on their
+    // recursion depth. Neither a topic nor a pattern is otherwise length-bounded — a client could
+    // otherwise pack tens of thousands of single-character segments into one still well-under-1-MiB
+    // frame — and a StackOverflowException cannot be caught in .NET, so an uncapped depth would let a
+    // single malformed subscribe or publish take the whole hub process down rather than just that one
+    // frame. 128 is generous for any topic hierarchy a real deployment would use while keeping the worst
+    // case nowhere near a default 1 MiB thread stack.
+    private const int MaxSegmentCount = 128;
+
     /// <summary>
     /// Splits a topic or pattern into its dot-separated segments, validating it is well formed for the
     /// role it is being used in.
@@ -215,6 +253,13 @@ internal sealed class TopicSubscriptionTrie
         ArgumentException.ThrowIfNullOrEmpty(value);
 
         string[] segments = value.Split('.');
+
+        if (segments.Length > MaxSegmentCount)
+        {
+            throw new ArgumentException(
+                $"A topic or pattern cannot have more than {MaxSegmentCount} dot-separated segments.",
+                nameof(value));
+        }
 
         for (int i = 0; i < segments.Length; i++)
         {
