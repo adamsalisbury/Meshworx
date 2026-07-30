@@ -479,4 +479,120 @@ public sealed class MeshClientServiceCollectionExtensionsTests
             stopwatch.Elapsed < TimeSpan.FromSeconds(2),
             $"Expected an immediate failure rather than a retry loop, took {stopwatch.Elapsed.TotalMilliseconds}ms");
     }
+
+    /// <summary>
+    /// A misconfigured option that a downstream constructor rejects — a negative
+    /// <see cref="MeshClientOptions.ConnectTimeout"/>, here — must fail host startup immediately rather
+    /// than being treated as a transient connection failure and retried for ever. Before this fix, the
+    /// retry loop's bare catch would have swallowed the resulting <see cref="ArgumentOutOfRangeException"/>
+    /// (itself an <see cref="ArgumentException"/>) exactly like a refused connection.
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task AddMeshClient_HostStart_NegativeConnectTimeout_FailsImmediatelyRatherThanRetryingForever()
+    {
+        var builder = new HostBuilder();
+        builder.ConfigureServices(services =>
+        {
+            services.AddLogging();
+            services.AddMeshClient("Alice", options =>
+            {
+                options.ConnectTimeout = TimeSpan.FromSeconds(-5);
+                options.ConnectRetryDelay = TimeSpan.FromMilliseconds(50);
+                options.TransportFactory = _ => Task.FromResult<ITransport>(new Mock<ITransport>().Object);
+            });
+        });
+
+        using IHost host = builder.Build();
+
+        var stopwatch = Stopwatch.StartNew();
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => host.StartAsync());
+        stopwatch.Stop();
+
+        Assert.True(
+            stopwatch.Elapsed < TimeSpan.FromSeconds(2),
+            $"Expected an immediate failure rather than a retry loop, took {stopwatch.Elapsed.TotalMilliseconds}ms");
+    }
+
+    /// <summary>
+    /// A credential the hub's authenticator rejects is a permanent refusal — the hub will refuse the
+    /// identical credential again on every retry — so it must fail host startup immediately rather than
+    /// re-presenting the same credential to the hub indefinitely at the retry interval.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task AddMeshClient_HostStart_AuthenticationRefused_FailsImmediatelyRatherThanRetryingForever()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(
+            new Mock<ILogger<MeshHub>>().Object,
+            listener,
+            authenticator: (_, _) => ValueTask.FromResult(false));
+        await hub.StartAsync();
+
+        var builder = new HostBuilder();
+        builder.ConfigureServices(services =>
+        {
+            services.AddLogging();
+            services.AddMeshClient("Alice", options =>
+            {
+                options.ConnectRetryDelay = TimeSpan.FromMilliseconds(50);
+                options.TransportFactory = _ => Task.FromResult<ITransport>(listener.Connect());
+            });
+        });
+
+        using IHost host = builder.Build();
+
+        var stopwatch = Stopwatch.StartNew();
+        await Assert.ThrowsAsync<RegistrationRefusedException>(() => host.StartAsync());
+        stopwatch.Stop();
+
+        Assert.True(
+            stopwatch.Elapsed < TimeSpan.FromSeconds(5),
+            $"Expected an immediate failure rather than a retry loop, took {stopwatch.Elapsed.TotalMilliseconds}ms");
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// The reconnector path retries its initial connection exactly like the plain path — a hub that has
+    /// not finished starting yet must not kill host startup just because <see cref="MeshClientOptions.UseReconnector"/>
+    /// happens to be set.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task AddMeshClient_UseReconnectorHostStart_TransportFactoryFailsThenSucceeds_ConnectsOnceReachable()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        var attempt = 0;
+
+        var builder = new HostBuilder();
+        builder.ConfigureServices(services =>
+        {
+            services.AddLogging();
+            services.AddMeshClient("Bob", options =>
+            {
+                options.UseReconnector = true;
+                options.ReconnectRetryDelay = TimeSpan.FromMilliseconds(20);
+                options.ConnectRetryDelay = TimeSpan.FromMilliseconds(20);
+                options.TransportFactory = _ =>
+                {
+                    Interlocked.Increment(ref attempt);
+                    return attempt <= 2
+                        ? Task.FromException<ITransport>(new IOException("hub not up yet"))
+                        : Task.FromResult<ITransport>(listener.Connect());
+                };
+            });
+        });
+
+        using IHost host = builder.Build();
+        await host.StartAsync();
+
+        IMeshClient client = host.Services.GetRequiredKeyedService<IMeshClient>("Bob");
+        Assert.True(client.IsConnected);
+        Assert.True(attempt >= 3);
+
+        await host.StopAsync();
+        await hub.StopAsync();
+    }
 }

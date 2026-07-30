@@ -2,6 +2,7 @@ using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.Transport.Tcp;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace AdamSalisbury.Meshworx.Extensions.DependencyInjection;
@@ -85,6 +86,7 @@ internal sealed class MeshClientHostedService(
     private async Task ConnectWithRetryAsync(MeshClientOptions options, CancellationToken cancellationToken)
     {
         TimeSpan retryDelay = options.ConnectRetryDelay ?? DefaultConnectRetryDelay;
+        ILogger<MeshClientHostedService>? logger = serviceProvider.GetService<ILogger<MeshClientHostedService>>();
 
         while (true)
         {
@@ -122,11 +124,29 @@ internal sealed class MeshClientHostedService(
                 // cancellation above.
                 throw;
             }
-            catch
+            catch (RegistrationRefusedException ex) when (ex.ErrorCode is
+                RegistrationErrorCode.UnsupportedProtocolVersion
+                or RegistrationErrorCode.ClientNameTooLong
+                or RegistrationErrorCode.AuthenticationFailed)
+            {
+                // A version mismatch, an over-length name, or a rejected credential are all refusals the
+                // hub will repeat for the identical request every time — retrying only means re-presenting
+                // the same, possibly sensitive, credential indefinitely at the retry interval rather than
+                // surfacing a clear failure. DuplicateClientName and HubAtCapacity are deliberately not
+                // listed here: both are genuinely worth retrying, since a departing previous instance of
+                // this same client freeing its name, or the hub freeing a client slot, are exactly the
+                // kind of transient condition this whole retry loop exists to tolerate.
+                throw;
+            }
+            catch (Exception ex)
             {
                 // Either this attempt's own timeout fired, or it failed outright (connection refused, DNS
                 // failure, and the like). Either way the hub may simply not be up yet — in a real
                 // deployment it is very often a separate process — so retry rather than killing the host.
+                // Logged at Warning, matching MeshClientReconnector's own equivalent retry log, so a hub
+                // that stays unreachable for a long time is visible rather than silent.
+                logger?.LogWarning(
+                    ex, "Client {ClientName} failed to connect; retrying in {RetryDelay}", clientName, retryDelay);
                 await Task.Delay(retryDelay, cancellationToken).ConfigureAwait(false);
             }
         }
