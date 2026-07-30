@@ -446,10 +446,14 @@ public sealed class MeshHubSessionResumptionTests
                 It.IsAny<CancellationToken>()))
             .ThrowsAsync(new IOException("simulated send failure"));
 
+        // Keyed on originalId (the identity the connection ends up torn down under) rather than on
+        // ClientName: a successful identity swap now also raises a ClientDisconnected for the discarded
+        // freshId (issue #105), which happens before this reply-send failure and would otherwise satisfy
+        // a name-only wait long before the teardown this test actually cares about has run.
         var disconnected = new TaskCompletionSource();
         void OnDisconnected(object? _, ClientConnectionEventArgs e)
         {
-            if (e.ClientName == "Worker")
+            if (e.ClientId == originalId)
             {
                 disconnected.TrySetResult();
             }
@@ -464,6 +468,55 @@ public sealed class MeshHubSessionResumptionTests
         Assert.False(fixture.Hub.IsClientRegistered(freshId));
         Assert.Equal(0, fixture.Hub.ConnectedClientCount);
 
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A resume swaps the connection onto a different id without the connection ever actually dropping,
+    /// so <see cref="MeshHub.ClientConnected"/> and <see cref="MeshHub.ClientDisconnected"/> must still
+    /// come in matched pairs across the swap (issue #105) — otherwise a subscriber tracking connected ids
+    /// leaks the discarded fresh id for ever and later receives an unmatched disconnect for the resumed
+    /// one at teardown.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task ResumeSession_ValidToken_RaisesMatchingDisconnectThenConnectForTheIdentitySwap()
+    {
+        var fixture = new MeshHubFixture(sessionResumptionWindow: Window);
+        await fixture.Hub.StartAsync();
+
+        (_, byte[] token) = await RegisterThenDisconnectAsync(fixture, "Worker");
+
+        // Subscribed before the fresh registration below, rather than after: registration adds the
+        // connection to the registry and raises ClientConnected as two separate steps, so waiting for
+        // RegisterMultiMessageClientAsync to return (which only waits on the registry) does not guarantee
+        // the event has fired yet, and subscribing afterwards would race it.
+        var events = new List<(string EventName, Guid ClientId)>();
+        void OnConnected(object? _, ClientConnectionEventArgs e) => events.Add(("ClientConnected", e.ClientId));
+        void OnDisconnected(object? _, ClientConnectionEventArgs e) => events.Add(("ClientDisconnected", e.ClientId));
+
+        fixture.Hub.ClientConnected += OnConnected;
+        fixture.Hub.ClientDisconnected += OnDisconnected;
+
+        var returning = await fixture.RegisterMultiMessageClientAsync("Worker", versionMax: 0x06);
+        var frames = new FrameRecorder(returning.Transport);
+        Guid freshId = returning.Id;
+
+        returning.EnqueueMessage(MeshHubFixture.CreateResumeSessionRequest(token));
+        byte[] resumed = await frames.WaitForAsync(f => f[0] == 0x17).WaitAsync(WaitTimeout);
+        var resumedId = new Guid(resumed.AsSpan(1, 16));
+
+        fixture.Hub.ClientConnected -= OnConnected;
+        fixture.Hub.ClientDisconnected -= OnDisconnected;
+
+        // The fresh registration's own ClientConnected(freshId) is included here rather than filtered
+        // out, so the assertion pins the whole sequence rather than just the swap in isolation — proving
+        // freshId ends up disconnected exactly once and never simultaneously "connected" alongside
+        // resumedId.
+        Assert.Equal(
+            [("ClientConnected", freshId), ("ClientDisconnected", freshId), ("ClientConnected", resumedId)],
+            events);
+
+        returning.Disconnect();
         await fixture.Hub.StopAsync();
     }
 
