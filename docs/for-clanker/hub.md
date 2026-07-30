@@ -620,6 +620,8 @@ await using var hub = new MeshHub(
 | `LeaveGroup` | `LeaveGroup` | Remove member; if the group is now empty, mark `Removed` and drop it from `_groups`. Also called by `JoinGroupAsync` on refusal and by `RemoveFromAllGroups` (`:2291`) at teardown. | `MeshHub.cs:2278` |
 | `SendToGroup` | `GroupMessage` | **Requires the sender to be a member.** Tests `group.Members.Contains(senderId)` *inside* the group lock (`:2341`); a non-member is logged `Debug` and **dropped** (`:2351-2357`). A member snapshots the ids, then one shared `DeliverGroupMessage` frame is `TryWrite`n to each member **except the sender**. A full-queue drop raises `QueueSaturated` only — same reasoning as `BroadcastMessage` above, since the recipient's id comes from the group's own membership set, not the sender. | `MeshHub.cs:2321` |
 | `SendToGroupWithHeaders` | `GroupMessageWithHeaders` | As `SendToGroup`, but each recipient's own `NegotiatedProtocolVersion` picks its frame shape, exactly like `RouteMessageWithHeaders`. At most **two** shared frames are built regardless of group size — one with the header block, one without — each lazily built (`??=`) only if some member actually needs that shape. A full-queue drop raises `QueueSaturated` only, same as `SendToGroup`. **Does not** honour `DeliveryOptions.AwaitCapacity` — only the two direct-send paths above do. | `MeshHub.cs:2416` |
+| `PublishToTopic` | `PublishTopicMessage` | issue #37. Matches the topic against `TopicSubscriptionTrie`; **no membership/subscription of the sender's own required** (unlike `SendToGroup`). Charges the fan-out delivery budget via `ChargeFanOutDelivery`, checks the built frame against the transport frame cap (`ExceedsFrameCap`/`DropOversizeFanOut`, same guard `SendToGroup` uses), then enqueues one shared frame to every match except the sender. A full-queue drop raises `QueueSaturated` only, same reasoning as `BroadcastMessage`/`SendToGroup`. See [Topic-based publish/subscribe](#topic-based-publishsubscribe) below. | `MeshHub.cs:3786` |
+| `PublishToTopicWithHeaders` | `PublishTopicMessageWithHeaders` | As `PublishToTopic`, but each recipient's own `NegotiatedProtocolVersion` picks its frame shape (at most two shared frames, lazily built, exactly like `SendToGroupWithHeaders`), and `ReadPriority` selects the delivery lane. **Does not** honour `DeliveryOptions.AwaitCapacity` — no fan-out path does. | `MeshHub.cs:3839` |
 
 **Shared delivery frames:** broadcast and group sends allocate the delivery buffer **once** (or, for the
 two header-bearing group/direct paths, once per distinct frame shape actually needed) and hand the same
@@ -878,6 +880,12 @@ either guard runs — see [known-issues.md](known-issues.md) KI-59 for the clien
   merge** — a group the client believed it was in that this reply does not report (including one dropped
   by the two guards above) is silently discarded from the client's own view. See
   [known-issues.md](known-issues.md) KI-60.
+- **Nothing in this feature restores topic subscriptions.** `ResumableSession` captures `Groups` only —
+  there is no `Topics` field, `MakeSessionDormant` never reads `connection.Topics`, and
+  `ResumeSessionAsync` calls `RestoreGroupMembershipAsync` with no topic-side counterpart alongside it. A
+  resumed client's topic subscriptions (issue #37) are gone just as completely as a freshly-registered
+  client's, with nothing in the `SessionResumed` reply to say so. See
+  [known-issues.md](known-issues.md) KI-65.
 
 <a id="offline-delivery"></a>
 
@@ -1030,6 +1038,83 @@ Gotchas when writing a group authoriser:
 
 ---
 
+<a id="topic-based-publishsubscribe"></a>
+
+### Topic-based publish/subscribe
+
+Added for issue #37. A third addressing mode alongside direct and group: a client subscribes to a
+**pattern**, publishes to a concrete **topic**, and the hub delivers to every distinct subscriber whose
+pattern matches — without requiring the publisher to hold any subscription of its own, unlike a group
+send. Opcodes `0x19`–`0x1E` (see [protocol.md](protocol.md#topic-pubsub-frames-issue-37)).
+
+**`TopicSubscriptionTrie`** (`TopicSubscriptionTrie.cs`, `internal sealed`) is the hub-wide routing
+structure, one instance per `MeshHub` (`_topics`, `MeshHub.cs:209`), disposed alongside the hub
+(`MeshHub.cs:963`). It is a segment trie, not a flat scan: `Subscribe`/`Unsubscribe`/`Match` each walk one
+node per dot-separated segment, so `Match`'s cost is proportional to the topic's depth and the branching
+factor actually subscribed at each level — never to the total subscriber count. A `ReaderWriterLockSlim`
+guards it: `Match` (the publish hot path) takes the **read** lock, so any number of publishes traverse
+concurrently; `Subscribe`/`Unsubscribe` — far rarer — take the **write** lock. Neither lock is held while
+a message is actually delivered, only during the trie traversal itself.
+
+**Pattern syntax mirrors MQTT.** A pattern or topic is a dot-separated hierarchy (`orders.eu.created`).
+Two wildcard segments are reserved for a **pattern** (never legal in a concrete topic passed to
+`PublishAsync`): `+` matches exactly one segment, and `#` matches the remainder of the hierarchy from
+that point on — including the parent topic itself — and may only appear as a pattern's **final**
+segment. `orders.+.created` matches `orders.eu.created` but not `orders.eu.region.created`; `orders.#`
+matches both, and also bare `orders`. **Every pattern and topic is capped at 128 dot-separated segments**
+(`TopicSubscriptionTrie.MaxSegmentCount`, `TopicSubscriptionTrie.cs:251`) — `Match`/`Collect` recurse once
+per segment, and an uncapped depth would let one malformed subscribe or publish overflow the stack; a
+`StackOverflowException` cannot be caught in .NET, so this cap is what keeps a hostile frame from taking
+the whole hub process down rather than just that one frame. **Subscription *count* per client has no
+equivalent cap** — see [known-issues.md](known-issues.md) KI-63.
+
+**Dispatch (`HandleClientAsync`'s ladder, `MeshHub.cs:1483-1549`):**
+
+| Opcode | Handler | Behaviour |
+|---|---|---|
+| `SubscribeTopic` | inline | `_topics.Subscribe(pattern, connection.Id)` plus `connection.Topics.Add(pattern)`. An invalid pattern (bad wildcard placement, too many segments) is logged `Debug` and the subscription is silently dropped — no error frame, same shape as every other malformed-input path in this file. Since commit `fb2f9a0`, `MeshClient.SubscribeAsync` validates the same shape client-side before ever sending, so this hub-side path is now reachable only from a non-`MeshClient` peer, or one that hand-builds a frame. |
+| `UnsubscribeTopic` | `UnsubscribeTopic` (`:3757-3766`) | Removes from both the trie and `connection.Topics`. An empty pattern is a no-op. |
+| `PublishTopicMessage` | `PublishToTopic` (`:3790`) | See [Routing helpers](#routing-helpers) above. |
+| `PublishTopicMessageWithHeaders` | `PublishToTopicWithHeaders` (`:3843`) | See [Routing helpers](#routing-helpers) above. |
+
+Each of these four branches also carries a `connection.NegotiatedProtocolVersion >=
+Protocol.TopicPubSubMinVersion` guard (added by commit `fb2f9a0`, alongside the opcode check) — a frame
+from a connection negotiated below `8` falls through the ladder untouched, exactly like an unrecognised
+opcode (KI-9), rather than being acted on. See [Versioning](#versioning-and-the-topic-pubsub-gate) below.
+
+**`ClientConnection.Topics`** (`HashSet<string>`, `MeshHub.cs:4168`) mirrors `Groups` exactly: touched only
+by that connection's own receive loop and its own teardown, so — like `Groups` — it needs no lock of its
+own. `RemoveFromAllTopics` (`:3772-3780`) unsubscribes every pattern it holds from `_topics` at
+disconnect, mirroring `RemoveFromAllGroups`, and is called from the same teardown path
+(`MeshHub.cs:1641`).
+
+**No authorisation seam exists for either subscribe or publish** — contrast with [Group
+authorisation](#group-authorisation) above, which at least has an optional `GroupAuthoriser`. Any
+admitted client may subscribe to any pattern (including `#`, matching every topic on the hub) and publish
+to any topic. See [known-issues.md](known-issues.md) KI-62.
+
+**`MeshClientReconnector` does not restore topic subscriptions after a reconnect** — unlike group
+membership, which it re-joins automatically. See [known-issues.md](known-issues.md) KI-64 and
+[client.md](client.md#topic-based-publishsubscribe). **The hub's own native session resumption
+(`sessionResumptionWindow`) has the identical gap for a different reason** — see
+[Session resumption](#session-resumption) above and [known-issues.md](known-issues.md) KI-65.
+
+<a id="versioning-and-the-topic-pubsub-gate"></a>
+
+**All six opcodes shipped in one commit with no protocol version gate at all — a genuine gap against this
+docs set's own additive-opcode rule — and were fixed the very next commit.** `Protocol.MaxSupportedVersion`
+is now `8` and `Protocol.TopicPubSubMinVersion = 8` gates the four client → hub opcodes
+(`SubscribeTopic`/`UnsubscribeTopic`/`PublishTopicMessage`/`PublishTopicMessageWithHeaders`) on both ends —
+`MeshClient` refuses to send one below that version (`RequireTopicPubSubSupport`, throwing
+`NotSupportedException`), and the hub's four dispatch branches above additionally check
+`NegotiatedProtocolVersion` before acting. See [protocol.md](protocol.md#topic-pubsub-frames-issue-37) and
+[known-issues.md](known-issues.md) KI-61 (fixed) for the full history; a frame from a connection that
+never negotiated high enough — an older client or hub built before commit `fb2f9a0` — falls through the
+dispatch ladder exactly like any other unrecognised opcode (KI-9), silently, with no error reply of any
+kind.
+
+---
+
 <a id="metrics"></a>
 
 ### Metrics
@@ -1049,8 +1134,8 @@ name). See `MetricsCapture<T>` in [testing.md](testing.md#metrics-tests).
 | Instrument | Kind | Tags | Source |
 |---|---|---|---|
 | `meshworx.hub.clients.connected` | `UpDownCounter<int>` | — | created `:396`; `+1` on registration (`:1041`), `-1` on removal (`:1249`) |
-| `meshworx.hub.messages.routed` | `Counter<long>` | `direction`: `direct` / `broadcast` / `group` | created `:400`; recorded in `RouteMessage` (`:1906`), `RouteMessageWithHeaders` (`:1969`), `BroadcastMessage` (`:2066`), `SendToGroup` (`:2380`), `SendToGroupWithHeaders` (`:2453`) |
-| `meshworx.hub.bytes.routed` | `Counter<long>` | `direction`: `direct` / `broadcast` / `group` | created `:405`; recorded alongside each `messages.routed` add, with the body's length |
+| `meshworx.hub.messages.routed` | `Counter<long>` | `direction`: `direct` / `broadcast` / `group` / `topic` (issue #37) | created `:400`; recorded in `RouteMessage` (`:1906`), `RouteMessageWithHeaders` (`:1969`), `BroadcastMessage` (`:2066`), `SendToGroup` (`:2380`), `SendToGroupWithHeaders` (`:2453`), `PublishToTopic`/`PublishToTopicWithHeaders` (`:3829-3830`, `:3876-3877`) |
+| `meshworx.hub.bytes.routed` | `Counter<long>` | `direction`: `direct` / `broadcast` / `group` / `topic` (issue #37) | created `:405`; recorded alongside each `messages.routed` add, with the body's length |
 | `meshworx.hub.messages.dropped` | `Counter<long>` | `reason`: `unknown-recipient` / `queue-full` / `expired` (PR #85) / `offline-queue-full` (issue #28) | created `:410`; recorded at every drop site — `RouteMessage` unknown-recipient (`:1883`) and queue-full (`:1898`), `RouteMessageWithHeaders` the same pair (`:1937`, `:1964`), `BroadcastMessage` queue-full (`:2055`), `SendToGroup` queue-full (`:2398`), `SendToGroupWithHeaders` queue-full (`:2482`), `SendLoopAsync` expired (`:1666`, via `IsExpiredFrame` — see [dropping expired frames](#dropping-expired-frames)). **Every one of the five queue-full sites also raises `QueueSaturated` immediately alongside this counter add (PR #87) — see [Backpressure signalling](#backpressure-signalling-and-awaiting-capacity) below; the counter itself gained no new tag** |
 | `meshworx.hub.messages.offline_queued` | `Counter<long>` | — | issue #28; incremented in `TryStoreForOfflineDeliveryAsync` once a store has accepted a message. The same message is counted on `messages.routed` (`direction=direct`) **later**, when the recipient returns and `DeliverStoredMessagesAsync` queues it — so a held message is counted once here and once there, never twice on the same instrument |
 | `meshworx.hub.outbound_queue.depth` | `ObservableGauge<int>` | — | created `:614`; callback `ObserveOutboundQueueDepth` (`:632-641`) sums `ClientConnection.OutboundQueue.Count` across every entry in `_clients` on each collection pass. `OutboundQueue` is a `PriorityOutboundQueue` (see [priority lanes](#priority-lanes) above), not a `Channel<byte[]>` — it has no `Reader` property at all; `Count` is its own dedicated property (`Capacity - _capacityGate.CurrentCount`), already aggregated across its three internal lanes |
@@ -1100,6 +1185,11 @@ name). See `MetricsCapture<T>` in [testing.md](testing.md#metrics-tests).
   PR #85 (issue #29)**. See [known-issues.md](known-issues.md) KI-32 for the fuller write-up of this
   asymmetry — PR #74's two new routing methods inherit it unchanged, they do not introduce a new variant
   of it.
+- **`PublishToTopic`/`PublishToTopicWithHeaders` (issue #37) follow the same "only when there is a
+  recipient" shape as broadcast/group, via `ChargeFanOutDelivery`'s early `return false`** when
+  `TopicSubscriptionTrie.Match` finds no subscriber, or finds only the publisher's own subscription — so
+  a publish to a topic nobody (else) subscribes to records nothing on either instrument, the `direction=
+  topic` tag included.
 - **PR #85 makes `reason=expired` a genuine exception to "routed and dropped are mutually exclusive for
   `direct`".** `SendLoopAsync` (a separate task from the one that increments `routed`) can drop a direct
   frame as expired *after* `RouteMessage`/`RouteMessageWithHeaders` already counted it as `routed` — see
@@ -1173,6 +1263,19 @@ not part of the public contract:**
   no arguments is a **behavioural change** from any hub built before this PR. See
   [Per-remote-endpoint connection cap](#per-remote-endpoint-connection-cap) below and
   [known-issues.md](known-issues.md) KI-29.
+- **A topic publish requires no subscription of the publisher's own, unlike a group send.** There is also
+  no authorisation seam for either subscribe or publish, and no cap on how many patterns one client may
+  subscribe to. See [Topic-based publish/subscribe](#topic-based-publishsubscribe) above and
+  [known-issues.md](known-issues.md) KI-62/KI-63.
+- **Four of the six new topic opcodes are client → hub and, for one commit, shipped with no protocol
+  version bump**, breaking this docs set's own additive-opcode rule (see
+  [index §6](../for-clanker.md#6-cross-cutting-conventions-imitate-these)). Commit `fb2f9a0` fixed it —
+  `Protocol.TopicPubSubMinVersion = 8` now gates all four on both ends, and a connection negotiated below
+  it has its subscribe/publish calls refused client-side (`NotSupportedException`) rather than silently
+  no-op against an unaware peer. See [known-issues.md](known-issues.md) KI-61 (fixed).
+- **Session resumption restores group membership but never topic subscriptions.** A resumed client silently
+  loses any topic subscription it held, distinct from `MeshClientReconnector`'s own gap above. See
+  [Session resumption](#session-resumption) above and [known-issues.md](known-issues.md) KI-65.
 
 ## Idiomatic usage (from tests)
 
