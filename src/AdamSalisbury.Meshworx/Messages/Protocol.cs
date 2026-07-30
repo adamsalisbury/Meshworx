@@ -11,7 +11,7 @@ internal static class Protocol
     /// The highest wire-protocol version this build of the hub and client supports, and the version
     /// advertised when there is no reason to negotiate down.
     /// </summary>
-    internal const byte MaxSupportedVersion = 8;
+    internal const byte MaxSupportedVersion = 9;
 
     /// <summary>
     /// The lowest negotiated protocol version at which the structured message-header envelope
@@ -48,6 +48,15 @@ internal static class Protocol
     internal const byte TopicPubSubMinVersion = 8;
 
     /// <summary>
+    /// The lowest negotiated protocol version at which client attribute metadata
+    /// (<see cref="MessageType.SetClientAttributes"/>, <see cref="MessageType.FindClientsRequest"/> and
+    /// <see cref="MessageType.FindClientsResponse"/>) may be used. Follows the same rationale as
+    /// <see cref="TopicPubSubMinVersion"/>: the opcodes did not exist before this version on either end,
+    /// so a connection negotiated below it refuses to send or act on them.
+    /// </summary>
+    internal const byte ClientAttributesMinVersion = 9;
+
+    /// <summary>
     /// The length, in bytes, of a session resumption token. 32 bytes of cryptographically secure
     /// randomness — the token is a bearer credential for an identity, so it has to be long enough that
     /// guessing one is not a realistic attack even against a hub that will happily be asked repeatedly.
@@ -55,4 +64,20 @@ internal static class Protocol
     internal const int SessionTokenLength = 32;
 
     internal const int MaxClientNameLength = 256;
+
+    /// <summary>
+    /// The maximum number of key/value pairs a single client's attribute bag may hold. Bounds the memory
+    /// a hub commits per client to directory metadata, independently of how many clients are connected.
+    /// </summary>
+    internal const int MaxClientAttributeCount = 32;
+
+    /// <summary>
+    /// The maximum length, in UTF-8 bytes, of a single attribute key.
+    /// </summary>
+    internal const int MaxClientAttributeKeyLength = 128;
+
+    /// <summary>
+    /// The maximum length, in UTF-8 bytes, of a single attribute value.
+    /// </summary>
+    internal const int MaxClientAttributeValueLength = 512;
 }

@@ -32,4 +32,7 @@ internal enum MessageType : byte
     PublishTopicMessageWithHeaders = 0x1C,
     DeliverTopicMessage = 0x1D,
     DeliverTopicMessageWithHeaders = 0x1E,
+    SetClientAttributes = 0x1F,
+    FindClientsRequest = 0x20,
+    FindClientsResponse = 0x21,
 }
