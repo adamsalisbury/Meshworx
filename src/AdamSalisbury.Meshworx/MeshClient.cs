@@ -796,6 +796,15 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         // on a message that belongs to a different operation entirely.
         TraceContextHeaderKeys.TraceParent,
         TraceContextHeaderKeys.TraceState,
+
+        // Reserved because the receive loop acts on these before a message is ever raised: a header
+        // literally named mesh.chunk.id/index/count would be read by TryReadChunkHeaders as real
+        // reassembly metadata, and the message carrying it would be silently absorbed into the
+        // reassembler — and, if a chunk count and index happened to be internally consistent, held
+        // against a logical message that never arrives the rest of, until the transfer timeout frees it.
+        ChunkHeaderKeys.Id,
+        ChunkHeaderKeys.Index,
+        ChunkHeaderKeys.Count,
     ];
 
     /// <summary>
@@ -1540,6 +1549,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                                         out byte[]? reassembled))
                                 {
                                     messageData = reassembled;
+
+                                    // The chunk keys are per-chunk bookkeeping, meaningless once
+                                    // reassembly is done — a subscriber must see exactly the headers the
+                                    // sender passed to SendLargeAsync, not the internal reassembly
+                                    // metadata every individual chunk carried.
+                                    headers = ChunkHeaderKeys.WithoutChunkHeaders(headers);
                                 }
                                 else
                                 {

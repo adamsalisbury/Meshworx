@@ -186,6 +186,14 @@ public class MeshClientChunkingTests
 
         MessageHeaders delivered = await received.Task.WaitAsync(WaitTimeout);
         Assert.Equal("report", delivered["kind"]);
+
+        // The subscriber must see exactly the headers the sender passed to SendLargeAsync — not the
+        // internal mesh.chunk.id/index/count reassembly metadata every individual chunk carried, which
+        // would otherwise leak through and, if echoed back on a reply, cause the far side's receive loop
+        // to silently absorb it as a chunk instead of raising it (issue #107).
+        Assert.False(delivered.ContainsKey(ChunkHeaderKeys.Id));
+        Assert.False(delivered.ContainsKey(ChunkHeaderKeys.Index));
+        Assert.False(delivered.ContainsKey(ChunkHeaderKeys.Count));
     }
 
     /// <summary>
@@ -218,6 +226,27 @@ public class MeshClientChunkingTests
 
         await Assert.ThrowsAsync<ArgumentException>(
             () => fixture.Client.SendLargeAsync(Guid.NewGuid(), new byte[10], headers));
+    }
+
+    /// <summary>
+    /// The three chunk header keys are just as reserved as any other built-in helper's — a caller
+    /// setting one by hand must be rejected up front, on any send, not just <see cref="IMeshClient.SendLargeAsync"/>
+    /// (issue #107).
+    /// </summary>
+    [Theory]
+    [InlineData("mesh.chunk.id")]
+    [InlineData("mesh.chunk.index")]
+    [InlineData("mesh.chunk.count")]
+    public async Task SendAsync_WithChunkHeaderKey_Throws(string chunkHeaderKey)
+    {
+        var fixture = new MeshClientFixture();
+        fixture.SetupSuccessfulRegistration();
+        await fixture.ConnectAsync();
+
+        var headers = new MessageHeaders(new Dictionary<string, string> { [chunkHeaderKey] = "x" });
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => fixture.Client.SendAsync(Guid.NewGuid(), new byte[10], headers));
     }
 
     /// <summary>

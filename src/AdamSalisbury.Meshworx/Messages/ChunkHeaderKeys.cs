@@ -79,6 +79,27 @@ internal static class ChunkHeaderKeys
     }
 
     /// <summary>
+    /// Rebuilds <paramref name="headers"/> with the three chunk keys removed, once a transfer has
+    /// completed and been reassembled into a single message.
+    /// </summary>
+    /// <remarks>
+    /// The chunk keys are internal reassembly bookkeeping, present on every individual chunk but
+    /// meaningless once reassembly is done — <see cref="IMeshClient.SendLargeAsync"/>'s contract is that
+    /// a subscriber sees the headers it was sent, needing no code of its own to distinguish a chunked
+    /// message from an ordinary one. Left in, they would also break the common pattern of echoing
+    /// received headers back onto a reply: the far side's receive loop would read them as real chunk
+    /// metadata via <see cref="TryReadChunkHeaders"/> and silently absorb the reply into its own
+    /// reassembler instead of raising it.
+    /// </remarks>
+    /// <param name="headers">The reassembled message's headers, still carrying the three chunk keys.</param>
+    /// <returns>A new <see cref="MessageHeaders"/> instance with the three chunk keys removed.</returns>
+    internal static MessageHeaders WithoutChunkHeaders(MessageHeaders headers)
+    {
+        return new MessageHeaders(headers.Where(
+            entry => entry.Key is not (Id or Index or Count)));
+    }
+
+    /// <summary>
     /// The most chunks a single logical message may claim to be split into.
     /// </summary>
     /// <remarks>
