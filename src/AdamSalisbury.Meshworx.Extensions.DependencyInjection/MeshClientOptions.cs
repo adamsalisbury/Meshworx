@@ -114,4 +114,29 @@ public sealed class MeshClientOptions
     /// the reassembly and freeing what it was holding.
     /// </summary>
     public TimeSpan? ChunkTransferTimeout { get; set; }
+
+    /// <summary>
+    /// Gets or sets how long a single attempt at the client's initial connection, made when the host
+    /// starts, may take before it is abandoned and retried.
+    /// </summary>
+    /// <remarks>
+    /// Applies to the plain connection path only — a reconnector-backed client (<see cref="UseReconnector"/>)
+    /// bounds its own first attempt with <see cref="ReconnectConnectTimeout"/> instead, since that value
+    /// already exists for exactly this purpose on that path. Defaults to 10 seconds.
+    /// </remarks>
+    public TimeSpan? ConnectTimeout { get; set; }
+
+    /// <summary>
+    /// Gets or sets how long the hosted service that connects this client at host startup waits between
+    /// failed attempts at the initial connection, before the client has connected even once.
+    /// </summary>
+    /// <remarks>
+    /// Used on both the plain and reconnector-backed paths alike: a hub that has not finished starting
+    /// yet — very often true in a real deployment, where the hub is usually a separate process — should
+    /// not cause the client's host to fail to start, so the initial connection is retried under the
+    /// host's own start token rather than given up on after one attempt. This is distinct from
+    /// <see cref="ReconnectRetryDelay"/>, which governs the reconnector's retries after a connection that
+    /// was already established is later lost. Defaults to 1 second.
+    /// </remarks>
+    public TimeSpan? ConnectRetryDelay { get; set; }
 }

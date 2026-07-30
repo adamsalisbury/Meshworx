@@ -36,6 +36,19 @@ public static class MeshClientServiceCollectionExtensions
     /// does not already provide one. Calling this again with the same <paramref name="clientName"/> only
     /// registers the client and its hosted service once; a later call still layers its
     /// <paramref name="configureOptions"/> onto the same named options pipeline.
+    /// <para>
+    /// The initial connection is retried, with a back-off delay, if it does not succeed straight away —
+    /// bounded on each attempt by <see cref="MeshClientOptions.ConnectTimeout"/> (or
+    /// <see cref="MeshClientOptions.ReconnectConnectTimeout"/> when <see cref="MeshClientOptions.UseReconnector"/>
+    /// is set) — rather than failing host startup on the very first attempt. That tolerates a hub that has
+    /// not finished starting yet in a separate process, but it is not a substitute for correct ordering
+    /// within the <em>same</em> process: <see cref="Microsoft.Extensions.Hosting.IHostedService"/> instances
+    /// start one at a time, in registration order, so registering this before
+    /// <c>AddMeshHub</c> when both are hosted together still leaves the client retrying against a hub
+    /// whose own listener has not started — and, by default, cannot start until this client's connection
+    /// attempts stop retrying and this call returns. Register <c>AddMeshHub</c> first whenever the hub and
+    /// one of its own clients share a host.
+    /// </para>
     /// </remarks>
     public static IServiceCollection AddMeshClient(
         this IServiceCollection services,
