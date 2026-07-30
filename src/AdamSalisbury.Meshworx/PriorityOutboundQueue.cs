@@ -221,10 +221,14 @@ internal sealed class PriorityOutboundQueue : IDisposable
     /// both run their course — because this is an iterator, resuming after a <c>yield return</c> continues
     /// exactly where the method paused rather than restarting the outer loop, so a high-priority frame
     /// enqueued while a pass is already part-way through servicing the normal lane can wait behind up to
-    /// the remainder of that burst (bounded by <see cref="NormalBurstLimit"/>) before it is recognised.
-    /// This bound is small and constant regardless of backlog size, so it does not undermine "overtakes a
-    /// backlog of bulk traffic" for any backlog worth the name — but it is not a zero-frame guarantee for
-    /// the specific instant a high-priority frame arrives.
+    /// the remainder of that burst (bounded by <see cref="NormalBurstLimit"/>) <em>and</em> the one
+    /// low-lane frame the loop checks unconditionally straight after — the low check runs every cycle
+    /// regardless of how much of the normal burst actually ran, so it is not skipped just because a
+    /// high-priority frame is now waiting. The true worst-case bound is therefore
+    /// <see cref="NormalBurstLimit"/> + 1, not <see cref="NormalBurstLimit"/> alone. This bound is small
+    /// and constant regardless of backlog size, so it does not undermine "overtakes a backlog of bulk
+    /// traffic" for any backlog worth the name — but it is not a zero-frame guarantee for the specific
+    /// instant a high-priority frame arrives.
     /// </remarks>
     public async IAsyncEnumerable<byte[]> ReadAllAsync([EnumeratorCancellation] CancellationToken cancellationToken)
     {
