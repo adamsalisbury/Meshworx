@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: f277e60 (main, HEAD) — 21 commits on top of the previous reconciliation point, d89891d/PR #87; working tree clean throughout this pass (git status --porcelain empty at start and end; main, origin/main and the working branch all resolve to f277e60)
+reconciled-to-commit: f277e60 (main, HEAD) — 19 commits on top of the previous reconciliation point, d89891d/PR #87; working tree clean throughout this pass (git status --porcelain empty at start and end; main, origin/main and the working branch all resolve to f277e60)
 reconciled-to-date: 2026-07-30
 mode: update
 -->
@@ -15,7 +15,7 @@ rather than read directly, it says so.
 > **Documented tree, this pass: `main` at `f277e60`, reconciling every commit between the previous
 > documentation baseline (`d89891d`, PR #87) and here.** The docs set was last touched by PR #90 (session
 > resumption, commit `2a2377d`) — everything from `2a2377d` (exclusive) to `f277e60` was unreconciled
-> before this pass, 21 commits: `b74c699` (per-client inbound rate limiting, issue #69), `6596726`
+> before this pass, 19 commits: `b74c699` (per-client inbound rate limiting, issue #69), `6596726`
 > (pluggable serialization codec, feat #91), `603d3c8` (distributed-tracing header propagation, feat #92),
 > `7b93c7f` (large-message chunking, feat #93), `b09f719` (strongly-typed client contracts, feat #94),
 > then `5b875ef`/`31880be`/`8a1b557`/`972dd83`/`b6ec5c6`/`58aefb4`/`fc66529`/`6c09297`/`d466535`/
@@ -80,7 +80,7 @@ rather than read directly, it says so.
 > grew from roughly 2638 lines (PR #87 baseline) to 3745, `MeshClient.cs` from roughly 1676 to 2228,
 > `IMeshClient.cs` from roughly 406 to 491, and `Messages/Protocol.cs` gained two new version-gated
 > constants.** That is a near-doubling of the two largest files in the library, driven by six feature
-> areas landing across 21 commits with no doc reconciliation in between. Given the "REQUIRED FIXES"
+> areas landing across 19 commits with no doc reconciliation in between. Given the "REQUIRED FIXES"
 > priority for this pass explicitly ranks a full line-number sweep last and permits leaving pre-existing,
 > untouched citations for a dedicated follow-up, **this pass re-derived coordinates fresh, from the
 > current source, only for the sections it was actively writing or correcting** (the six new-capability

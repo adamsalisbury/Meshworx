@@ -48,7 +48,7 @@ up peers, manages group membership, and raises events for inbound traffic and di
 | `DisposeAsync` | `ValueTask` — `DisconnectAsync` then disposes the lookup semaphore | `MeshClient.cs:950` |
 
 > **Coordinate caveat, this pass — `MeshClient.cs` grew from roughly 1676 to 2228 lines (+552) and
-> `IMeshClient.cs` from roughly 406 to 491 (+85) across 21 commits (see the freshness narrative at the top
+> `IMeshClient.cs` from roughly 406 to 491 (+85) across 19 commits (see the freshness narrative at the top
 > of [for-clanker.md](../for-clanker.md) for the full commit list).** Per that narrative's stated scope,
 > this pass re-derived coordinates fresh from the current source only for the rows and sections it
 > actively added or corrected — `SendToGroupAsync` (priority), `SendLargeAsync`, `SendAsync` (headers)'s
