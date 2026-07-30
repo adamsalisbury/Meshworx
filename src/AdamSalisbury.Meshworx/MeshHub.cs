@@ -178,6 +178,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private static readonly KeyValuePair<string, object?> DirectDirectionTag = new("direction", "direct");
     private static readonly KeyValuePair<string, object?> BroadcastDirectionTag = new("direction", "broadcast");
     private static readonly KeyValuePair<string, object?> GroupDirectionTag = new("direction", "group");
+    private static readonly KeyValuePair<string, object?> TopicDirectionTag = new("direction", "topic");
     private static readonly KeyValuePair<string, object?> UnknownRecipientDropTag = new("reason", "unknown-recipient");
     private static readonly KeyValuePair<string, object?> QueueFullDropTag = new("reason", "queue-full");
     private static readonly KeyValuePair<string, object?> ExpiredDropTag = new("reason", "expired");
@@ -201,6 +202,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // on disconnect; that set is only ever touched by the connection's own receive loop (and its
     // teardown, which runs after the loop ends), so it needs no additional lock.
     private readonly ConcurrentDictionary<string, Group> _groups = new(StringComparer.Ordinal);
+
+    // Every client's topic-pattern subscriptions, matched against a published topic without scanning
+    // the whole subscriber population — see TopicSubscriptionTrie's own remarks for the matching rules
+    // and the concurrency model.
+    private readonly TopicSubscriptionTrie _topics = new();
 
     // Guards every lifecycle field below. Starting, stopping and disposing can each be called from a
     // different thread, so each of them takes the state it needs in one critical section and then works
@@ -954,6 +960,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         await StopAsync().ConfigureAwait(false);
         await _listener.DisposeAsync().ConfigureAwait(false);
         _authenticationSlots?.Dispose();
+        _topics.Dispose();
         _meter.Dispose();
     }
 
@@ -1374,13 +1381,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 if (messageType is MessageType.BroadcastMessage
                         or MessageType.GroupMessage
                         or MessageType.GroupMessageWithHeaders
+                        or MessageType.PublishTopicMessage
+                        or MessageType.PublishTopicMessageWithHeaders
                     && !connection.RateLimiter.TryAdmitFanOut())
                 {
                     if (_rateLimitLogThrottle.ShouldLog())
                     {
                         _logger.LogWarning(
-                            "Client {ClientId} exceeded its fan-out rate limit; broadcast or group message "
-                            + "dropped",
+                            "Client {ClientId} exceeded its fan-out rate limit; broadcast, group or topic "
+                            + "message dropped",
                             clientId);
                     }
 
@@ -1466,6 +1475,73 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                                 clientId,
                                 groupName,
                                 data.AsMemory(3, nameLength),
+                                headerBlock,
+                                body);
+                        }
+                    }
+                }
+                else if (data.Length > 1
+                    && connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion
+                    && (MessageType)data[0] == MessageType.SubscribeTopic)
+                {
+                    string pattern = Encoding.UTF8.GetString(data.AsSpan(1));
+
+                    try
+                    {
+                        _topics.Subscribe(pattern, connection.Id);
+                        connection.Topics.Add(pattern);
+                    }
+                    catch (ArgumentException ex)
+                    {
+                        _logger.LogDebug(
+                            ex, "Client {ClientId} sent an invalid topic pattern; subscription ignored", clientId);
+                    }
+                }
+                else if (data.Length > 1
+                    && connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion
+                    && (MessageType)data[0] == MessageType.UnsubscribeTopic)
+                {
+                    string pattern = Encoding.UTF8.GetString(data.AsSpan(1));
+                    UnsubscribeTopic(connection, pattern);
+                }
+                else if (data.Length >= 3
+                    && connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion
+                    && (MessageType)data[0] == MessageType.PublishTopicMessage)
+                {
+                    int topicLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(1, 2));
+                    if (data.Length >= 3 + topicLength)
+                    {
+                        string topic = Encoding.UTF8.GetString(data.AsSpan(3, topicLength));
+                        PublishToTopic(
+                            clientId,
+                            topic,
+                            data.AsMemory(3, topicLength),
+                            data.AsMemory(3 + topicLength));
+                    }
+                }
+                else if (data.Length >= 5
+                    && connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion
+                    && (MessageType)data[0] == MessageType.PublishTopicMessageWithHeaders)
+                {
+                    int topicLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(1, 2));
+                    int headerLengthOffset = 3 + topicLength;
+
+                    if (data.Length >= headerLengthOffset + 2)
+                    {
+                        int headerBlockLength = BinaryPrimitives.ReadUInt16BigEndian(
+                            data.AsSpan(headerLengthOffset, 2));
+                        int bodyOffset = headerLengthOffset + 2 + headerBlockLength;
+
+                        if (data.Length >= bodyOffset)
+                        {
+                            string topic = Encoding.UTF8.GetString(data.AsSpan(3, topicLength));
+                            ReadOnlyMemory<byte> headerBlock = data.AsMemory(headerLengthOffset + 2, headerBlockLength);
+                            ReadOnlyMemory<byte> body = data.AsMemory(bodyOffset);
+
+                            PublishToTopicWithHeaders(
+                                clientId,
+                                topic,
+                                data.AsMemory(3, topicLength),
                                 headerBlock,
                                 body);
                         }
@@ -1566,6 +1642,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 MakeSessionDormant(connection);
 
                 RemoveFromAllGroups(connection);
+                RemoveFromAllTopics(connection);
                 _clientNames.TryRemove(connection.Name, out _);
 
                 // connection.Id, not the local clientId: a resume that rebinds the connection and
@@ -3673,6 +3750,286 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         return frame;
     }
 
+    /// <summary>
+    /// Removes a client's subscription to a topic pattern, both from the routing trie and from the
+    /// connection's own record of what it holds.
+    /// </summary>
+    private void UnsubscribeTopic(ClientConnection connection, string pattern)
+    {
+        if (string.IsNullOrEmpty(pattern))
+        {
+            return;
+        }
+
+        _topics.Unsubscribe(pattern, connection.Id);
+        connection.Topics.Remove(pattern);
+    }
+
+    /// <summary>
+    /// Removes every one of a disconnecting client's topic subscriptions, mirroring
+    /// <see cref="RemoveFromAllGroups"/>.
+    /// </summary>
+    private void RemoveFromAllTopics(ClientConnection connection)
+    {
+        foreach (string pattern in connection.Topics)
+        {
+            _topics.Unsubscribe(pattern, connection.Id);
+        }
+
+        connection.Topics.Clear();
+    }
+
+    /// <summary>
+    /// Publishes a message to every client subscribed to a pattern that matches <paramref name="topic"/>.
+    /// </summary>
+    /// <remarks>
+    /// Unlike a group send, publishing does not require the sender to hold any subscription of its own —
+    /// a topic is an address, not a membership, so there is nothing to authorise here beyond the rate
+    /// limits every fan-out send is already charged against at the dispatch site.
+    /// </remarks>
+    private void PublishToTopic(
+        Guid senderId,
+        string topic,
+        ReadOnlyMemory<byte> topicBytes,
+        ReadOnlyMemory<byte> messageData)
+    {
+        IReadOnlySet<Guid> recipients;
+        try
+        {
+            recipients = _topics.Match(topic);
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogDebug(ex, "Client {SenderId} published to an invalid topic; message dropped", senderId);
+            return;
+        }
+
+        if (recipients.Count == 0)
+        {
+            return;
+        }
+
+        if (!ChargeFanOutDelivery(senderId, recipients, out int chargeableRecipientCount))
+        {
+            return;
+        }
+
+        int topicLength = topicBytes.Length;
+        int frameLength = 1 + 16 + 2 + topicLength + messageData.Length;
+
+        if (ExceedsFrameCap(frameLength))
+        {
+            DropOversizeFanOut(senderId, frameLength, "topic message");
+            return;
+        }
+
+        var deliveryPayload = new byte[frameLength];
+        deliveryPayload[0] = (byte)MessageType.DeliverTopicMessage;
+        senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(deliveryPayload.AsSpan(17, 2), (ushort)topicLength);
+        topicBytes.Span.CopyTo(deliveryPayload.AsSpan(19));
+        messageData.CopyTo(deliveryPayload.AsMemory(19 + topicLength));
+
+        _messagesRoutedCounter.Add(1, TopicDirectionTag);
+        _bytesRoutedCounter.Add(messageData.Length, TopicDirectionTag);
+
+        DeliverToTopicSubscribers(senderId, recipients, chargeableRecipientCount, deliveryPayload, MessagePriority.Normal);
+    }
+
+    /// <summary>
+    /// Publishes a header-bearing message to every client subscribed to a pattern that matches
+    /// <paramref name="topic"/>, mirroring <see cref="PublishToTopic"/>.
+    /// </summary>
+    private void PublishToTopicWithHeaders(
+        Guid senderId,
+        string topic,
+        ReadOnlyMemory<byte> topicBytes,
+        ReadOnlyMemory<byte> headerBlock,
+        ReadOnlyMemory<byte> body)
+    {
+        IReadOnlySet<Guid> recipients;
+        try
+        {
+            recipients = _topics.Match(topic);
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogDebug(ex, "Client {SenderId} published to an invalid topic; message dropped", senderId);
+            return;
+        }
+
+        if (recipients.Count == 0)
+        {
+            return;
+        }
+
+        if (!ChargeFanOutDelivery(senderId, recipients, out int chargeableRecipientCount))
+        {
+            return;
+        }
+
+        int topicLength = topicBytes.Length;
+        int frameLength = 1 + 16 + 2 + topicLength + 2 + headerBlock.Length + body.Length;
+
+        if (ExceedsFrameCap(frameLength))
+        {
+            DropOversizeFanOut(senderId, frameLength, "topic message");
+            return;
+        }
+
+        _messagesRoutedCounter.Add(1, TopicDirectionTag);
+        _bytesRoutedCounter.Add(body.Length, TopicDirectionTag);
+
+        MessagePriority priority = ReadPriority(headerBlock);
+
+        byte[]? withHeadersFrame = null;
+        byte[]? strippedFrame = null;
+
+        foreach (Guid recipientId in recipients)
+        {
+            if (recipientId == senderId || !_clients.TryGetValue(recipientId, out ClientConnection? recipient))
+            {
+                continue;
+            }
+
+            byte[] deliveryPayload = recipient.NegotiatedProtocolVersion >= Protocol.HeaderEnvelopeMinVersion
+                ? withHeadersFrame ??= BuildDeliverTopicMessageWithHeaders(senderId, topicBytes, headerBlock, body)
+                : strippedFrame ??= BuildDeliverTopicMessage(senderId, topicBytes, body);
+
+            if (!recipient.OutboundQueue.TryEnqueue(priority, deliveryPayload))
+            {
+                _logger.LogWarning(
+                    "Outbound queue for {RecipientId} is full, topic message from {SenderId} dropped",
+                    recipientId,
+                    senderId);
+                _messagesDroppedCounter.Add(1, QueueFullDropTag);
+                RaiseQueueSaturated(senderId, recipientId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Decides whether a topic publish has anything to deliver and, if so, charges the publisher's
+    /// fan-out delivery-volume budget for it.
+    /// </summary>
+    /// <param name="senderId">The identifier of the publishing client.</param>
+    /// <param name="recipients">Every client a topic match found, including the publisher if it also subscribes.</param>
+    /// <param name="recipientCount">
+    /// The number of recipients that will actually receive the message — every match excluding the
+    /// publisher itself, when it is also a subscriber.
+    /// </param>
+    /// <returns>
+    /// <see langword="false"/> if there is nothing to deliver, or the budget refused the send — either
+    /// way the caller must not build or enqueue a delivery frame.
+    /// </returns>
+    private bool ChargeFanOutDelivery(Guid senderId, IReadOnlySet<Guid> recipients, out int recipientCount)
+    {
+        // A HashSet-backed set answers its own membership question in O(1); the recipient count the
+        // publisher itself never receives is either 0 or 1, never more, so a Contains check plus a
+        // conditional subtraction is all this needs — no scan of the set is required.
+        recipientCount = recipients.Contains(senderId) ? recipients.Count - 1 : recipients.Count;
+
+        if (recipientCount <= 0)
+        {
+            // The only match was the publisher's own subscription; nothing to deliver and no budget to
+            // spend.
+            return false;
+        }
+
+        if (_clients.TryGetValue(senderId, out ClientConnection? senderConnection)
+            && !senderConnection.RateLimiter.TryAdmitFanOutDelivery(recipientCount))
+        {
+            if (_rateLimitLogThrottle.ShouldLog())
+            {
+                _logger.LogWarning(
+                    "Client {SenderId} exceeded its fan-out delivery-volume rate limit; topic message "
+                    + "dropped",
+                    senderId);
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Enqueues an already-built, headerless topic delivery frame onto every recipient except the
+    /// publisher, mirroring the enqueue loop in <see cref="SendToGroup"/>.
+    /// </summary>
+    private void DeliverToTopicSubscribers(
+        Guid senderId,
+        IReadOnlySet<Guid> recipients,
+        int chargeableRecipientCount,
+        byte[] deliveryPayload,
+        MessagePriority priority)
+    {
+        if (chargeableRecipientCount <= 0)
+        {
+            return;
+        }
+
+        foreach (Guid recipientId in recipients)
+        {
+            if (recipientId == senderId)
+            {
+                continue;
+            }
+
+            if (_clients.TryGetValue(recipientId, out ClientConnection? recipient)
+                && !recipient.OutboundQueue.TryEnqueue(priority, deliveryPayload))
+            {
+                _logger.LogWarning(
+                    "Outbound queue for {RecipientId} is full, topic message from {SenderId} dropped",
+                    recipientId,
+                    senderId);
+                _messagesDroppedCounter.Add(1, QueueFullDropTag);
+                RaiseQueueSaturated(senderId, recipientId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds a plain <see cref="MessageType.DeliverTopicMessage"/> frame:
+    /// <c>[type][senderId(16)][topicLength(2)][topic][body]</c>.
+    /// </summary>
+    private static byte[] BuildDeliverTopicMessage(
+        Guid senderId, ReadOnlyMemory<byte> topicBytes, ReadOnlyMemory<byte> body)
+    {
+        int topicLength = topicBytes.Length;
+        var frame = new byte[1 + 16 + 2 + topicLength + body.Length];
+        frame[0] = (byte)MessageType.DeliverTopicMessage;
+        senderId.TryWriteBytes(frame.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(17, 2), (ushort)topicLength);
+        topicBytes.Span.CopyTo(frame.AsSpan(19));
+        body.CopyTo(frame.AsMemory(19 + topicLength));
+        return frame;
+    }
+
+    /// <summary>
+    /// Builds a <see cref="MessageType.DeliverTopicMessageWithHeaders"/> frame:
+    /// <c>[type][senderId(16)][topicLength(2)][topic][headerBlockLength(2)][headerBlock][body]</c>.
+    /// </summary>
+    private static byte[] BuildDeliverTopicMessageWithHeaders(
+        Guid senderId,
+        ReadOnlyMemory<byte> topicBytes,
+        ReadOnlyMemory<byte> headerBlock,
+        ReadOnlyMemory<byte> body)
+    {
+        int topicLength = topicBytes.Length;
+        var frame = new byte[1 + 16 + 2 + topicLength + 2 + headerBlock.Length + body.Length];
+        frame[0] = (byte)MessageType.DeliverTopicMessageWithHeaders;
+        senderId.TryWriteBytes(frame.AsSpan(1));
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(17, 2), (ushort)topicLength);
+        topicBytes.Span.CopyTo(frame.AsSpan(19));
+
+        int headerLengthOffset = 19 + topicLength;
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(headerLengthOffset, 2), (ushort)headerBlock.Length);
+        headerBlock.CopyTo(frame.AsMemory(headerLengthOffset + 2));
+        body.CopyTo(frame.AsMemory(headerLengthOffset + 2 + headerBlock.Length));
+        return frame;
+    }
+
     // A single group's membership, guarded by its own lock. Removed is set true under Lock when the
     // group is taken out of _groups so a concurrent join that already fetched this instance retries
     // against a fresh one rather than resurrecting a dead group.
@@ -3802,6 +4159,13 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         /// receive loop and its teardown (which runs after the loop ends), so it needs no lock.
         /// </summary>
         public HashSet<string> Groups { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// The set of topic patterns this client has subscribed to. Only ever touched by this
+        /// connection's own receive loop and its teardown, so — like <see cref="Groups"/> — it needs no
+        /// lock.
+        /// </summary>
+        public HashSet<string> Topics { get; } = new(StringComparer.Ordinal);
 
         public PriorityOutboundQueue OutboundQueue { get; } = new(OutboundQueueCapacity);
 

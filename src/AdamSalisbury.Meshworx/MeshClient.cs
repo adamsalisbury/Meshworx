@@ -72,6 +72,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private readonly Lock _groupMembershipLock = new();
     private readonly HashSet<string> _joinedGroups = new(StringComparer.Ordinal);
 
+    private readonly Lock _topicSubscriptionLock = new();
+    private readonly HashSet<string> _subscribedTopics = new(StringComparer.Ordinal);
+
     private static readonly TimeSpan DefaultSendRetryDelay = TimeSpan.FromMilliseconds(100);
 
     // How much payload one chunk carries. A frame must fit the transport's 1 MiB cap once the message
@@ -229,10 +232,25 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public IReadOnlyCollection<string> SubscribedTopics
+    {
+        get
+        {
+            lock (_topicSubscriptionLock)
+            {
+                return _subscribedTopics.ToArray();
+            }
+        }
+    }
+
+    /// <inheritdoc/>
     public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
 
     /// <inheritdoc/>
     public event EventHandler<GroupMessageReceivedEventArgs>? GroupMessageReceived;
+
+    /// <inheritdoc/>
+    public event EventHandler<TopicMessageReceivedEventArgs>? TopicMessageReceived;
 
     /// <inheritdoc/>
     public event EventHandler<GroupJoinRefusedEventArgs>? GroupJoinRefused;
@@ -1111,6 +1129,140 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         return SendToGroupAsync(groupName, message, headers, cancellationToken);
     }
 
+    /// <inheritdoc/>
+    public async Task SubscribeAsync(string pattern, CancellationToken cancellationToken = default)
+    {
+        TopicSubscriptionTrie.ValidatePattern(pattern);
+
+        ITransport transport = GetConnectedTransport();
+        RequireTopicPubSubSupport(NegotiatedProtocolVersion);
+
+        // Recorded before the frame goes out, mirroring JoinGroupAsync — there is no authorisation hook
+        // for a subscription that could refuse it after the fact, but recording first keeps the two
+        // methods symmetric and means a concurrent Unsubscribe of the same pattern can never race a
+        // record made after this method's own send.
+        bool recorded;
+        lock (_topicSubscriptionLock)
+        {
+            recorded = _subscribedTopics.Add(pattern);
+        }
+
+        try
+        {
+            await SendTopicSubscriptionAsync(transport, MessageType.SubscribeTopic, pattern, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            if (recorded)
+            {
+                lock (_topicSubscriptionLock)
+                {
+                    _subscribedTopics.Remove(pattern);
+                }
+            }
+
+            throw;
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task UnsubscribeAsync(string pattern, CancellationToken cancellationToken = default)
+    {
+        TopicSubscriptionTrie.ValidatePattern(pattern);
+
+        ITransport transport = GetConnectedTransport();
+        RequireTopicPubSubSupport(NegotiatedProtocolVersion);
+
+        await SendTopicSubscriptionAsync(transport, MessageType.UnsubscribeTopic, pattern, cancellationToken)
+            .ConfigureAwait(false);
+
+        lock (_topicSubscriptionLock)
+        {
+            _subscribedTopics.Remove(pattern);
+        }
+    }
+
+    /// <inheritdoc/>
+    public Task PublishAsync(
+        string topic, ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default)
+    {
+        return PublishAsync(topic, message, MessageHeaders.Empty, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public async Task PublishAsync(
+        string topic,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default)
+    {
+        TopicSubscriptionTrie.ValidateTopic(topic);
+        ArgumentNullException.ThrowIfNull(headers);
+
+        ITransport transport = GetConnectedTransport();
+        RequireTopicPubSubSupport(NegotiatedProtocolVersion);
+
+        using Activity? activity = MeshworxActivitySource.Instance.StartActivity(
+            MeshworxActivitySource.SendActivityName, ActivityKind.Producer);
+
+        if (activity is not null)
+        {
+            activity.SetTag("meshworx.topic", topic);
+            activity.SetTag("meshworx.message_size", message.Length);
+        }
+
+        headers = WithTraceContext(headers, activity);
+
+        byte[] topicBytes = Encoding.UTF8.GetBytes(topic);
+        if (topicBytes.Length > ushort.MaxValue)
+        {
+            throw new ArgumentException("The topic is too long.", nameof(topic));
+        }
+
+        byte[] payload;
+        if (headers.Count == 0)
+        {
+            // No header block is written at all when there is nothing to carry, mirroring
+            // SendToGroupAsync's own headerless fast path.
+            payload = new byte[1 + 2 + topicBytes.Length + message.Length];
+            payload[0] = (byte)MessageType.PublishTopicMessage;
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)topicBytes.Length);
+            topicBytes.CopyTo(payload, 3);
+            message.CopyTo(payload.AsMemory(3 + topicBytes.Length));
+        }
+        else
+        {
+            RequireHeaderEnvelopeSupport(NegotiatedProtocolVersion);
+
+            int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+            int headerLengthOffset = 3 + topicBytes.Length;
+            payload = new byte[headerLengthOffset + 2 + headerLength + message.Length];
+            payload[0] = (byte)MessageType.PublishTopicMessageWithHeaders;
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(1, 2), (ushort)topicBytes.Length);
+            topicBytes.CopyTo(payload, 3);
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(headerLengthOffset, 2), (ushort)headerLength);
+            HeaderEnvelope.Write(headers, payload.AsSpan(headerLengthOffset + 2, headerLength));
+            message.CopyTo(payload.AsMemory(headerLengthOffset + 2 + headerLength));
+        }
+
+        await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task SendTopicSubscriptionAsync(
+        ITransport transport,
+        MessageType type,
+        string pattern,
+        CancellationToken cancellationToken)
+    {
+        byte[] patternBytes = Encoding.UTF8.GetBytes(pattern);
+        var payload = new byte[1 + patternBytes.Length];
+        payload[0] = (byte)type;
+        patternBytes.CopyTo(payload, 1);
+
+        await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>
     /// Guards a header-bearing send against a connection that negotiated a protocol version predating
     /// the header envelope, so headers the caller supplied are never silently dropped on the wire.
@@ -1199,6 +1351,23 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             throw new NotSupportedException(
                 $"Message headers require a negotiated protocol version of at least "
                 + $"{Protocol.HeaderEnvelopeMinVersion}; this connection negotiated version "
+                + $"{negotiatedProtocolVersion}.");
+        }
+    }
+
+    /// <summary>
+    /// Guards every topic pub/sub call against a connection that negotiated a protocol version predating
+    /// the feature, so a client built with topic support talking to an older hub fails fast and audibly
+    /// rather than having its subscribe or publish frame silently go unrecognised by a peer that has never
+    /// heard of the opcode.
+    /// </summary>
+    private static void RequireTopicPubSubSupport(byte negotiatedProtocolVersion)
+    {
+        if (negotiatedProtocolVersion < Protocol.TopicPubSubMinVersion)
+        {
+            throw new NotSupportedException(
+                $"Topic pub/sub requires a negotiated protocol version of at least "
+                + $"{Protocol.TopicPubSubMinVersion}; this connection negotiated version "
                 + $"{negotiatedProtocolVersion}.");
         }
     }
@@ -1508,6 +1677,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             _joinedGroups.Clear();
         }
 
+        lock (_topicSubscriptionLock)
+        {
+            _subscribedTopics.Clear();
+        }
+
         if (transport is not null)
         {
             await transport.DisposeAsync().ConfigureAwait(false);
@@ -1763,6 +1937,81 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                                     {
                                         // Callback boundary — a throwing subscriber must not halt the loop.
                                         _logger.LogError(ex, "A GroupMessageReceived handler threw an exception");
+                                        receiveActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                else if (data.Length >= 19
+                    && (MessageType)data[0] == MessageType.DeliverTopicMessage)
+                {
+                    var senderId = new Guid(data.AsSpan(1, 16));
+                    int topicLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(17, 2));
+
+                    if (data.Length >= 19 + topicLength)
+                    {
+                        string topic = Encoding.UTF8.GetString(data.AsSpan(19, topicLength));
+                        ReadOnlyMemory<byte> messageData = data.AsMemory(19 + topicLength);
+
+                        try
+                        {
+                            TopicMessageReceived?.Invoke(this, new TopicMessageReceivedEventArgs
+                            {
+                                SenderId = senderId,
+                                Topic = topic,
+                                Data = messageData,
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            // Callback boundary — a throwing subscriber must not halt the loop.
+                            _logger.LogError(ex, "A TopicMessageReceived handler threw an exception");
+                        }
+                    }
+                }
+                else if (data.Length >= 21
+                    && (MessageType)data[0] == MessageType.DeliverTopicMessageWithHeaders)
+                {
+                    var senderId = new Guid(data.AsSpan(1, 16));
+                    int topicLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(17, 2));
+                    int headerLengthOffset = 19 + topicLength;
+
+                    if (data.Length >= headerLengthOffset + 2)
+                    {
+                        int headerBlockLength = BinaryPrimitives.ReadUInt16BigEndian(
+                            data.AsSpan(headerLengthOffset, 2));
+                        int bodyOffset = headerLengthOffset + 2 + headerBlockLength;
+
+                        if (data.Length >= bodyOffset)
+                        {
+                            string topic = Encoding.UTF8.GetString(data.AsSpan(19, topicLength));
+                            MessageHeaders? headers = TryReadHeaderBlock(
+                                data.AsSpan(headerLengthOffset + 2), headerBlockLength, senderId);
+
+                            if (headers is not null && !IsExpired(headers, senderId))
+                            {
+                                ReadOnlyMemory<byte> messageData = data.AsMemory(bodyOffset);
+
+                                using (Activity? receiveActivity = StartReceiveActivity(headers, senderId))
+                                {
+                                    receiveActivity?.SetTag("meshworx.topic", topic);
+
+                                    try
+                                    {
+                                        TopicMessageReceived?.Invoke(this, new TopicMessageReceivedEventArgs
+                                        {
+                                            SenderId = senderId,
+                                            Topic = topic,
+                                            Data = messageData,
+                                            Headers = headers,
+                                        });
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        // Callback boundary — a throwing subscriber must not halt the loop.
+                                        _logger.LogError(ex, "A TopicMessageReceived handler threw an exception");
                                         receiveActivity?.SetStatus(ActivityStatusCode.Error, ex.Message);
                                     }
                                 }

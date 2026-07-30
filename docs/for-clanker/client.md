@@ -23,6 +23,7 @@ up peers, manages group membership, and raises events for inbound traffic and di
 | `Name` | `string` — set on connect, cleared on disconnect | `MeshClient.cs:134` |
 | `IsConnected` | `bool` — true only in `Connected` state | `MeshClient.cs:140` |
 | `JoinedGroups` | `IReadOnlyCollection<string>` — **snapshot** of client-side membership | `MeshClient.cs:152` |
+| `SubscribedTopics` | `IReadOnlyCollection<string>` — issue #37; **snapshot** of client-side topic-pattern subscriptions, cleared on disconnect | `MeshClient.cs:235` |
 | `ConnectAsync` | `Task ConnectAsync(ITransport, string clientName, ReadOnlyMemory<byte> credential=default, CancellationToken=default)` | `MeshClient.cs:179` |
 | `NegotiatedProtocolVersion` | `byte` — the wire-protocol version agreed with the hub during the last successful `ConnectAsync`; `0` when not connected | `MeshClient.cs:137` |
 | `SessionResumed` | `bool` (issue #43) — whether the last `ConnectAsync` reclaimed the identity this client held before its previous connection, rather than being assigned a fresh one. `false` is the ordinary case and never an error | `MeshClient.cs:156` |
@@ -40,14 +41,31 @@ up peers, manages group membership, and raises events for inbound traffic and di
 | `GetClientIdByNameAsync` | `Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken=default)` | `MeshClient.cs:820` |
 | `RequestAsync` | `Task<ReadOnlyMemory<byte>> RequestAsync(Guid recipientId, ReadOnlyMemory<byte>, TimeSpan timeout, CancellationToken=default)` — PR #83; correlated request/reply over a direct message, see [Request/response (RPC)](#request-response) | `MeshClient.cs:869` |
 | `ReplyAsync` | `Task ReplyAsync(MessageReceivedEventArgs request, ReadOnlyMemory<byte>, CancellationToken=default)` — PR #83; answers a request received via `MessageReceived`, see [Request/response (RPC)](#request-response) | `MeshClient.cs:926` |
+| `SubscribeAsync` / `UnsubscribeAsync` | `Task ...(string pattern, CancellationToken=default)` — issue #37; **optimistic**, mirroring `JoinGroupAsync`/`LeaveGroupAsync`, except there is no refusal to react to — no authorisation seam exists at all. `SubscribeAsync` records the pattern in `SubscribedTopics` before sending and rolls the record back if the send itself throws. Both validate the pattern's shape (`ArgumentException`) and require protocol version `Protocol.TopicPubSubMinVersion` (`8`, `NotSupportedException` below it — commit `fb2f9a0`); see [Topic-based publish/subscribe](#topic-based-publishsubscribe) | `MeshClient.cs:1133` / `:1170` |
+| `PublishAsync` | `Task PublishAsync(string topic, ReadOnlyMemory<byte>, CancellationToken=default)` — issue #37; compatibility overload, forwards to the headers overload with `MessageHeaders.Empty`. **No subscription of the publisher's own required.** Throws `ArgumentException` for an invalid topic shape (wildcard segment, empty segment, over the 128-segment cap, or exceeding `ushort.MaxValue` UTF-8 bytes) and `NotSupportedException` below protocol version `8` | `MeshClient.cs:1187` |
+| `PublishAsync` (headers) | `Task PublishAsync(string topic, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — issue #37; same version requirement as the direct/group headers overloads (`RequireHeaderEnvelopeSupport`) when `headers` is non-empty, plus the topic pub/sub gate above; starts a `Producer` trace activity since commit `fb2f9a0` (see [Distributed tracing](#distributed-tracing)); see [Topic-based publish/subscribe](#topic-based-publishsubscribe) | `MeshClient.cs:1194` |
 | `MessageReceived` | `event EventHandler<MessageReceivedEventArgs>` — direct **and** broadcast; `Headers` populated when the sender attached any (PR #74); `CorrelationId` set when the message is a request awaiting a reply (PR #83) | `MeshClient.cs:164` |
 | `GroupMessageReceived` | `event EventHandler<GroupMessageReceivedEventArgs>` — carries group name; `Headers` populated when the sender attached any (PR #74) | `MeshClient.cs:167` |
+| `TopicMessageReceived` | `event EventHandler<TopicMessageReceivedEventArgs>` — issue #37; carries the concrete topic (never a pattern) plus sender id, data and headers; see [Topic-based publish/subscribe](#topic-based-publishsubscribe) | `MeshClient.cs:253` |
 | `GroupJoinRefused` | `event EventHandler<GroupJoinRefusedEventArgs>` — the hub refused a join; the group has **already** been removed from `JoinedGroups` when this fires | `MeshClient.cs:170` |
 | `Disconnected` | `event EventHandler<DisconnectedEventArgs>` — **unexpected** endings only | `MeshClient.cs:173` |
 | `SendRejected` | `event EventHandler<SendRejectedEventArgs>` — the hub dropped a message this client sent because the recipient's outbound queue was full. PR #87 (issue #30); only raised when the hub was constructed with `notifyOnQueueSaturation`, and only for a **direct** send — see [Backpressure signalling](#backpressure-signalling) | `MeshClient.cs:176` |
 | `DisposeAsync` | `ValueTask` — `DisconnectAsync` then disposes the lookup semaphore | `MeshClient.cs:950` |
 
-> **Coordinate caveat, this pass — `MeshClient.cs` grew from roughly 1676 to 2228 lines (+552) and
+> **Coordinate caveat, this pass (issue #37, topic pub/sub) — `MeshClient.cs` grew from 2289 to 2507 lines
+> (+218) and `IMeshClient.cs` from 574 to 665 (+91), purely additively.** Every new row this pass added to
+> the table above (`SubscribedTopics`, `SubscribeAsync`/`UnsubscribeAsync`, both `PublishAsync` overloads,
+> `TopicMessageReceived`) was derived fresh from the current source. This pass did not touch, and did not
+> re-verify, any pre-existing row or citation elsewhere in this file — the insertions land after
+> `SendToGroupAsync` (priority) and after `GroupMessageReceived` respectively (see the diff:
+> `IMeshClient.cs`'s `SubscribedTopics` property lands right after `JoinedGroups`, shifting everything from
+> `ConnectAsync` onward by a further +10 on top of whatever this file's rows already carried), so any
+> citation below `GetClientIdByNameAsync`/`RequestAsync`/`ReplyAsync` in `IMeshClient.cs`, or below the
+> `SendAsync`/`SendToGroupAsync` region in `MeshClient.cs`, that this pass's own edits did not touch should
+> be treated as carrying the **same** unverified status the previous pass's own caveat below already
+> assigned it — this pass adds a further, un-reconciled shift on top rather than resolving that one.
+>
+> **Coordinate caveat, previous pass — `MeshClient.cs` grew from roughly 1676 to 2228 lines (+552) and
 > `IMeshClient.cs` from roughly 406 to 491 (+85) across 19 commits (see the freshness narrative at the top
 > of [for-clanker.md](../for-clanker.md) for the full commit list).** Per that narrative's stated scope,
 > this pass re-derived coordinates fresh from the current source only for the rows and sections it
@@ -169,7 +187,10 @@ throw `InvalidOperationException("Not connected to a hub.")` unless `Connected`.
 > was in that the hub does not report (one joined mid-disconnect that never landed, or one restored
 > server-side but then refused on re-authorisation) is silently dropped from the client's own view. A
 > truncated or malformed group block leaves `JoinedGroups` untouched rather than partially applying it.
-> See [known-issues.md](known-issues.md) KI-59 and KI-60.
+> See [known-issues.md](known-issues.md) KI-59 and KI-60. **No equivalent restore, or reply block, exists
+> for topic subscriptions (issue #37)** — a resumed client's `SubscribedTopics` is not repopulated from
+> anything, and the hub-side state it would have to come from is never captured in the first place. See
+> [known-issues.md](known-issues.md) KI-65.
 
 > **`NegotiatedProtocolVersion` is read by the send path since PR #74 (issue #32), not just logged.**
 > `SendAsync`'s headers overload — and, since PR #83, `RequestAsync`/`ReplyAsync`, and since PR #84 the
@@ -370,6 +391,85 @@ retried by anything in the library; a handler that wants to try again must ask a
 Note the client logs the refused group name **unclipped** (`MeshClient.cs:1209`), unlike the hub, which
 clips to 64 characters. The name came from your own hub, so this is not the same exposure, but it is
 worth knowing if you parse client logs.
+
+<a id="topic-based-publishsubscribe"></a>
+
+### Topic-based publish/subscribe
+
+Added for issue #37. A third addressing mode alongside direct sends and groups: subscribe to a
+**pattern**, publish to a concrete **topic**, receive via `TopicMessageReceived`. Full hub-side mechanics
+in [hub.md](hub.md#topic-based-publishsubscribe); wire layout in
+[protocol.md](protocol.md#topic-pubsub-frames-issue-37).
+
+```csharp
+await client.SubscribeAsync("orders.+.created");
+client.TopicMessageReceived += (_, e) =>
+    Console.WriteLine($"{e.Topic}: {Encoding.UTF8.GetString(e.Data.Span)}");
+
+// elsewhere, a different client:
+await other.PublishAsync("orders.eu.created", Encoding.UTF8.GetBytes("order 123"));
+```
+
+**`SubscribeAsync`/`UnsubscribeAsync` (`MeshClient.cs:1133`/`:1170`) mirror `JoinGroupAsync`/
+`LeaveGroupAsync`'s optimistic-record shape, but with one real difference: there is no refusal to react
+to at all.** `SubscribeAsync` records the pattern in `_subscribedTopics` **before** sending the frame,
+then rolls the record back only if the send itself throws (`recorded`, same "only if this call is what
+added it" guard `JoinGroupAsync` uses) — but unlike a group join, there is no `GroupAuthoriser` equivalent
+that can refuse it afterwards, so `SubscribeAsync` returning successfully means the subscription is as
+final as it will ever be. See [known-issues.md](known-issues.md) KI-62 for the authorisation gap this
+reflects, and KI-63 for the absence of any cap on how many patterns one client may hold.
+`UnsubscribeAsync` keeps the opposite order, like `LeaveGroupAsync`: send first, then remove locally.
+
+**Both methods, plus `PublishAsync`, validate the pattern/topic's shape client-side before doing anything
+else** (`TopicSubscriptionTrie.ValidatePattern`/`ValidateTopic`, internal static, called at
+`MeshClient.cs:1135`, `:1172`, `:1200`) — added by commit `fb2f9a0`. A pattern/topic with a wrong wildcard
+position, an empty segment, or over the 128-segment cap now throws `ArgumentException` immediately and
+locally, matching what `IMeshClient`'s own XML docs already promised. Before that fix, an invalid value
+was accepted here and rejected only inside the hub's `TopicSubscriptionTrie`, logged at `Debug` and
+silently dropped — `SubscribedTopics` would report a subscription that matched nothing, forever, with no
+exception raised on this side at all. See [known-issues.md](known-issues.md) KI-61 (fixed) for the full
+history, and [hub.md](hub.md#topic-based-publishsubscribe) for the hub-side validation this now runs
+ahead of (which remains in place as defence-in-depth for a non-`MeshClient` peer).
+
+**`PublishAsync` requires no subscription of the publisher's own** — a topic is an address, not a
+membership, unlike `SendToGroupAsync`. The headerless overload is a byte-identical-cost compatibility
+wrapper over the headers overload with `MessageHeaders.Empty`, the same pattern every other headers pair
+in this file follows; the headers overload calls the same `RequireHeaderEnvelopeSupport` guard the direct/
+group headers overloads use, so a non-empty `headers` on a connection negotiated below
+`Protocol.HeaderEnvelopeMinVersion` throws `NotSupportedException` rather than being silently dropped.
+**Since commit `fb2f9a0` the headers overload also starts a `Producer` `Activity` and folds trace context
+in via `WithTraceContext`, mirroring `SendToGroupAsync` exactly** — before that fix this was the one
+header-bearing send path with no tracing at all, so a topic message with headers always started an
+orphaned trace on the receiving end rather than continuing the publisher's. See
+[Distributed tracing](#distributed-tracing) below.
+
+**`TopicMessageReceived` (`MeshClient.cs:253`) is a distinct event from `MessageReceived`/
+`GroupMessageReceived`**, carrying `TopicMessageReceivedEventArgs` — sender id, the concrete `Topic` the
+publisher wrote (never the subscriber's own pattern), the payload, and headers (`MessageHeaders.Empty` if
+none were attached). The receive loop decodes `DeliverTopicMessage`/`DeliverTopicMessageWithHeaders`
+(`MeshClient.cs:1947-2021`) the same way it decodes the direct/group equivalents — a throwing handler is
+caught and logged, never allowed to halt the loop (the same callback-boundary containment as every other
+event in this file) — and, for the header-bearing frame, checks `IsExpired` and starts a receive
+`Activity` exactly like `DeliverMessageWithHeaders` does, so message expiry (KI-47) and distributed
+tracing both apply to topic messages with no special-casing.
+
+**`SubscribedTopics` is cleared on every disconnect** (`CleanUpAsync`, `MeshClient.cs:1680-1683`), the
+same as `JoinedGroups`. **Unlike `JoinedGroups`, nothing restores it on reconnect** — `MeshClientReconnector`
+has no counterpart to `RestoreGroupMembershipAsync` for topics, and session resumption's `SessionResumed`
+reply reports restored group memberships only, never subscriptions. See
+[known-issues.md](known-issues.md) KI-64 for the `MeshClientReconnector` gap and KI-65 for the identical
+gap in the hub's own native session resumption. An application that needs subscriptions to survive a
+reconnect must re-issue `SubscribeAsync` for each pattern itself, from a `Reconnected` handler (or, for
+session resumption, once `SessionResumed` becomes `true`) — see
+[`MeshClientReconnector`](#meshclientreconnector) below.
+
+**No authorisation seam exists for subscribe or publish** — a genuine gap against this codebase's own
+`GroupAuthoriser`-shaped pattern for groups, see [known-issues.md](known-issues.md) KI-62. **The
+version-gate gap this section previously described is fixed**: commit `fb2f9a0` added
+`Protocol.TopicPubSubMinVersion = 8`, and all four client → hub topic methods now call
+`RequireTopicPubSubSupport(NegotiatedProtocolVersion)` before sending, throwing `NotSupportedException` on
+a connection negotiated below it — see [known-issues.md](known-issues.md) KI-61 (fixed) and
+[protocol.md](protocol.md#versioning) for the pattern this now follows.
 
 <a id="sending-headers"></a>
 
@@ -859,9 +959,14 @@ ActivitySource.AddActivityListener(listener);
 await alice.SendAsync(bobId, payload); // now carries traceparent/tracestate automatically
 ```
 
-- Two named activities: `Meshworx.Send` (`Producer`, started in `SendCoreAsync` for direct sends and in
-  the shared `SendToGroupAsync` implementation for group sends) and `Meshworx.Receive` (`Consumer`,
-  started by `StartReceiveActivity`, `MeshClient.cs:1127-1137`).
+- Two named activities: `Meshworx.Send` (`Producer`, started in `SendCoreAsync` for direct sends, in the
+  shared `SendToGroupAsync` implementation for group sends, and — since commit `fb2f9a0` — inline in
+  `PublishAsync`'s headers overload for topic publishes, tagged with `meshworx.topic` and
+  `meshworx.message_size`) and `Meshworx.Receive` (`Consumer`, started by `StartReceiveActivity`,
+  `MeshClient.cs:1127-1137`). Before that fix, a topic publish with headers started no `Producer` activity
+  at all, so the receiving `DeliverTopicMessageWithHeaders` handler's `StartReceiveActivity` call always
+  began a fresh, orphaned trace rather than continuing the publisher's — see
+  [known-issues.md](known-issues.md) KI-61 (fixed).
 - Header keys are the **literal W3C names**, deliberately not `mesh.`-prefixed — `TraceContextHeaderKeys.TraceParent`
   = `"traceparent"`, `.TraceState` = `"tracestate"` (`Messages/TraceContextHeaderKeys.cs:26,32`) — so a
   bridge into HTTP/gRPC/a message broker sees the standard names. Both are among the 13 reserved header
@@ -1092,6 +1197,25 @@ reads exactly `[1L]` after one genuine drop-and-reconnect.
   `meshworx.client.reconnects` are not the same signal: the metric only increments when
   `ConnectWithRetryAsync` itself did the reconnecting, whereas `Reconnected` fires on this same stale-goal-met
   path too — the counter is the stricter of the two.
+- **It does NOT restore topic subscriptions (issue #37) — this was deliberately out of scope, unlike
+  groups.** There is no `restoreTopicSubscriptions` parameter and no counterpart anywhere to
+  `RestoreGroupMembershipAsync` for `SubscribedTopics`. `Client.SubscribedTopics` reads empty immediately
+  after any reconnect, the same as after a fresh `ConnectAsync`, and nothing in this class re-issues
+  `SubscribeAsync` for a pattern the application held before the drop. See
+  [known-issues.md](known-issues.md) KI-64 and [Topic-based publish/subscribe](#topic-based-publishsubscribe)
+  above. An application that needs subscriptions to survive a reconnect must track its own desired set and
+  re-subscribe from a `Reconnected` handler:
+
+```csharp
+var desiredTopics = new[] { "orders.+.created", "alerts.#" };
+reconnector.Reconnected += async (_, _) =>
+{
+    foreach (string pattern in desiredTopics)
+    {
+        await reconnector.Client.SubscribeAsync(pattern);
+    }
+};
+```
 
 ```csharp
 await using var reconnector = new MeshClientReconnector(

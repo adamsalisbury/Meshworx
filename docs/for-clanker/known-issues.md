@@ -69,6 +69,11 @@ the risk to a change, not a claim that the code is defective.
 | KI-58 | `mesh.contract.method` is the bare method name, not contract-qualified — two different `[MeshContract]` interfaces sharing a method name are ambiguous on the wire; the header is also unauthenticated, same as `mesh.reply`/`mesh.ack` | `AdamSalisbury.Meshworx.Contracts.Generator/MeshContractGenerator.cs`, `ContractHeaderKeys.cs` | medium (correctness), pending fix; spoofability is by design, see KI-43/KI-46 | open — **PR #120 (open, unmerged) fixes the collision** by qualifying the header value; see [contracts.md](contracts.md#pending-pr-120) |
 | KI-59 | `SessionResumed`'s reported-groups block silently drops an over-length group name and caps the reported count at 65,535 | `MeshHub.cs` (`BuildReportableGroupNameBytes`) | low (correctness, by design) | open — **by design**, added after a security review; the membership itself is still restored, only the reply's ability to name it is bounded; see full entry below |
 | KI-60 | `MeshClient.RestoreJoinedGroupsFromResumedReply` fully replaces `JoinedGroups` rather than merging — a group the client believed it was in that the hub does not report is silently discarded | `MeshClient.cs:511-553` | low (correctness) | open — **by design**; the hub's report is authoritative; see full entry below |
+| KI-61 | Topic subscribe/publish opcodes shipped client → hub with no version gate, breaking this docs set's own additive-opcode rule | `Messages/MessageType.cs:29-32`, `Messages/Protocol.cs:48`, `MeshClient.cs:1133-1250`, `MeshHub.cs:1483-1549` | medium (correctness / forward-compatibility) | **fixed** — commit `fb2f9a0`; `Protocol.TopicPubSubMinVersion = 8` now gates all four client → hub opcodes on both ends, mirroring `HeaderEnvelopeMinVersion`; see full entry below |
+| KI-62 | No authorisation hook exists for topic subscribe or publish; groups have an optional one, topics have none at all | `MeshHub.cs:1483-1549`, `IMeshClient.cs:389-461` | medium (security) | open — **by design**; extends KI-2, see full entry below |
+| KI-63 | Topic subscription count and pattern length are unbounded per client | `MeshClient.cs:1133-1167`, `TopicSubscriptionTrie.cs:251`, `MeshHub.cs:4168` | medium (availability) | open — **by design**, mirrors a pre-existing, never-flagged gap in group membership; see full entry below |
+| KI-64 | `MeshClientReconnector` does not restore topic subscriptions after a reconnect | `MeshClientReconnector.cs`, `MeshClient.cs:1680-1683`, `MeshHub.cs:3772-3780` | medium (correctness) | open — **deliberately out of scope** for issue #37; see full entry below |
+| KI-65 | Session resumption restores group membership but never topic subscriptions | `MeshHub.cs` (`ResumableSession`, `MakeSessionDormant`, `ResumeSessionAsync`), `MeshClient.cs` (`RestoreJoinedGroupsFromResumedReply`, no topic counterpart) | medium (correctness) | open — **deliberately deferred**, a disclosed follow-up beyond issue #37; see full entry below |
 
 ---
 
@@ -1814,6 +1819,174 @@ above assert; see [hub.md](hub.md#session-resumption) for where they're describe
   pre-disconnect snapshot against `JoinedGroups` immediately after `SessionResumed` fires, rather than
   trusting `JoinedGroups` alone to carry that distinction. See [client.md](client.md#session-resumption)
   and [hub.md](hub.md#session-resumption).
+
+### KI-61 — Topic subscribe/publish opcodes shipped with no protocol version gate — **FIXED (commit `fb2f9a0`)**
+- **Where:** `Messages/MessageType.cs:29-32` (`SubscribeTopic = 0x19`, `UnsubscribeTopic = 0x1A`,
+  `PublishTopicMessage = 0x1B`, `PublishTopicMessageWithHeaders = 0x1C`); `Messages/Protocol.cs:48`
+  (`TopicPubSubMinVersion = 8`, added by the fix); `MeshClient.cs:1133`, `:1170`, `:1194`
+  (`SubscribeAsync`, `UnsubscribeAsync`, `PublishAsync`, each now calling `RequireTopicPubSubSupport`,
+  the guard itself at `:1364-1372`); `MeshHub.cs:1483-1549` (the four dispatch branches, each now also
+  gated on `connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion`).
+- **Severity:** medium (correctness / forward-compatibility).
+- **Status:** **fixed by commit `fb2f9a0`**, the commit immediately following the one that introduced the
+  gap. `Protocol.MaxSupportedVersion` was raised from `7` to `8` and a new
+  `Protocol.TopicPubSubMinVersion = 8` constant added, mirroring the shape `HeaderEnvelopeMinVersion`/
+  `SessionResumptionMinVersion` already established. Retained here rather than deleted, because the
+  failure mode is worth knowing if you ever work against an older tag or commit of this codebase — see
+  [protocol.md](protocol.md#versioning) for the general pattern this is now a further confirming example
+  of, alongside the header envelope and session resumption.
+- **What it was:** four of this feature's six new opcodes travel client → hub (`SubscribeTopic`,
+  `UnsubscribeTopic`, `PublishTopicMessage`, `PublishTopicMessageWithHeaders`) and, for one commit, shipped
+  reachable at any negotiated version on both ends, with nothing consulting `NegotiatedProtocolVersion`
+  before sending or acting on one — the exact shape
+  [protocol.md's additive-opcodes rule](protocol.md#additive-opcodes-within-a-version) (derived from
+  `GroupJoinRefused`/`QueueSaturated`, and the rule issue #43's `ResumeSession` was built to satisfy) says a
+  client → hub opcode may never take. The header-bearing `PublishAsync` overload's only version check at
+  the time, `RequireHeaderEnvelopeSupport(NegotiatedProtocolVersion)`, guarded the **header block**, a
+  pre-existing and unrelated concern — it did nothing for a plain publish and nothing at all for
+  subscribe/unsubscribe. The practical consequence: a client built with topic support, talking to a hub
+  built from a copy that predates the feature, got `SubscribeAsync` returning success and the pattern
+  appearing in `SubscribedTopics` — and no topic message ever arrived, forever, with no exception raised,
+  no event fired, and nothing visible to the caller beyond the hub's own silent-unknown-opcode fall-through
+  (KI-9).
+- **What changed:**
+  - `MeshClient.RequireTopicPubSubSupport(byte negotiatedProtocolVersion)` (`MeshClient.cs:1364-1372`) — a
+    private static guard, the same shape as the pre-existing `RequireHeaderEnvelopeSupport` — throws
+    `NotSupportedException` below version `8`. Called from `SubscribeAsync` (`:1138`), `UnsubscribeAsync`
+    (`:1175`) and `PublishAsync`'s headers overload (`:1204`); the headerless `PublishAsync` overload
+    forwards to the headers one, so a single call site covers both.
+  - `MeshHub`'s four topic dispatch branches (`MeshHub.cs:1483-1549`) each gained an additional
+    `&& connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion` clause. A frame from a
+    connection negotiated below `8` now falls through the dispatch ladder exactly like an unrecognised
+    opcode (KI-9) rather than being acted on — a hub upgraded ahead of some of its clients keeps serving
+    them ordinary traffic, it simply never subscribes/publishes on their behalf until they upgrade too.
+  - The same commit also added client-side pattern/topic shape validation
+    (`TopicSubscriptionTrie.ValidatePattern`/`ValidateTopic`, internal static, `TopicSubscriptionTrie.cs:307`/
+    `:318`), called from `SubscribeAsync`, `UnsubscribeAsync` and `PublishAsync` before anything is recorded
+    or sent — a related but distinct gap the same review found: an invalid pattern or topic (wrong wildcard
+    position, empty segment, over the 128-segment cap) used to be accepted by `MeshClient` and rejected only
+    inside the hub's trie, logged at `Debug` and silently dropped, leaving `SubscribedTopics` reporting a
+    subscription that matched nothing forever with no exception — contradicting the `ArgumentException`
+    the interface's own XML docs already promised. It now throws immediately and locally. See
+    [client.md](client.md#topic-based-publishsubscribe).
+  - `PublishAsync`'s header-bearing overload also gained distributed-trace propagation (a `Producer`
+    `Activity` plus `WithTraceContext`), mirroring `SendToGroupAsync` exactly — previously every topic
+    message with headers started an orphaned trace on the receiving end instead of continuing the
+    publisher's. See [client.md](client.md#distributed-tracing).
+- **What to do:** treat `8` as the version any deployment relying on topic pub/sub must have negotiated on
+  both ends — a hub or client built before commit `fb2f9a0` cannot participate in it correctly regardless
+  of which side of the gap it is on. Do not remove `RequireTopicPubSubSupport` or the hub's four
+  `NegotiatedProtocolVersion` guards on the reasoning that "the opcodes have always been there" — that
+  reasoning is exactly what this entry documents as unsafe. If you add the next topic-adjacent client → hub
+  capability, gate it behind its own new `Protocol.XyzMinVersion` the same way, rather than assuming this
+  feature's existing gate covers it.
+
+### KI-62 — No authorisation hook exists for topic subscribe or publish; groups have an optional one, topics have none at all
+- **Where:** `MeshHub.cs:1483-1549` (the `SubscribeTopic`/`UnsubscribeTopic`/`PublishTopicMessage`/
+  `PublishTopicMessageWithHeaders` dispatch branches — no callback of any kind is consulted in any of
+  them); `IMeshClient.cs:389-461` (`SubscribeAsync`'s and `PublishAsync`'s own XML docs state this
+  plainly: "there is no authorisation hook and no refusal").
+- **Severity:** medium (security), open — by design.
+- **Why it bites:** this extends KI-2 ("authorisation covers groups only") one step further — topics have
+  no equivalent seam at all, not even an unused constructor parameter the way `groupAuthoriser` exists for
+  groups. Any client admitted by the (itself optional, KI-2) `ClientAuthenticator` may subscribe to any
+  pattern — including the bare `#`, which by `TopicSubscriptionTrie`'s own matching rules (see
+  [hub.md](hub.md#topic-based-publishsubscribe)) matches every topic ever published on the hub — and may
+  publish to any topic. Combined with KI-2's open-admission default, an unauthenticated hub lets any
+  reachable peer eavesdrop on the entirety of topic traffic with a single `SubscribeTopic` frame for `#`.
+  Publishing itself needs no subscription of the publisher's own either — a topic is an address, not a
+  membership, unlike a group send's membership requirement — so there is nothing resembling the
+  group-send rule in KI-2 to fall back on here.
+- **What to do:** treat topic pub/sub, like groups without a `GroupAuthoriser` configured, as inside the
+  trust boundary the `ClientAuthenticator` establishes, not a boundary of its own. Do not use topics as a
+  tenant- or feature-isolation mechanism without adding your own gate at the application layer — for
+  example, namespacing topics per tenant and validating a `SubscribeAsync`/`PublishAsync` call's target
+  against the caller's own identity before issuing it — since the hub will not do that for you.
+
+### KI-63 — Topic subscription count and pattern length are unbounded per client
+- **Where:** `MeshClient.cs:1133-1167` (`SubscribeAsync` — no cap on how many distinct patterns
+  `_subscribedTopics` may hold); `TopicSubscriptionTrie.cs:251` (`MaxSegmentCount = 128` bounds only a
+  single pattern's *segment count*, not how many patterns a client may register); `MeshHub.cs:4168`
+  (`ClientConnection.Topics`, an unbounded `HashSet<string>`).
+- **Severity:** medium (availability), open — by design, mirrors a pre-existing, never-flagged gap in
+  group membership.
+- **Why it bites:** a single client may call `SubscribeAsync` an unlimited number of times with distinct
+  patterns, each contributing nodes to the hub-wide `TopicSubscriptionTrie`. Nothing analogous to the
+  `maxClients`/queue-capacity/rate-limiter bounds PR #68 (issue #16, KI-29) added for other per-hub
+  resources caps this — a buggy or malicious client can grow the trie without limit, and every subscribed
+  client pays the traversal cost of every literal branch that exists at each segment level (see
+  [hub.md](hub.md#topic-based-publishsubscribe) for `Match`'s cost model). This is not a novel category of
+  gap in this codebase — `JoinGroupAsync` has never bounded how many groups one client may join either,
+  and that was never itself given its own known-issues entry — but the two-way surface here (a client can
+  flood both subscriptions **and** publishes, each gated only by the pre-existing per-second budgets in
+  [Rate limiting](hub.md#rate-limiting), not by any per-client ceiling on standing state) makes it worth a
+  standing entry now that a trie exists to hold the state.
+- **What to do:** if a per-client subscription ceiling matters for a deployment, enforce it at the
+  application layer — for example a decorator around `IMeshClient` that counts calls to `SubscribeAsync`,
+  or extend `TopicSubscriptionTrie`/`ClientConnection.Topics` with a count check the same shape as
+  `MaxSegmentCount`, following the PR #68 resource-bound sweep as the precedent for where such a cap
+  would belong.
+
+### KI-64 — `MeshClientReconnector` does not restore topic subscriptions after a reconnect
+- **Where:** `MeshClientReconnector.cs` (no counterpart anywhere to `RestoreGroupMembershipAsync`/
+  `_pendingGroupRestore` for topics); `MeshClient.cs:1680-1683` (`CleanUpAsync` clears
+  `_subscribedTopics` on every disconnect, the same as `_joinedGroups`); `MeshHub.cs:3772-3780`
+  (`RemoveFromAllTopics` strips every one of a disconnecting connection's subscriptions from the trie, the
+  same as `RemoveFromAllGroups`).
+- **Severity:** medium (correctness), open — **deliberately out of scope** for this feature (issue #37);
+  the same "new capability, reconnection wiring not extended" shape KI-38 documents for a different
+  feature.
+- **Why it bites:** both sides forget a client's topic subscriptions the moment its connection drops — the
+  client clears its own `SubscribedTopics` snapshot, and the hub removes every one of that connection's
+  patterns from the routing trie. Unlike group membership, which `MeshClientReconnector` re-joins
+  automatically after a reconnect (`RestoreGroupMembershipAsync`, gated by `restoreGroupMembership`, see
+  [client.md](client.md#how-it-works)), nothing re-issues `SubscribeAsync` for any pattern the application
+  held before the drop. **This entry is specifically about `MeshClientReconnector`'s own restore wiring —
+  the hub's separate, native session-resumption feature (`sessionResumptionWindow`) has exactly the same
+  gap for a different reason and is tracked on its own as KI-65**, since it is a distinct reconnection
+  mechanism with its own restore path (`RestoreGroupMembershipAsync`) that was never extended to topics
+  either.
+- **What to do:** an application relying on both `MeshClientReconnector` and topic subscriptions must track
+  its own desired subscription set and re-issue `SubscribeAsync` for each pattern from a `Reconnected`
+  handler, exactly as applications had to for groups before PR #52 added automatic rejoin. Do not assume
+  `SubscribedTopics` survives a reconnect the way `JoinedGroups` (mostly) does — and see KI-65 if the
+  application also uses `sessionResumptionWindow`, since that path needs the identical treatment.
+
+### KI-65 — Session resumption restores group membership, never topic subscriptions
+- **Where:** `MeshHub.cs` — `ResumableSession` (private sealed class, a `Groups` property only, no
+  `Topics`); `MakeSessionDormant` (captures `connection.Groups` only); `ResumeSessionAsync` (calls
+  `RestoreGroupMembershipAsync`, with no topic-side counterpart called alongside it). `MeshClient.cs` —
+  `RestoreJoinedGroupsFromResumedReply` (`:529`, parses the `SessionResumed` reply's group block; no
+  topic counterpart exists anywhere in the class).
+- **Severity:** medium (correctness), open — **deliberately deferred**: a correctness review surfaced this
+  alongside the two KI-61 gaps during the same pass, but it was disclosed as an out-of-scope follow-up
+  rather than fixed in the same commit.
+- **Why it bites:** this is about the hub's own native session-resumption feature
+  (`sessionResumptionWindow`, gated on `Protocol.SessionResumptionMinVersion = 6`, see
+  [hub.md](hub.md#session-resumption) and KI-50/KI-52/KI-53) — a different reconnection mechanism from
+  `MeshClientReconnector`, which KI-64 already covers. Session resumption already restored a resumed
+  client's group memberships before issue #37 existed (`RestoreGroupMembershipAsync`, re-authorising each
+  one against any configured `GroupAuthoriser`), and since protocol version 7 (PR #135/issue #109) the
+  `SessionResumed` reply has reported which groups were actually restored
+  (`RestoreJoinedGroupsFromResumedReply`, see [client.md](client.md#session-resumption)). Topic pub/sub
+  added a second piece of per-connection state with exactly the same shape as group membership —
+  `ClientConnection.Topics` on the hub, mirrored by `MeshClient._subscribedTopics` — but nothing wires it
+  into either half of resumption: `ResumableSession` has no `Topics` field to capture into,
+  `MakeSessionDormant` only ever reads `connection.Groups`, and `RestoreGroupMembershipAsync` has no
+  topic-side counterpart to call from `ResumeSessionAsync`. A client with an active topic subscription
+  that undergoes a genuine session resume — a reconnect within `sessionResumptionWindow`, not a
+  `MeshClientReconnector`-driven reconnect — gets its identity, its group memberships and its resumption
+  token all reclaimed correctly, and silently loses every topic subscription it held, with nothing in the
+  `SessionResumed` reply or anywhere else to signal it.
+- **What to do:** an application combining `sessionResumptionWindow` with topic subscriptions must not
+  assume `SubscribedTopics` survives a resume any more than it survives a plain reconnect (KI-64) —
+  re-issue `SubscribeAsync` for every pattern the application needs once `SessionResumed` becomes `true`
+  (see [client.md](client.md#session-resumption)), the same discipline KI-64 already recommends for
+  `MeshClientReconnector`. If you extend the hub to close this gap, follow `RestoreGroupMembershipAsync`'s
+  own shape: add a `Topics` capture to `ResumableSession`/`MakeSessionDormant`, a topic-restoring
+  counterpart called from `ResumeSessionAsync`, and — if the client should learn what survived, mirroring
+  the group block — a further protocol widening the same shape `SessionResumedGroupsMinVersion` was for
+  groups. Do not silently reuse `SessionResumedGroupsMinVersion` itself for an unrelated payload change.
 
 ---
 

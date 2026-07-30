@@ -8,7 +8,7 @@ document/verify carefully when you touch it. Everything here is read from
 sites in `MeshHub.cs` / `MeshClient.cs`.
 
 - **Protocol version is a negotiated range** (`Protocol.MinSupportedVersion` = `4`,
-  `Protocol.MaxSupportedVersion` = `7`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
+  `Protocol.MaxSupportedVersion` = `8`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
   it can speak; the hub picks the highest version common to both sides — see
   [Registration handshake](#registration-handshake). Negotiation itself was introduced by PR #73
   (issue #47); PR #74 (issue #32) is the **first thing to actually widen the range and branch on the
@@ -29,7 +29,13 @@ sites in `MeshHub.cs` / `MeshClient.cs`.
   #109 is the third widening**, raising `MaxSupportedVersion` from `6` to `7`
   (`Protocol.SessionResumedGroupsMinVersion = 7`) so a `SessionResumed` reply can report which group
   memberships the hub actually restored — see [Session resumption](#session-resumption) below for the
-  wire layout this adds.
+  wire layout this adds. **Commit `fb2f9a0` is the fourth widening**, raising `MaxSupportedVersion` from
+  `7` to `8` and adding `Protocol.TopicPubSubMinVersion = 8` — this closes a gap topic pub/sub (issue #37)
+  shipped with one commit earlier: its four client → hub opcodes
+  (`SubscribeTopic`/`UnsubscribeTopic`/`PublishTopicMessage`/`PublishTopicMessageWithHeaders`) were
+  reachable at any negotiated version for that one commit, breaking this file's own additive-opcode rule —
+  see [Topic pub/sub frames](#topic-pubsub-frames-issue-37) below and
+  [known-issues.md](known-issues.md) KI-61 (now fixed).
 - **`MessageType` and `Protocol` are `internal`** — opcodes are not visible outside the assembly.
 - **Byte order:** big-endian for all multi-byte integers (`BinaryPrimitives.*BigEndian`). Ids are
   16-byte `Guid`s written with `Guid.TryWriteBytes` / read with `new Guid(span)`.
@@ -87,8 +93,25 @@ Everything in the tables below is the **message payload** (i.e. after the transp
 | `ResumeSession` | `0x16` | client → hub | resumption token (rest of frame; 32 bytes in practice) |
 | `SessionResumed` | `0x17` | hub → client | reclaimed client id (16), token length (2, BE), renewed token, and — version 7+ only, PR #135/issue #109 — group count (2, BE) followed by that many `[nameLength (2, BE)][utf8 name]` restored-group entries |
 | `SessionResumeRefused` | `0x18` | hub → client | none |
+| `SubscribeTopic` | `0x19` | client → hub | UTF-8 topic pattern (rest of frame) |
+| `UnsubscribeTopic` | `0x1A` | client → hub | UTF-8 topic pattern (rest of frame) |
+| `PublishTopicMessage` | `0x1B` | client → hub | topic length (2, BE), UTF-8 topic, message bytes |
+| `PublishTopicMessageWithHeaders` | `0x1C` | client → hub | topic length (2, BE), UTF-8 topic, header-block length (2, BE), header block, message bytes |
+| `DeliverTopicMessage` | `0x1D` | hub → client | sender id (16), topic length (2, BE), UTF-8 topic, message bytes |
+| `DeliverTopicMessageWithHeaders` | `0x1E` | hub → client | sender id (16), topic length (2, BE), UTF-8 topic, header-block length (2, BE), header block, message bytes |
 
-`0x18` is the highest opcode in use; the next new one is `0x19`. The four header-bearing opcodes
+`0x1E` is the highest opcode in use; the next new one is `0x1F`. Topic-based publish/subscribe (issue
+#37) is covered in full in [Topic pub/sub frames](#topic-pubsub-frames-issue-37) below and
+[hub.md](hub.md#topic-based-publishsubscribe)/[client.md](client.md#topic-based-publishsubscribe). **Two
+of its six opcodes (`DeliverTopicMessage`/`DeliverTopicMessageWithHeaders`) are a further confirming
+example of the additive-opcode route — hub → client only, no version bump needed. The other four
+(`SubscribeTopic`/`UnsubscribeTopic`/`PublishTopicMessage`/`PublishTopicMessageWithHeaders`) are client →
+hub and, by this section's own rule, needed one — for one commit they shipped without it, then commit
+`fb2f9a0` added `Protocol.TopicPubSubMinVersion = 8` and gated all four on both ends** — see
+[Additive opcodes within a version](#additive-opcodes-within-a-version) below and
+[known-issues.md](known-issues.md) KI-61 (fixed) for the full write-up of that history.
+
+The four header-bearing opcodes
 (`0x11`–`0x14`, PR #74, issue #32) are each the existing opcode's frame with one extra
 `[headerBlockLength(2, BE)][headerBlock]` pair spliced in right after the fields that address the
 message (recipient id / group name) and before the opaque message body — see
@@ -135,12 +158,12 @@ the negotiated version is below 6 or the hub has resumption switched off, which 
 earlier build produced.
 
 `versionMin`/`versionMax` is the client's supported range; `MeshClient` always sends
-`Protocol.MinSupportedVersion`/`Protocol.MaxSupportedVersion` (`4`/`7` as of PR #135/issue #109 — this
-figure was already stale at `4`/`5` before this pass, left over from the PR #74 reconciliation and never
-updated across the PR #85/issue #43/PR #135 widenings in between), so a hub and client both built from
-this codebase negotiate `7`, but the wire and the hub's negotiation both treat it as a
-real range — a client built against an older copy of the library (advertising `4`/`4`) still
-interoperates, negotiating down to `4` and losing only the header envelope — see
+`Protocol.MinSupportedVersion`/`Protocol.MaxSupportedVersion` (`4`/`8` as of commit `fb2f9a0`, which
+widened the range from `4`/`7` to gate topic pub/sub — see [Topic pub/sub frames](#topic-pubsub-frames-issue-37)
+below), so a hub and client both built from this codebase negotiate `8`, but the wire and the hub's
+negotiation both treat it as a real range — a client built against an older copy of the library
+(advertising `4`/`4`) still interoperates, negotiating down to `4` and losing only the header envelope —
+see
 [Versioning](#versioning). The **credential is everything after the name** — its length is implied by
 the frame length, so it can be empty (the default). The hub does not interpret those bytes; it hands
 them to the configured `ClientAuthenticator` and nothing else reads them. See
@@ -488,7 +511,9 @@ membership itself is unaffected — only the reply cannot name it), and the repo
 at `ushort.MaxValue` (65,535), with any remainder silently unreported. `MeshClient.RestoreJoinedGroupsFromResumedReply`
 parses this block and **replaces** `JoinedGroups` wholesale from it — see
 [client.md](client.md#session-resumption), [hub.md](hub.md#session-resumption) and
-[known-issues.md](known-issues.md) KI-59/KI-60.
+[known-issues.md](known-issues.md) KI-59/KI-60. **No equivalent block exists for topic subscriptions** —
+the restore this section describes has no topic-side counterpart anywhere in the resumption exchange, so
+a resumed client's topic subscriptions are simply gone; see [known-issues.md](known-issues.md) KI-65.
 
 **Resumption happens *after* registration, not inside it, and that is forced by the handshake's own
 ordering.** The obvious design — carry the token in the `RegistrationRequest` frame — cannot work: the
@@ -520,6 +545,58 @@ consume the wrong frame.
 | The session must be **dormant** (its connection gone) | a token reclaims an unused identity, never takes a live one |
 | The session's **name must match** the resuming connection's registered name | otherwise any token holder could take over any identity |
 | Validated by `TryGetValue` **then** claimed by `TryRemove` | a token that fails validation is left in place for its rightful owner; the winning `TryRemove` is what makes two racing resumes resolve to one |
+
+<a id="topic-pubsub-frames-issue-37"></a>
+
+### Topic pub/sub frames (issue #37)
+
+Six opcodes. **For the one commit that introduced them, this shipped with no version gate at all** —
+`Protocol.MaxSupportedVersion` stayed `7` and no `Protocol.TopicPubSubMinVersion` constant existed,
+unlike [Message headers](#message-headers) and [Session resumption](#session-resumption) above, both of
+which added one when they landed. The very next commit, `fb2f9a0`, fixed this: `MaxSupportedVersion` is
+now `8` and `Protocol.TopicPubSubMinVersion = 8` gates all four client → hub opcodes below, on both hub
+and client. See [known-issues.md](known-issues.md) KI-61 (fixed) for the full history of that gap.
+
+```
+client → hub : [0x19 SubscribeTopic][utf8 pattern...]                                      # whole remainder is the pattern
+client → hub : [0x1A UnsubscribeTopic][utf8 pattern...]
+client → hub : [0x1B PublishTopicMessage][topicLen u16 BE][utf8 topic][body...]             # needs len ≥ 3
+client → hub : [0x1C PublishTopicMessageWithHeaders][topicLen u16 BE][utf8 topic][headerLen u16 BE][headerBlock][body...]  # needs len ≥ 5
+hub → client : [0x1D DeliverTopicMessage][senderId 16][topicLen u16 BE][utf8 topic][body...]                        # needs len ≥ 19
+hub → client : [0x1E DeliverTopicMessageWithHeaders][senderId 16][topicLen u16 BE][utf8 topic][headerLen u16 BE][headerBlock][body...]  # needs len ≥ 21
+```
+
+A pattern is the same dot-separated hierarchy as a concrete topic, with two reserved wildcard segments
+borrowed from MQTT — `+` matches exactly one segment, `#` matches the remainder and may only be the
+pattern's final segment. Matching is entirely hub-side, via `TopicSubscriptionTrie`
+(`TopicSubscriptionTrie.cs`) — see [hub.md](hub.md#topic-based-publishsubscribe) for the matching rules
+and its concurrency model. The hub never decodes a header block on this path beyond the same
+single-key `ReadPriority` scan the direct/group paths already use (see
+[Priority header](#priority-header-ab16567)) — a topic publish is otherwise exactly as opaque to the hub
+as a group send.
+
+**Publishing requires no subscription of the publisher's own**, unlike a group send's membership
+requirement (`GroupMessage`, [Message frames](#message-frames-exact-byte-offsets) above) — a topic is an
+address, not a membership, so a publisher that has never called `SubscribeAsync` still reaches every
+matching subscriber. There is also no authorisation seam of any kind for either subscribe or publish,
+unlike groups' optional `GroupAuthoriser` — see [known-issues.md](known-issues.md) KI-62.
+
+**This is the sixth new-opcode addition documented in this file, and — for one commit — the first one
+that did not follow its own [additive-opcodes rule](#additive-opcodes-within-a-version) correctly.**
+`DeliverTopicMessage`/`DeliverTopicMessageWithHeaders` (`0x1D`/`0x1E`) are hub → client only and are a
+further confirming example of that rule, exactly like `GroupJoinRefused` and `QueueSaturated` before
+them. `SubscribeTopic`/`UnsubscribeTopic`/`PublishTopicMessage`/`PublishTopicMessageWithHeaders`
+(`0x19`–`0x1C`) are client → hub, which by the rule's own stated test — "one a client may *send*... must
+bump `Protocol.MaxSupportedVersion`", the exact test `ResumeSession` was built to satisfy — needed a
+widening and a `Protocol.TopicPubSubMinVersion` gate the same shape as
+`Protocol.SessionResumptionMinVersion`. That did not ship with the feature itself, but the very next
+commit, `fb2f9a0`, added exactly that: `Protocol.TopicPubSubMinVersion = 8`, checked by both
+`MeshClient` (`RequireTopicPubSubSupport`, throwing `NotSupportedException`) and `MeshHub` (an added
+`connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion` clause on each of the four
+dispatch branches). The failure mode the gap briefly created was silent and specific — a client calling
+`SubscribeAsync`/`PublishAsync` against a hub built without the feature got no exception, no refusal, and
+`SubscribeAsync` still returned with the pattern appearing in `SubscribedTopics`, but no message ever
+arrived — see [known-issues.md](known-issues.md) KI-61 (fixed) for the full write-up.
 
 <a id="additive-opcodes-within-a-version"></a>
 
@@ -559,6 +636,17 @@ effectively does not), and no existing frame's layout changed. Unlike `GroupJoin
 all is itself opt-in (`notifyOnQueueSaturation`), so most hubs will never emit it regardless of what any
 connected client's own version supports.
 
+**Topic pub/sub (`0x19`–`0x1E`, issue #37) was, for one commit, the first addition to break this rule
+rather than confirm it.** `DeliverTopicMessage`/`DeliverTopicMessageWithHeaders` (hub → client) are a
+third confirming example, same shape as the two above. But `SubscribeTopic`/`UnsubscribeTopic`/
+`PublishTopicMessage`/`PublishTopicMessageWithHeaders` travel client → hub — the exact case this section
+says "must bump `Protocol.MaxSupportedVersion`", the same test `ResumeSession` was built to satisfy two
+paragraphs up — and none of them got that treatment when the feature landed. The next commit, `fb2f9a0`,
+corrected it: `Protocol.TopicPubSubMinVersion = 8` now gates all four, so this is a **fourth confirming
+example** once its brief exception is accounted for. See
+[Topic pub/sub frames](#topic-pubsub-frames-issue-37) above and
+[known-issues.md](known-issues.md) KI-61 (fixed) for the history.
+
 Lookup (correlated request/response):
 ```
 ClientLookupRequest : [0x06][correlationId i32 BE][utf8 name]    # client→hub, needs len ≥ 5
@@ -590,6 +678,22 @@ drop. The client decodes it in the receive loop and raises `SendRejected`
 [Additive opcodes within a version](#additive-opcodes-within-a-version) below for why this needed no
 version bump.
 
+Topic pub/sub (issue #37) — see [Topic pub/sub frames](#topic-pubsub-frames-issue-37) above for the full
+byte layout:
+```
+SubscribeTopic                 : [0x19][utf8 pattern...]                                          # client→hub
+UnsubscribeTopic                : [0x1A][utf8 pattern...]                                          # client→hub
+PublishTopicMessage             : [0x1B][topicLen u16 BE][utf8 topic][body...]                     # client→hub, needs len ≥ 3
+PublishTopicMessageWithHeaders  : [0x1C][topicLen u16 BE][utf8 topic][headerLen u16 BE][headerBlock][body...]  # client→hub, needs len ≥ 5
+DeliverTopicMessage             : [0x1D][senderId 16][topicLen u16 BE][utf8 topic][body...]                    # hub→client, needs len ≥ 19
+DeliverTopicMessageWithHeaders  : [0x1E][senderId 16][topicLen u16 BE][utf8 topic][headerLen u16 BE][headerBlock][body...]  # hub→client, needs len ≥ 21
+```
+Unlike every block above it in this section, the two client → hub opcodes here (`0x19`/`0x1A`, plus
+`0x1B`/`0x1C`) needed a version gate by this file's own rule — for one commit they shipped without one,
+then commit `fb2f9a0` added `Protocol.TopicPubSubMinVersion` to cover all four. See
+[Additive opcodes within a version](#additive-opcodes-within-a-version) below and
+[known-issues.md](known-issues.md) KI-61 (fixed).
+
 ---
 
 ## Length-guard behaviour (why malformed frames "do nothing")
@@ -611,6 +715,14 @@ condition (`MeshClient.cs:1118-1120`, see [client.md](client.md#request-response
 genuine new branch** — `QueueSaturated` (`0x15`) is a distinct opcode, not a nested check inside an
 existing one, so the client's ladder gained its own `else if` (`MeshClient.cs:1243-1258`) the same way
 PR #74's four opcodes did, growing the ladder by one branch rather than widening an existing condition.
+**Issue #37's six topic opcodes add six more genuine branches to each ladder** (hub:
+`MeshHub.cs:1483-1549`; client: `MeshClient.cs:1947-2021` for the two delivery branches, plus
+`SubscribeAsync`/`UnsubscribeAsync`/`PublishAsync` on the send side) — the additive, one-branch-per-opcode
+shape scales the same way regardless of whether the opcode should also have bumped the version. The hub's
+four topic dispatch branches additionally each gained a `NegotiatedProtocolVersion` guard, one commit
+after the opcodes themselves landed (see
+[Additive opcodes within a version](#additive-opcodes-within-a-version) below for the four that briefly
+should have had one and did not).
 
 That fall-through is what makes a hub → client opcode addable without a version bump: the client's
 `GroupJoinRefused` branch (`MeshClient.cs:1195-1220`) guards on `data.Length > 1`, so a refusal carrying an
@@ -629,12 +741,14 @@ Version negotiation gates the handshake only; there is no per-message version ta
 version-gated capability is instead gated by **opcode** (does this peer even send/recognise it) plus, on
 the hub, by **`ClientConnection.NegotiatedProtocolVersion`** (does *this* peer's own negotiated version
 support it). `Protocol.cs` (`Messages/Protocol.cs`) declares `MinSupportedVersion` (`4`) and
-`MaxSupportedVersion` (`7`) bounding the range this build of the hub/client will speak, plus
+`MaxSupportedVersion` (`8`) bounding the range this build of the hub/client will speak, plus
 `HeaderEnvelopeMinVersion` (`5`) marking the version at which the header envelope became available,
-`SessionResumptionMinVersion` (`6`) marking the same for session resumption, and
+`SessionResumptionMinVersion` (`6`) marking the same for session resumption,
 `SessionResumedGroupsMinVersion` (`7`, PR #135/issue #109) marking the version at which a `SessionResumed`
-reply reports the group memberships the hub actually restored — see [Session resumption](#session-resumption)
-above.
+reply reports the group memberships the hub actually restored, and `TopicPubSubMinVersion` (`8`, commit
+`fb2f9a0`) marking the version at which topic pub/sub's four client → hub opcodes may be used — see
+[Session resumption](#session-resumption) above and
+[Topic pub/sub frames](#topic-pubsub-frames-issue-37) below.
 `MeshClient.ConnectAsync` always advertises its own `[MinSupportedVersion, MaxSupportedVersion]`;
 `MeshHub.TryNegotiateProtocolVersion` (`MeshHub.cs:1381-1403`) intersects that with its own range and, on
 overlap, picks the **highest** version common to both — a peer never has to downgrade further than
@@ -659,6 +773,16 @@ the mechanism:
   before it will send a non-empty `MessageHeaders` over a connection negotiated below
   `HeaderEnvelopeMinVersion` — see [Message headers](#message-headers).
 
+**Topic pub/sub (issue #37) was, for one commit, the first capability since PR #73 introduced real
+negotiation to add opcodes a peer may *send* without widening `MaxSupportedVersion` or adding a
+`Protocol.XyzMinVersion` constant at all.** For that one commit, `SubscribeAsync`/`UnsubscribeAsync`/the
+headerless `PublishAsync` never read `NegotiatedProtocolVersion`; the header-bearing `PublishAsync`
+overload read it only to guard the header block via the pre-existing `RequireHeaderEnvelopeSupport`,
+which says nothing about whether the *topic* opcodes themselves are understood on the other end. This was
+the pattern this section says **not** to follow — "do not assume a version bump alone makes a change
+safe" cuts the other way here: the change needed the bump and did not take it. The very next commit,
+`fb2f9a0`, corrected it — see [known-issues.md](known-issues.md) KI-61 (fixed) for the history.
+
 This is the pattern to imitate for the next optional capability: widen `MaxSupportedVersion`, add a
 `Protocol.XyzMinVersion` marking where it becomes available, and have **both** hub and client consult
 `NegotiatedProtocolVersion` before doing anything the other side might not understand — do not assume a
@@ -666,7 +790,11 @@ version bump alone makes a change safe; something on both sides has to actually 
 **Issue #43 is the second capability to follow it**, and adds one further lesson: the gate only works
 for something sent *after* the negotiated version is known. Anything that would have to travel in the
 registration frame itself cannot be version-gated at all, because neither end knows the version yet —
-restructure it into a later exchange rather than trying to make the frame conditional.
+restructure it into a later exchange rather than trying to make the frame conditional. **Topic pub/sub's
+fix, commit `fb2f9a0`, is a third example of the pattern once fully applied** — `Protocol.TopicPubSubMinVersion`
+plus `RequireTopicPubSubSupport` on the client and a `NegotiatedProtocolVersion` check on each of the
+hub's four dispatch branches — and its own history (KI-61) is the cautionary counter-example for why
+"added in the same commit as the opcodes" matters, not just "added eventually".
 
 Any backward-incompatible change to the frames above must still bump `MaxSupportedVersion` (and, if the
 old shape can no longer be produced or understood at all, `MinSupportedVersion` too)

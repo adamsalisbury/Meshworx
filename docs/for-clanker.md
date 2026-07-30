@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: f277e60 (main, HEAD) — 19 commits on top of the previous reconciliation point, d89891d/PR #87; working tree clean throughout this pass (git status --porcelain empty at start and end; main, origin/main and the working branch all resolve to f277e60)
+reconciled-to-commit: 01b5765 (feature/topic-pub-sub — three commits ahead of the d218b69 the previous pass reconciled to: ec1eab9 "perf: return the trie's own subscriber set instead of copying it to an array", fb2f9a0 "fix: gate topic pub/sub behind a protocol version and validate client-side", 01b5765 "test: cover client-side topic pattern validation and the protocol version gate"; working tree clean throughout this pass)
 reconciled-to-date: 2026-07-30
 mode: update
 -->
@@ -12,8 +12,167 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree, this pass: `main` at `f277e60`, reconciling every commit between the previous
-> documentation baseline (`d89891d`, PR #87) and here.** The docs set was last touched by PR #90 (session
+> **Documented tree, this pass:** three commits landed on `feature/topic-pub-sub` since the previous
+> pass reconciled to `d218b69` — `ec1eab9` (a pure performance change, `TopicSubscriptionTrie.Match` now
+> returns its own backing `IReadOnlySet<Guid>` instead of copying it to an array), `fb2f9a0` (the
+> substantive one — **fixes KI-61**, plus two related, previously-undocumented gaps the same review
+> found) and `01b5765` (adds `TopicPubSubClientTests.cs`, tests for exactly what `fb2f9a0` changed, no
+> further behaviour). `git diff d218b69..HEAD --stat`: 9 files, 430 insertions, 39 deletions.
+>
+> **`fb2f9a0` fixes KI-61 outright.** `Protocol.MaxSupportedVersion` is now `8`, a new
+> `Protocol.TopicPubSubMinVersion = 8` constant exists, `MeshClient.RequireTopicPubSubSupport` is now
+> called from `SubscribeAsync`/`UnsubscribeAsync`/both `PublishAsync` overloads (throwing
+> `NotSupportedException` below that version, mirroring `RequireHeaderEnvelopeSupport`), and `MeshHub`'s
+> four topic dispatch branches each additionally require
+> `connection.NegotiatedProtocolVersion >= Protocol.TopicPubSubMinVersion`. KI-61 is now marked **fixed**
+> throughout this docs set, not left describing a live gap — see
+> [known-issues.md](for-clanker/known-issues.md) KI-61 and every place that cross-referenced it
+> ([protocol.md](for-clanker/protocol.md), [hub.md](for-clanker/hub.md#topic-based-publishsubscribe),
+> [client.md](for-clanker/client.md#topic-based-publishsubscribe), §2/§6/§8 below).
+>
+> **The same commit fixes two further gaps the same correctness review found, neither previously
+> documented anywhere in this set (they postdate the initial topic pub/sub reconciliation):**
+> - **No client-side pattern/topic validation.** `SubscribeAsync`/`UnsubscribeAsync`/`PublishAsync` used
+>   to accept a malformed pattern or topic and let the hub's trie reject it silently at `Debug`, leaving
+>   `SubscribedTopics` reporting a subscription that matched nothing forever, with no exception — contrary
+>   to the `ArgumentException` the interface already documented. `TopicSubscriptionTrie` now exposes
+>   internal static `ValidatePattern`/`ValidateTopic`, called from all three `MeshClient` methods before
+>   anything is recorded or sent.
+> - **No distributed-trace propagation on `PublishAsync`'s headers overload.** It now starts a `Producer`
+>   `Activity` and folds trace context in via `WithTraceContext`, mirroring `SendToGroupAsync` — previously
+>   a topic message with headers always started an orphaned trace on the receiving end.
+>
+> Neither gets its own known-issues entry (both are fixed); every place in this docs set that could have
+> been read as describing the old, broken behaviour as current has been checked and, where necessary,
+> corrected — see [client.md](for-clanker/client.md#topic-based-publishsubscribe) and
+> [known-issues.md](for-clanker/known-issues.md) KI-61 for both write-ups folded into the fixed entry.
+>
+> **One further correctness finding was deliberately deferred rather than fixed, and is disclosed as such:
+> session resumption restores group membership but never topic subscriptions.** `MeshHub`'s
+> `ResumableSession` has a `Groups` property and no `Topics` one; `MakeSessionDormant` captures
+> `connection.Groups` only; `ResumeSessionAsync` calls `RestoreGroupMembershipAsync` with no topic-side
+> counterpart. `MeshClient.RestoreJoinedGroupsFromResumedReply` has no topic equivalent either. This is
+> distinct from KI-64 (which is about `MeshClientReconnector`, a different reconnection mechanism) — a
+> client that undergoes a genuine `sessionResumptionWindow` resume silently loses any topic subscription
+> it held. Recorded as new **[known-issues.md](for-clanker/known-issues.md) KI-65** (medium, correctness,
+> open — deliberately deferred), cross-referenced from
+> [hub.md](for-clanker/hub.md#session-resumption), [client.md](for-clanker/client.md#session-resumption)
+> and [protocol.md](for-clanker/protocol.md#session-resumption).
+>
+> **Files touched this pass:** [for-clanker.md](../for-clanker.md) (this file — freshness stamp, this
+> blockquote, §2 capabilities-table row, §8 pitfalls), [known-issues.md](for-clanker/known-issues.md)
+> (summary table, KI-61 rewritten as fixed, KI-62/KI-63/KI-64 coordinate fixes, new KI-65),
+> [protocol.md](for-clanker/protocol.md) (every KI-61 cross-reference, the version-history intro,
+> Topic pub/sub frames, Additive opcodes, Versioning, session resumption cross-reference to KI-65),
+> [hub.md](for-clanker/hub.md) (Topic-based publish/subscribe section, session resumption gotchas,
+> Contracts & gotchas), [client.md](for-clanker/client.md) (Public surface table, Topic-based
+> publish/subscribe section, Distributed tracing, session resumption blockquote), and
+> [testing.md](for-clanker/testing.md) (new `TopicPubSubClientTests.cs` row, `TopicSubscriptionTrieTests.cs`
+> row updated for the `ec1eab9`/`fb2f9a0` changes to `Match`'s return type). No file outside `./docs/` was
+> modified.
+>
+> ---
+>
+> **Documented tree (prior pass): branch `feature/topic-pub-sub` (closing issue #37), two commits (`bdb5efb`,
+> `d218b69`) on top of `main`/`origin/main` at `af5b030` (`git merge-base main HEAD` confirmed equal to
+> `main`'s own tip — this branch sits directly on `main` with no divergence, and `af5b030` is exactly the
+> `f277e60` commit the previous pass reconciled to, so nothing on `main` moved between passes). The second
+> commit is a fix to the first, not a separate feature — "fix: bound topic segment count and use a
+> reader/writer lock in the trie" hardens `TopicSubscriptionTrie` against a stack-overflow via an
+> unbounded segment count and switches its lock from (by inference, since only the final shape is visible
+> in this diff) a plain mutual-exclusion lock to a `ReaderWriterLockSlim`, so that concurrent publishes on
+> the hot path do not serialise against one another. Diffed with `git diff main...HEAD --stat`: 8 files,
+> 1402 insertions, 0 deletions — a new `TopicSubscriptionTrie.cs` (313 lines), `IMeshClient.cs` (+91),
+> `MeshClient.cs` (+218), `MeshHub.cs` (+369, net +365 by `wc -l` — `MeshHub.cs` is now 4183 lines, up from
+> 3818 on `main`; `MeshClient.cs` is now 2507, up from 2289; `IMeshClient.cs` is now 665, up from 574), a
+> 6-line addition to `Messages/MessageType.cs`, a new `Messages/TopicMessageReceivedEventArgs.cs` (29
+> lines), and growth in `MeshIntegrationTests.cs` (+161) plus a new `TopicSubscriptionTrieTests.cs` (217
+> lines, new file).
+>
+> **This branch adds a third addressing mode alongside direct sends and groups: topic-based publish/
+> subscribe with MQTT-style wildcard patterns.** A client calls `SubscribeAsync(pattern)` to register
+> interest in a dot-separated topic hierarchy — `+` matches exactly one segment, `#` matches the
+> remainder and only as a pattern's final segment — and `PublishAsync(topic, payload[, headers])` to send
+> to every distinct subscriber whose pattern matches, delivered via the new `TopicMessageReceived` event.
+> Six new opcodes (`0x19`–`0x1E`), a new hub-owned `TopicSubscriptionTrie` (`TopicSubscriptionTrie.cs`,
+> `internal sealed`) doing the pattern matching in `O(topic depth × branching factor)` rather than a flat
+> scan of every subscriber, guarded by a `ReaderWriterLockSlim` so publishes (read lock) never serialise
+> against one another while subscribe/unsubscribe (write lock, far rarer) do. Full write-up in
+> [hub.md](for-clanker/hub.md#topic-based-publishsubscribe),
+> [client.md](for-clanker/client.md#topic-based-publishsubscribe) and
+> [protocol.md](for-clanker/protocol.md#topic-pubsub-frames-issue-37).
+>
+> **A genuine gap was found while reconciling this branch, not fixed by this documentation pass (docs-only):
+> four of the six new opcodes are client → hub and shipped with no protocol version bump, breaking this very
+> docs set's own additive-opcode rule** (established from `GroupJoinRefused`, confirmed by `QueueSaturated`,
+> and the exact rule `ResumeSession` — issue #43 — was built to satisfy: "a client → hub opcode... always
+> [needs `Protocol.MaxSupportedVersion` bumped]", precisely because an older hub drops an unrecognised
+> opcode silently rather than degrading visibly). `Protocol.MaxSupportedVersion` stays `7`; there is no
+> `Protocol.TopicPubSubMinVersion`; and none of `SubscribeAsync`/`UnsubscribeAsync`/the headerless
+> `PublishAsync` ever consult `NegotiatedProtocolVersion` — verified directly against `MeshClient.cs:1132-
+> 1234` rather than inferred. The header-bearing `PublishAsync` overload's only version check
+> (`RequireHeaderEnvelopeSupport`) guards the header block, a pre-existing and unrelated concern; it does
+> nothing for a plain publish and nothing for subscribe/unsubscribe either way. **The practical
+> consequence:** a client built from this codebase, talking to a hub built without this feature,
+> gets `SubscribeAsync` returning success and the pattern appearing in `SubscribedTopics` — and no message
+> ever arrives, forever, with no exception, no event and no log visible to the caller. Recorded as new
+> **[known-issues.md](for-clanker/known-issues.md) KI-61** (medium, correctness/forward-compatibility, open
+> — by omission — **this was fixed by commit `fb2f9a0` in the very next pass; see the top of this file and
+> the KI-61 entry itself, now marked fixed**), and called out inline in
+> [protocol.md](for-clanker/protocol.md#additive-opcodes-within-a-version) as the first addition to this
+> file's own rule that breaks it rather than confirming it (`DeliverTopicMessage`/
+> `DeliverTopicMessageWithHeaders`, the two hub → client opcodes, **are** a further confirming example —
+> only the four client → hub ones are the gap).
+>
+> **Three further deliberate scope decisions, each substantiated directly against the code and each given
+> its own known-issues entry, following this docs set's standing convention of lifting every non-trivial
+> gotcha into the register rather than leaving it only in prose:**
+> - **Publishing requires no subscription of the publisher's own, unlike a group send** — confirmed by
+>   reading `PublishToTopic`/`PublishToTopicWithHeaders` (`MeshHub.cs:3786`, `:3839`), which match against
+>   `TopicSubscriptionTrie` with no membership check anywhere, and by the type's own `<remarks>` on
+>   `PublishAsync` stating it explicitly. Documented as fact, not flagged as an issue — this is a
+>   deliberate design difference from groups, not a gap.
+> - **No authorisation hook exists for topic subscribe or publish at all** — confirmed by reading the
+>   `SubscribeTopic`/`UnsubscribeTopic`/`PublishTopicMessage`/`PublishTopicMessageWithHeaders` dispatch
+>   branches (`MeshHub.cs:1483-1545`), none of which consult any callback, and by `IMeshClient.cs`'s own
+>   XML docs stating "there is no authorisation hook and no refusal". Unlike groups' optional
+>   `GroupAuthoriser`, there is not even an unused constructor parameter for this. Recorded as
+>   **[known-issues.md](for-clanker/known-issues.md) KI-62** (medium, security, open — by design; extends
+>   KI-2).
+> - **Subscription count and pattern length are otherwise unbounded per client** — confirmed by reading
+>   `SubscribeAsync` (`MeshClient.cs:1132-1166`, no cap on how many distinct patterns `_subscribedTopics`
+>   may hold) and `TopicSubscriptionTrie.MaxSegmentCount` (`:245`, bounds only a single pattern's segment
+>   count, not how many patterns a client may register). This mirrors a pre-existing, never-flagged gap in
+>   `JoinGroupAsync` — confirmed by grepping `MeshHub.cs` for any `maxGroups`/count-cap constant and finding
+>   none — but the two-way surface (a client can flood both subscriptions and publishes) made it worth a
+>   standing entry now that a trie exists to hold the state. Recorded as
+>   **[known-issues.md](for-clanker/known-issues.md) KI-63** (medium, availability, open — by design).
+> - **`MeshClientReconnector` is NOT extended to restore topic subscriptions after a reconnect** — confirmed
+>   by reading `MeshClientReconnector.cs` in full and finding no counterpart anywhere to
+>   `RestoreGroupMembershipAsync`/`_pendingGroupRestore` for topics, and by confirming both
+>   `MeshClient.CleanUpAsync` (`:1646-1652`) and `MeshHub.RemoveFromAllTopics` (`:3768-3776`) discard a
+>   connection's subscriptions completely at disconnect, with no restore path anywhere including session
+>   resumption (whose `SessionResumed` reply reports groups only). This is the same "new capability,
+>   reconnection wiring not extended" shape KI-38 documents for the Unix-socket/named-pipe transport's
+>   connection cap — a real gap, deliberately out of scope for this PR rather than an oversight found by
+>   this pass. Recorded as **[known-issues.md](for-clanker/known-issues.md) KI-64** (medium, correctness,
+>   open — deliberately out of scope for issue #37).
+>
+> **Files touched this pass:** [for-clanker.md](../for-clanker.md) (this file — §1 addressing-modes
+> sentence, §2 capabilities table, §3 component map, §6 conventions worked example, §8 pitfalls, freshness
+> stamp), [hub.md](for-clanker/hub.md) (new Topic-based publish/subscribe section, Routing helpers table,
+> Rate limiting section, Metrics section, Contracts & gotchas), [client.md](for-clanker/client.md) (new
+> Topic-based publish/subscribe section, Public surface table, MeshClientReconnector Contract & gotcha,
+> coordinate-caveat blockquote), [protocol.md](for-clanker/protocol.md) (Opcodes table, new Topic pub/sub
+> frames section, Additive opcodes within a version, Length-guard behaviour, Versioning),
+> [testing.md](for-clanker/testing.md) (new `TopicSubscriptionTrieTests.cs` row, updated
+> `MeshIntegrationTests.cs` row), and [known-issues.md](for-clanker/known-issues.md) (summary table plus
+> four new detailed entries, KI-61 through KI-64). No file outside `./docs/` was modified.
+>
+> ---
+>
+> **Documented tree (prior pass):** `main` at `f277e60`, reconciling every commit between the previous
+> documentation baseline (`d89891d`, PR #87) and here. The docs set was last touched by PR #90 (session
 > resumption, commit `2a2377d`) — everything from `2a2377d` (exclusive) to `f277e60` was unreconciled
 > before this pass, 19 commits: `b74c699` (per-client inbound rate limiting, issue #69), `6596726`
 > (pluggable serialization codec, feat #91), `603d3c8` (distributed-tracing header propagation, feat #92),
@@ -839,13 +998,15 @@ nothing in the core library changed to support it. See [dependency-injection.md]
 The model in one paragraph: a **hub** (`MeshHub`) listens on a pluggable transport and accepts
 **clients** (`MeshClient`). Each client registers under a **unique name** and is assigned a `Guid` id.
 Clients then exchange **opaque byte payloads** — addressed directly by recipient id, broadcast to
-everyone, or sent to a named **group**. The hub never interprets payloads; it reads a one-byte routing
-opcode and forwards the body. Delivery is **best-effort, fire-and-forget by default** — no ordering
-guarantees beyond a single connection's stream, and no persistence. Each of those defaults now has an
-opt-in escape hatch bolted alongside it rather than replacing it: acknowledgements (PR #84), retries
-(PR #83's request/response, `MeshClient`'s send retry policy), and — since issue #28 — an optional
-`IOfflineStore` that holds a direct message for a **disconnected** recipient instead of dropping it.
-None of them is on unless configured.
+everyone, sent to a named **group**, or — since issue #37 — published to a **topic**, matched against
+every client's subscribed wildcard patterns (`+`/`#`, MQTT-style) without requiring the publisher to hold
+a subscription of its own. The hub never interprets payloads; it reads a one-byte routing opcode and
+forwards the body. Delivery is **best-effort, fire-and-forget by default** — no ordering guarantees
+beyond a single connection's stream, and no persistence. Each of those defaults now has an opt-in escape
+hatch bolted alongside it rather than replacing it: acknowledgements (PR #84), retries (PR #83's
+request/response, `MeshClient`'s send retry policy), and — since issue #28 — an optional `IOfflineStore`
+that holds a direct message for a **disconnected** recipient instead of dropping it. None of them is on
+unless configured.
 
 Since protocol version 3 the hub has an **authentication seam**: an optional `ClientAuthenticator`
 callback decides whether a registering client may join, given its name and an opaque credential it
@@ -855,8 +1016,10 @@ under any unused name.
 There is also an **authorisation seam, but it covers groups only**. An optional `GroupAuthoriser`
 callback gates every group join, and — with or without it — **sending to a group requires membership of
 that group**. Nothing else is gated: an admitted client can still resolve names, broadcast, and
-direct-send to any id it holds. Treat the transport boundary as the trust boundary, and see
-[known-issues.md](for-clanker/known-issues.md) KI-2.
+direct-send to any id it holds. **Topics (issue #37) have no authorisation seam at all** — not even an
+unused constructor parameter — and no membership requirement either; any admitted client may subscribe to
+any pattern and publish to any topic. Treat the transport boundary as the trust boundary, and see
+[known-issues.md](for-clanker/known-issues.md) KI-2, KI-62.
 
 ### Headline facts
 
@@ -866,7 +1029,7 @@ direct-send to any id it holds. Treat the transport boundary as the trust bounda
 | Target framework | `net10.0` | `AdamSalisbury.Meshworx.csproj:4` |
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
-| Wire protocol version | Negotiated range, currently `4`–`7` (was a fixed `3`, then a `4`–`4` range from PR #73; widened to `5` by PR #74 for the header envelope, to `6` by issue #43 for session resumption, and to `7` by PR #135/issue #109 so a `SessionResumed` reply can report the group memberships the hub actually restored) | `Messages/Protocol.cs:8`, `:14`, `:21`, `:27`, `:38` |
+| Wire protocol version | Negotiated range, currently `4`–`8` (was a fixed `3`, then a `4`–`4` range from PR #73; widened to `5` by PR #74 for the header envelope, to `6` by issue #43 for session resumption, to `7` by PR #135/issue #109 so a `SessionResumed` reply can report the group memberships the hub actually restored, and to `8` by commit `fb2f9a0` gating topic pub/sub). **Issue #37 (topic pub/sub) adds six opcodes (`0x19`–`0x1E`)** — four of them are client → hub and, for one commit, shipped within version `7` with no gate of their own, breaking this docs set's own additive-opcode rule; the next commit, `fb2f9a0`, added `Protocol.TopicPubSubMinVersion = 8` and closed it, see KI-61 (fixed) | `Messages/Protocol.cs:8`, `:14`, `:21`, `:29`, `:38`, `:48`; `Messages/MessageType.cs:29-32` |
 | Max frame payload | 1 MiB (`1024*1024`). `TcpTransport`/`UnixSocketTransport`/`NamedPipeTransport`/`QuicTransport` share **one** constant (`StreamFramer.MaxPayloadSize`, PR #81, extended to `QuicTransport` by PR #82); `WebSocketTransport` keeps its own independent constant of the same value | `Transport/Framing/StreamFramer.cs:28`, `Transport/WebSocket/WebSocketTransport.cs:25` |
 | Transport encryption | TCP/WebSocket: optional TLS, **off by default**. `UnixSocketTransport`/`NamedPipeTransport` (PR #81): **no TLS option at all** — local-only, access controlled by filesystem/ACL permissions instead. `QuicTransport` (PR #82): TLS **mandatory** — QUIC requires it at the protocol level, so there is no cleartext mode | `Transport/Tcp/TcpTransport.cs:142`, `TcpTransportListener.cs:110`, `Transport/WebSocket/WebSocketTransportListener.cs:112`, `Transport/Quic/QuicTransport.cs:126-141` |
 | Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:23` |
@@ -986,6 +1149,9 @@ use the manual sequence directly; they do not go through the DI package.
 | Send a payload larger than the 1 MiB frame cap | `SendLargeAsync(recipientId, payload, headers)` | Chunking, issue #93; splits into ≤4096 chunks reassembled at the recipient, bounded by `maxReassemblyBytes`/`chunkTransferTimeout`; silent to the sender on any reassembly failure, no priority/ack support; see [client.md](for-clanker/client.md#large-message-chunking) |
 | Send/receive a typed payload | `client.SendAsync<T>(recipientId, value, serializer)` etc. | Extension methods, `AdamSalisbury.Meshworx.Serialization`; see [serialization.md](for-clanker/serialization.md) |
 | Call/handle a typed contract method | generated `{Contract}Proxy` / `{Contract}Dispatcher` | `[MeshContract]` source generator, `AdamSalisbury.Meshworx.Contracts`; see [contracts.md](for-clanker/contracts.md) |
+| Subscribe / unsubscribe to a topic pattern | `SubscribeAsync(pattern)` / `UnsubscribeAsync(pattern)` | Issue #37; MQTT-style `+`/`#` wildcards; **no authorisation seam and no refusal** — a successful call is final; validates the pattern's shape (`ArgumentException`) and requires protocol version 8+ (`NotSupportedException` below it, commit `fb2f9a0`), see KI-61 (fixed)/KI-62; see [client.md](for-clanker/client.md#topic-based-publishsubscribe) |
+| Publish to a topic | `PublishAsync(topic, payload[, headers])` | Issue #37; every matching subscriber receives it via `TopicMessageReceived`; **no subscription of the publisher's own required**, unlike `SendToGroupAsync`; requires protocol version 8+ regardless of headers, and the headers overload additionally has the same `Protocol.HeaderEnvelopeMinVersion` requirement as the direct/group headers overloads, plus distributed-trace propagation since commit `fb2f9a0`; see [client.md](for-clanker/client.md#topic-based-publishsubscribe) |
+| Learn a topic message arrived | `TopicMessageReceived` event | Issue #37; carries the concrete topic published to (never the subscriber's own pattern), sender id, payload and headers |
 
 ---
 
@@ -1027,6 +1193,13 @@ The **outbound queue + send loop per connection** is the core of the hub's concu
 receive loops never block on a slow recipient's socket; they just enqueue. See
 [hub.md](for-clanker/hub.md) for the full model.
 
+**Data flow for a topic publish (issue #37):** client `PublishAsync` frames `[PublishTopicMessage][topicLen
+(2)][topic][body]` → the hub's receive loop matches the topic against the hub-owned
+`TopicSubscriptionTrie` (no membership check, unlike a group send) → for each match except the publisher
+itself, builds a shared `[DeliverTopicMessage][senderId(16)][topicLen(2)][topic][body]` frame and
+`TryWrite`s it to that recipient's outbound queue, exactly like a broadcast/group fan-out. See
+[hub.md](for-clanker/hub.md#topic-based-publishsubscribe).
+
 ### Component map → where to read
 
 | Area | Types | File |
@@ -1038,6 +1211,7 @@ receive loops never block on a slow recipient's socket; they just enqueue. See
 | Public value types | event args, `MessageHeaders`, `DisconnectReason`, `RegistrationErrorCode`, `ClientAuthenticator`, `RegistrationContext`, `GroupAuthoriser`, `GroupJoinContext`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
 | Offline delivery (store and forward) | `IOfflineStore`, `OfflineMessage`, `InMemoryOfflineStore` (issue #28) | [hub.md](for-clanker/hub.md#offline-delivery), [types.md](for-clanker/types.md#offline-delivery-types) |
 | Session resumption (incl. restored-group reporting) | `sessionResumptionWindow`, `IMeshClient.SessionResumed`, opcodes `0x16`–`0x18` (issue #43, extended by PR #135/issue #109) | [hub.md](for-clanker/hub.md#session-resumption), [client.md](for-clanker/client.md#session-resumption), [protocol.md](for-clanker/protocol.md#session-resumption) |
+| Topic-based publish/subscribe (wildcard) | `TopicSubscriptionTrie`, `IMeshClient.SubscribeAsync`/`UnsubscribeAsync`/`PublishAsync`/`TopicMessageReceived`, opcodes `0x19`–`0x1E` (issue #37) | [client.md](for-clanker/client.md#topic-based-publishsubscribe), [hub.md](for-clanker/hub.md#topic-based-publishsubscribe), [protocol.md](for-clanker/protocol.md#topic-pubsub-frames-issue-37) |
 | Message priority lanes | `MessagePriority`, `PriorityOutboundQueue`, `DeliveryOptions.AtPriority`/`.WithPriority` (`ab16567`) | [client.md](for-clanker/client.md#message-priority), [hub.md](for-clanker/hub.md#priority-lanes), [protocol.md](for-clanker/protocol.md#priority-header) |
 | Per-client inbound rate limiting | `ClientRateLimiter`, `TokenBucket` (issue #69) | [hub.md](for-clanker/hub.md#rate-limiting) |
 | Distributed tracing propagation | `MeshworxActivitySource`, `TraceContextHeaderKeys` (feat #92) | [client.md](for-clanker/client.md#distributed-tracing), [protocol.md](for-clanker/protocol.md#trace-context-headers) |
@@ -1395,6 +1569,27 @@ carries — worth knowing if you are adding a similar per-connection budget: it 
 an opcode, or a version bump, only a check early in `HandleClientAsync`'s dispatch. See
 [hub.md](for-clanker/hub.md#rate-limiting).
 
+**Topic-based publish/subscribe (issue #37) is a worked example of the numbered route at the top of this
+checklist — and, at the same time, a cautionary tale about step 2.** Six new opcodes (`0x19`–`0x1E`),
+following steps 1/3/4/5/6 correctly: added to `MessageType`, client framing/interface members and hub
+dispatch branches added, protocol table and README updated, tests added (`TopicSubscriptionTrieTests.cs`,
+`TopicPubSubClientTests.cs`; `MeshIntegrationTests.cs` end-to-end coverage). **Step 2 — raise
+`Protocol.MaxSupportedVersion` and add a `Protocol.XyzMinVersion` gate — was skipped for the four opcodes
+that needed it, for exactly one commit.** `DeliverTopicMessage`/`DeliverTopicMessageWithHeaders` are hub →
+client only and correctly took the
+[additive-opcode exception](for-clanker/protocol.md#additive-opcodes-within-a-version) this checklist's
+step 2 carves out (no bump needed, same as `GroupJoinRefused`/`QueueSaturated`) — but
+`SubscribeTopic`/`UnsubscribeTopic`/`PublishTopicMessage`/`PublishTopicMessageWithHeaders` are client →
+hub, exactly the case step 2 says "always" needs the bump, and did not get it when the feature landed. The
+next commit, `fb2f9a0`, fixed it: `MaxSupportedVersion` is now `8`, `Protocol.TopicPubSubMinVersion = 8`
+exists, and both `SubscribeAsync`/`UnsubscribeAsync`/`PublishAsync` and the hub's four dispatch branches
+now read `NegotiatedProtocolVersion`. **Use the one-commit gap as the negative example the next time you
+add a client → hub opcode**: get step 2 right in the same commit as the opcodes, the way `ResumeSession`
+(issue #43) did, rather than relying on a follow-up commit to catch it. See
+[known-issues.md](for-clanker/known-issues.md) KI-61 (fixed) for the full history and
+[client.md](for-clanker/client.md#topic-based-publishsubscribe)/
+[hub.md](for-clanker/hub.md#topic-based-publishsubscribe) for the feature itself.
+
 **Two open, unmerged PRs touch this checklist's own subject matter and are deliberately not reflected
 above as shipped:** PR #120 changes the typed-contracts generator's dispatch identity and adds headers
 overloads to `RequestAsync`/`ReplyAsync` (see [contracts.md](for-clanker/contracts.md#pending-pr-120));
@@ -1453,6 +1648,20 @@ there is no publish step in CI — CI only builds and tests.
   authoriser, and it shipped **without** a protocol version bump. A client that used to publish to a
   group without joining it still connects and still sends — it is simply never delivered. There is no
   send-only capability: joining to publish also means receiving. KI-2, KI-4.
+- **Topic subscribe/publish (issue #37) has no authorisation seam at all, no membership requirement, and
+  no per-client cap on subscription count.** Any admitted client may subscribe to any pattern (including
+  `#`, matching every topic on the hub) and publish to any topic with no subscription of its own. KI-62,
+  KI-63.
+- **Four of the six new topic opcodes shipped, for one commit, with no protocol version gate — fixed the
+  next commit.** Commit `fb2f9a0` added `Protocol.TopicPubSubMinVersion = 8`; `SubscribeAsync`/
+  `UnsubscribeAsync`/`PublishAsync` now throw `NotSupportedException` below it, and the hub's four
+  dispatch branches check `NegotiatedProtocolVersion` before acting. A hub or client built before that
+  commit cannot interoperate correctly on this feature regardless of which side is older. KI-61 (fixed).
+- **`MeshClientReconnector` does not restore topic subscriptions after a reconnect**, unlike group
+  membership, which it re-joins automatically. An application combining reconnection with topic
+  subscriptions must re-`SubscribeAsync` itself from a `Reconnected` handler. KI-64. **The hub's own
+  native session resumption has the identical gap, for a different reason** — a resumed client's topic
+  subscriptions are lost too, with nothing in the `SessionResumed` reply to say so. KI-65.
 - **Version negotiation is now actually used, but only for one capability.** The hub picks the highest
   wire-protocol version common to its own range and the connecting client's, so a range mismatch fails
   gracefully instead of the old hard refuse-on-mismatch. PR #74's message-header envelope is the first
