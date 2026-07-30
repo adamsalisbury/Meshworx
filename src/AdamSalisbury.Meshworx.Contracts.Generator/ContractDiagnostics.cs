@@ -68,6 +68,52 @@ internal static class ContractDiagnostics
         description: "A property or event models shared state or a callback, neither of which a "
             + "one-way message can carry. Express the intent as a method.");
 
+    internal static readonly DiagnosticDescriptor GenericContractUnsupported = new(
+        "MESH007",
+        "Contract interface cannot be generic",
+        "Contract '{0}' is generic; a contract interface must not declare type parameters",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true,
+        description: "The generator emits a proxy and a dispatcher for concrete types it can see at "
+            + "compile time, and names the contract on the wire. An open type parameter has neither a "
+            + "shape to serialize nor a single identity to name.");
+
+    internal static readonly DiagnosticDescriptor BaseInterfacesUnsupported = new(
+        "MESH008",
+        "Contract interface cannot inherit other interfaces",
+        "Contract '{0}' inherits '{1}'; a contract interface must not declare base interfaces",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true,
+        description: "Only members declared on the contract itself are proxied and dispatched. An "
+            + "inherited member would be part of the interface the proxy claims to implement but absent "
+            + "from the generated code, so the contract is required to be self-contained rather than "
+            + "silently half-implemented.");
+
+    internal static readonly DiagnosticDescriptor NestedContractUnsupported = new(
+        "MESH009",
+        "Contract interface cannot be nested",
+        "Contract '{0}' is nested inside '{1}'; a contract interface must be declared directly in a "
+            + "namespace",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true,
+        description: "The generated proxy and dispatcher are emitted as top-level types beside the "
+            + "contract's namespace, which a nested contract has no way to name.");
+
+    internal static readonly DiagnosticDescriptor GeneratorFailure = new(
+        "MESH010",
+        "The contract generator failed",
+        "The contract generator failed while emitting contract '{0}': {1}",
+        Category,
+        DiagnosticSeverity.Error,
+        isEnabledByDefault: true,
+        description: "An exception escaping a source generator is reported by the compiler as a single "
+            + "warning, and suppresses every file that generator would have emitted for the whole "
+            + "compilation — including well-formed contracts unrelated to the failure. Reporting it "
+            + "here keeps the failure attributable and keeps it an error.");
+
     internal static readonly DiagnosticDescriptor CancellationTokenMustBeLast = new(
         "MESH006",
         "CancellationToken must be the last parameter",

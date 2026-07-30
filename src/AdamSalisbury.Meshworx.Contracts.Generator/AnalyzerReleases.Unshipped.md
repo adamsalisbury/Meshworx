@@ -11,3 +11,7 @@ MESH003 | Meshworx.Contracts | Error | Contract method cannot be generic
 MESH004 | Meshworx.Contracts | Error | Contract method names must be unique
 MESH005 | Meshworx.Contracts | Error | Contract may only declare methods
 MESH006 | Meshworx.Contracts | Error | CancellationToken must be the last parameter
+MESH007 | Meshworx.Contracts | Error | Contract interface cannot be generic
+MESH008 | Meshworx.Contracts | Error | Contract interface cannot inherit other interfaces
+MESH009 | Meshworx.Contracts | Error | Contract interface cannot be nested
+MESH010 | Meshworx.Contracts | Error | The contract generator failed

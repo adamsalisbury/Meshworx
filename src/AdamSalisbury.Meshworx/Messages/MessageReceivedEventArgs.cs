@@ -13,12 +13,13 @@ public sealed class MessageReceivedEventArgs : EventArgs
 
     /// <summary>
     /// Gets the correlation id if this message is a request sent via
-    /// <see cref="IMeshClient.RequestAsync"/> awaiting a reply, or <see langword="null"/> if it is an
+    /// <see cref="IMeshClient.RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/> awaiting a reply, or <see langword="null"/> if it is an
     /// ordinary message.
     /// </summary>
     /// <remarks>
     /// A handler that finds this set should answer the request with
-    /// <see cref="IMeshClient.ReplyAsync"/>, passing this event's arguments back in. Replies themselves
+    /// <see cref="IMeshClient.ReplyAsync(MessageReceivedEventArgs, ReadOnlyMemory{byte}, CancellationToken)"/>, passing this event's
+    /// arguments back in. Replies themselves
     /// are resolved internally by the receive loop and never raise <see cref="IMeshClient.MessageReceived"/>.
     /// </remarks>
     public long? CorrelationId { get; init; }

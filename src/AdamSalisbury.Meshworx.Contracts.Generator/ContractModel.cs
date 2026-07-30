@@ -17,6 +17,9 @@ namespace AdamSalisbury.Meshworx.Contracts.Generator;
 internal sealed record ContractModel(
     string Namespace,
     string InterfaceName,
+    string InterfaceDisplayName,
+    string ContractIdentity,
+    string HintName,
     string BaseName,
     bool IsPublic,
     ImmutableArray<ContractMethod> Methods,
@@ -27,6 +30,9 @@ internal sealed record ContractModel(
         return other is not null
             && Namespace == other.Namespace
             && InterfaceName == other.InterfaceName
+            && InterfaceDisplayName == other.InterfaceDisplayName
+            && ContractIdentity == other.ContractIdentity
+            && HintName == other.HintName
             && BaseName == other.BaseName
             && IsPublic == other.IsPublic
             && Methods.SequenceEqual(other.Methods)
@@ -38,6 +44,9 @@ internal sealed record ContractModel(
         return Hash.Combine(
             Namespace?.GetHashCode() ?? 0,
             InterfaceName?.GetHashCode() ?? 0,
+            InterfaceDisplayName?.GetHashCode() ?? 0,
+            ContractIdentity?.GetHashCode() ?? 0,
+            HintName?.GetHashCode() ?? 0,
             BaseName?.GetHashCode() ?? 0,
             IsPublic ? 1 : 0,
             Methods.Length,
@@ -45,10 +54,18 @@ internal sealed record ContractModel(
     }
 }
 
+/// <summary>
+/// One contract method, reduced to values.
+/// </summary>
+/// <remarks>
+/// <see cref="CancellationTokenParameterName"/> holds the token parameter's own declared name rather
+/// than a flag, so the emitted signature reuses it. Hard-coding <c>cancellationToken</c> would collide
+/// with a contract that happens to name an ordinary serialized parameter the same thing.
+/// </remarks>
 internal sealed record ContractMethod(
     string Name,
     string? ResultType,
-    bool HasCancellationToken,
+    string? CancellationTokenParameterName,
     ImmutableArray<ContractParameter> Parameters)
 {
     public bool Equals(ContractMethod? other)
@@ -56,7 +73,7 @@ internal sealed record ContractMethod(
         return other is not null
             && Name == other.Name
             && ResultType == other.ResultType
-            && HasCancellationToken == other.HasCancellationToken
+            && CancellationTokenParameterName == other.CancellationTokenParameterName
             && Parameters.SequenceEqual(other.Parameters);
     }
 
@@ -65,7 +82,7 @@ internal sealed record ContractMethod(
         return Hash.Combine(
             Name?.GetHashCode() ?? 0,
             ResultType?.GetHashCode() ?? 0,
-            HasCancellationToken ? 1 : 0,
+            CancellationTokenParameterName?.GetHashCode() ?? 0,
             Parameters.Length);
     }
 }

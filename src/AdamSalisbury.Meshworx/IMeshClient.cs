@@ -390,7 +390,8 @@ public interface IMeshClient : IAsyncDisposable
     /// <see cref="MessageHeaders"/>). The responder observes the request through
     /// <see cref="MessageReceived"/> — a raised event whose
     /// <see cref="MessageReceivedEventArgs.CorrelationId"/> is not <see langword="null"/> is a
-    /// request awaiting a reply — and answers it with <see cref="ReplyAsync"/>.
+    /// request awaiting a reply — and answers it with
+    /// <see cref="ReplyAsync(MessageReceivedEventArgs, ReadOnlyMemory{byte}, CancellationToken)"/>.
     /// <para>
     /// Concurrent requests from the same client are independent: each is tracked by its own correlation
     /// id and resolved only by a reply carrying that same id. A reply that arrives after this call has
@@ -402,7 +403,10 @@ public interface IMeshClient : IAsyncDisposable
     /// <param name="message">The request payload.</param>
     /// <param name="timeout">The maximum time to wait for a reply before the call fails.</param>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
-    /// <returns>The reply payload sent back via <see cref="ReplyAsync"/>.</returns>
+    /// <returns>
+    /// The reply payload sent back via
+    /// <see cref="ReplyAsync(MessageReceivedEventArgs, ReadOnlyMemory{byte}, CancellationToken)"/>.
+    /// </returns>
     /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
     /// <exception cref="NotSupportedException">
     /// The hub negotiated a protocol version that predates the header envelope.
@@ -417,12 +421,14 @@ public interface IMeshClient : IAsyncDisposable
 
     /// <summary>
     /// Replies to a request previously received via <see cref="MessageReceived"/>, completing the
-    /// sender's pending <see cref="RequestAsync"/> call.
+    /// sender's pending
+    /// <see cref="RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/> call.
     /// </summary>
     /// <param name="request">
     /// The <see cref="MessageReceivedEventArgs"/> the request arrived on. Its
     /// <see cref="MessageReceivedEventArgs.CorrelationId"/> must be set, i.e. it must have come
-    /// from a <see cref="RequestAsync"/> call rather than an ordinary send.
+    /// from a <see cref="RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/> call
+    /// rather than an ordinary send.
     /// </param>
     /// <param name="message">The reply payload.</param>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
@@ -432,6 +438,83 @@ public interface IMeshClient : IAsyncDisposable
     Task ReplyAsync(
         MessageReceivedEventArgs request,
         ReadOnlyMemory<byte> message,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a request to another client and awaits a correlated reply, carrying structured headers
+    /// alongside the request body.
+    /// </summary>
+    /// <remarks>
+    /// Identical to <see cref="RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/>
+    /// in every respect but the headers: they travel with the request and are visible to the responder
+    /// on the <see cref="MessageReceived"/> event that raises it. The correlation id tying the reply
+    /// back to this call is added to a copy of <paramref name="headers"/>, so the instance passed in is
+    /// never mutated and may be reused across many requests.
+    /// <para>
+    /// A key reserved by a built-in helper — the correlation id and reply marker among them — cannot be
+    /// set through <paramref name="headers"/>. The receive loop acts on those keys, so an application
+    /// value carried under one would be intercepted rather than delivered; setting one is an
+    /// <see cref="ArgumentException"/> rather than a value silently replaced.
+    /// </para>
+    /// </remarks>
+    /// <param name="recipientId">The unique identifier of the client to request a reply from.</param>
+    /// <param name="message">The request payload.</param>
+    /// <param name="timeout">The maximum time to wait for a reply before the call fails.</param>
+    /// <param name="headers">The structured headers to attach to the request.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <returns>
+    /// The reply payload sent back via
+    /// <see cref="ReplyAsync(MessageReceivedEventArgs, ReadOnlyMemory{byte}, CancellationToken)"/>.
+    /// </returns>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The hub negotiated a protocol version that predates the header envelope.
+    /// </exception>
+    /// <exception cref="TimeoutException">No reply arrived within <paramref name="timeout"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeout"/> is not positive.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="headers"/> contains a key reserved for a built-in helper.
+    /// </exception>
+    Task<ReadOnlyMemory<byte>> RequestAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        TimeSpan timeout,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Replies to a request previously received via <see cref="MessageReceived"/>, carrying structured
+    /// headers alongside the reply body.
+    /// </summary>
+    /// <remarks>
+    /// Identical to
+    /// <see cref="ReplyAsync(MessageReceivedEventArgs, ReadOnlyMemory{byte}, CancellationToken)"/> but
+    /// for the headers, which the requester sees on the reply. The correlation id and reply marker are
+    /// added to a copy of <paramref name="headers"/>, and a key reserved by a built-in helper cannot be
+    /// set through it — see
+    /// <see cref="RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, MessageHeaders, CancellationToken)"/>
+    /// for why.
+    /// </remarks>
+    /// <param name="request">
+    /// The <see cref="MessageReceivedEventArgs"/> the request arrived on. Its
+    /// <see cref="MessageReceivedEventArgs.CorrelationId"/> must be set.
+    /// </param>
+    /// <param name="message">The reply payload.</param>
+    /// <param name="headers">The structured headers to attach to the reply.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">
+    /// The client is not connected to a hub, or <paramref name="request"/> was not a request.
+    /// </exception>
+    /// <exception cref="NotSupportedException">
+    /// The hub negotiated a protocol version that predates the header envelope.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="headers"/> contains a key reserved for a built-in helper.
+    /// </exception>
+    Task ReplyAsync(
+        MessageReceivedEventArgs request,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
         CancellationToken cancellationToken = default);
 
     /// <summary>

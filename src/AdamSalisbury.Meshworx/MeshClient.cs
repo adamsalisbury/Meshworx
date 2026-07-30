@@ -770,7 +770,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// <summary>
     /// Builds and sends a direct message frame, with or without a header block. Shared by the public
     /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, MessageHeaders, CancellationToken)"/> and by
-    /// <see cref="RequestAsync"/>, <see cref="ReplyAsync"/>,
+    /// <see cref="RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/>,
+    /// <see cref="ReplyAsync(MessageReceivedEventArgs, ReadOnlyMemory{byte}, CancellationToken)"/>,
     /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, DeliveryOptions, CancellationToken)"/>,
     /// <see cref="SendAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/> and the
     /// acknowledgement send in the receive loop, all of which construct
@@ -1342,12 +1343,26 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
-    public async Task<ReadOnlyMemory<byte>> RequestAsync(
+    public Task<ReadOnlyMemory<byte>> RequestAsync(
         Guid recipientId,
         ReadOnlyMemory<byte> message,
         TimeSpan timeout,
         CancellationToken cancellationToken = default)
     {
+        return RequestAsync(recipientId, message, timeout, MessageHeaders.Empty, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public async Task<ReadOnlyMemory<byte>> RequestAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        TimeSpan timeout,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(headers);
+        ThrowIfReservedHeaderKeyPresent(headers);
+
         if (timeout <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(timeout), "The request timeout must be positive.");
@@ -1364,14 +1379,14 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         try
         {
-            var headers = new MessageHeaders(
-            [
+            MessageHeaders requestHeaders = WithReservedHeaders(
+                headers,
                 new KeyValuePair<string, string>(
                     RequestReplyHeaderKeys.CorrelationId,
-                    correlationId.ToString(CultureInfo.InvariantCulture)),
-            ]);
+                    correlationId.ToString(CultureInfo.InvariantCulture)));
 
-            await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+            await SendCoreAsync(recipientId, message, requestHeaders, cancellationToken)
+                .ConfigureAwait(false);
 
             // Bound the wait by cancelling it, matching the pattern SendOnceAsync uses for its own
             // timeout: cancelling releases the wait rather than abandoning it, so a request that never
@@ -1404,7 +1419,19 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         ReadOnlyMemory<byte> message,
         CancellationToken cancellationToken = default)
     {
+        return ReplyAsync(request, message, MessageHeaders.Empty, cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public Task ReplyAsync(
+        MessageReceivedEventArgs request,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default)
+    {
         ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(headers);
+        ThrowIfReservedHeaderKeyPresent(headers);
 
         if (request.CorrelationId is not { } correlationId)
         {
@@ -1412,14 +1439,47 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 "The supplied message was not a request and cannot be replied to.");
         }
 
-        var headers = new MessageHeaders(
-        [
+        MessageHeaders replyHeaders = WithReservedHeaders(
+            headers,
             new KeyValuePair<string, string>(
-                RequestReplyHeaderKeys.CorrelationId, correlationId.ToString(CultureInfo.InvariantCulture)),
-            new KeyValuePair<string, string>(RequestReplyHeaderKeys.Reply, "1"),
-        ]);
+                RequestReplyHeaderKeys.CorrelationId,
+                correlationId.ToString(CultureInfo.InvariantCulture)),
+            new KeyValuePair<string, string>(RequestReplyHeaderKeys.Reply, "1"));
 
-        return SendCoreAsync(request.SenderId, message, headers, cancellationToken);
+        return SendCoreAsync(request.SenderId, message, replyHeaders, cancellationToken);
+    }
+
+    /// <summary>
+    /// Returns the caller's headers with a built-in helper's own headers added, without mutating the
+    /// original.
+    /// </summary>
+    /// <remarks>
+    /// A caller's <see cref="MessageHeaders"/> is immutable and may be reused across many sends, so the
+    /// reserved keys are added to a copy — the same shape <see cref="WithTraceContext"/> uses for the
+    /// same reason. The caller's own entries cannot collide with the added ones:
+    /// <see cref="ThrowIfReservedHeaderKeyPresent"/> has already rejected any that would.
+    /// </remarks>
+    private static MessageHeaders WithReservedHeaders(
+        MessageHeaders headers, params KeyValuePair<string, string>[] reserved)
+    {
+        if (headers.Count == 0)
+        {
+            return new MessageHeaders(reserved);
+        }
+
+        var merged = new Dictionary<string, string>(headers.Count + reserved.Length, StringComparer.Ordinal);
+
+        foreach (KeyValuePair<string, string> header in headers)
+        {
+            merged[header.Key] = header.Value;
+        }
+
+        foreach (KeyValuePair<string, string> header in reserved)
+        {
+            merged[header.Key] = header.Value;
+        }
+
+        return MessageHeaders.FromOwnedDictionary(merged);
     }
 
     /// <inheritdoc/>
@@ -2012,7 +2072,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <summary>
-    /// Completes a pending <see cref="RequestAsync"/> call if <paramref name="headers"/> mark this frame
+    /// Completes a pending <see cref="RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/> call if
+    /// <paramref name="headers"/> mark this frame
     /// as a reply, so it is resolved internally rather than surfaced through <see cref="MessageReceived"/>.
     /// </summary>
     /// <param name="senderId">
@@ -2212,7 +2273,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private sealed record PendingLookup(int CorrelationId, TaskCompletionSource<Guid?> Completion);
 
     /// <summary>
-    /// A <see cref="RequestAsync"/> call awaiting a reply. <see cref="ExpectedResponderId"/> is checked
+    /// A <see cref="RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/> call awaiting a reply. <see cref="ExpectedResponderId"/> is checked
     /// against the actual sender of an incoming reply frame before <see cref="Completion"/> is resolved,
     /// so a client other than the one this request was addressed to cannot forge a reply and resolve it.
     /// </summary>
