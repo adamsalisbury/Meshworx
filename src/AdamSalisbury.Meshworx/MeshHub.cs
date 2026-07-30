@@ -733,7 +733,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 _cts = null;
                 _acceptLoopTask = null;
 
-                _stopTask = StopCoreAsync(cts, acceptLoopTask, cancellationToken);
+                // Started on the thread pool rather than called directly: an async method runs
+                // synchronously up to its first await on the calling thread, and StopCoreAsync's first
+                // await has no ConfigureAwait to fall back on — a caller stopping the hub from a UI thread
+                // would silently strand the shutdown's continuation on that thread's message pump.
+                // Task.Run's own cancellation parameter is deliberately CancellationToken.None rather than
+                // the caller's cancellationToken: that token bounds only this caller's own wait on the
+                // shutdown, per the remarks above — it must never gate whether the shutdown itself runs.
+                _stopTask = Task.Run(
+                    () => StopCoreAsync(cts, acceptLoopTask, cancellationToken), CancellationToken.None);
             }
 
             shutdown = _stopTask;
@@ -751,11 +759,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private async Task StopCoreAsync(
         CancellationTokenSource cts, Task? acceptLoopTask, CancellationToken cancellationToken)
     {
-        // Nothing of the shutdown may run on the caller's stack while it still holds the state lock, and
-        // the first thing below is transport I/O. The TCP listener can reason its teardown's synchronous
-        // head safe instead; here there is an arbitrary ITransport in the way, so yield.
-        await Task.Yield();
-
+        // Started via Task.Run at the call site, which is what keeps nothing of the shutdown running on
+        // the caller's stack while it still holds the state lock — nothing here needs to yield first.
         try
         {
             byte[] disconnectPayload = [(byte)MessageType.Disconnect];
@@ -922,7 +927,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             // Mark the hub disposed before any teardown begins, so a start racing this call is refused
             // rather than racing the listener's disposal.
             _disposed = true;
-            _disposeTask ??= DisposeCoreAsync();
+
+            // Started on the thread pool rather than called directly: an async method runs synchronously
+            // up to its first await on the calling thread, and DisposeCoreAsync's first await has no
+            // ConfigureAwait to fall back on — a caller disposing the hub from a UI thread would silently
+            // strand the teardown's continuation on that thread's message pump.
+            _disposeTask ??= Task.Run(DisposeCoreAsync);
             disposal = _disposeTask;
         }
 
@@ -934,9 +944,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// </summary>
     private async Task DisposeCoreAsync()
     {
-        // Started from inside the state lock, and the shutdown it awaits takes that same lock. Yield first
-        // so none of it runs on the disposing thread while the lock is still held.
-        await Task.Yield();
+        // Started from inside the state lock via Task.Run at the call site, and the shutdown it awaits
+        // takes that same lock — Task.Run is what keeps this off the disposing thread while the lock is
+        // still held, so nothing here needs to yield first.
 
         await StopAsync().ConfigureAwait(false);
         await _listener.DisposeAsync().ConfigureAwait(false);
