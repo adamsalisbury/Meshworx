@@ -494,6 +494,64 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         completion?.TrySetResult(resumed);
     }
 
+    /// <summary>
+    /// Repopulates <see cref="_joinedGroups"/> from the group block a <see cref="Protocol.SessionResumedGroupsMinVersion"/>
+    /// or later hub appends to a <see cref="MessageType.SessionResumed"/> reply, so <see cref="JoinedGroups"/>
+    /// reflects the memberships the hub actually restored rather than staying empty from the
+    /// <see cref="CleanUpAsync"/> clear the preceding disconnect left behind (issue #109).
+    /// </summary>
+    /// <remarks>
+    /// A negotiated version below <see cref="Protocol.SessionResumedGroupsMinVersion"/>, or a reply too
+    /// short to carry the block at all, leaves <see cref="_joinedGroups"/> untouched: the hub restored the
+    /// memberships either way, this client-side record just cannot learn what they were from the reply
+    /// itself in that case, exactly as it could not before this method existed.
+    /// </remarks>
+    /// <param name="data">The full <see cref="MessageType.SessionResumed"/> frame.</param>
+    /// <param name="groupsOffset">The offset immediately after the resumption token, where the group block begins.</param>
+    private void RestoreJoinedGroupsFromResumedReply(byte[] data, int groupsOffset)
+    {
+        if (NegotiatedProtocolVersion < Protocol.SessionResumedGroupsMinVersion
+            || data.Length < groupsOffset + 2)
+        {
+            return;
+        }
+
+        int groupCount = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(groupsOffset, 2));
+        int offset = groupsOffset + 2;
+        var restoredGroups = new List<string>(groupCount);
+
+        for (int i = 0; i < groupCount; i++)
+        {
+            if (data.Length < offset + 2)
+            {
+                // Truncated block: something upstream mangled the frame. Leave the membership record as
+                // it was rather than acting on a partial read.
+                return;
+            }
+
+            int nameLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(offset, 2));
+            offset += 2;
+
+            if (data.Length < offset + nameLength)
+            {
+                return;
+            }
+
+            restoredGroups.Add(Encoding.UTF8.GetString(data.AsSpan(offset, nameLength)));
+            offset += nameLength;
+        }
+
+        lock (_groupMembershipLock)
+        {
+            _joinedGroups.Clear();
+
+            foreach (string groupName in restoredGroups)
+            {
+                _joinedGroups.Add(groupName);
+            }
+        }
+    }
+
     /// <inheritdoc/>
     public async Task DisconnectAsync(CancellationToken cancellationToken = default)
     {
@@ -1732,6 +1790,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                             _sessionTokenName = Name;
                         }
 
+                        RestoreJoinedGroupsFromResumedReply(data, 19 + tokenLength);
                         CompletePendingResume(true);
                     }
                 }

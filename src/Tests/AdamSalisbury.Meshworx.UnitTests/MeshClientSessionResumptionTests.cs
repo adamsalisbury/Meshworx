@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using System.Text;
 using System.Threading.Channels;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
@@ -156,12 +158,137 @@ public sealed class MeshClientSessionResumptionTests
         await client.DisposeAsync();
     }
 
-    private sealed record ResumeReply(bool Accepted, Guid ResumedId, byte[] RenewedToken)
+    /// <summary>
+    /// A version-7 hub's acceptance carries the group memberships it restored, and the client repopulates
+    /// <see cref="IMeshClient.JoinedGroups"/> from them directly, without re-joining anything (issue #109).
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task ConnectAsync_ResumeAcceptedWithRestoredGroups_RepopulatesJoinedGroups()
     {
-        public static ResumeReply Accept(Guid resumedId, byte[] renewedToken) =>
-            new(true, resumedId, renewedToken);
+        var client = new MeshClient(new Mock<ILogger<MeshClient>>().Object);
+        var first = new ResumptionHarness(issuedToken: IssuedToken, client: client);
 
-        public static ResumeReply Refuse() => new(false, Guid.Empty, []);
+        await client.ConnectAsync(first.Transport.Object, "Worker");
+        await client.DisconnectAsync();
+
+        // Nothing left over from before the drop — the resumed membership must come entirely from the
+        // reply, not from anything CleanUpAsync failed to clear.
+        Assert.Empty(client.JoinedGroups);
+
+        var second = new ResumptionHarness(
+            issuedToken: IssuedToken,
+            client: client,
+            resumeReply: ResumeReply.Accept(Guid.NewGuid(), RenewedToken, ["news", "alerts"]));
+
+        await client.ConnectAsync(second.Transport.Object, "Worker");
+
+        Assert.True(client.SessionResumed);
+        Assert.Equal(["alerts", "news"], client.JoinedGroups.Order(StringComparer.Ordinal));
+
+        await client.DisposeAsync();
+    }
+
+    /// <summary>
+    /// A resume that restores no memberships at all still repopulates cleanly to an empty set — the
+    /// distinction is not "the block was absent" versus "the block listed nothing", it is real absence of
+    /// membership either way.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task ConnectAsync_ResumeAcceptedWithNoRestoredGroups_LeavesJoinedGroupsEmpty()
+    {
+        var client = new MeshClient(new Mock<ILogger<MeshClient>>().Object);
+        var first = new ResumptionHarness(issuedToken: IssuedToken, client: client);
+
+        await client.ConnectAsync(first.Transport.Object, "Worker");
+        await client.DisconnectAsync();
+
+        var second = new ResumptionHarness(
+            issuedToken: IssuedToken,
+            client: client,
+            resumeReply: ResumeReply.Accept(Guid.NewGuid(), RenewedToken, []));
+
+        await client.ConnectAsync(second.Transport.Object, "Worker");
+
+        Assert.True(client.SessionResumed);
+        Assert.Empty(client.JoinedGroups);
+
+        await client.DisposeAsync();
+    }
+
+    /// <summary>
+    /// A group block truncated mid-name — the kind of malformed frame a well-behaved hub never sends, but
+    /// nothing on the wire between them guarantees — is not acted on at all: the resume itself still
+    /// succeeds, and <see cref="IMeshClient.JoinedGroups"/> is left exactly as it was rather than being
+    /// partially populated from a read that ran off the end of the frame.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task ConnectAsync_ResumeAcceptedWithATruncatedGroupBlock_LeavesJoinedGroupsUntouched()
+    {
+        var client = new MeshClient(new Mock<ILogger<MeshClient>>().Object);
+        var first = new ResumptionHarness(issuedToken: IssuedToken, client: client);
+
+        await client.ConnectAsync(first.Transport.Object, "Worker");
+        await client.DisconnectAsync();
+
+        // A well-formed SessionResumed reply — id, token length, token — followed by a group block that
+        // claims two entries but supplies only one, and that one truncated before its own name bytes end.
+        byte[] renewedToken = RenewedToken;
+        var truncated = new byte[1 + 16 + 2 + renewedToken.Length + 2 + 2 + 3];
+        truncated[0] = 0x17; // SessionResumed
+        Guid.NewGuid().TryWriteBytes(truncated.AsSpan(1, 16));
+        BinaryPrimitives.WriteUInt16BigEndian(truncated.AsSpan(17, 2), (ushort)renewedToken.Length);
+        renewedToken.CopyTo(truncated, 19);
+
+        int groupsOffset = 19 + renewedToken.Length;
+        BinaryPrimitives.WriteUInt16BigEndian(truncated.AsSpan(groupsOffset, 2), 2); // claims two groups
+        BinaryPrimitives.WriteUInt16BigEndian(truncated.AsSpan(groupsOffset + 2, 2), 10); // first name is 10 bytes
+        // ...but only 3 bytes of that name, and no second entry, actually follow.
+        Encoding.UTF8.GetBytes("abc").CopyTo(truncated, groupsOffset + 4);
+
+        var second = new ResumptionHarness(issuedToken: IssuedToken, client: client, rawResumeReply: truncated);
+
+        await client.ConnectAsync(second.Transport.Object, "Worker");
+
+        Assert.True(client.SessionResumed);
+        Assert.Empty(client.JoinedGroups);
+
+        await client.DisposeAsync();
+    }
+
+    /// <summary>
+    /// A hub that only negotiated version 6 sends the reply shape version 6 always produced — no group
+    /// block at all. <see cref="IMeshClient.JoinedGroups"/> is left exactly as it was, which is empty:
+    /// the pre-#109 behaviour for a peer this old, not a regression this fix introduces for it.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task ConnectAsync_ResumeAcceptedByAVersionSixHub_LeavesJoinedGroupsEmpty()
+    {
+        var client = new MeshClient(new Mock<ILogger<MeshClient>>().Object);
+        var first = new ResumptionHarness(issuedToken: IssuedToken, client: client, negotiatedVersion: 0x06);
+
+        await client.ConnectAsync(first.Transport.Object, "Worker");
+        await client.DisconnectAsync();
+
+        var second = new ResumptionHarness(
+            issuedToken: IssuedToken,
+            client: client,
+            resumeReply: ResumeReply.Accept(Guid.NewGuid(), RenewedToken, groups: null),
+            negotiatedVersion: 0x06);
+
+        await client.ConnectAsync(second.Transport.Object, "Worker");
+
+        Assert.True(client.SessionResumed);
+        Assert.Empty(client.JoinedGroups);
+
+        await client.DisposeAsync();
+    }
+
+    private sealed record ResumeReply(bool Accepted, Guid ResumedId, byte[] RenewedToken, IReadOnlyList<string>? Groups)
+    {
+        public static ResumeReply Accept(Guid resumedId, byte[] renewedToken, IReadOnlyList<string>? groups = null) =>
+            new(true, resumedId, renewedToken, groups);
+
+        public static ResumeReply Refuse() => new(false, Guid.Empty, [], Groups: null);
     }
 
     /// <summary>
@@ -195,7 +322,8 @@ public sealed class MeshClientSessionResumptionTests
             byte[]? issuedToken,
             MeshClient? client = null,
             ResumeReply? resumeReply = null,
-            byte negotiatedVersion = Protocol.MaxSupportedVersion)
+            byte negotiatedVersion = Protocol.MaxSupportedVersion,
+            byte[]? rawResumeReply = null)
         {
             Client = client ?? new MeshClient(new Mock<ILogger<MeshClient>>().Object);
 
@@ -228,13 +356,19 @@ public sealed class MeshClientSessionResumptionTests
                         _resumeAttempts.Add(data.Span[1..].ToArray());
                     }
 
+                    if (rawResumeReply is not null)
+                    {
+                        _inbound.Writer.TryWrite(rawResumeReply);
+                        return;
+                    }
+
                     if (resumeReply is null)
                     {
                         return;
                     }
 
                     _inbound.Writer.TryWrite(resumeReply.Accepted
-                        ? BuildResumed(resumeReply.ResumedId, resumeReply.RenewedToken)
+                        ? BuildResumed(resumeReply.ResumedId, resumeReply.RenewedToken, resumeReply.Groups)
                         : [0x18]);
                 })
                 .Returns(Task.CompletedTask);
@@ -243,14 +377,40 @@ public sealed class MeshClientSessionResumptionTests
                 .Returns<CancellationToken>(async ct => await _inbound.Reader.ReadAsync(ct).ConfigureAwait(false));
         }
 
-        private static byte[] BuildResumed(Guid resumedId, byte[] renewedToken)
+        private static byte[] BuildResumed(Guid resumedId, byte[] renewedToken, IReadOnlyList<string>? groups)
         {
-            var payload = new byte[1 + 16 + 2 + renewedToken.Length];
+            if (groups is null)
+            {
+                var payloadWithoutGroups = new byte[1 + 16 + 2 + renewedToken.Length];
+                payloadWithoutGroups[0] = 0x17; // SessionResumed
+                resumedId.TryWriteBytes(payloadWithoutGroups.AsSpan(1, 16));
+                BinaryPrimitives.WriteUInt16BigEndian(
+                    payloadWithoutGroups.AsSpan(17, 2), (ushort)renewedToken.Length);
+                renewedToken.CopyTo(payloadWithoutGroups, 19);
+                return payloadWithoutGroups;
+            }
+
+            byte[][] groupNameBytes = [.. groups.Select(Encoding.UTF8.GetBytes)];
+            int groupsBlockLength = 2 + groupNameBytes.Sum(nameBytes => 2 + nameBytes.Length);
+
+            var payload = new byte[1 + 16 + 2 + renewedToken.Length + groupsBlockLength];
             payload[0] = 0x17; // SessionResumed
             resumedId.TryWriteBytes(payload.AsSpan(1, 16));
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(
-                payload.AsSpan(17, 2), (ushort)renewedToken.Length);
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(17, 2), (ushort)renewedToken.Length);
             renewedToken.CopyTo(payload, 19);
+
+            int offset = 19 + renewedToken.Length;
+            BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(offset, 2), (ushort)groupNameBytes.Length);
+            offset += 2;
+
+            foreach (byte[] nameBytes in groupNameBytes)
+            {
+                BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(offset, 2), (ushort)nameBytes.Length);
+                offset += 2;
+                nameBytes.CopyTo(payload, offset);
+                offset += nameBytes.Length;
+            }
+
             return payload;
         }
     }
