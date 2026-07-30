@@ -709,4 +709,155 @@ public sealed class MeshIntegrationTests
         Assert.Equal("news", group.GroupName);
         Assert.Equal("group news", Encoding.UTF8.GetString(group.Data.Span));
     }
+
+    /// <summary>
+    /// The largest body a broadcast can carry is delivered intact.
+    /// </summary>
+    /// <remarks>
+    /// A broadcast's delivery frame is <c>[type][senderId(16)][body]</c>, so the largest body that fits
+    /// in a 1 MiB frame is seventeen bytes short of it. The pair of tests brackets the boundary: this
+    /// one proves the limit is not enforced a byte early, and the next proves what happens past it.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task EndToEnd_BroadcastAtTheLargestDeliverableSize_IsDelivered()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        await bob.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Bob");
+        await alice.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Alice");
+
+        var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        bob.MessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        var payload = new byte[(1024 * 1024) - 17];
+        payload[^1] = 42;
+
+        await alice.BroadcastAsync(payload);
+
+        MessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal(payload.Length, received.Data.Length);
+        Assert.Equal(42, received.Data.Span[^1]);
+        Assert.True(bob.IsConnected);
+    }
+
+    /// <summary>
+    /// A broadcast whose delivery frame would exceed the cap is dropped, and every other client stays
+    /// connected.
+    /// </summary>
+    /// <remarks>
+    /// The defect this pins: a fan-out frame is sixteen bytes larger than the inbound frame that
+    /// produced it, so a body the sending client's own validation accepted built a frame the recipients'
+    /// transports refused. That refusal was treated as a transport fault and cancelled each recipient's
+    /// token — one client's single broadcast disconnected every other client on the hub, with no
+    /// exception raised to the sender.
+    /// <para>
+    /// The second, ordinary broadcast is the barrier: it can only arrive if the recipients survived the
+    /// first, so the test does not depend on a sleep. That the recipient receives exactly one message is
+    /// what proves the oversize one was dropped rather than delivered.
+    /// </para>
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task EndToEnd_BroadcastTooLargeToDeliver_IsDroppedWithoutDisconnectingRecipients()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+        await using var carol = CreateClient();
+
+        await bob.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Bob");
+        await carol.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Carol");
+        await alice.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Alice");
+
+        var bobMessages = new List<int>();
+        var bobSawSecond = new TaskCompletionSource();
+        bob.MessageReceived += (_, e) =>
+        {
+            lock (bobMessages)
+            {
+                bobMessages.Add(e.Data.Length);
+            }
+
+            if (e.Data.Length == 3)
+            {
+                bobSawSecond.TrySetResult();
+            }
+        };
+
+        // One byte past what a delivery frame can carry, and sixteen inside what the sending client
+        // itself accepts.
+        await alice.BroadcastAsync(new byte[(1024 * 1024) - 16]);
+
+        await alice.BroadcastAsync(new byte[] { 1, 2, 3 });
+        await bobSawSecond.Task.WaitAsync(WaitTimeout);
+
+        Assert.True(bob.IsConnected);
+        Assert.True(carol.IsConnected);
+        Assert.True(alice.IsConnected);
+        Assert.Equal(3, hub.ConnectedClientCount);
+
+        lock (bobMessages)
+        {
+            Assert.Equal([3], bobMessages);
+        }
+    }
+
+    /// <summary>
+    /// The same holds for a group send, which grows by the same sixteen bytes.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task EndToEnd_GroupMessageTooLargeToDeliver_IsDroppedWithoutDisconnectingMembers()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var alice = CreateClient();
+        await using var bob = CreateClient();
+
+        await bob.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Bob");
+        await alice.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Alice");
+
+        await bob.JoinGroupAsync("news");
+        await alice.JoinGroupAsync("news");
+
+        var bobMessages = new List<int>();
+        var bobSawSecond = new TaskCompletionSource();
+        bob.GroupMessageReceived += (_, e) =>
+        {
+            lock (bobMessages)
+            {
+                bobMessages.Add(e.Data.Length);
+            }
+
+            if (e.Data.Length == 3)
+            {
+                bobSawSecond.TrySetResult();
+            }
+        };
+
+        await alice.SendToGroupAsync("news", new byte[(1024 * 1024) - 16]);
+
+        await alice.SendToGroupAsync("news", new byte[] { 1, 2, 3 });
+        await bobSawSecond.Task.WaitAsync(WaitTimeout);
+
+        Assert.True(bob.IsConnected);
+        Assert.Equal(2, hub.ConnectedClientCount);
+
+        lock (bobMessages)
+        {
+            Assert.Equal([3], bobMessages);
+        }
+    }
 }

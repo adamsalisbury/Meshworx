@@ -170,4 +170,66 @@ public sealed class InMemoryTransportTests
 
         await Assert.ThrowsAsync<ObjectDisposedException>(() => acceptTask);
     }
+
+    /// <summary>
+    /// A payload over the frame cap is rejected, exactly as every stream transport rejects it.
+    /// </summary>
+    /// <remarks>
+    /// This type stands in for the real transports across the hub's own test suite, so a cap it does not
+    /// enforce is a defect the suite cannot see. A near-maximum fan-out builds a delivery frame sixteen
+    /// bytes larger than the inbound one that produced it, and without this check that frame was
+    /// delivered happily in-process while disconnecting every recipient over TCP.
+    /// </remarks>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_PayloadOverTheFrameCap_Throws()
+    {
+        (InMemoryTransport first, InMemoryTransport _) = InMemoryTransport.CreatePair();
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => first.SendAsync(new byte[(1024 * 1024) + 1]));
+    }
+
+    /// <summary>
+    /// A payload at exactly the cap is accepted, so the check bounds the frame rather than shrinking it.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_PayloadAtTheFrameCap_IsDelivered()
+    {
+        (InMemoryTransport first, InMemoryTransport second) = InMemoryTransport.CreatePair();
+
+        await first.SendAsync(new byte[1024 * 1024]);
+
+        byte[]? received = await second.ReceiveAsync();
+
+        Assert.Equal(1024 * 1024, received!.Length);
+    }
+
+    /// <summary>
+    /// Receiving on a disposed endpoint throws rather than awaiting a channel nothing will complete.
+    /// SendAsync has always been guarded; without the same guard here the type was asymmetric with
+    /// itself as well as with every stream transport.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task ReceiveAsync_AfterOwnDispose_ThrowsObjectDisposedException()
+    {
+        (InMemoryTransport first, InMemoryTransport _) = InMemoryTransport.CreatePair();
+
+        await first.DisposeAsync();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => first.ReceiveAsync());
+    }
+
+    /// <summary>
+    /// Sending to a departed peer fails rather than reporting success for ever into a channel with no
+    /// reader, which is what a stream transport surfaces for a closed connection.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendAsync_AfterPeerDisposed_ThrowsIOException()
+    {
+        (InMemoryTransport first, InMemoryTransport second) = InMemoryTransport.CreatePair();
+
+        await second.DisposeAsync();
+
+        await Assert.ThrowsAsync<IOException>(() => first.SendAsync(new byte[] { 1 }));
+    }
 }
