@@ -91,4 +91,52 @@ public sealed class MeshHubOptions
     /// that opted into <see cref="AdamSalisbury.Meshworx.DeliveryOptions.AwaitCapacity"/>.
     /// </summary>
     public TimeSpan? BackpressureAwaitTimeout { get; set; }
+
+    /// <summary>
+    /// Gets or sets the store used to hold messages addressed to a disconnected client until it
+    /// reconnects.
+    /// </summary>
+    /// <remarks>
+    /// Leave unset to have the hub resolve an <see cref="IOfflineStore"/> registered elsewhere in the
+    /// container, if any — the natural shape for a store that is itself a service with its own
+    /// dependencies. Set this to supply one directly instead, which takes priority over anything
+    /// registered in the container. With neither, the hub holds nothing for a disconnected client.
+    /// </remarks>
+    public IOfflineStore? OfflineStore { get; set; }
+
+    /// <summary>
+    /// Gets or sets how long the hub waits on <see cref="OfflineStore"/> before giving up on a single call.
+    /// </summary>
+    public TimeSpan? OfflineStoreTimeout { get; set; }
+
+    /// <summary>
+    /// Gets or sets how long a disconnected client's session may be resumed within.
+    /// </summary>
+    /// <remarks>
+    /// Leave unset to switch session resumption off entirely, in which case a reconnecting client is
+    /// always issued a fresh identity.
+    /// </remarks>
+    public TimeSpan? SessionResumptionWindow { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum number of inbound messages the hub accepts from a single client per second.
+    /// </summary>
+    public int? MaxInboundMessagesPerSecond { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum number of inbound bytes the hub accepts from a single client per second.
+    /// </summary>
+    public int? MaxInboundBytesPerSecond { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum number of fan-out sends — broadcasts and group sends — a single client
+    /// may issue per second.
+    /// </summary>
+    public int? MaxFanOutMessagesPerSecond { get; set; }
+
+    /// <summary>
+    /// Gets or sets the maximum number of individual deliveries a single client's fan-out sends may
+    /// produce per second, across every recipient combined.
+    /// </summary>
+    public int? MaxFanOutDeliveriesPerSecond { get; set; }
 }
