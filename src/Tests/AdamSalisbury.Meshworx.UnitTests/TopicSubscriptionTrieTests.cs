@@ -33,7 +33,7 @@ public sealed class TopicSubscriptionTrieTests
         Guid subscriber = Guid.NewGuid();
         trie.Subscribe(pattern, subscriber);
 
-        IReadOnlyList<Guid> matches = trie.Match(topic);
+        IReadOnlySet<Guid> matches = trie.Match(topic);
 
         Assert.Equal(expectMatch, matches.Contains(subscriber));
     }
@@ -51,7 +51,7 @@ public sealed class TopicSubscriptionTrieTests
         Guid subscriber = Guid.NewGuid();
         trie.Subscribe(pattern, subscriber);
 
-        IReadOnlyList<Guid> matches = trie.Match(topic);
+        IReadOnlySet<Guid> matches = trie.Match(topic);
 
         Assert.Equal(expectMatch, matches.Contains(subscriber));
     }
@@ -68,7 +68,7 @@ public sealed class TopicSubscriptionTrieTests
         trie.Subscribe("orders.+.created", plusSubscriber);
         trie.Subscribe("orders.#", hashSubscriber);
 
-        IReadOnlyList<Guid> matches = trie.Match("orders.eu.created");
+        IReadOnlySet<Guid> matches = trie.Match("orders.eu.created");
 
         Assert.Equal(3, matches.Count);
         Assert.Contains(literalSubscriber, matches);
@@ -84,7 +84,7 @@ public sealed class TopicSubscriptionTrieTests
         trie.Subscribe("orders.eu.created", subscriber);
         trie.Subscribe("orders.#", subscriber);
 
-        IReadOnlyList<Guid> matches = trie.Match("orders.eu.created");
+        IReadOnlySet<Guid> matches = trie.Match("orders.eu.created");
 
         Assert.Equal([subscriber], matches);
     }

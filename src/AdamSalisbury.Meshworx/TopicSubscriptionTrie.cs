@@ -109,11 +109,17 @@ internal sealed class TopicSubscriptionTrie : IDisposable
     /// </summary>
     /// <param name="topic">The concrete topic a message was published to.</param>
     /// <returns>
-    /// The distinct set of matching subscribers, or an empty array if none match. Never
+    /// The distinct set of matching subscribers, or an empty set if none match. Never
     /// <see langword="null"/>.
     /// </returns>
+    /// <remarks>
+    /// Returned as the <see cref="HashSet{T}"/> built during the traversal itself, rather than copied
+    /// into an array, so a caller that only needs to test membership — deciding whether the publisher is
+    /// also among the recipients, say — can use <see cref="IReadOnlySet{T}.Contains"/> in O(1) instead of
+    /// a linear scan.
+    /// </remarks>
     /// <exception cref="ArgumentException"><paramref name="topic"/> is not a valid concrete topic.</exception>
-    public IReadOnlyList<Guid> Match(string topic)
+    public IReadOnlySet<Guid> Match(string topic)
     {
         string[] segments = SplitAndValidate(topic, isPattern: false);
         var results = new HashSet<Guid>();
@@ -128,7 +134,7 @@ internal sealed class TopicSubscriptionTrie : IDisposable
             _lock.ExitReadLock();
         }
 
-        return results.Count == 0 ? [] : [.. results];
+        return results;
     }
 
     /// <summary>

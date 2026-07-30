@@ -3789,7 +3789,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         ReadOnlyMemory<byte> topicBytes,
         ReadOnlyMemory<byte> messageData)
     {
-        IReadOnlyList<Guid> recipients;
+        IReadOnlySet<Guid> recipients;
         try
         {
             recipients = _topics.Match(topic);
@@ -3843,7 +3843,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         ReadOnlyMemory<byte> headerBlock,
         ReadOnlyMemory<byte> body)
     {
-        IReadOnlyList<Guid> recipients;
+        IReadOnlySet<Guid> recipients;
         try
         {
             recipients = _topics.Match(topic);
@@ -3918,17 +3918,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// <see langword="false"/> if there is nothing to deliver, or the budget refused the send — either
     /// way the caller must not build or enqueue a delivery frame.
     /// </returns>
-    private bool ChargeFanOutDelivery(Guid senderId, IReadOnlyList<Guid> recipients, out int recipientCount)
+    private bool ChargeFanOutDelivery(Guid senderId, IReadOnlySet<Guid> recipients, out int recipientCount)
     {
-        recipientCount = recipients.Count;
-        for (int i = 0; i < recipients.Count; i++)
-        {
-            if (recipients[i] == senderId)
-            {
-                recipientCount--;
-                break;
-            }
-        }
+        // A HashSet-backed set answers its own membership question in O(1); the recipient count the
+        // publisher itself never receives is either 0 or 1, never more, so a Contains check plus a
+        // conditional subtraction is all this needs — no scan of the set is required.
+        recipientCount = recipients.Contains(senderId) ? recipients.Count - 1 : recipients.Count;
 
         if (recipientCount <= 0)
         {
@@ -3960,7 +3955,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// </summary>
     private void DeliverToTopicSubscribers(
         Guid senderId,
-        IReadOnlyList<Guid> recipients,
+        IReadOnlySet<Guid> recipients,
         int chargeableRecipientCount,
         byte[] deliveryPayload,
         MessagePriority priority)

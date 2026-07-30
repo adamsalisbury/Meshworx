@@ -574,13 +574,22 @@ package.
 1. **Every inbound frame** is charged against the general message/byte budgets first
    (`TryAdmitFrame`), deliberately **before** any opcode or length check — including a zero-length frame —
    so an empty-frame flood cannot bypass the budget for free.
-2. Only `BroadcastMessage`, `GroupMessage` and `GroupMessageWithHeaders` additionally charge the fan-out
-   **frequency** budget (`TryAdmitFanOut`) — a header-bearing group send is included deliberately, so a
-   client cannot dodge the budget by attaching an empty header block.
+2. Only `BroadcastMessage`, `GroupMessage`, `GroupMessageWithHeaders`, `PublishTopicMessage` and
+   `PublishTopicMessageWithHeaders` additionally charge the fan-out **frequency** budget
+   (`TryAdmitFanOut`, `MeshHub.cs:1381-1389`) — a header-bearing group or topic send is included
+   deliberately, so a client cannot dodge the budget by attaching an empty header block. **Topic
+   subscribe/unsubscribe (`0x19`/`0x1A`) are not charged against this budget at all** — only the fan-out
+   *send* opcodes are; see [known-issues.md](known-issues.md) KI-63 for the separate, standing-state gap
+   this leaves (subscription count itself has no cap of any kind, budget or otherwise).
 3. `TryAdmitFanOutDelivery(recipientCount)` is charged once per fan-out, at each of the three fan-out call
    sites in [Routing helpers](#routing-helpers) below, **up front against the full recipient count** — a
    broadcast/group send either clears the whole delivery-volume budget or is dropped in its entirety;
-   there is no partial delivery to some recipients and drop for others.
+   there is no partial delivery to some recipients and drop for others. **The two topic-publish methods
+   below use the same budget via a shared helper, `ChargeFanOutDelivery`** (`MeshHub.cs:3921-3959`) —
+   functionally identical to the inline `TryAdmitFanOutDelivery` call the older three fan-out methods each
+   repeat, refactored into one place because topic delivery has to compute the chargeable recipient count
+   from a `TopicSubscriptionTrie.Match` result first (excluding the publisher itself, if it also
+   subscribes) rather than reading a fixed connection list.
 
 **On exceeding any bucket, the frame is silently dropped** — no error frame, no disconnect, the sender is
 never told, matching the existing full-outbound-queue drop shape (KI-1). The only observable signal is a
