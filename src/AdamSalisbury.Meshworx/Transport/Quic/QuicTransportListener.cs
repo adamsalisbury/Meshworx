@@ -470,8 +470,8 @@ public sealed class QuicTransportListener : ITransportListener
         ChannelWriter<QuicTransport> writer,
         CancellationToken cancellationToken)
     {
-        await Task.Yield();
-
+        // Started via Task.Run at the call site, which is what keeps StartAsync non-blocking — nothing
+        // here needs to yield first.
         using var negotiationSlots = new SemaphoreSlim(_maxConcurrentNegotiations, _maxConcurrentNegotiations);
         var negotiationsPerSource = new ConcurrentDictionary<IPAddress, int>();
         var inFlight = new ConcurrentDictionary<Task, byte>();
