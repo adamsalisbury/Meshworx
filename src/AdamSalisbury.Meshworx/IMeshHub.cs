@@ -44,7 +44,10 @@ public interface IMeshHub : IAsyncDisposable
     /// </summary>
     /// <remarks>
     /// Raised from the client's handler task, so handlers may be invoked concurrently for different
-    /// clients and must be thread-safe.
+    /// clients and must be thread-safe. Also raised, carrying the reclaimed identity, when a connection
+    /// successfully resumes a dormant session — the connection was never unreachable, but a subscriber
+    /// tracking connected ids by id needs the new one, paired with a <see cref="ClientDisconnected"/> for
+    /// the id it is replacing.
     /// </remarks>
     event EventHandler<ClientConnectionEventArgs> ClientConnected;
 
@@ -53,7 +56,10 @@ public interface IMeshHub : IAsyncDisposable
     /// </summary>
     /// <remarks>
     /// Raised from the client's handler task, so handlers may be invoked concurrently for different
-    /// clients and must be thread-safe.
+    /// clients and must be thread-safe. Also raised, carrying the discarded fresh identity, when a
+    /// connection successfully resumes a dormant session under a different id — the connection itself has
+    /// not actually disconnected, only the id it answers to has changed, and this is immediately followed
+    /// by a <see cref="ClientConnected"/> for the reclaimed id.
     /// </remarks>
     event EventHandler<ClientConnectionEventArgs> ClientDisconnected;
 
