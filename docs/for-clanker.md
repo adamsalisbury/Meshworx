@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: a950987 (feature/client-attributes — issue #38, client attribute metadata and FindClientsAsync directory queries, on top of the merged issue #37 topic pub/sub work on main)
+reconciled-to-commit: a3d20a3 (feature/presence-roster — issue #39, presence/roster API, on top of the merged issue #38 client-attributes work on main)
 reconciled-to-date: 2026-07-30
 mode: update
 -->
@@ -12,12 +12,14 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree, this pass:** issue #38 landed on `feature/client-attributes` (branched from `main`
-> after issue #37's topic pub/sub merged as `d4cc5aa`) — commit `a950987` adds `SetClientAttributes`/
-> `FindClientsRequest`/`FindClientsResponse` (opcodes `0x1F`–`0x21`), `IMeshClient.UpdateAttributesAsync`/
-> `FindClientsAsync`, `ClientConnection.Attributes` on the hub, and `Protocol.ClientAttributesMinVersion
-> = 9` — gated from the outset this time, applying the lesson issue #37's KI-61 taught rather than
-> repeating it. `git diff d4cc5aa..HEAD --stat`: 9 files, 761 insertions, 3 deletions.
+> **Documented tree, this pass:** issue #39 landed on `feature/presence-roster` (branched from `main`
+> after issue #38's client-attributes work merged as `b03a72d`) — commit `a3d20a3` adds
+> `SubscribePresence`/`UnsubscribePresence`/`PresenceChanged` (opcodes `0x22`–`0x24`),
+> `IMeshClient.GetClientsAsync`/`SubscribePresenceAsync`/`UnsubscribePresenceAsync`/`PresenceChanged`, a
+> new `enablePresence` constructor parameter on `MeshHub` (default `false`), and
+> `Protocol.PresenceMinVersion = 10` — gated from the outset, same discipline issue #38 established.
+> `GetClientsAsync` needed no new opcode, reusing issue #38's `FindClientsRequest`/`FindClientsResponse`
+> with an empty query. `git diff b03a72d..HEAD --stat`: 11 files, 473 insertions, 15 deletions.
 >
 > **`fb2f9a0` fixes KI-61 outright.** `Protocol.MaxSupportedVersion` is now `8`, a new
 > `Protocol.TopicPubSubMinVersion = 8` constant exists, `MeshClient.RequireTopicPubSubSupport` is now
@@ -1029,7 +1031,7 @@ any pattern and publish to any topic. Treat the transport boundary as the trust 
 | Target framework | `net10.0` | `AdamSalisbury.Meshworx.csproj:4` |
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
-| Wire protocol version | Negotiated range, currently `4`–`9` (was a fixed `3`, then a `4`–`4` range from PR #73; widened to `5` by PR #74 for the header envelope, to `6` by issue #43 for session resumption, to `7` by PR #135/issue #109 so a `SessionResumed` reply can report the group memberships the hub actually restored, to `8` by commit `fb2f9a0` gating topic pub/sub, and to `9` by issue #38 gating client attributes). **Issue #37 (topic pub/sub) adds six opcodes (`0x19`–`0x1E`)** — four of them are client → hub and, for one commit, shipped within version `7` with no gate of their own, breaking this docs set's own additive-opcode rule; the next commit, `fb2f9a0`, added `Protocol.TopicPubSubMinVersion = 8` and closed it, see KI-61 (fixed). **Issue #38 (client attributes) adds three opcodes (`0x1F`–`0x21`)**, gated behind `Protocol.ClientAttributesMinVersion = 9` from the outset — KI-61's lesson applied, not repeated | `Messages/Protocol.cs:8`, `:14`, `:21`, `:29`, `:38`, `:48`, `:56`; `Messages/MessageType.cs:29-32` |
+| Wire protocol version | Negotiated range, currently `4`–`10` (was a fixed `3`, then a `4`–`4` range from PR #73; widened to `5` by PR #74 for the header envelope, to `6` by issue #43 for session resumption, to `7` by PR #135/issue #109 so a `SessionResumed` reply can report the group memberships the hub actually restored, to `8` by commit `fb2f9a0` gating topic pub/sub, to `9` by issue #38 gating client attributes, and to `10` by issue #39 gating presence). **Issue #37 (topic pub/sub) adds six opcodes (`0x19`–`0x1E`)** — four of them are client → hub and, for one commit, shipped within version `7` with no gate of their own, breaking this docs set's own additive-opcode rule; the next commit, `fb2f9a0`, added `Protocol.TopicPubSubMinVersion = 8` and closed it, see KI-61 (fixed). **Issue #38 (client attributes) adds three opcodes (`0x1F`–`0x21`)**, gated behind `Protocol.ClientAttributesMinVersion = 9` from the outset — KI-61's lesson applied, not repeated. **Issue #39 (presence) adds three opcodes (`0x22`–`0x24`)**, gated behind `Protocol.PresenceMinVersion = 10` from the outset; its roster snapshot (`GetClientsAsync`) needed no new opcode at all, reusing issue #38's `FindClientsRequest`/`FindClientsResponse` with an empty query | `Messages/Protocol.cs:8`, `:14`, `:21`, `:29`, `:38`, `:48`, `:56`, `:64`; `Messages/MessageType.cs:29-34` |
 | Max frame payload | 1 MiB (`1024*1024`). `TcpTransport`/`UnixSocketTransport`/`NamedPipeTransport`/`QuicTransport` share **one** constant (`StreamFramer.MaxPayloadSize`, PR #81, extended to `QuicTransport` by PR #82); `WebSocketTransport` keeps its own independent constant of the same value | `Transport/Framing/StreamFramer.cs:28`, `Transport/WebSocket/WebSocketTransport.cs:25` |
 | Transport encryption | TCP/WebSocket: optional TLS, **off by default**. `UnixSocketTransport`/`NamedPipeTransport` (PR #81): **no TLS option at all** — local-only, access controlled by filesystem/ACL permissions instead. `QuicTransport` (PR #82): TLS **mandatory** — QUIC requires it at the protocol level, so there is no cleartext mode | `Transport/Tcp/TcpTransport.cs:142`, `TcpTransportListener.cs:110`, `Transport/WebSocket/WebSocketTransportListener.cs:112`, `Transport/Quic/QuicTransport.cs:126-141` |
 | Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:23` |
