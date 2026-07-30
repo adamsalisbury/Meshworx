@@ -2633,6 +2633,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _clientNames[connection.Name] = resumedId;
         _clients.TryRemove(freshId, out _);
 
+        // The registration that admitted this connection raised ClientConnected for freshId, and nothing
+        // has raised ClientDisconnected for it since — the connection never actually dropped, it just
+        // changed which id it answers to. A subscriber tracking connected ids would otherwise leak
+        // freshId for ever and later receive an unmatched ClientDisconnected for resumedId at teardown.
+        // Raising this pair keeps every id balanced without inventing a new event type.
+        RaiseClientEvent(ClientDisconnected, freshId, connection.Name, nameof(ClientDisconnected));
+        RaiseClientEvent(ClientConnected, resumedId, connection.Name, nameof(ClientConnected));
+
         await RestoreGroupMembershipAsync(connection, session.Groups, cancellationToken).ConfigureAwait(false);
 
         byte[] renewedToken = RandomNumberGenerator.GetBytes(Protocol.SessionTokenLength);
