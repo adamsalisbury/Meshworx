@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Text;
@@ -3199,6 +3200,44 @@ public sealed class MeshHubTests
 
         // The first accept throws; the loop must recover and accept this client.
         var client = await fixture.RegisterClientAsync("AfterFailure");
+
+        Assert.True(fixture.Hub.IsClientRegistered(client.Id));
+
+        client.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A persistent accept failure — descriptor exhaustion, notably — must not spin the accept loop hot:
+    /// each failure is paced by a retry delay before the loop tries again, rather than logging and
+    /// retrying instantly (issue #117). Pinned by timing several consecutive failures rather than one,
+    /// since a single failure recovers too fast to distinguish a paced retry from an unpaced spin.
+    /// </summary>
+    [Fact(Timeout = 3000)]
+    public async Task AcceptLoop_RepeatedTransientAcceptFailures_PacesRetriesRatherThanSpinningHot()
+    {
+        const int failureCount = 5;
+
+        var fixture = new MeshHubFixture();
+        for (int i = 0; i < failureCount; i++)
+        {
+            fixture.FailNextAccept(new IOException($"transient accept failure {i}"));
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        await fixture.Hub.StartAsync();
+
+        // The five failures are dequeued and retried before this, the real client behind them, is ever
+        // reached — so this only completes once every one of them has been paced.
+        var client = await fixture.RegisterClientAsync("AfterFailures");
+        stopwatch.Stop();
+
+        TimeSpan expectedFloor = TimeSpan.FromMilliseconds(50 * (failureCount - 1));
+        Assert.True(
+            stopwatch.Elapsed >= expectedFloor,
+            $"Expected at least {expectedFloor.TotalMilliseconds}ms of paced retries across "
+                + $"{failureCount} failures, but registration completed after "
+                + $"{stopwatch.Elapsed.TotalMilliseconds}ms — the loop is spinning rather than pacing.");
 
         Assert.True(fixture.Hub.IsClientRegistered(client.Id));
 

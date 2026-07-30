@@ -86,6 +86,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // authorisation timeouts.
     private static readonly TimeSpan DefaultOfflineStoreTimeout = TimeSpan.FromSeconds(10);
 
+    // Applied only after a failed AcceptAsync, never after a successful one, so a healthy burst of
+    // incoming connections is never throttled. Matches TcpTransportListener's own AcceptRetryDelay: a
+    // persistent accept failure — descriptor exhaustion, most notably — must not spin this loop hot,
+    // whatever ITransportListener implementation is plugged in. A per-listener implementation may already
+    // pace its own retries (the TLS handshake pump does), but ITransportListener is a public extension
+    // point, so this loop cannot assume every implementation does.
+    private static readonly TimeSpan AcceptRetryDelay = TimeSpan.FromMilliseconds(50);
+
     private readonly ILogger<MeshHub> _logger;
     private readonly ITransportListener _listener;
     private readonly TimeSpan _registrationTimeout;
@@ -960,6 +968,20 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 // stop the hub serving every future client. Log and keep listening. This is the
                 // background service's top-level loop, so catching broadly here is intentional.
                 _logger.LogWarning(ex, "Failed to accept an incoming connection; continuing to listen");
+
+                // A persistent failure — descriptor exhaustion, notably — must not spin this loop hot
+                // logging and retrying instantly. Paced here rather than trusted to every
+                // ITransportListener implementation, since some (the cleartext TCP and Unix accept paths,
+                // historically) accept failures instantly with no pacing of their own.
+                try
+                {
+                    await Task.Delay(AcceptRetryDelay, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
                 continue;
             }
 
