@@ -139,50 +139,66 @@ public class MeshClientSerializationExtensionsTests
     }
 
     /// <summary>
-    /// A typed request serializes the outbound value and deserializes the reply with the same codec.
+    /// A typed request serializes the outbound value, tags it with the codec's content type, and
+    /// deserializes the reply with the same codec.
     /// </summary>
+    /// <remarks>
+    /// The content-type assertion is not incidental. Without the header a receiver carrying more than
+    /// one codec accepts the request for all of them, so the first in the chain claims it and decodes
+    /// another codec's bytes — the exact failure the header exists to prevent.
+    /// </remarks>
     [Fact]
     public async Task RequestAsync_Typed_SerializesRequestAndDeserializesReply()
     {
         var client = new Mock<IMeshClient>();
         ReadOnlyMemory<byte> sentBody = default;
+        MessageHeaders? sentHeaders = null;
 
         client
             .Setup(c => c.RequestAsync(
                 RecipientId,
                 It.IsAny<ReadOnlyMemory<byte>>(),
                 It.IsAny<TimeSpan>(),
+                It.IsAny<MessageHeaders>(),
                 It.IsAny<CancellationToken>()))
-            .Callback<Guid, ReadOnlyMemory<byte>, TimeSpan, CancellationToken>(
-                (_, body, _, _) => sentBody = body)
+            .Callback<Guid, ReadOnlyMemory<byte>, TimeSpan, MessageHeaders, CancellationToken>(
+                (_, body, _, headers, _) => (sentBody, sentHeaders) = (body, headers))
             .ReturnsAsync((ReadOnlyMemory<byte>)Encoding.UTF8.GetBytes("""{"X":9,"Y":8}"""));
 
         Point? reply = await client.Object.RequestAsync<Point, Point>(
             RecipientId, new Point(1, 2), JsonMessageSerializer.Default, TimeSpan.FromSeconds(5));
 
         Assert.Equal("""{"X":1,"Y":2}""", Encoding.UTF8.GetString(sentBody.Span));
+        Assert.Equal("application/json", sentHeaders![SerializationHeaderKeys.ContentType]);
         Assert.Equal(new Point(9, 8), reply);
     }
 
+    /// <summary>
+    /// A typed reply is tagged with the codec's content type too, for the same reason a typed request
+    /// is: the requester decodes it, and has the same several codecs to choose between.
+    /// </summary>
     [Fact]
-    public async Task ReplyAsync_Typed_SendsSerializedBody()
+    public async Task ReplyAsync_Typed_SendsSerializedBodyUnderItsContentType()
     {
         var client = new Mock<IMeshClient>();
         ReadOnlyMemory<byte> sentBody = default;
+        MessageHeaders? sentHeaders = null;
 
         client
             .Setup(c => c.ReplyAsync(
                 It.IsAny<MessageReceivedEventArgs>(),
                 It.IsAny<ReadOnlyMemory<byte>>(),
+                It.IsAny<MessageHeaders>(),
                 It.IsAny<CancellationToken>()))
-            .Callback<MessageReceivedEventArgs, ReadOnlyMemory<byte>, CancellationToken>(
-                (_, body, _) => sentBody = body)
+            .Callback<MessageReceivedEventArgs, ReadOnlyMemory<byte>, MessageHeaders, CancellationToken>(
+                (_, body, headers, _) => (sentBody, sentHeaders) = (body, headers))
             .Returns(Task.CompletedTask);
 
         var request = new MessageReceivedEventArgs { SenderId = RecipientId, Data = default };
         await client.Object.ReplyAsync(request, new Point(7, 7), JsonMessageSerializer.Default);
 
         Assert.Equal("""{"X":7,"Y":7}""", Encoding.UTF8.GetString(sentBody.Span));
+        Assert.Equal("application/json", sentHeaders![SerializationHeaderKeys.ContentType]);
     }
 
     [Fact]

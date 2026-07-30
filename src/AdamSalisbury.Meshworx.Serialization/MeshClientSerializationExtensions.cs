@@ -84,13 +84,18 @@ public static class MeshClientSerializationExtensions
     /// <param name="value">The request value to serialize and send.</param>
     /// <param name="serializer">The codec to serialize the request and deserialize the reply with.</param>
     /// <param name="timeout">How long to wait for a reply before giving up.</param>
+    /// <param name="headers">
+    /// Additional headers to send alongside the request, or <see langword="null"/> for none. The content
+    /// type is added to a copy of these; the instance passed in is never mutated.
+    /// </param>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
     /// <returns>The deserialized reply.</returns>
     /// <remarks>
     /// The reply is deserialized with the same codec the request was serialized with, on the assumption
     /// that a responder replies in the format it was asked in. A responder that deliberately replies in
     /// another format should be called via the byte-oriented
-    /// <see cref="IMeshClient.RequestAsync"/> instead, and its reply decoded explicitly.
+    /// <see cref="IMeshClient.RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/> instead, and its reply
+    /// decoded explicitly.
     /// </remarks>
     public static async Task<TReply?> RequestAsync<TRequest, TReply>(
         this IMeshClient client,
@@ -98,6 +103,7 @@ public static class MeshClientSerializationExtensions
         TRequest value,
         IMessageSerializer serializer,
         TimeSpan timeout,
+        MessageHeaders? headers = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(client);
@@ -105,7 +111,12 @@ public static class MeshClientSerializationExtensions
 
         ReadOnlyMemory<byte> body = serializer.Serialize(value);
         ReadOnlyMemory<byte> reply = await client
-            .RequestAsync(recipientId, body, timeout, cancellationToken)
+            .RequestAsync(
+                recipientId,
+                body,
+                timeout,
+                WithContentType(headers, serializer.ContentType),
+                cancellationToken)
             .ConfigureAwait(false);
 
         return serializer.Deserialize<TReply>(reply.Span);
@@ -119,6 +130,10 @@ public static class MeshClientSerializationExtensions
     /// <param name="request">The received request being replied to.</param>
     /// <param name="value">The value to serialize and send as the reply.</param>
     /// <param name="serializer">The codec to serialize with.</param>
+    /// <param name="headers">
+    /// Additional headers to send alongside the reply, or <see langword="null"/> for none. The content
+    /// type is added to a copy of these; the instance passed in is never mutated.
+    /// </param>
     /// <param name="cancellationToken">A token to cancel the operation.</param>
     /// <returns>A task that completes once the reply has been handed to the transport.</returns>
     public static Task ReplyAsync<TValue>(
@@ -126,13 +141,15 @@ public static class MeshClientSerializationExtensions
         MessageReceivedEventArgs request,
         TValue value,
         IMessageSerializer serializer,
+        MessageHeaders? headers = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(client);
         ArgumentNullException.ThrowIfNull(serializer);
 
         ReadOnlyMemory<byte> body = serializer.Serialize(value);
-        return client.ReplyAsync(request, body, cancellationToken);
+        return client.ReplyAsync(
+            request, body, WithContentType(headers, serializer.ContentType), cancellationToken);
     }
 
     /// <summary>

@@ -1,8 +1,10 @@
 namespace AdamSalisbury.Meshworx.Messages;
 
 /// <summary>
-/// The well-known <see cref="MessageHeaders"/> keys used by <see cref="IMeshClient.RequestAsync"/> and
-/// <see cref="IMeshClient.ReplyAsync"/> to correlate a request with its reply.
+/// The well-known <see cref="MessageHeaders"/> keys used by <see cref="IMeshClient.RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/>
+/// and
+/// <see cref="IMeshClient.ReplyAsync(MessageReceivedEventArgs, ReadOnlyMemory{byte}, CancellationToken)"/> to correlate a request
+/// with its reply.
 /// </summary>
 /// <remarks>
 /// Both a request and its reply carry <see cref="CorrelationId"/>; only the reply also carries

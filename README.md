@@ -984,10 +984,13 @@ That generates `OrderServiceProxy` (implementing `IOrderService`) and `OrderServ
 IOrderService orders = new OrderServiceProxy(client, JsonMessageSerializer.Default, recipientId);
 await orders.SubmitAsync(42, "WIDGET");
 
-// Receiving side.
-var dispatcher = new OrderServiceDispatcher(new OrderService(), JsonMessageSerializer.Default);
-client.MessageReceived += async (_, e) => await dispatcher.TryDispatchAsync(e, client);
+// Receiving side. The client is a constructor argument because this contract declares a method
+// returning a value, and that method's reply has to go back somewhere.
+var dispatcher = new OrderServiceDispatcher(new OrderService(), JsonMessageSerializer.Default, client);
+client.MessageReceived += async (_, e) => await dispatcher.TryDispatchAsync(e);
 ```
+
+A contract whose methods all return `Task` is entirely one-way, so its dispatcher takes no client.
 
 **No reflection at run time.** The generator has every signature at compile time, so argument packing
 is a generated record and method selection a generated switch. A mistyped call is a build error, not a
@@ -995,9 +998,21 @@ message that silently fails to dispatch.
 
 A method returning `Task` is a one-way send; one returning `Task<T>` goes out as a request and its
 reply is decoded back into `T`, correlated by the core library's own request/response helper rather
-than by a scheme the generator invents. `TryDispatchAsync` returns `false` for a message that is not
-this contract's, so a connection carrying several contracts can offer each message to every dispatcher
-in turn.
+than by a scheme the generator invents. Both carry the codec's content type, like every other typed
+send.
+
+`TryDispatchAsync` returns `false` for a message that is not this contract's, so a connection carrying
+several contracts can offer each message to every dispatcher in turn. What makes that safe is the wire
+identity: `mesh.contract.method` carries the **fully qualified** method name —
+`Acme.Orders.IOrderService.SubmitAsync` — so two contracts that happen to declare a method of the same
+name cannot claim each other's messages. It follows that renaming a contract's namespace or interface
+changes what goes on the wire, and both endpoints must be rebuilt together.
+
+`TryDispatchAsync` is meant to be called from a `MessageReceived` handler, so it is total over its
+input: a body this contract's codec cannot decode, and a request that owes a reply but arrived as an
+ordinary send, are both declined rather than thrown into the receive loop — and the second is declined
+*before* the implementation runs, so a handler's side effects are never committed by a call that cannot
+be answered.
 
 Contract methods must return `Task` or `Task<T>` and may take a trailing `CancellationToken` (which is
 not serialized — it travels no further than the calling process). Anything the generator cannot express
@@ -1011,6 +1026,12 @@ is a build error naming the member and the reason, rather than a member silently
 | `MESH004` | An overloaded method name — a method is identified on the wire by name alone |
 | `MESH005` | A property or event — neither is expressible as a one-way message |
 | `MESH006` | A `CancellationToken` that is not the last parameter |
+| `MESH007` | A generic contract interface — an open type parameter has no single identity to name |
+| `MESH008` | A contract interface with base interfaces — a contract must be self-contained |
+| `MESH009` | A nested contract interface — a contract must be declared directly in a namespace |
+| `MESH010` | The generator itself failed — reported against the contract that caused it |
+
+A static interface member is not part of the wire contract and is skipped rather than diagnosed.
 
 The hub knows nothing about any of this. A contract call is an ordinary message with an ordinary
 header block naming the method, routed exactly as every other message is.
