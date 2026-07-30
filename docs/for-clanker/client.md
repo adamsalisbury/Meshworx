@@ -18,7 +18,7 @@ up peers, manages group membership, and raises events for inbound traffic and di
 
 | Member | Signature / notes | Source |
 |---|---|---|
-| ctor | `MeshClient(ILogger<MeshClient>, TimeSpan? idleTimeout=null, TimeSpan? sendTimeout=null, int maxSendAttempts=1, TimeSpan? sendRetryDelay=null)` | `MeshClient.cs:90` |
+| ctor | `MeshClient(ILogger<MeshClient>, TimeSpan? idleTimeout=null, TimeSpan? sendTimeout=null, int maxSendAttempts=1, TimeSpan? sendRetryDelay=null, int? maxReassemblyBytes=null, TimeSpan? chunkTransferTimeout=null, TimeProvider? timeProvider=null)` — the last three params added by chunking (feat #93); see [Large-message chunking](#large-message-chunking) | `MeshClient.cs:139-147` |
 | `Id` | `Guid` — assigned by hub; `Guid.Empty` when disconnected | `MeshClient.cs:131` |
 | `Name` | `string` — set on connect, cleared on disconnect | `MeshClient.cs:134` |
 | `IsConnected` | `bool` — true only in `Connected` state | `MeshClient.cs:140` |
@@ -28,13 +28,15 @@ up peers, manages group membership, and raises events for inbound traffic and di
 | `SessionResumed` | `bool` (issue #43) — whether the last `ConnectAsync` reclaimed the identity this client held before its previous connection, rather than being assigned a fresh one. `false` is the ordinary case and never an error | `MeshClient.cs:156` |
 | `DisconnectAsync` | `Task DisconnectAsync(CancellationToken=default)` — graceful; no `Disconnected` event | `MeshClient.cs:297` |
 | `SendAsync` | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, CancellationToken=default)` — compatibility overload, forwards to the headers overload with `MessageHeaders.Empty` | `MeshClient.cs:371` |
-| `SendAsync` (headers) | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); **throws `ArgumentException` if `headers` contains any of the seven reserved request/reply/acknowledgement/expiry/backpressure keys** (PR #83, extended by PR #84, PR #85 and PR #87); see [Sending headers](#sending-headers) | `MeshClient.cs:380` |
+| `SendAsync` (headers) | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); **throws `ArgumentException` if `headers` contains any of the 13 reserved keys** (request/reply, acknowledgement, expiry, backpressure, priority, trace context ×2, chunk ×3 — see [known-issues.md](known-issues.md) KI-42 for the full, current list); see [Sending headers](#sending-headers) | `MeshClient.cs:652` |
 | `SendAsync` (delivery options) | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, DeliveryOptions options, CancellationToken=default)` — PR #84, extended by PR #87 (issue #30); `DeliveryOptions.None` is identical to the plain overload; `.RequireAck(timeout)` awaits an end-to-end delivery acknowledgement or throws `TimeoutException`; `.AwaitingCapacity()`/`.WithAwaitCapacity()` ask the hub to await room on a saturated recipient queue instead of dropping, see [Backpressure signalling](#backpressure-signalling) | `MeshClient.cs:393` |
 | `SendAsync` (time-to-live) | `Task SendAsync(Guid recipientId, ReadOnlyMemory<byte>, TimeSpan timeToLive, CancellationToken=default)` — PR #85 (issue #29); throws `ArgumentOutOfRangeException` if `timeToLive` is not positive; the message is dropped, not delivered, once it expires, see [Message expiry (time-to-live)](#message-expiry-time-to-live) | `MeshClient.cs:467` |
 | `BroadcastAsync` | `Task BroadcastAsync(ReadOnlyMemory<byte>, CancellationToken=default)` | `MeshClient.cs:580` |
 | `JoinGroupAsync` / `LeaveGroupAsync` | `Task ...(string groupName, CancellationToken=default)` — **optimistic**: `JoinGroupAsync` records membership *before* sending and the hub may still refuse, see [Group membership](#group-membership) | `MeshClient.cs:602` / `:643` |
 | `SendToGroupAsync` | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, CancellationToken=default)` — compatibility overload, forwards to the headers overload with `MessageHeaders.Empty` | `MeshClient.cs:659` |
 | `SendToGroupAsync` (headers) | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); see [Sending headers](#sending-headers) | `MeshClient.cs:668` |
+| `SendToGroupAsync` (priority) | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, MessagePriority priority, CancellationToken=default)` — priority lanes (`ab16567`); `Normal` short-circuits to the headerless overload, anything else takes the header-bearing path; see [Message priority](#message-priority) | `MeshClient.cs:1093-1111` |
+| `SendLargeAsync` | `Task SendLargeAsync(Guid recipientId, ReadOnlyMemory<byte>, MessageHeaders? headers=null, CancellationToken=default)` — chunking (feat #93); requires protocol version 5+ (throws `NotSupportedException` below it); no `DeliveryOptions`/priority/ack support; see [Large-message chunking](#large-message-chunking) | `MeshClient.cs:891-895` |
 | `GetClientIdByNameAsync` | `Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken=default)` | `MeshClient.cs:820` |
 | `RequestAsync` | `Task<ReadOnlyMemory<byte>> RequestAsync(Guid recipientId, ReadOnlyMemory<byte>, TimeSpan timeout, CancellationToken=default)` — PR #83; correlated request/reply over a direct message, see [Request/response (RPC)](#request-response) | `MeshClient.cs:869` |
 | `ReplyAsync` | `Task ReplyAsync(MessageReceivedEventArgs request, ReadOnlyMemory<byte>, CancellationToken=default)` — PR #83; answers a request received via `MessageReceived`, see [Request/response (RPC)](#request-response) | `MeshClient.cs:926` |
@@ -45,6 +47,18 @@ up peers, manages group membership, and raises events for inbound traffic and di
 | `SendRejected` | `event EventHandler<SendRejectedEventArgs>` — the hub dropped a message this client sent because the recipient's outbound queue was full. PR #87 (issue #30); only raised when the hub was constructed with `notifyOnQueueSaturation`, and only for a **direct** send — see [Backpressure signalling](#backpressure-signalling) | `MeshClient.cs:176` |
 | `DisposeAsync` | `ValueTask` — `DisconnectAsync` then disposes the lookup semaphore | `MeshClient.cs:950` |
 
+> **Coordinate caveat, this pass — `MeshClient.cs` grew from roughly 1676 to 2228 lines (+552) and
+> `IMeshClient.cs` from roughly 406 to 491 (+85) across 19 commits (see the freshness narrative at the top
+> of [for-clanker.md](../for-clanker.md) for the full commit list).** Per that narrative's stated scope,
+> this pass re-derived coordinates fresh from the current source only for the rows and sections it
+> actively added or corrected — `SendToGroupAsync` (priority), `SendLargeAsync`, `SendAsync` (headers)'s
+> call site and reserved-key count, the ctor row, and the new [Message priority](#message-priority),
+> [Large-message chunking](#large-message-chunking) and [Distributed tracing](#distributed-tracing)
+> sections below. Every other row and citation in this table and file predates this pass's edits and was
+> **not** re-verified against the doubled file length — treat them as unconfirmed until a dedicated
+> coordinate-hygiene pass re-derives them, consistent with the caveat already established for the older,
+> pre-PR-73 gap this same block documents below.
+>
 > **Coordinate caveat — resolved for PR #73, re-pointed for PR #74, PR #83, PR #84 and PR #85, re-pointed
 > again for PR #87.** Every row in this table, and every `MeshClient.cs`/`IMeshClient.cs` citation in the
 > rest of this file (excluding the `MeshClientReconnector` section below, which this branch does not
@@ -109,7 +123,8 @@ throw `InvalidOperationException("Not connected to a hub.")` unless `Connected`.
    unless currently `Disconnected` (state-specific message otherwise).
 2. Sends `RegistrationRequest` (`[0x04][versionMin][versionMax][nameLen u16 BE][utf8 name][credential]`,
    `MeshClient.cs:214-222`), always advertising `Protocol.MinSupportedVersion`/`MaxSupportedVersion`
-   (`4`/`6` as of issue #43), then awaits one frame.
+   (`4`/`7` as of PR #135/issue #109 — was `4`/`6` as of issue #43, before that a fixed `4`/`4` range),
+   then awaits one frame.
 3. If the reply is `Error`, throws `RegistrationRefusedException` carrying the
    `RegistrationErrorCode` — which now includes `AuthenticationFailed` if the hub's authenticator
    rejected the credential, and (unchanged) `UnsupportedProtocolVersion` if the hub could not negotiate a
@@ -125,8 +140,8 @@ throw `InvalidOperationException("Not connected to a hub.")` unless `Connected`.
 6. On **any** failure it cleans up (disposes the transport), resets to `Disconnected` (and
    `NegotiatedProtocolVersion` to `0`), logs, and rethrows.
 
-> **Session resumption is attempted *after* the receive loop is started, and never fails a connect
-> (issue #43).** Two things follow from where it sits:
+> <a id="session-resumption"></a>**Session resumption is attempted *after* the receive loop is started,
+> and never fails a connect (issue #43).** Two things follow from where it sits:
 > - **It cannot be a second blocking read.** The hub's `SessionResumed` reply is not necessarily the
 >   next frame on the wire — registration may have already queued offline-store messages (issue #28) for
 >   this name, and those arrive first. So the reply is handled in the dispatch ladder like any other
@@ -141,6 +156,20 @@ throw `InvalidOperationException("Not connected to a hub.")` unless `Connected`.
 > the whole point of it. It is dropped only when it is spent, or when connecting under a different name,
 > for which it is meaningless. Note the ordering trap: the token to *present* is captured before the
 > registration reply overwrites it with the newly issued one.
+>
+> **On a version-7+ hub (PR #135, issue #109), a successful resume also repopulates `JoinedGroups` from
+> the group memberships the hub actually restored.** `RestoreJoinedGroupsFromResumedReply`
+> (`MeshClient.cs:511-553`), called from the receive loop at the resume-reply branch
+> (`MeshClient.cs:1793`), parses a `[groupCount u16 BE]([nameLength u16 BE][utf8 name])×groupCount` block
+> appended to the `SessionResumed` reply below the token when `NegotiatedProtocolVersion >=
+> Protocol.SessionResumedGroupsMinVersion` (`7`) — see [protocol.md](protocol.md#session-resumption). A
+> connection negotiated at exactly version `6` gets the byte-identical pre-#109 reply shape with no group
+> block at all, and `JoinedGroups` is left exactly as it was before the resume. **This is a full replace,
+> not a merge** — `_joinedGroups.Clear()` runs before repopulating, so any group the client believed it
+> was in that the hub does not report (one joined mid-disconnect that never landed, or one restored
+> server-side but then refused on re-authorisation) is silently dropped from the client's own view. A
+> truncated or malformed group block leaves `JoinedGroups` untouched rather than partially applying it.
+> See [known-issues.md](known-issues.md) KI-59 and KI-60.
 
 > **`NegotiatedProtocolVersion` is read by the send path since PR #74 (issue #32), not just logged.**
 > `SendAsync`'s headers overload — and, since PR #83, `RequestAsync`/`ReplyAsync`, and since PR #84 the
@@ -766,6 +795,157 @@ just after expiring. Either way the effect on the application is identical — t
 - **`SendAsync(..., TimeSpan, ...)` bypasses `ThrowIfReservedHeaderKeyPresent`** the same way
   `RequestAsync`, `ReplyAsync` and the `RequireAck` branch do — it is a legitimate producer of the
   `"mesh.expires-at"` key via `SendCoreAsync` directly, not the public headers overload.
+
+### Message priority
+
+`MessagePriority` (`Messages/MessagePriority.cs:13-32`) is a three-value enum — `Normal = 0` (default),
+`Low = 1`, `High = 2` — landed in commit `ab16567`, chronologically **before** the PR #90 documentation
+baseline (`2a2377d`) but never reconciled until this pass; see the freshness narrative at the top of
+[for-clanker.md](../for-clanker.md). It controls which of the hub's three outbound lanes a delivered
+frame is queued on — see [hub.md](hub.md#priority-lanes) for the queue mechanics.
+
+Two ways to set it, both **only take effect on a header-bearing send**:
+
+```csharp
+// Direct message, via DeliveryOptions:
+await alice.SendAsync(bobId, payload, DeliveryOptions.AtPriority(MessagePriority.High));
+await alice.SendAsync(bobId, payload,
+    DeliveryOptions.RequireAck(TimeSpan.FromSeconds(5)).WithPriority(MessagePriority.High)); // composes
+
+// Group message, via the dedicated overload:
+await alice.SendToGroupAsync("ops-alerts", payload, MessagePriority.High);
+```
+
+- `DeliveryOptions.Priority` (`DeliveryOptions.cs:65`), `DeliveryOptions.AtPriority(MessagePriority)`
+  (`:113-117`, factory) and `options.WithPriority(MessagePriority)` (`:143-146`, combinator — composes
+  with `RequireAck`/`AwaitingCapacity`/`WithAwaitCapacity`) reach priority through the existing
+  `SendAsync(Guid, ReadOnlyMemory<byte>, DeliveryOptions, CancellationToken)` overload. The `mesh.priority`
+  header (`MessagePriorityHeaderKeys.cs:17`) is only written when `Priority != Normal`
+  (`MeshClient.cs:666,679-683,714-718`), so a `Normal`-priority send costs nothing extra on the wire.
+- `SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, MessagePriority priority, CancellationToken=default)`
+  (`MeshClient.cs:1093-1111`) short-circuits to the plain, headerless overload when `priority == Normal`
+  (`:1099-1103`); anything else builds a single-header `MessageHeaders` and forwards to the header-bearing
+  `SendToGroupAsync` (`:1105-1110`).
+
+**Contract & gotchas:**
+- **There is no direct-send `MessagePriority` convenience overload** — `SendAsync(recipientId, payload,
+  priority)` does not exist; a direct send always goes through `DeliveryOptions.AtPriority`/`WithPriority`.
+- **`BroadcastAsync` has no priority parameter or overload at all, and the plain `SendToGroupAsync`
+  overload is always `Normal`.** Only a header-bearing send — a direct send via `DeliveryOptions`, or the
+  three-argument `SendToGroupAsync` above — ever reaches the hub's priority-aware routing path; a
+  broadcast is always enqueued at `Normal` regardless of anything the sender does. See
+  [known-issues.md](known-issues.md) KI-54.
+- **`SendLargeAsync` (chunking, below) has no priority parameter.** Every chunk of a large transfer lands
+  on the `Normal` lane.
+- `MessagePriorityHeaderKeys.Priority` (`"mesh.priority"`) is one of the 13 reserved header keys
+  (`ReservedHeaderKeys`, `MeshClient.cs:840-866`) — an application cannot set it directly through the
+  headers overload; `ThrowIfReservedHeaderKeyPresent` throws `ArgumentException`.
+
+### Distributed tracing
+
+Opt-in, `System.Diagnostics.Activity`-based trace propagation, landed by feat #92 — genuinely opt-in in
+the .NET sense: with no `ActivityListener` subscribed to `MeshworxActivitySource.Instance`
+(`Diagnostics/MeshworxActivitySource.cs:29,45-48`), `StartActivity` returns `null`, nothing is allocated,
+and the wire is byte-identical to a build with no tracing support at all.
+
+```csharp
+using var listener = new ActivityListener
+{
+    ShouldListenTo = source => source.Name == "AdamSalisbury.Meshworx",
+    Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+};
+ActivitySource.AddActivityListener(listener);
+
+await alice.SendAsync(bobId, payload); // now carries traceparent/tracestate automatically
+```
+
+- Two named activities: `Meshworx.Send` (`Producer`, started in `SendCoreAsync` for direct sends and in
+  the shared `SendToGroupAsync` implementation for group sends) and `Meshworx.Receive` (`Consumer`,
+  started by `StartReceiveActivity`, `MeshClient.cs:1127-1137`).
+- Header keys are the **literal W3C names**, deliberately not `mesh.`-prefixed — `TraceContextHeaderKeys.TraceParent`
+  = `"traceparent"`, `.TraceState` = `"tracestate"` (`Messages/TraceContextHeaderKeys.cs:26,32`) — so a
+  bridge into HTTP/gRPC/a message broker sees the standard names. Both are among the 13 reserved header
+  keys; an application cannot set either directly.
+- `WithTraceContext` (`MeshClient.cs:1164-1192`) degrades gracefully rather than failing a send: returns
+  the caller's headers untouched if the connection negotiated below `Protocol.HeaderEnvelopeMinVersion`
+  (tracing never breaks delivery on an older peer), or if there is no context to propagate (no listener
+  **and** no ambient `Activity.Current`). When there is a context, it merges `traceparent`/`tracestate`
+  into a **copy** of the caller's immutable headers.
+- **The hub never reads or writes these headers** — they pass through unchanged like any header the hub
+  has no behaviour for, the same as every "fourth route" capability before priority/chunking made the hub
+  partially aware of specific keys.
+
+**Contract & gotchas:**
+- **A malformed inbound `traceparent` never breaks delivery** — `TryExtractTraceContext` is total and
+  simply fails to parse, so the receiver starts a fresh trace instead of throwing.
+- **Only header-bearing deliveries get a receive-side span.** Plain/headerless `DeliverMessage`/
+  `DeliverGroupMessage` frames get no `Meshworx.Receive` activity at all — in practice this only matters
+  when there was never an active trace to continue in the first place, since `WithTraceContext` always
+  makes an actively-traced send header-bearing.
+- **`SendLargeAsync` (chunking, below) produces one `Meshworx.Send` span per chunk, not one span for the
+  whole logical transfer** — there is no chunk-transfer-level span.
+- Tracing tests run in a dedicated, non-parallel xUnit collection
+  (`src/Tests/AdamSalisbury.Meshworx.UnitTests/MeshClientTracingTests.cs:23-27`) because `ActivityListener`
+  registration is process-wide and would otherwise perturb timing-sensitive tests elsewhere in the suite —
+  follow the same isolation if you add tests that register a listener.
+
+### Large-message chunking
+
+`SendLargeAsync(Guid recipientId, ReadOnlyMemory<byte> message, MessageHeaders? headers=null,
+CancellationToken cancellationToken=default)` (`IMeshClient.cs:270-274`, implementation
+`MeshClient.cs:891-895`), added by feat #93, splits a payload across multiple chunked frames so it is not
+bound by `SendAsync`'s ordinary 1 MiB frame cap. Requires protocol version 5+ — throws
+`NotSupportedException` below it, the same header-envelope requirement `SendAsync(..., MessageHeaders,
+...)` has. **Every call chunks, regardless of size** — there is no size threshold; a 1-byte message via
+`SendLargeAsync` still becomes exactly one chunk. Ordinary `SendAsync` is never auto-chunked: a payload
+exceeding the frame cap sent via `SendAsync` still throws `ArgumentException` from the framer.
+
+```csharp
+byte[] file = await File.ReadAllBytesAsync(path);
+await alice.SendLargeAsync(bobId, file);
+// Bob's MessageReceived fires once, with the whole reassembled payload — chunking is invisible to the
+// receiving application except for latency and, on failure, silence (see gotchas below).
+```
+
+**How it works:**
+- Chunk body size is bounded by `MaxChunkBodySize = StreamFramer.MaxPayloadSize -
+  ChunkFrameOverheadReserve` (`MeshClient.cs:87-88`; the 4 KiB reserve covers the message type, recipient
+  id, header-length prefix, the three chunk headers and room for the caller's own headers). `chunkCount =
+  ceil(message.Length / MaxChunkBodySize)`, floored at 1 for an empty payload. Throws `ArgumentException`
+  if the message would need more than `ChunkHeaderKeys.MaxChunksPerMessage` (4096) chunks.
+- Each chunk is an ordinary header-bearing send carrying three reserved keys
+  (`Messages/ChunkHeaderKeys.cs`): `Id` (`"mesh.chunk.id"`, a fresh `Guid.NewGuid()` per `SendLargeAsync`
+  call, GUID "D" format), `Index` (`"mesh.chunk.index"`, zero-based) and `Count`
+  (`"mesh.chunk.count"`). **The hub has no awareness of chunking at all** — it routes each chunk as an
+  ordinary opaque header-bearing frame; reassembly is purely an endpoint concern.
+- Recipient-side reassembly is `ChunkReassembler` (`ChunkReassembler.cs`), not thread-safe by design —
+  only ever touched from the single-threaded receive loop. Chunks are placed by their declared `index`, so
+  out-of-order delivery reassembles correctly. Transfers are keyed by `(senderId, messageId)`, so
+  concurrent large sends — even several from the same sender to the same recipient — interleave safely.
+  Bounded by `maxReassemblyBytes` (default 64 MiB, `DefaultMaxReassemblyBytes`,
+  `ChunkReassembler.cs:23`) and `chunkTransferTimeout` (default 1 minute, `DefaultTransferTimeout`,
+  `:26`), both overridable via the `MeshClient` constructor.
+- On a completed reassembly, the three chunk headers are stripped from the delivered `MessageHeaders`
+  before `MessageReceived` fires (`ChunkHeaderKeys.WithoutChunkHeaders`, added by the PR #134/issue #107
+  fix, `MeshClient.cs:1615`) — a subscriber sees exactly the headers passed to `SendLargeAsync`, nothing
+  internal leaks through. On disconnect, `MeshClient` clears every in-flight transfer
+  (`_reassembler.Clear()`, `MeshClient.cs:631,1934`); a reconnect starts fresh.
+
+**Contract & gotchas:**
+- **Failure is silent to the sender, on every failure mode** — a budget breach, a duplicate/inconsistent
+  chunk index, or an idle-transfer timeout all discard the transfer with no notification back to the
+  sender (`IMeshClient.cs:256-260` documents this explicitly). `SendLargeAsync` takes no `DeliveryOptions`
+  and cannot be combined with `RequireAck`. See [known-issues.md](known-issues.md) KI-56.
+- **No priority support** — every chunk lands on the `Normal` lane (see [Message priority](#message-priority)
+  above), regardless of any priority the logical transfer might deserve.
+- **Each chunk still costs a full outbound-queue slot on the recipient** — a large transfer at ~1 MiB
+  chunks against the hub's 1024-slot-per-client outbound queue capacity can consume a meaningful fraction
+  of it for the duration of delivery.
+- The three chunk header keys are among the 13 reserved keys — an application cannot set
+  `mesh.chunk.id`/`.index`/`.count` directly; they were **not** originally reserved (PR #93's first
+  landing), and a completed reassembly used to leave them on the delivered headers unstripped — both
+  closed by the PR #134/issue #107 fix described above. If you handle raw headers anywhere in application
+  code, do not assume every `mesh.*` key you might see was always guarded this way.
 
 ### `GetClientIdByNameAsync` — the correlated lookup
 

@@ -61,28 +61,33 @@ reserved vocabulary within any `MessageHeaders` an application constructs. `Corr
 [client.md](client.md#request-response) and [known-issues.md](known-issues.md) KI-42/KI-43.
 
 `DeliveryOptions` (`readonly struct`, `IEquatable<DeliveryOptions>`, `DeliveryOptions.cs`, namespace
-`AdamSalisbury.Meshworx` — **not** `.Messages` — added by PR #84, extended by PR #87, issue #30) —
-controls whether `IMeshClient.SendAsync(Guid, ReadOnlyMemory<byte>, DeliveryOptions, CancellationToken)`
-waits for an end-to-end delivery acknowledgement and/or asks the hub to await capacity on a saturated
-recipient queue instead of dropping. Three ways to obtain one, plus a combinator:
+`AdamSalisbury.Meshworx` — **not** `.Messages` — added by PR #84, extended by PR #87 (issue #30) and by
+priority lanes (`ab16567`)) — controls whether `IMeshClient.SendAsync(Guid, ReadOnlyMemory<byte>,
+DeliveryOptions, CancellationToken)` waits for an end-to-end delivery acknowledgement, asks the hub to
+await capacity on a saturated recipient queue instead of dropping, and/or sets the message's
+`MessagePriority`. Four properties (`RequireAcknowledgement`, `AcknowledgementTimeout`, `AwaitCapacity`,
+`Priority`), all read-only, `Equals`/`GetHashCode` covering all four; four ways to obtain or modify one:
 
 - `DeliveryOptions.None` — a `static readonly` field, and the struct's own default value (so
   `default(DeliveryOptions)` and a caller who never touches this type both get fire-and-forget, identical
-  to every other `SendAsync` overload).
+  to every other `SendAsync` overload). `Priority` defaults to `MessagePriority.Normal`.
 - `DeliveryOptions.RequireAck(TimeSpan timeout)` — a static factory; throws `ArgumentOutOfRangeException`
   synchronously if `timeout` is not positive. Sets `RequireAcknowledgement`/`AcknowledgementTimeout`.
 - `DeliveryOptions.AwaitingCapacity()` — a static factory (PR #87); sets `AwaitCapacity` without requiring
   an acknowledgement. Does **not** make the `SendAsync` call itself wait — see
   [client.md](client.md#backpressure-signalling).
+- `DeliveryOptions.AtPriority(MessagePriority priority)` — a static factory (priority lanes); sets
+  `Priority` alone. See [client.md](client.md#message-priority).
 - `options.WithAwaitCapacity()` — an instance method (PR #87) returning a copy of `options` with
   `AwaitCapacity` also set, so `RequireAck(...).WithAwaitCapacity()` gets both. Read its own remarks (and
   [known-issues.md](known-issues.md) KI-49) before combining the two — their timeouts are independent.
-- There is no public constructor; `RequireAcknowledgement`, `AcknowledgementTimeout` and `AwaitCapacity`
-  are all read-only properties, and `Equals`/`GetHashCode` cover all three.
+- `options.WithPriority(MessagePriority priority)` — an instance method (priority lanes) returning a copy
+  of `options` with `Priority` also set, so it composes with `RequireAck(...)`/`AwaitingCapacity()`.
+- There is no public constructor.
 
-See [client.md](client.md#delivery-acknowledgement) and [client.md](client.md#backpressure-signalling)
-for how to use it, and [known-issues.md](known-issues.md) KI-44/KI-45/KI-48/KI-49 for what its guarantees
-do and do not cover.
+See [client.md](client.md#delivery-acknowledgement), [client.md](client.md#backpressure-signalling) and
+[client.md](client.md#message-priority) for how to use it, and [known-issues.md](known-issues.md)
+KI-44/KI-45/KI-48/KI-49/KI-54 for what its guarantees do and do not cover.
 
 `DeliveryAcknowledgementHeaderKeys` (`internal static class`,
 `Messages/DeliveryAcknowledgementHeaderKeys.cs`, added by PR #84) — the acknowledgement counterpart to
@@ -119,6 +124,7 @@ throws `ArgumentException` if a caller's own `MessageHeaders` contains it — se
 |---|---|---|
 | `DisconnectReason` | `RemoteDisconnect` (hub sent `Disconnect`), `ConnectionLost` (transport failed / idle timeout) | `Messages/DisconnectReason.cs` |
 | `RegistrationErrorCode : byte` | `DuplicateClientName=0x01`, `UnsupportedProtocolVersion=0x02`, `ClientNameTooLong=0x03`, `HubAtCapacity=0x04`, `AuthenticationFailed=0x05` (namespace `AdamSalisbury.Meshworx`) | `RegistrationErrorCode.cs` |
+| `MessagePriority` | `Normal=0` (default), `Low=1`, `High=2` (namespace `AdamSalisbury.Meshworx.Messages`, `ab16567`) | `Messages/MessagePriority.cs:13-32` |
 
 `RegistrationErrorCode`'s byte values are wire values — see [protocol.md](protocol.md). Do not renumber
 without a version bump. `AuthenticationFailed` was added with protocol version 3; it is the code the hub
@@ -310,15 +316,30 @@ catch (RegistrationRefusedException ex) { /* ex.ErrorCode tells you why */ }
 ## Internal types (not visible outside the assembly, listed for orientation)
 
 - `enum MessageType : byte` (`Messages/MessageType.cs`) — the opcodes; see [protocol.md](protocol.md).
-- `static class Protocol` (`Messages/Protocol.cs`) — `MinSupportedVersion = 4`, `MaxSupportedVersion = 6`
-  (raised from `4` to `5` by PR #74, issue #32, to admit the header envelope, and from `5` to `6` by
-  issue #43 to admit session resumption; replaced the single `Version = 3` constant in PR #73; see
+- `static class Protocol` (`Messages/Protocol.cs`) — `MinSupportedVersion = 4`, `MaxSupportedVersion = 7`
+  (raised from `4` to `5` by PR #74, issue #32, to admit the header envelope; from `5` to `6` by issue #43
+  to admit session resumption; and from `6` to `7` by PR #135/issue #109 to admit restored-group reporting
+  on a resume; replaced the single `Version = 3` constant in PR #73; see
   [protocol.md](protocol.md#versioning)), `HeaderEnvelopeMinVersion = 5` (added by PR #74 — the lowest
-  negotiated version at which `MessageHeaders` may be used), `SessionResumptionMinVersion = 6` and
-  `SessionTokenLength = 32` (issue #43), `MaxClientNameLength = 256`.
+  negotiated version at which `MessageHeaders` may be used), `SessionResumptionMinVersion = 6`,
+  `SessionResumedGroupsMinVersion = 7` (PR #135/issue #109), `SessionTokenLength = 32` (issue #43),
+  `MaxClientNameLength = 256`.
 - `static class HeaderEnvelope` (`Messages/HeaderEnvelope.cs`, added by PR #74) — encodes/decodes the
   header-block wire format for the four header-bearing opcodes; see
   [protocol.md](protocol.md#message-headers).
+- The reserved `MessageHeaders` well-known key classes, all `internal` — `RequestReplyHeaderKeys`,
+  `DeliveryAcknowledgementHeaderKeys`, `MessageExpiryHeaderKeys`, `BackpressureHeaderKeys`,
+  `MessagePriorityHeaderKeys`, `TraceContextHeaderKeys`, `ChunkHeaderKeys` (all `Messages/*.cs`) — 13 keys
+  in total across the seven classes; see [known-issues.md](known-issues.md) KI-42 for the complete,
+  current list and [protocol.md](protocol.md#message-headers) for the wire shapes.
+- `sealed class PriorityOutboundQueue` (`PriorityOutboundQueue.cs`, `ab16567`) — the three-lane
+  (high/normal/low) outbound queue every `ClientConnection` uses; see [hub.md](hub.md#priority-lanes).
+- `sealed class ClientRateLimiter`, `TokenBucket`, `SharedLogThrottle` (`RateLimiting/*.cs`, issue #69) —
+  per-connection inbound admission control; see [hub.md](hub.md#rate-limiting).
+- `sealed class ChunkReassembler` (`ChunkReassembler.cs`, feat #93) — client-side reassembly for
+  `SendLargeAsync`; see [client.md](client.md#large-message-chunking).
+- `static class MeshworxActivitySource` (`Diagnostics/MeshworxActivitySource.cs`, feat #92) — the shared
+  `ActivitySource` for distributed tracing; see [client.md](client.md#distributed-tracing).
 - `MeshHub.ClientConnection` (carries `NegotiatedProtocolVersion`, PR #74; since PR #87,
   `IsAwaitingCapacity`/`BeginAwaitingCapacity()`/`CapacityWaitScope` for the backpressure-parking
   mechanism; and, since issue #43, a **settable** `Id` via `Rebind` plus `SessionTokenHash`),

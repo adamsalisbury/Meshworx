@@ -764,7 +764,7 @@ actual `MeshHub`/`MeshClient`.
 
 ## `UnixSocketTransport` / `UnixSocketTransportListener` — `Transport/Unix/`
 
-Added by PR #81 (issue #20), **not yet merged to `main`**. Fast, portless, same-host inter-process
+Added by PR #81 (issue #20, merged). Fast, portless, same-host inter-process
 communication on Linux and macOS — a sidecar process, or a multi-process desktop/daemon layout, where
 opening a loopback TCP port is unnecessary overhead. Framing is the [shared `StreamFramer`
 helper](#shared-framing-streamframer-internal--transportframingstreamframercs18) — identical to
@@ -883,7 +883,7 @@ await client.ConnectAsync(await UnixSocketTransport.ConnectAsync("/tmp/meshworx.
 
 ## `NamedPipeTransport` / `NamedPipeTransportListener` — `Transport/NamedPipes/`
 
-Added by PR #81 (issue #20), **not yet merged to `main`**. The Windows equivalent of
+Added by PR #81 (issue #20, merged). The Windows equivalent of
 `UnixSocketTransport` — same-host inter-process communication with no open port — for the platform that
 has no `AF_UNIX`-over-a-path convention Meshworx relies on elsewhere.  **Windows-only**: every entry
 point throws `PlatformNotSupportedException` on any other operating system, checked **before** any
@@ -1004,7 +1004,7 @@ await client.ConnectAsync(await NamedPipeTransport.ConnectAsync("meshworx"), "Al
 
 ## `QuicTransport` / `QuicTransportListener` — `Transport/Quic/`
 
-Added by PR #82 (issue #21), **not yet merged to `main`**. Reaches a hub over QUIC
+Added by PR #82 (issue #21, merged). Reaches a hub over QUIC
 (`System.Net.Quic`) using a single bidirectional `QuicStream` per connection — TLS 1.3 and faster
 connection setup versus TCP, and (unlike TCP) resistance to head-of-line blocking at the transport
 level, though Meshworx does not exploit multi-stream multiplexing today (see
