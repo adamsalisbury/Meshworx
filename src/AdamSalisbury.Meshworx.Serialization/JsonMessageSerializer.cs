@@ -19,6 +19,13 @@ namespace AdamSalisbury.Meshworx.Serialization;
 /// <see cref="JsonSerializerOptions.TypeInfoResolver"/> if the consuming application is trimmed or
 /// ahead-of-time compiled.
 /// </para>
+/// <para>
+/// Polymorphism is one-directional. An interface- or abstract-declared value serializes against its own
+/// runtime type, so nothing on the concrete instance is lost — see <see cref="Serialize{TValue}"/>. There
+/// is no equivalent on the way back in: reconstructing the right concrete type from a body alone needs a
+/// type discriminator this codec does not set up, so deserializing into an interface or abstract type
+/// throws rather than guessing — see <see cref="Deserialize{TValue}"/>.
+/// </para>
 /// </remarks>
 public sealed class JsonMessageSerializer : IMessageSerializer
 {
@@ -49,14 +56,31 @@ public sealed class JsonMessageSerializer : IMessageSerializer
     public string ContentType => "application/json";
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// When <typeparamref name="TValue"/> is an interface or an abstract type, this serializes against
+    /// <c>value.GetType()</c> — the value's runtime type — rather than the declared one.
+    /// <see cref="System.Text.Json"/> otherwise writes only the contract of the declared type, silently
+    /// dropping every member the concrete instance carries beyond it.
+    /// </remarks>
     public ReadOnlyMemory<byte> Serialize<TValue>(TValue value)
     {
+        if (value is not null && (typeof(TValue).IsInterface || typeof(TValue).IsAbstract))
+        {
+            return JsonSerializer.SerializeToUtf8Bytes(value, value.GetType(), _options);
+        }
+
         return JsonSerializer.SerializeToUtf8Bytes(value, _options);
     }
 
     /// <inheritdoc/>
     /// <exception cref="JsonException">
     /// The body is not valid JSON, or does not describe a <typeparamref name="TValue"/>.
+    /// </exception>
+    /// <exception cref="NotSupportedException">
+    /// <typeparamref name="TValue"/> is an interface or an abstract type.
+    /// <see cref="System.Text.Json"/> cannot construct an instance of one without a configured
+    /// polymorphic contract, which this codec does not set up — deserializing to such a type is a
+    /// caller error, not a malformed body, so it is not wrapped as <see cref="JsonException"/>.
     /// </exception>
     public TValue? Deserialize<TValue>(ReadOnlySpan<byte> data)
     {
