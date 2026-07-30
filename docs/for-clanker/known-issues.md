@@ -74,6 +74,8 @@ the risk to a change, not a claim that the code is defective.
 | KI-63 | Topic subscription count and pattern length are unbounded per client | `MeshClient.cs:1133-1167`, `TopicSubscriptionTrie.cs:251`, `MeshHub.cs:4168` | medium (availability) | open — **by design**, mirrors a pre-existing, never-flagged gap in group membership; see full entry below |
 | KI-64 | `MeshClientReconnector` does not restore topic subscriptions after a reconnect | `MeshClientReconnector.cs`, `MeshClient.cs:1680-1683`, `MeshHub.cs:3772-3780` | medium (correctness) | open — **deliberately out of scope** for issue #37; see full entry below |
 | KI-65 | Session resumption restores group membership but never topic subscriptions | `MeshHub.cs` (`ResumableSession`, `MakeSessionDormant`, `ResumeSessionAsync`), `MeshClient.cs` (`RestoreJoinedGroupsFromResumedReply`, no topic counterpart) | medium (correctness) | open — **deliberately deferred**, a disclosed follow-up beyond issue #37; see full entry below |
+| KI-66 | No authorisation hook exists for client attributes or `FindClientsAsync`, mirroring KI-62's gap for topics | `MeshHub.cs` (`SetClientAttributes`, `SendFindClientsResponseAsync`), `IMeshClient.cs` (`UpdateAttributesAsync`, `FindClientsAsync`) | medium (security) | open — **by design**; extends KI-2/KI-62; see full entry below |
+| KI-67 | An empty-criteria `FindClientsAsync` query lets any connected client enumerate every other connected client's id and name — a new capability `GetClientIdByNameAsync` never offered | `MeshHub.cs` (`SendFindClientsResponseAsync`), `IMeshClient.cs` (`FindClientsAsync`) | medium (security) | open — **by design**, disclosed in issue #38's PR; see full entry below |
 
 ---
 
@@ -1987,6 +1989,41 @@ above assert; see [hub.md](hub.md#session-resumption) for where they're describe
   counterpart called from `ResumeSessionAsync`, and — if the client should learn what survived, mirroring
   the group block — a further protocol widening the same shape `SessionResumedGroupsMinVersion` was for
   groups. Do not silently reuse `SessionResumedGroupsMinVersion` itself for an unrelated payload change.
+
+### KI-66 — No authorisation hook exists for client attributes or FindClientsAsync
+- **Where:** `MeshHub.cs` — the `SetClientAttributes` and `FindClientsRequest` dispatch branches (no
+  callback of any kind is consulted in either); `SetClientAttributes` (private method, applies a decoded
+  bag unconditionally once it passes the bound checks); `SendFindClientsResponseAsync` (answers any
+  query from any connection). `IMeshClient.cs` — `UpdateAttributesAsync`/`FindClientsAsync`'s own XML docs
+  do not mention an authorisation seam because there isn't one.
+- **Severity:** medium (security), open — by design, extends KI-2/KI-62.
+- **Why it bites:** exactly the same shape as KI-62's gap for topics, one feature later: any client
+  admitted by the (itself optional, KI-2) `ClientAuthenticator` may set any attribute bag on itself — there
+  is nothing preventing a client claiming `role=admin` it has no real claim to — and may query anyone
+  else's attributes with no restriction on who is asking or what they are asking for. Groups have an
+  optional `GroupAuthoriser`; topics and client attributes both have nothing resembling one.
+- **What to do:** treat client attributes, like topics, as inside the trust boundary the
+  `ClientAuthenticator` establishes rather than a boundary of their own. An application that needs
+  attribute values to be trustworthy (an actual role claim, not a self-asserted one) must validate or
+  assign them at the application layer — for example, deriving `role` from the authenticator's own
+  decision and calling `UpdateAttributesAsync` with a hub-trusted value immediately after
+  `ConnectAsync`, rather than letting the connecting client set its own.
+
+### KI-67 — An empty-criteria FindClientsAsync query enumerates every connected client
+- **Where:** `MeshHub.cs` (`SendFindClientsResponseAsync`, which applies `MatchesQuery` — vacuously true
+  for an empty `AttributeQuery` — against every entry in `_clients.Values`); `IMeshClient.cs`
+  (`FindClientsAsync`'s own XML docs state "an empty query matches everyone currently connected").
+- **Severity:** medium (security), open — by design, disclosed in issue #38's PR rather than found later.
+- **Why it bites:** before issue #38, a client could only resolve a name it already knew via
+  `GetClientIdByNameAsync` — there was no way to discover a name it did not already have. An empty-criteria
+  `FindClientsAsync` call is a full directory enumeration primitive: every connected client's id and name,
+  with no prior knowledge required. Combined with KI-2's open-admission default and KI-66's lack of an
+  authorisation seam, any peer that can complete the connection handshake can list the entire connected
+  population.
+- **What to do:** a deployment where client identity (name, or presence at all) is sensitive must not rely
+  on obscurity — assume any connected client can enumerate every other one. Restrict who may connect at
+  all via `ClientAuthenticator` (KI-2) rather than trying to hide the directory once connected; there is no
+  narrower control available today.
 
 ---
 
