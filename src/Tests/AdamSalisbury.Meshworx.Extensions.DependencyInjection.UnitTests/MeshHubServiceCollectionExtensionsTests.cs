@@ -1,3 +1,4 @@
+using System.Reflection;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -67,6 +68,42 @@ public sealed class MeshHubServiceCollectionExtensionsTests
         Assert.Null(options.MaxConnectionsPerRemoteEndpoint);
         Assert.False(options.NotifyOnQueueSaturation);
         Assert.Null(options.BackpressureAwaitTimeout);
+        Assert.Null(options.OfflineStore);
+        Assert.Null(options.OfflineStoreTimeout);
+        Assert.Null(options.SessionResumptionWindow);
+        Assert.Null(options.MaxInboundMessagesPerSecond);
+        Assert.Null(options.MaxInboundBytesPerSecond);
+        Assert.Null(options.MaxFanOutMessagesPerSecond);
+        Assert.Null(options.MaxFanOutDeliveriesPerSecond);
+    }
+
+    /// <summary>
+    /// Every settable <see cref="MeshHubOptions"/> property that is not itself DI plumbing (<see cref="MeshHubOptions.Port"/>
+    /// and <see cref="MeshHubOptions.Listener"/> together stand in for the listener parameter) must name a
+    /// real <see cref="MeshHub"/> constructor parameter, and every constructor parameter beyond the logger
+    /// and listener must have a matching options property — so that a future MeshHub constructor addition
+    /// fails this test rather than silently becoming unreachable through AddMeshHub (issue #99).
+    /// </summary>
+    [Fact]
+    public void MeshHubOptions_EveryProperty_MirrorsAMeshHubConstructorParameter()
+    {
+        ParameterInfo[] constructorParameters = typeof(MeshHub)
+            .GetConstructors()
+            .Single()
+            .GetParameters();
+
+        var expectedParameterNames = constructorParameters
+            .Select(p => p.Name!)
+            .Where(name => name is not ("logger" or "listener"))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var actualPropertyNames = typeof(MeshHubOptions)
+            .GetProperties()
+            .Select(p => p.Name)
+            .Where(name => name is not ("Port" or "Listener"))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        Assert.Equal(expectedParameterNames, actualPropertyNames);
     }
 
     [Fact(Timeout = 1000)]

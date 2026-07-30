@@ -97,6 +97,13 @@ public static class MeshHubServiceCollectionExtensions
         var logger = serviceProvider.GetRequiredService<ILogger<MeshHub>>();
         ITransportListener listener = options.Listener ?? new TcpTransportListener(options.Port);
 
+        // An explicitly configured store takes priority over one resolved from the container, matching
+        // how Listener above overrides the built-in TcpTransportListener rather than being layered with
+        // it. Falls back to whatever IOfflineStore the container has, if any — the natural shape for a
+        // store that is itself a service with its own dependencies, rather than a value the caller sets
+        // directly on the options.
+        IOfflineStore? offlineStore = options.OfflineStore ?? serviceProvider.GetService<IOfflineStore>();
+
         return new MeshHub(
             logger,
             listener,
@@ -110,6 +117,13 @@ public static class MeshHubServiceCollectionExtensions
             options.GroupAuthorisationTimeout,
             options.MaxConnectionsPerRemoteEndpoint,
             options.NotifyOnQueueSaturation,
-            options.BackpressureAwaitTimeout);
+            options.BackpressureAwaitTimeout,
+            offlineStore,
+            options.OfflineStoreTimeout,
+            options.SessionResumptionWindow,
+            options.MaxInboundMessagesPerSecond,
+            options.MaxInboundBytesPerSecond,
+            options.MaxFanOutMessagesPerSecond,
+            options.MaxFanOutDeliveriesPerSecond);
     }
 }

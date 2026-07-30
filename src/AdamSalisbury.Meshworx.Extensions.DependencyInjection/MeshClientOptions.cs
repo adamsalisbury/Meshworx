@@ -102,4 +102,16 @@ public sealed class MeshClientOptions
     /// </summary>
     /// <remarks>Only used when <see cref="UseReconnector"/> is <see langword="true"/>. Defaults to <see langword="true"/>.</remarks>
     public bool RestoreGroupMembership { get; set; } = true;
+
+    /// <summary>
+    /// Gets or sets the maximum total size, in bytes, the client holds while reassembling a chunked
+    /// message from an unauthenticated or partially-trusted peer.
+    /// </summary>
+    public int? MaxReassemblyBytes { get; set; }
+
+    /// <summary>
+    /// Gets or sets how long the client waits for the remaining chunks of a message before abandoning
+    /// the reassembly and freeing what it was holding.
+    /// </summary>
+    public TimeSpan? ChunkTransferTimeout { get; set; }
 }

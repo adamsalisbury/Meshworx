@@ -1,3 +1,4 @@
+using System.Reflection;
 using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.Transport.InMemory;
 using Microsoft.Extensions.Configuration;
@@ -59,6 +60,76 @@ public sealed class MeshClientServiceCollectionExtensionsTests
         Assert.Equal(1, options.MaxSendAttempts);
         Assert.False(options.UseReconnector);
         Assert.True(options.RestoreGroupMembership);
+        Assert.Null(options.SendRetryDelay);
+        Assert.Null(options.ReconnectRetryDelay);
+        Assert.Null(options.ReconnectConnectTimeout);
+        Assert.Null(options.MaxReassemblyBytes);
+        Assert.Null(options.ChunkTransferTimeout);
+    }
+
+    /// <summary>
+    /// Every settable <see cref="MeshClientOptions"/> property that is not itself DI plumbing
+    /// (<see cref="MeshClientOptions.ClientName"/>, <see cref="MeshClientOptions.Host"/>,
+    /// <see cref="MeshClientOptions.Port"/>, <see cref="MeshClientOptions.TransportFactory"/> and
+    /// <see cref="MeshClientOptions.UseReconnector"/> together stand in for the constructor parameters
+    /// those five replace) must name a real <see cref="MeshClient"/> or
+    /// <see cref="MeshClientReconnector"/> constructor parameter, and every constructor parameter beyond
+    /// that plumbing must have a matching options property — so that a future constructor addition to
+    /// either type fails this test rather than silently becoming unreachable through AddMeshClient
+    /// (issue #99).
+    /// </summary>
+    [Fact]
+    public void MeshClientOptions_EveryProperty_MirrorsAMeshClientOrMeshClientReconnectorConstructorParameter()
+    {
+        ParameterInfo[] clientParameters = typeof(MeshClient).GetConstructors().Single().GetParameters();
+        ParameterInfo[] reconnectorParameters =
+            typeof(MeshClientReconnector).GetConstructors().Single().GetParameters();
+
+        // logger is supplied from the container on both constructors, not carried on the options.
+        // timeProvider is a testing seam with no options surface anywhere in this package.
+        var excludedClientParameters = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "logger", "timeProvider",
+        };
+
+        // client/clientName/transportFactory are supplied by AddMeshClient itself — the client it just
+        // built, the clientName argument, and the TransportFactory/default-transport closure — not read
+        // from the options a second time.
+        var excludedReconnectorParameters = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "client", "clientName", "transportFactory", "logger",
+        };
+
+        // MeshClientReconnector's retryDelay/connectTimeout would collide in meaning with a hypothetical
+        // MeshClient-side retry/connect setting, so the options properties disambiguate with a
+        // Reconnect-prefixed name; every other parameter name matches its property name exactly.
+        var reconnectorParameterRenames = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["retryDelay"] = "ReconnectRetryDelay",
+            ["connectTimeout"] = "ReconnectConnectTimeout",
+        };
+
+        var expectedPropertyNames = clientParameters
+            .Select(p => p.Name!)
+            .Where(name => !excludedClientParameters.Contains(name))
+            .Concat(reconnectorParameters
+                .Select(p => p.Name!)
+                .Where(name => !excludedReconnectorParameters.Contains(name))
+                .Select(name => reconnectorParameterRenames.GetValueOrDefault(name, name)))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var diPlumbingPropertyNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "ClientName", "Host", "Port", "TransportFactory", "UseReconnector",
+        };
+
+        var actualPropertyNames = typeof(MeshClientOptions)
+            .GetProperties()
+            .Select(p => p.Name)
+            .Where(name => !diPlumbingPropertyNames.Contains(name))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        Assert.Equal(expectedPropertyNames, actualPropertyNames);
     }
 
     [Fact(Timeout = 1000)]
