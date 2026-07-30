@@ -208,6 +208,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // and the concurrency model.
     private readonly TopicSubscriptionTrie _topics = new();
 
+    // Whether SubscribePresence is honoured at all — see the constructor's own remarks on enablePresence
+    // for why this defaults to false.
+    private readonly bool _enablePresence;
+
+    // Every connection currently subscribed to presence, keyed by its own id so a disconnect or explicit
+    // unsubscribe can remove it in O(1) without touching every connected client. Deliberately a set of
+    // subscribers rather than a flag scanned across _clients.Values on every connect/disconnect: presence
+    // deltas fire on ordinary connection churn, not on an occasional directory query, so the cost of
+    // finding "who cares about this" has to scale with the subscriber count, not the whole population.
+    private readonly ConcurrentDictionary<Guid, ClientConnection> _presenceSubscribers = new();
+
     // Guards every lifecycle field below. Starting, stopping and disposing can each be called from a
     // different thread, so each of them takes the state it needs in one critical section and then works
     // only from locals: reading a field twice is what let a concurrent stop null the token source
@@ -381,6 +392,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// the other defaults already implied, so a hub built with every default unchanged sees no new
     /// limit in practice. Pass <see cref="int.MaxValue"/> to opt out.
     /// </param>
+    /// <param name="enablePresence">
+    /// Whether a client may subscribe to presence — being pushed a notification whenever another client
+    /// joins or leaves the hub. Defaults to <see langword="false"/>: a
+    /// <see cref="MessageType.SubscribePresence"/> frame is silently refused (no error, no subscription,
+    /// no notification ever sent) unless this is set. Some deployments must not let a connected client
+    /// learn who else is connected; this keeps that the default rather than something an integrator has
+    /// to remember to lock down. Enabling it exposes the same directory information
+    /// <see cref="IMeshClient.FindClientsAsync"/> and <see cref="IMeshClient.GetClientsAsync"/> already
+    /// do to any client that can complete the connection handshake — see
+    /// <see cref="ClientAuthenticator"/> to restrict who that is.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
@@ -401,7 +423,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         int? maxInboundMessagesPerSecond = null,
         int? maxInboundBytesPerSecond = null,
         int? maxFanOutMessagesPerSecond = null,
-        int? maxFanOutDeliveriesPerSecond = null)
+        int? maxFanOutDeliveriesPerSecond = null,
+        bool enablePresence = false)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -534,6 +557,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _maxInboundBytesPerSecond = maxInboundBytesPerSecond ?? DefaultMaxInboundBytesPerSecond;
         _maxFanOutMessagesPerSecond = maxFanOutMessagesPerSecond ?? DefaultMaxFanOutMessagesPerSecond;
         _maxFanOutDeliveriesPerSecond = maxFanOutDeliveriesPerSecond ?? DefaultMaxFanOutDeliveriesPerSecond;
+        _enablePresence = enablePresence;
 
         if (authenticator is not null)
         {
@@ -1316,7 +1340,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             await transport.SendAsync(responsePayload, cancellationToken).ConfigureAwait(false);
 
             _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
-            RaiseClientEvent(ClientConnected, clientId, clientName, nameof(ClientConnected));
+            RaiseClientEvent(ClientConnected, clientId, clientName, nameof(ClientConnected), PresenceChangeType.Joined);
 
             clientCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             sendLoopTask = SendLoopAsync(connection, clientCts);
@@ -1570,6 +1594,23 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     await SendFindClientsResponseAsync(
                         transport, correlationId, data.AsMemory(5), clientCts.Token).ConfigureAwait(false);
                 }
+                else if (connection.NegotiatedProtocolVersion >= Protocol.PresenceMinVersion
+                    && (MessageType)data[0] == MessageType.SubscribePresence)
+                {
+                    if (_enablePresence)
+                    {
+                        _presenceSubscribers[connection.Id] = connection;
+                    }
+
+                    // A hub not built with presence enabled refuses the subscription silently, exactly
+                    // as an unrecognised opcode would — no error frame, and no notification is ever
+                    // pushed, whether or not the client believes it subscribed.
+                }
+                else if (connection.NegotiatedProtocolVersion >= Protocol.PresenceMinVersion
+                    && (MessageType)data[0] == MessageType.UnsubscribePresence)
+                {
+                    _presenceSubscribers.TryRemove(connection.Id, out _);
+                }
                 else if (data.Length >= 5
                     && (MessageType)data[0] == MessageType.ClientLookupRequest)
                 {
@@ -1666,6 +1707,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
                 RemoveFromAllGroups(connection);
                 RemoveFromAllTopics(connection);
+                _presenceSubscribers.TryRemove(connection.Id, out _);
                 _clientNames.TryRemove(connection.Name, out _);
 
                 // connection.Id, not the local clientId: a resume that rebinds the connection and
@@ -1709,7 +1751,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             {
                 await connection.DisposeAsync().ConfigureAwait(false);
                 _logger.LogInformation("Client {ClientId} disconnected", clientId);
-                RaiseClientEvent(ClientDisconnected, connection.Id, connection.Name, nameof(ClientDisconnected));
+                RaiseClientEvent(ClientDisconnected, connection.Id, connection.Name, nameof(ClientDisconnected), PresenceChangeType.Left);
             }
             else
             {
@@ -1929,25 +1971,71 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Raises the in-process <see cref="ClientConnected"/>/<see cref="ClientDisconnected"/> event and
+    /// pushes a matching presence delta to every subscribed connection, at exactly the same moment for
+    /// both — presence is the wire-level equivalent of these events for a remote subscriber, so it fires
+    /// on precisely the events they do, including the paired fire a session resume produces for the
+    /// discarded fresh identity and the reclaimed one.
+    /// </summary>
     private void RaiseClientEvent(
         EventHandler<ClientConnectionEventArgs>? handler,
         Guid clientId,
         string clientName,
-        string eventName)
+        string eventName,
+        PresenceChangeType presenceChangeType)
     {
-        if (handler is null)
+        if (handler is not null)
+        {
+            try
+            {
+                handler(this, new ClientConnectionEventArgs { ClientId = clientId, ClientName = clientName });
+            }
+            catch (Exception ex)
+            {
+                // A throwing subscriber must not fault the client handler task. Callback boundary.
+                _logger.LogError(ex, "A {EventName} handler threw an exception", eventName);
+            }
+        }
+
+        PushPresenceDelta(clientId, clientName, presenceChangeType);
+    }
+
+    /// <summary>
+    /// Pushes a <see cref="MessageType.PresenceChanged"/> frame to every presence-subscribed connection
+    /// except the one the delta is about.
+    /// </summary>
+    private void PushPresenceDelta(Guid clientId, string clientName, PresenceChangeType changeType)
+    {
+        if (!_enablePresence || _presenceSubscribers.IsEmpty)
         {
             return;
         }
 
-        try
+        byte[] nameBytes = Encoding.UTF8.GetBytes(clientName);
+        var payload = new byte[1 + 1 + 16 + 2 + nameBytes.Length];
+        payload[0] = (byte)MessageType.PresenceChanged;
+        payload[1] = (byte)changeType;
+        clientId.TryWriteBytes(payload.AsSpan(2, 16));
+        BinaryPrimitives.WriteUInt16BigEndian(payload.AsSpan(18, 2), (ushort)nameBytes.Length);
+        nameBytes.CopyTo(payload, 20);
+
+        foreach (ClientConnection subscriber in _presenceSubscribers.Values)
         {
-            handler(this, new ClientConnectionEventArgs { ClientId = clientId, ClientName = clientName });
-        }
-        catch (Exception ex)
-        {
-            // A throwing subscriber must not fault the client handler task. Callback boundary.
-            _logger.LogError(ex, "A {EventName} handler threw an exception", eventName);
+            if (subscriber.Id == clientId)
+            {
+                // A client never needs telling about its own connection or disconnection.
+                continue;
+            }
+
+            if (!subscriber.OutboundQueue.TryEnqueue(MessagePriority.Normal, payload))
+            {
+                _logger.LogWarning(
+                    "Outbound queue for {SubscriberId} is full, presence delta for {ClientId} dropped",
+                    subscriber.Id,
+                    clientId);
+                _messagesDroppedCounter.Add(1, QueueFullDropTag);
+            }
         }
     }
 
@@ -2777,8 +2865,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         // changed which id it answers to. A subscriber tracking connected ids would otherwise leak
         // freshId for ever and later receive an unmatched ClientDisconnected for resumedId at teardown.
         // Raising this pair keeps every id balanced without inventing a new event type.
-        RaiseClientEvent(ClientDisconnected, freshId, connection.Name, nameof(ClientDisconnected));
-        RaiseClientEvent(ClientConnected, resumedId, connection.Name, nameof(ClientConnected));
+        RaiseClientEvent(ClientDisconnected, freshId, connection.Name, nameof(ClientDisconnected), PresenceChangeType.Left);
+        RaiseClientEvent(ClientConnected, resumedId, connection.Name, nameof(ClientConnected), PresenceChangeType.Joined);
 
         IReadOnlyList<string> restoredGroups = await RestoreGroupMembershipAsync(
             connection, session.Groups, cancellationToken).ConfigureAwait(false);

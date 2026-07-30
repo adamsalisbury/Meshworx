@@ -11,7 +11,7 @@ internal static class Protocol
     /// The highest wire-protocol version this build of the hub and client supports, and the version
     /// advertised when there is no reason to negotiate down.
     /// </summary>
-    internal const byte MaxSupportedVersion = 9;
+    internal const byte MaxSupportedVersion = 10;
 
     /// <summary>
     /// The lowest negotiated protocol version at which the structured message-header envelope
@@ -55,6 +55,14 @@ internal static class Protocol
     /// so a connection negotiated below it refuses to send or act on them.
     /// </summary>
     internal const byte ClientAttributesMinVersion = 9;
+
+    /// <summary>
+    /// The lowest negotiated protocol version at which presence subscription
+    /// (<see cref="MessageType.SubscribePresence"/>, <see cref="MessageType.UnsubscribePresence"/> and
+    /// <see cref="MessageType.PresenceChanged"/>) may be used. Follows the same rationale as
+    /// <see cref="TopicPubSubMinVersion"/> and <see cref="ClientAttributesMinVersion"/>.
+    /// </summary>
+    internal const byte PresenceMinVersion = 10;
 
     /// <summary>
     /// The length, in bytes, of a session resumption token. 32 bytes of cryptographically secure

@@ -259,6 +259,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     public event EventHandler<TopicMessageReceivedEventArgs>? TopicMessageReceived;
 
     /// <inheritdoc/>
+    public event EventHandler<PresenceChangedEventArgs>? PresenceChanged;
+
+    /// <inheritdoc/>
     public event EventHandler<GroupJoinRefusedEventArgs>? GroupJoinRefused;
 
     /// <inheritdoc/>
@@ -1624,6 +1627,43 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public Task<IReadOnlyList<ClientDescriptor>> GetClientsAsync(CancellationToken cancellationToken = default)
+    {
+        return FindClientsAsync(new AttributeQuery([]), cancellationToken);
+    }
+
+    /// <inheritdoc/>
+    public async Task SubscribePresenceAsync(CancellationToken cancellationToken = default)
+    {
+        ITransport transport = GetConnectedTransport();
+        RequirePresenceSupport(NegotiatedProtocolVersion);
+
+        byte[] payload = [(byte)MessageType.SubscribePresence];
+        await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public async Task UnsubscribePresenceAsync(CancellationToken cancellationToken = default)
+    {
+        ITransport transport = GetConnectedTransport();
+        RequirePresenceSupport(NegotiatedProtocolVersion);
+
+        byte[] payload = [(byte)MessageType.UnsubscribePresence];
+        await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void RequirePresenceSupport(byte negotiatedProtocolVersion)
+    {
+        if (negotiatedProtocolVersion < Protocol.PresenceMinVersion)
+        {
+            throw new NotSupportedException(
+                $"Presence requires a negotiated protocol version of at least "
+                + $"{Protocol.PresenceMinVersion}; this connection negotiated version "
+                + $"{negotiatedProtocolVersion}.");
+        }
+    }
+
+    /// <inheritdoc/>
     public Task<ReadOnlyMemory<byte>> RequestAsync(
         Guid recipientId,
         ReadOnlyMemory<byte> message,
@@ -2200,6 +2240,34 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     else
                     {
                         _logger.LogWarning("Discarding a malformed find-clients response");
+                    }
+                }
+                else if (data.Length >= 20
+                    && (MessageType)data[0] == MessageType.PresenceChanged)
+                {
+                    var changeType = (PresenceChangeType)data[1];
+                    var presenceClientId = new Guid(data.AsSpan(2, 16));
+                    int nameLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(18, 2));
+
+                    if (data.Length >= 20 + nameLength
+                        && changeType is PresenceChangeType.Joined or PresenceChangeType.Left)
+                    {
+                        string presenceClientName = Encoding.UTF8.GetString(data.AsSpan(20, nameLength));
+
+                        try
+                        {
+                            PresenceChanged?.Invoke(this, new PresenceChangedEventArgs
+                            {
+                                ClientId = presenceClientId,
+                                ClientName = presenceClientName,
+                                ChangeType = changeType,
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            // Callback boundary — a throwing subscriber must not halt the loop.
+                            _logger.LogError(ex, "A PresenceChanged handler threw an exception");
+                        }
                     }
                 }
                 else if (data.Length >= 17

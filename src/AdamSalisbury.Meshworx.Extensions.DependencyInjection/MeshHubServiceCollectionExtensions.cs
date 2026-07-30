@@ -130,6 +130,7 @@ public static class MeshHubServiceCollectionExtensions
             options.MaxInboundMessagesPerSecond,
             options.MaxInboundBytesPerSecond,
             options.MaxFanOutMessagesPerSecond,
-            options.MaxFanOutDeliveriesPerSecond);
+            options.MaxFanOutDeliveriesPerSecond,
+            options.EnablePresence);
     }
 }
