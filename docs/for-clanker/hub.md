@@ -646,10 +646,18 @@ total-1024-per-client budget a plain single-lane queue always had (`OutboundQueu
 
 **Drain order is strict-with-burst-caps, not pure strict-priority and not weighted-fair** (`ReadAllAsync`,
 `PriorityOutboundQueue.cs:229-292`): up to 8 high-priority frames (`HighBurstLimit`), then up to 4
-normal-priority frames (`NormalBurstLimit`), then **exactly one** low-priority frame, looping immediately
-if anything was serviced. This guarantees the low lane a turn every cycle regardless of high/normal
-backlog size — it cannot be starved indefinitely — at the cost of a small, bounded latency: a high-priority
-frame arriving mid-burst can wait up to `NormalBurstLimit` (4) frames before being recognised, never more.
+normal-priority frames (`NormalBurstLimit`), then **exactly one** low-priority frame if one is waiting —
+checked unconditionally every cycle, regardless of how much of the normal burst actually ran — looping
+immediately if anything was serviced. This guarantees the low lane a turn every cycle regardless of
+high/normal backlog size — it cannot be starved indefinitely — at the cost of a small, bounded latency: a
+high-priority frame that arrives just after that cycle's high-lane check has already passed can wait
+behind the rest of the normal burst *and* the one guaranteed low-lane frame before the loop comes back
+round to recheck the high lane — up to `NormalBurstLimit + 1` (5) frames, not `NormalBurstLimit` (4) as
+the source's own XML doc comment on `ReadAllAsync` states (`PriorityOutboundQueue.cs:220-227` — that
+comment addresses only the normal burst and omits the low lane's guaranteed per-cycle slot; this is a
+pre-existing imprecision in the source comment, out of scope for a docs-only pass to change, filed as
+[issue #138](https://github.com/adamsalisbury/Meshworx/issues/138) instead). Never more than that:
+one high-priority frame arriving mid-cycle adds at most one extra pass before it is serviced.
 
 **`ReadPriority(ReadOnlyMemory<byte> headerBlock)` (`MeshHub.cs:2970-2981`) is the one narrow,
 single-key `HeaderEnvelope.TryReadValue` scan that decides the lane** — the same "read one key, don't

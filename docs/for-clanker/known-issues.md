@@ -66,7 +66,7 @@ the risk to a change, not a claim that the code is defective.
 | KI-55 | A rate-limited inbound drop is invisible to `meshworx.hub.messages.dropped` — no dropped-reason tag exists for it | `MeshHub.cs` (`ClientRateLimiter` call sites) | low–medium (observability) | open — **not a defect, a metrics gap**; see full entry below |
 | KI-56 | `SendLargeAsync`'s chunked transfer fails silently to the sender on any reassembly failure | `ChunkReassembler.cs`, `MeshClient.cs` | medium (correctness) | open — **by design**, consistent with KI-1/KI-5; see full entry below |
 | KI-57 | `JsonMessageSerializer`'s runtime-type resolution for an interface-/abstract-declared value is top-level only, and throws under an incomplete AOT `JsonSerializerContext` | `AdamSalisbury.Meshworx.Serialization/JsonMessageSerializer.cs` | medium (correctness / AOT) | open — **by design**; see full entry below |
-| KI-58 | `mesh.contract.method` is the bare method name, not contract-qualified — two different `[MeshContract]` interfaces sharing a method name are ambiguous on the wire | `AdamSalisbury.Meshworx.Contracts.Generator/MeshContractGenerator.cs`, `ContractHeaderKeys.cs` | medium (correctness), pending fix | open — **PR #120 (open, unmerged) fixes this** by qualifying the header value; see [contracts.md](contracts.md#pending-pr-120) |
+| KI-58 | `mesh.contract.method` is the bare method name, not contract-qualified — two different `[MeshContract]` interfaces sharing a method name are ambiguous on the wire; the header is also unauthenticated, same as `mesh.reply`/`mesh.ack` | `AdamSalisbury.Meshworx.Contracts.Generator/MeshContractGenerator.cs`, `ContractHeaderKeys.cs` | medium (correctness), pending fix; spoofability is by design, see KI-43/KI-46 | open — **PR #120 (open, unmerged) fixes the collision** by qualifying the header value; see [contracts.md](contracts.md#pending-pr-120) |
 | KI-59 | `SessionResumed`'s reported-groups block silently drops an over-length group name and caps the reported count at 65,535 | `MeshHub.cs` (`BuildReportableGroupNameBytes`) | low (correctness, by design) | open — **by design**, added after a security review; the membership itself is still restored, only the reply's ability to name it is bounded; see full entry below |
 | KI-60 | `MeshClient.RestoreJoinedGroupsFromResumedReply` fully replaces `JoinedGroups` rather than merging — a group the client believed it was in that the hub does not report is silently discarded | `MeshClient.cs:511-553` | low (correctness) | open — **by design**; the hub's report is authoritative; see full entry below |
 
@@ -1763,6 +1763,18 @@ above assert; see [hub.md](hub.md#session-resumption) for where they're describe
   (`Task<T>`-declared) contract method's generated proxy does not actually reach a matching dispatcher on
   `main` today — only a `Task`-returning (one-way) contract method's proxy path is exercised end-to-end
   correctly right now.
+- **`mesh.contract.method` is also unauthenticated — the same standing gap as KI-43/KI-46, one step
+  further.** `mesh.contract.method` is not among the 13 keys `ReservedHeaderKeys` rejects (see KI-42) —
+  the hub never inspects it and nothing stops an application constructing a
+  `SendMessageWithHeaders`/`SendAsync(..., MessageHeaders, ...)` call by hand and setting it directly, with
+  no generated proxy involved at all. A dispatcher wired to `MessageReceived` cannot distinguish a frame a
+  real proxy produced from one any connected peer hand-built, and unlike KI-43/KI-46 — where a spoofed
+  header only ever causes a genuine message to be silently dropped — a spoofed `mesh.contract.method`
+  causes the dispatcher to **deserialize the frame's body as that method's argument type and invoke the
+  registered implementation with it**. Do not wire a `[MeshContract]` dispatcher to a hub whose connected
+  peers are not already fully trusted; this is the same "the transport boundary is the trust boundary"
+  principle the rest of this docs set assumes throughout, made explicit here because contract dispatch is
+  the one place where the consequence is an actual method call rather than a matched or dropped header.
 
 ### KI-59 — `SessionResumed`'s reported-groups block silently drops an over-length group name and caps the reported count at 65,535
 - **Where:** `MeshHub.BuildReportableGroupNameBytes` — the oversized-name guard drops a group whose UTF-8

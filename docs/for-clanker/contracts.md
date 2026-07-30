@@ -97,6 +97,14 @@ Six current diagnostics, all `DiagnosticSeverity.Error` (`ContractDiagnostics.cs
 - **Only an interface may carry `[MeshContract]`** — a class, a nested type, or a generic interface is
   rejected or unsupported by the generator (see diagnostics above; PR #120 adds three more covering
   generic/base-interface/nested cases not caught today).
+- **`mesh.contract.method` is unauthenticated — any connected peer can hand-build it, not just a real
+  generated proxy.** It is not one of the 13 reserved keys (see above), so nothing stops application code
+  calling `SendAsync(recipientId, body, headers, cancellationToken)` directly with an arbitrary
+  `mesh.contract.method` value and body — no proxy required. A dispatcher wired to `MessageReceived`
+  cannot tell that apart from a frame a real proxy produced, and reacts by **deserializing the body as
+  that method's argument type and invoking the implementation**, not merely by matching or dropping a
+  header the way KI-43 (`mesh.reply`) and KI-46 (`mesh.ack`) do. Only wire a `[MeshContract]` dispatcher to
+  a hub whose connected peers are already fully trusted. See [known-issues.md](known-issues.md) KI-58.
 
 <a id="pending-pr-120"></a>
 
