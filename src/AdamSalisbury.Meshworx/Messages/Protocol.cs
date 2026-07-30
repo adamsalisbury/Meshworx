@@ -11,7 +11,7 @@ internal static class Protocol
     /// The highest wire-protocol version this build of the hub and client supports, and the version
     /// advertised when there is no reason to negotiate down.
     /// </summary>
-    internal const byte MaxSupportedVersion = 6;
+    internal const byte MaxSupportedVersion = 7;
 
     /// <summary>
     /// The lowest negotiated protocol version at which the structured message-header envelope
@@ -27,6 +27,15 @@ internal static class Protocol
     /// reply carries none, so the frame stays byte-identical to what earlier versions produced.
     /// </summary>
     internal const byte SessionResumptionMinVersion = 6;
+
+    /// <summary>
+    /// The lowest negotiated protocol version at which a <see cref="MessageType.SessionResumed"/> reply
+    /// carries the group memberships the hub restored for the reclaimed identity. A connection negotiated
+    /// below this version still has those memberships restored on the hub — <see
+    /// cref="SessionResumptionMinVersion"/> alone governs that — it just learns nothing about them from the
+    /// reply itself, so the reply stays byte-identical to what version 6 produces.
+    /// </summary>
+    internal const byte SessionResumedGroupsMinVersion = 7;
 
     /// <summary>
     /// The length, in bytes, of a session resumption token. 32 bytes of cryptographically secure

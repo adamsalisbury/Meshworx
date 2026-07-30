@@ -1,5 +1,7 @@
+using System.Buffers.Binary;
 using System.Collections;
 using System.Reflection;
+using System.Text;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.UnitTests.Fixtures;
 using Moq;
@@ -240,6 +242,92 @@ public sealed class MeshHubSessionResumptionTests
 
         returning.Disconnect();
         member.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A version-7 connection's <see cref="MessageType.SessionResumed"/> reply lists the group
+    /// memberships the hub just restored, so the client can repopulate its own record without re-joining
+    /// anything (issue #109).
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task ResumeSession_VersionSevenClient_ReplyListsTheRestoredGroups()
+    {
+        var fixture = new MeshHubFixture(sessionResumptionWindow: Window);
+        await fixture.Hub.StartAsync();
+
+        var worker = await fixture.RegisterMultiMessageClientAsync("Worker", versionMax: 0x07);
+        byte[] token = ExtractToken(worker.RegistrationResponse);
+        worker.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("news"));
+        worker.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("alerts"));
+        await AwaitLookupBarrierAsync(fixture, worker, "Worker");
+
+        var disconnected = new TaskCompletionSource();
+        void OnDisconnected(object? _, ClientConnectionEventArgs e)
+        {
+            if (e.ClientName == "Worker")
+            {
+                disconnected.TrySetResult();
+            }
+        }
+
+        fixture.Hub.ClientDisconnected += OnDisconnected;
+        worker.Disconnect();
+        await disconnected.Task.WaitAsync(WaitTimeout);
+        fixture.Hub.ClientDisconnected -= OnDisconnected;
+
+        var returning = await fixture.RegisterMultiMessageClientAsync("Worker", versionMax: 0x07);
+        var frames = new FrameRecorder(returning.Transport);
+        returning.EnqueueMessage(MeshHubFixture.CreateResumeSessionRequest(token));
+
+        byte[] resumed = await frames.WaitForAsync(f => f[0] == 0x17).WaitAsync(WaitTimeout);
+
+        Assert.Equal(["alerts", "news"], ExtractRestoredGroups(resumed).Order(StringComparer.Ordinal));
+
+        returning.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A connection that only negotiated version 6 gets the reply shape version 6 always produced — no
+    /// group block appended — even though the hub genuinely restored a group membership behind it. The
+    /// membership is real; this connection simply has no way to be told about it from this frame
+    /// (issue #109).
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task ResumeSession_VersionSixClient_ReplyStaysTheOriginalShapeDespiteRestoredGroups()
+    {
+        var fixture = new MeshHubFixture(sessionResumptionWindow: Window);
+        await fixture.Hub.StartAsync();
+
+        var worker = await fixture.RegisterMultiMessageClientAsync("Worker", versionMax: 0x06);
+        byte[] token = ExtractToken(worker.RegistrationResponse);
+        worker.EnqueueMessage(MeshHubFixture.CreateJoinGroupRequest("news"));
+        await AwaitLookupBarrierAsync(fixture, worker, "Worker");
+
+        var disconnected = new TaskCompletionSource();
+        void OnDisconnected(object? _, ClientConnectionEventArgs e)
+        {
+            if (e.ClientName == "Worker")
+            {
+                disconnected.TrySetResult();
+            }
+        }
+
+        fixture.Hub.ClientDisconnected += OnDisconnected;
+        worker.Disconnect();
+        await disconnected.Task.WaitAsync(WaitTimeout);
+        fixture.Hub.ClientDisconnected -= OnDisconnected;
+
+        var returning = await fixture.RegisterMultiMessageClientAsync("Worker", versionMax: 0x06);
+        var frames = new FrameRecorder(returning.Transport);
+        returning.EnqueueMessage(MeshHubFixture.CreateResumeSessionRequest(token));
+
+        byte[] resumed = await frames.WaitForAsync(f => f[0] == 0x17).WaitAsync(WaitTimeout);
+
+        Assert.Equal(1 + 16 + 2 + Protocol.SessionTokenLength, resumed.Length);
+
+        returning.Disconnect();
         await fixture.Hub.StopAsync();
     }
 
@@ -533,9 +621,31 @@ public sealed class MeshHubSessionResumptionTests
 
     private static byte[] ExtractToken(byte[] registrationResponse)
     {
-        int tokenLength = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(
-            registrationResponse.AsSpan(18, 2));
+        int tokenLength = BinaryPrimitives.ReadUInt16BigEndian(registrationResponse.AsSpan(18, 2));
         return registrationResponse.AsSpan(20, tokenLength).ToArray();
+    }
+
+    /// <summary>
+    /// Decodes the group-membership block a version-7-or-later <see cref="MessageType.SessionResumed"/>
+    /// reply carries after its resumption token.
+    /// </summary>
+    private static List<string> ExtractRestoredGroups(byte[] sessionResumedFrame)
+    {
+        int tokenLength = BinaryPrimitives.ReadUInt16BigEndian(sessionResumedFrame.AsSpan(17, 2));
+        int offset = 19 + tokenLength;
+        int groupCount = BinaryPrimitives.ReadUInt16BigEndian(sessionResumedFrame.AsSpan(offset, 2));
+        offset += 2;
+
+        var groups = new List<string>(groupCount);
+        for (int i = 0; i < groupCount; i++)
+        {
+            int nameLength = BinaryPrimitives.ReadUInt16BigEndian(sessionResumedFrame.AsSpan(offset, 2));
+            offset += 2;
+            groups.Add(Encoding.UTF8.GetString(sessionResumedFrame.AsSpan(offset, nameLength)));
+            offset += nameLength;
+        }
+
+        return groups;
     }
 
     /// <summary>
