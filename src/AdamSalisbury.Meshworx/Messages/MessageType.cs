@@ -26,4 +26,10 @@ internal enum MessageType : byte
     ResumeSession = 0x16,
     SessionResumed = 0x17,
     SessionResumeRefused = 0x18,
+    SubscribeTopic = 0x19,
+    UnsubscribeTopic = 0x1A,
+    PublishTopicMessage = 0x1B,
+    PublishTopicMessageWithHeaders = 0x1C,
+    DeliverTopicMessage = 0x1D,
+    DeliverTopicMessageWithHeaders = 0x1E,
 }

@@ -62,6 +62,16 @@ public interface IMeshClient : IAsyncDisposable
     IReadOnlyCollection<string> JoinedGroups { get; }
 
     /// <summary>
+    /// Gets the topic patterns this client has subscribed to.
+    /// </summary>
+    /// <remarks>
+    /// The collection reflects the <see cref="SubscribeAsync"/> and <see cref="UnsubscribeAsync"/> calls
+    /// made on the current connection and is cleared when the client disconnects. It is a snapshot taken
+    /// when the property is read.
+    /// </remarks>
+    IReadOnlyCollection<string> SubscribedTopics { get; }
+
+    /// <summary>
     /// Connects to a hub via the specified transport and completes the registration handshake.
     /// </summary>
     /// <remarks>
@@ -373,6 +383,81 @@ public interface IMeshClient : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Subscribes to a topic pattern, so that a message published to any topic the pattern matches is
+    /// delivered to this client.
+    /// </summary>
+    /// <remarks>
+    /// A pattern is a dot-separated hierarchy that may use two reserved wildcard segments: <c>+</c>
+    /// matches exactly one segment, and <c>#</c> matches the remainder of the hierarchy and may only
+    /// appear as the pattern's final segment. <c>orders.+.created</c> matches <c>orders.eu.created</c>
+    /// but not <c>orders.eu.region.created</c>; <c>orders.#</c> matches both.
+    /// <para>
+    /// Subscribing to a pattern this client is already subscribed to has no effect. Unlike
+    /// <see cref="JoinGroupAsync"/>, there is no authorisation hook and no refusal: this returns once the
+    /// hub has accepted the request, and the pattern appears in <see cref="SubscribedTopics"/> from that
+    /// moment.
+    /// </para>
+    /// </remarks>
+    /// <param name="pattern">The topic pattern to subscribe to.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="ArgumentException"><paramref name="pattern"/> is not a valid pattern.</exception>
+    Task SubscribeAsync(string pattern, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Unsubscribes from a topic pattern, so that the client no longer receives messages published to a
+    /// topic it matches.
+    /// </summary>
+    /// <remarks>
+    /// Unsubscribing from a pattern the client is not subscribed to has no effect.
+    /// </remarks>
+    /// <param name="pattern">The topic pattern to unsubscribe from.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    Task UnsubscribeAsync(string pattern, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Publishes a message to a topic. Every client subscribed to a pattern that matches the topic
+    /// receives it, whether or not the publisher is itself subscribed to anything.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget, mirroring
+    /// <see cref="SendToGroupAsync(string, ReadOnlyMemory{byte}, CancellationToken)"/>. Recipients
+    /// receive it through <see cref="TopicMessageReceived"/>, which carries the concrete topic the
+    /// message was published to.
+    /// </remarks>
+    /// <param name="topic">The concrete topic to publish to. Cannot contain a wildcard segment.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="ArgumentException"><paramref name="topic"/> is not a valid concrete topic.</exception>
+    Task PublishAsync(string topic, ReadOnlyMemory<byte> message, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Publishes a message to a topic, carrying structured headers alongside the opaque message body.
+    /// </summary>
+    /// <remarks>
+    /// Identical to <see cref="PublishAsync(string, ReadOnlyMemory{byte}, CancellationToken)"/> but for
+    /// the headers. Passing <see cref="MessageHeaders.Empty"/> is equivalent to calling the overload
+    /// without headers — no header block is written to the wire, so it costs nothing extra.
+    /// </remarks>
+    /// <param name="topic">The concrete topic to publish to. Cannot contain a wildcard segment.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="headers">The structured headers to attach to the message.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="ArgumentException"><paramref name="topic"/> is not a valid concrete topic.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="headers"/> is non-empty but the hub negotiated a protocol version that predates
+    /// the header envelope.
+    /// </exception>
+    Task PublishAsync(
+        string topic,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders headers,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Queries the hub for a client's Id based on its name
     /// </summary>
     /// <param name="name">The name of the client for which the Id should be retrieved.</param>
@@ -527,6 +612,12 @@ public interface IMeshClient : IAsyncDisposable
     /// <see cref="MessageReceived"/>, the event carries the name of the group the message was sent to.
     /// </summary>
     event EventHandler<GroupMessageReceivedEventArgs> GroupMessageReceived;
+
+    /// <summary>
+    /// Raised when a message published to a topic this client is subscribed to is received. Unlike
+    /// <see cref="MessageReceived"/>, the event carries the concrete topic the message was published to.
+    /// </summary>
+    event EventHandler<TopicMessageReceivedEventArgs> TopicMessageReceived;
 
     /// <summary>
     /// Raised when the hub refuses this client membership of a group it asked to join, because the hub's

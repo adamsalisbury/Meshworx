@@ -275,6 +275,151 @@ public sealed class MeshIntegrationTests
     }
 
     /// <summary>
+    /// A message published to a topic is delivered to every client subscribed to a pattern that matches
+    /// it, including a wildcard subscription, over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_TopicMessageReachesWildcardSubscribers()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var publisher = CreateClient();
+        await using var subscriber = CreateClient();
+
+        await publisher.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Publisher");
+        await subscriber.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Subscriber");
+
+        var receivedTcs = new TaskCompletionSource<TopicMessageReceivedEventArgs>();
+        subscriber.TopicMessageReceived += (_, e) => receivedTcs.TrySetResult(e);
+
+        await subscriber.SubscribeAsync("orders.+.created");
+        // A lookup round-trip on the subscriber's connection is a barrier: the hub processes a client's
+        // frames in order, so the subscription is guaranteed applied by the time this returns.
+        await subscriber.GetClientIdByNameAsync("Publisher");
+
+        byte[] payload = Encoding.UTF8.GetBytes("order 42");
+        await publisher.PublishAsync("orders.eu.created", payload);
+
+        TopicMessageReceivedEventArgs received = await receivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(publisher.Id, received.SenderId);
+        Assert.Equal("orders.eu.created", received.Topic);
+        Assert.Equal(payload, received.Data.ToArray());
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A publisher need not itself be subscribed to anything to publish, and a topic with no matching
+    /// subscribers is simply dropped rather than erroring.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_PublishWithNoMatchingSubscribers_IsANoOp()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var publisher = CreateClient();
+        await publisher.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Publisher");
+
+        await publisher.PublishAsync("orders.eu.created", Encoding.UTF8.GetBytes("order 42"));
+
+        // Prove the hub is still healthy after a match-less publish: a direct message round trip still
+        // works on the same connection.
+        await using var other = CreateClient();
+        await other.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Other");
+        Guid? found = await publisher.GetClientIdByNameAsync("Other");
+        Assert.Equal(other.Id, found);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// After a client unsubscribes from a topic pattern, it no longer receives messages published to a
+    /// topic that pattern used to match, over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_UnsubscribedClientNoLongerReceivesTopicMessages()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var publisher = CreateClient();
+        await using var subscriber = CreateClient();
+
+        await publisher.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Publisher");
+        await subscriber.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Subscriber");
+
+        var directTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        subscriber.MessageReceived += (_, e) => directTcs.TrySetResult(e);
+        var topicTcs = new TaskCompletionSource<TopicMessageReceivedEventArgs>();
+        subscriber.TopicMessageReceived += (_, e) => topicTcs.TrySetResult(e);
+
+        await subscriber.SubscribeAsync("orders.#");
+        await subscriber.UnsubscribeAsync("orders.#");
+        await subscriber.GetClientIdByNameAsync("Publisher"); // barrier: subscribe and unsubscribe applied
+
+        // Publish to the now-unsubscribed topic, then send a direct message. The hub processes the
+        // publisher's frames in order, so receiving the direct message proves the topic message was not.
+        await publisher.PublishAsync("orders.eu.created", Encoding.UTF8.GetBytes("stale"));
+        await publisher.SendAsync(subscriber.Id, Encoding.UTF8.GetBytes("direct"));
+
+        MessageReceivedEventArgs received = await directTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal("direct", Encoding.UTF8.GetString(received.Data.Span));
+        Assert.False(topicTcs.Task.IsCompleted, "A topic message was delivered after unsubscribing.");
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A client's topic subscriptions are cleaned up when it disconnects: a later publish to a topic it
+    /// used to match reaches nobody, and does not resurrect against a reconnecting client of the same
+    /// name that never resubscribed.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_TopicSubscriptionsAreClearedOnDisconnect()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var publisher = CreateClient();
+        await publisher.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Publisher");
+
+        var subscriber = CreateClient();
+        await subscriber.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Subscriber");
+        await subscriber.SubscribeAsync("orders.#");
+        await subscriber.GetClientIdByNameAsync("Publisher"); // barrier: subscription applied
+        await subscriber.DisconnectAsync();
+
+        await using var reconnected = CreateClient();
+        var topicTcs = new TaskCompletionSource<TopicMessageReceivedEventArgs>();
+        reconnected.TopicMessageReceived += (_, e) => topicTcs.TrySetResult(e);
+        await reconnected.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Subscriber");
+
+        await publisher.PublishAsync("orders.eu.created", Encoding.UTF8.GetBytes("order 42"));
+
+        // No subscriber remains for this topic, so nothing arrives. Prove the hub is still healthy with a
+        // direct message on the same connection rather than asserting on an absence alone.
+        var directTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
+        reconnected.MessageReceived += (_, e) => directTcs.TrySetResult(e);
+        await publisher.SendAsync(reconnected.Id, Encoding.UTF8.GetBytes("direct"));
+
+        MessageReceivedEventArgs received = await directTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal("direct", Encoding.UTF8.GetString(received.Data.Span));
+        Assert.False(topicTcs.Task.IsCompleted, "A disconnected client's stale subscription still matched.");
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
     /// A lookup for a name that is not registered returns null over the real protocol.
     /// </summary>
     [Fact(Timeout = 10000)]
@@ -570,6 +715,22 @@ public sealed class MeshIntegrationTests
         Assert.Equal("team", groupReceived.GroupName);
         Assert.Equal(groupPayload, groupReceived.Data.ToArray());
         Assert.Equal("high", groupReceived.Headers["priority"]);
+
+        var topicReceivedTcs = new TaskCompletionSource<TopicMessageReceivedEventArgs>();
+        bob.TopicMessageReceived += (_, e) => topicReceivedTcs.TrySetResult(e);
+
+        await bob.SubscribeAsync("orders.#");
+        await bob.GetClientIdByNameAsync("Alice"); // barrier: subscription applied
+
+        byte[] topicPayload = Encoding.UTF8.GetBytes("order 42");
+        var topicHeaders = new MessageHeaders([new("priority", "high")]);
+        await alice.PublishAsync("orders.eu.created", topicPayload, topicHeaders);
+
+        TopicMessageReceivedEventArgs topicReceived = await topicReceivedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(alice.Id, topicReceived.SenderId);
+        Assert.Equal("orders.eu.created", topicReceived.Topic);
+        Assert.Equal(topicPayload, topicReceived.Data.ToArray());
+        Assert.Equal("high", topicReceived.Headers["priority"]);
 
         await hub.StopAsync();
     }
