@@ -1490,16 +1490,6 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             _logger.LogWarning(ex, "Client {ClientId} transport error", clientId);
         }
-        catch (ObjectDisposedException ex)
-        {
-            // Routing a message into a recipient's outbound queue is two steps — look it up, then
-            // enqueue — and the recipient can finish tearing down in between: PriorityOutboundQueue's own
-            // TryEnqueue/TryEnqueueAsync already tolerate that ordinarily, but a handful of the objects
-            // this loop touches directly (the recipient's transport, in the rarer paths that reach it) do
-            // not. Caught here, matching MeshClient.ReceiveLoopAsync's equivalent guard, so an innocent
-            // sender is not disconnected over a recipient's unrelated teardown race.
-            _logger.LogDebug(ex, "Client {ClientId} handler observed a disposed resource", clientId);
-        }
         finally
         {
             connection?.OutboundQueue.Complete();
