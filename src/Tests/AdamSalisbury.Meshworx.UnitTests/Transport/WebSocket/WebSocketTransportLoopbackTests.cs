@@ -51,6 +51,64 @@ public sealed class WebSocketTransportLoopbackTests
     }
 
     /// <summary>
+    /// StartAsync must not strand the negotiation pump's first continuation on whatever
+    /// <see cref="SynchronizationContext"/> happens to be installed on the calling thread (issue #118) —
+    /// a WPF or WinForms host calling <c>hub.StartAsync()</c> on its UI thread is not forbidden, and a UI
+    /// thread's message pump is not guaranteed to be running at that exact instant. Pinned with a
+    /// <see cref="SynchronizationContext"/> that captures every posted callback and never invokes it,
+    /// simulating exactly that: if the pump were still relying on yielding back through this context, the
+    /// connect-and-accept below would never complete.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task StartAsync_CalledUnderANeverPumpingSynchronizationContext_StillAcceptsConnections()
+    {
+        var listener = new WebSocketTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+
+        SynchronizationContext? previous = SynchronizationContext.Current;
+        try
+        {
+            SynchronizationContext.SetSynchronizationContext(new NeverPumpingSynchronizationContext());
+            await listener.StartAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previous);
+        }
+
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        try
+        {
+            var connectTask = WebSocketTransport.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/"));
+            var acceptTask = listener.AcceptAsync();
+
+            await using WebSocketTransport clientTransport = await connectTask.ConfigureAwait(false);
+            await using var serverTransport = await acceptTask.ConfigureAwait(false);
+
+            var payload = new byte[] { 1, 2, 3 };
+            await clientTransport.SendAsync(payload).ConfigureAwait(false);
+            Assert.Equal(payload, await serverTransport.ReceiveAsync().ConfigureAwait(false));
+        }
+        finally
+        {
+            await listener.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Captures every posted callback without ever invoking it, standing in for a UI thread whose message
+    /// loop is not currently pumping — exactly the condition under which a <c>Task.Yield()</c>-based
+    /// continuation would never run.
+    /// </summary>
+    private sealed class NeverPumpingSynchronizationContext : SynchronizationContext
+    {
+        public override void Post(SendOrPostCallback d, object? state)
+        {
+            // Deliberately does nothing with the callback.
+        }
+    }
+
+    /// <summary>
     /// A client is not required by RFC 6455 to wait for the <c>101 Switching Protocols</c> response
     /// before sending its first WebSocket frame. When the buffered header reader's single read happens
     /// to capture the start of that frame along with the terminating blank line, those bytes must reach

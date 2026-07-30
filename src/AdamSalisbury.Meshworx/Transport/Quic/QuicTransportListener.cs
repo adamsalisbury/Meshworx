@@ -309,7 +309,23 @@ public sealed class QuicTransportListener : ITransportListener
                 _listener = listener;
                 _negotiatedTransports = negotiatedTransports;
                 _negotiationCts = negotiationCts;
-                _negotiationPumpTask = NegotiationPumpAsync(listener, negotiatedTransports.Writer, negotiationCts.Token);
+
+                // Started on the thread pool rather than called directly: an async method runs
+                // synchronously up to its first await on the calling thread, and that first await here has
+                // no ConfigureAwait to fall back on — YieldAwaitable posts its continuation to
+                // SynchronizationContext.Current when one exists, so a caller starting the listener from a
+                // UI thread would silently strand the pump's continuation on that thread's message pump.
+                // Task.Run sidesteps the problem entirely: the whole pump, including its synchronous
+                // prefix, runs on a thread-pool thread with no SynchronizationContext to capture. Task.Run's
+                // own cancellation parameter is deliberately CancellationToken.None, not
+                // negotiationCts.Token, even though that token is what the pump itself observes: passing it
+                // to Task.Run risks the work item never running at all if DisposeAsync cancels the token
+                // before the thread pool gets to it, which would surface as the awaited task being Canceled
+                // rather than completed — breaking DisposeCoreAsync's documented assumption that awaiting
+                // this task cannot throw, since the pump's own try/catch never got to run.
+                _negotiationPumpTask = Task.Run(
+                    () => NegotiationPumpAsync(listener, negotiatedTransports.Writer, negotiationCts.Token),
+                    CancellationToken.None);
                 return;
             }
         }
@@ -454,8 +470,8 @@ public sealed class QuicTransportListener : ITransportListener
         ChannelWriter<QuicTransport> writer,
         CancellationToken cancellationToken)
     {
-        await Task.Yield();
-
+        // Started via Task.Run at the call site, which is what keeps StartAsync non-blocking — nothing
+        // here needs to yield first.
         using var negotiationSlots = new SemaphoreSlim(_maxConcurrentNegotiations, _maxConcurrentNegotiations);
         var negotiationsPerSource = new ConcurrentDictionary<IPAddress, int>();
         var inFlight = new ConcurrentDictionary<Task, byte>();

@@ -205,7 +205,30 @@ public sealed class WebSocketTransportListener : ITransportListener
                 });
 
             _negotiationCts = new CancellationTokenSource();
-            _negotiationPumpTask = NegotiationPumpAsync(listener, _negotiatedTransports.Writer, _negotiationCts.Token);
+
+            // Captured into locals rather than read from the fields inside the Task.Run lambda: the lambda
+            // body only runs once the thread pool gets to it, which can be after a concurrent DisposeAsync
+            // has already nulled _negotiatedTransports/_negotiationCts out — reading the fields lazily
+            // inside the lambda would then throw NullReferenceException instead of running the pump against
+            // the values this call actually published.
+            ChannelWriter<WebSocketTransport> negotiationWriter = _negotiatedTransports.Writer;
+            CancellationToken negotiationToken = _negotiationCts.Token;
+
+            // Started on the thread pool rather than called directly: an async method runs synchronously
+            // up to its first await on the calling thread, and that first await here has no ConfigureAwait
+            // to fall back on — YieldAwaitable posts its continuation to SynchronizationContext.Current
+            // when one exists, so a caller starting the listener from a UI thread would silently strand the
+            // pump's continuation on that thread's message pump. Task.Run sidesteps the problem entirely:
+            // the whole pump, including its synchronous prefix, runs on a thread-pool thread with no
+            // SynchronizationContext to capture. Task.Run's own cancellation parameter is deliberately
+            // CancellationToken.None, not negotiationToken, even though that token is what the pump itself
+            // observes: passing it to Task.Run risks the work item never running at all if DisposeAsync
+            // cancels the token before the thread pool gets to it, which would surface as the awaited task
+            // being Canceled rather than completed — breaking DisposeCoreAsync's documented assumption that
+            // awaiting this task cannot throw, since the pump's own try/catch never got to run.
+            _negotiationPumpTask = Task.Run(
+                () => NegotiationPumpAsync(listener, negotiationWriter, negotiationToken),
+                CancellationToken.None);
         }
 
         return Task.CompletedTask;
@@ -320,9 +343,8 @@ public sealed class WebSocketTransportListener : ITransportListener
         ChannelWriter<WebSocketTransport> writer,
         CancellationToken cancellationToken)
     {
-        // Yield so StartAsync returns before the first accept is issued, keeping it non-blocking.
-        await Task.Yield();
-
+        // Started via Task.Run at the call site, which is what keeps StartAsync non-blocking — nothing
+        // here needs to yield first.
         using var negotiationSlots = new SemaphoreSlim(_maxConcurrentHandshakes, _maxConcurrentHandshakes);
         using var pendingSlots = new SemaphoreSlim(_maxPendingHandshakes, _maxPendingHandshakes);
         var inFlight = new ConcurrentDictionary<Task, byte>();
