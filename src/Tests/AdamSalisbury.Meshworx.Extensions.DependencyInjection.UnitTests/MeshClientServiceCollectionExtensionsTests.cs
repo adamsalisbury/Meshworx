@@ -595,4 +595,106 @@ public sealed class MeshClientServiceCollectionExtensionsTests
         await host.StopAsync();
         await hub.StopAsync();
     }
+
+    // StartAsync/StopAsync consistency (issue #101)
+
+    /// <summary>
+    /// StopAsync must tear down what StartAsync actually started, not whatever
+    /// <see cref="MeshClientOptions.UseReconnector"/> currently reads as — under any reloading
+    /// configuration source, an <see cref="IOptionsMonitor{TOptions}"/> can return a different instance
+    /// on a later call than it did at start. Constructs <see cref="MeshClientHostedService"/> directly
+    /// against a mocked <see cref="IOptionsMonitor{TOptions}"/> that changes its answer between the
+    /// Start and Stop calls, reproducing that race deterministically rather than racing a real
+    /// configuration reload.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task StopAsync_UseReconnectorChangesFromTrueToFalseBetweenStartAndStop_StillDisposesTheReconnectorThatWasStarted()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddMeshClient("Alice", options =>
+        {
+            options.UseReconnector = true;
+            options.TransportFactory = _ => Task.FromResult<ITransport>(listener.Connect());
+        });
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+
+        var optionsMonitor = new Mock<IOptionsMonitor<MeshClientOptions>>();
+        optionsMonitor.SetupSequence(m => m.Get("Alice"))
+            .Returns(new MeshClientOptions
+            {
+                UseReconnector = true,
+                ClientName = "Alice",
+                TransportFactory = _ => Task.FromResult<ITransport>(listener.Connect()),
+            })
+            .Returns(new MeshClientOptions { UseReconnector = false, ClientName = "Alice" });
+
+        var hostedService = new MeshClientHostedService("Alice", provider, optionsMonitor.Object);
+        await hostedService.StartAsync(CancellationToken.None);
+
+        MeshClientReconnector reconnector = provider.GetRequiredKeyedService<MeshClientReconnector>("Alice");
+        Assert.True(reconnector.Client.IsConnected);
+
+        await hostedService.StopAsync(CancellationToken.None);
+
+        // Checked by reflection rather than reconnector.Client.IsConnected: the keyed IMeshClient factory
+        // resolves to the reconnector's own Client whenever the *real* container registration has
+        // UseReconnector set, regardless of what this test's mock returns — so the buggy behaviour
+        // (disconnecting that same client object directly, bypassing the reconnector entirely) would
+        // still coincidentally leave IsConnected false without the reconnector itself ever having been
+        // disposed, its background reconnect loop left running exactly as issue #101 describes.
+        FieldInfo disposedField = typeof(MeshClientReconnector).GetField(
+            "_disposed", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        Assert.Equal(1, (int)disposedField.GetValue(reconnector)!);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// The worse direction of the same bug: a plain client that was actually connected must still be
+    /// disconnected on stop, even if a reload makes <see cref="MeshClientOptions.UseReconnector"/> read
+    /// as <see langword="true"/> by the time <c>StopAsync</c> runs — the buggy behaviour would first-resolve
+    /// a reconnector that was never started and dispose that instead, leaving the connection the host
+    /// actually made open and the hub still counting it as registered.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task StopAsync_UseReconnectorChangesFromFalseToTrueBetweenStartAndStop_StillDisconnectsThePlainClientThatWasStarted()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddMeshClient("Alice");
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+
+        var optionsMonitor = new Mock<IOptionsMonitor<MeshClientOptions>>();
+        optionsMonitor.SetupSequence(m => m.Get("Alice"))
+            .Returns(new MeshClientOptions
+            {
+                UseReconnector = false,
+                ClientName = "Alice",
+                TransportFactory = _ => Task.FromResult<ITransport>(listener.Connect()),
+            })
+            .Returns(new MeshClientOptions { UseReconnector = true, ClientName = "Alice" });
+
+        var hostedService = new MeshClientHostedService("Alice", provider, optionsMonitor.Object);
+        await hostedService.StartAsync(CancellationToken.None);
+
+        IMeshClient client = provider.GetRequiredKeyedService<IMeshClient>("Alice");
+        Assert.True(client.IsConnected);
+
+        await hostedService.StopAsync(CancellationToken.None);
+
+        Assert.False(client.IsConnected);
+
+        await hub.StopAsync();
+    }
 }

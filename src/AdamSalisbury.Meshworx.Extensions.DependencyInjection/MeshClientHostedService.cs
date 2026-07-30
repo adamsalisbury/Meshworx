@@ -47,10 +47,24 @@ internal sealed class MeshClientHostedService(
     private static readonly TimeSpan DefaultConnectTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan DefaultConnectRetryDelay = TimeSpan.FromSeconds(1);
 
+    // Set once, in StartAsync, and read back unchanged in StopAsync — deliberately not re-read from
+    // optionsMonitor a second time. IOptionsMonitor.Get returns whatever the options pipeline currently
+    // holds, which can differ from what it held at start under any reloading configuration source
+    // (appsettings.json with the default reloadOnChange: true, a mounted ConfigMap, Azure App
+    // Configuration). StopAsync must tear down what StartAsync actually started — the reconnector if that
+    // is what was started, the plain client if that is what was started — never whichever the option
+    // currently says, or a reload between start and stop takes shutdown down the wrong branch entirely:
+    // disposing a reconnector that was never started leaks the one that was, or worse, first-resolving and
+    // disposing a reconnector that was never started at all while the plain client that is actually
+    // connected is left open. This mirrors the keyed IMeshClient factory, which effectively snapshots
+    // UseReconnector at first resolution in exactly the same way.
+    private bool _startedWithReconnector;
+
     /// <inheritdoc/>
     public Task StartAsync(CancellationToken cancellationToken)
     {
         MeshClientOptions options = optionsMonitor.Get(clientName);
+        _startedWithReconnector = options.UseReconnector;
 
         return ConnectWithRetryAsync(options, cancellationToken);
     }
@@ -58,9 +72,7 @@ internal sealed class MeshClientHostedService(
     /// <inheritdoc/>
     public Task StopAsync(CancellationToken cancellationToken)
     {
-        MeshClientOptions options = optionsMonitor.Get(clientName);
-
-        if (options.UseReconnector)
+        if (_startedWithReconnector)
         {
             MeshClientReconnector reconnector = serviceProvider.GetRequiredKeyedService<MeshClientReconnector>(clientName);
             return reconnector.DisposeAsync().AsTask();
@@ -72,7 +84,9 @@ internal sealed class MeshClientHostedService(
 
     /// <summary>
     /// Attempts the client's initial connection, retrying with a back-off delay under
-    /// <paramref name="cancellationToken"/> until it succeeds or that token is cancelled.
+    /// <paramref name="cancellationToken"/> until it succeeds, that token is cancelled, or the failure is
+    /// one retrying can never fix — a configuration error, or a permanent hub refusal — in which case it
+    /// propagates immediately instead.
     /// </summary>
     /// <remarks>
     /// On the reconnector path, a failed <see cref="MeshClientReconnector.StartAsync"/> call resets the
