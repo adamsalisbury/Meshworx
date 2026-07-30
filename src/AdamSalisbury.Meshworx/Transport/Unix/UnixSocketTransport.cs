@@ -99,10 +99,17 @@ public sealed class UnixSocketTransport : ITransport, IBatchSendTransport
     }
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Deliberately does not dispose <see cref="_writeLock"/>. <see cref="SemaphoreSlim.Dispose()"/>
+    /// abandons rather than completes any queued <see cref="SemaphoreSlim.WaitAsync()"/> waiter, so a
+    /// concurrent <see cref="SendAsync(ReadOnlyMemory{byte}, CancellationToken)"/> racing this teardown
+    /// would hang for ever instead of observing the stream fault it is actually waiting behind. The
+    /// semaphore never touches <see cref="SemaphoreSlim.AvailableWaitHandle"/>, so it holds no unmanaged
+    /// resource and leaving it undisposed is safe — it is simply collected once this transport is.
+    /// </remarks>
     public async ValueTask DisposeAsync()
     {
         await _stream.DisposeAsync().ConfigureAwait(false);
         _socket?.Dispose();
-        _writeLock.Dispose();
     }
 }
