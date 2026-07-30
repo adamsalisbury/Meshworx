@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Reflection;
 using AdamSalisbury.Meshworx.Transport.Tcp;
 
 namespace AdamSalisbury.Meshworx.UnitTests.Transport.Tcp;
@@ -250,6 +251,46 @@ public sealed class TcpTransportTests
         await transport.DisposeAsync();
 
         Assert.Throws<ObjectDisposedException>(() => stream.ReadByte());
+    }
+
+    /// <summary>
+    /// A SendAsync call queued behind the write lock when DisposeAsync runs completes rather than
+    /// hanging for ever (issue #104). SemaphoreSlim.Dispose abandons a queued WaitAsync waiter without
+    /// completing it, so if DisposeAsync disposed the write lock the queued send would never observe the
+    /// disposal at all — not even as a thrown exception. Pinned by holding the lock to simulate an
+    /// in-flight send, queuing a second send behind it, disposing the transport, then releasing the held
+    /// lock and requiring the queued send to settle (however it settles) within a short bound.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task DisposeAsync_SendQueuedOnWriteLock_CompletesRatherThanHangingForever()
+    {
+        var stream = new MemoryStream();
+        var transport = new TcpTransport(stream);
+
+        FieldInfo writeLockField = typeof(TcpTransport).GetField(
+            "_writeLock", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var writeLock = (SemaphoreSlim)writeLockField.GetValue(transport)!;
+
+        // Simulates another in-flight SendAsync already holding the lock.
+        await writeLock.WaitAsync();
+
+        Task queuedSend = transport.SendAsync(new byte[] { 1 });
+        await Task.Delay(50);
+
+        await transport.DisposeAsync();
+
+        try
+        {
+            writeLock.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Expected on the unfixed code, where DisposeAsync has already disposed the write lock;
+            // the queued send below is the thing actually under test.
+        }
+
+        Task settled = await Task.WhenAny(queuedSend, Task.Delay(TimeSpan.FromSeconds(1)));
+        Assert.Same(queuedSend, settled);
     }
 
     // SendAsync — batched (IBatchSendTransport)

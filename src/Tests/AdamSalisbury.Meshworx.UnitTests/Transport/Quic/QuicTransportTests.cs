@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Reflection;
 using AdamSalisbury.Meshworx.Transport.Quic;
 
 namespace AdamSalisbury.Meshworx.UnitTests.Transport.Quic;
@@ -96,5 +97,44 @@ public sealed class QuicTransportTests
         var transport = new QuicTransport(new MemoryStream());
 
         Assert.Null(transport.RemoteEndPoint);
+    }
+
+    /// <summary>
+    /// A SendAsync call queued behind the write lock when DisposeAsync runs completes rather than
+    /// hanging for ever (issue #104), mirroring TcpTransportTests's coverage of the same shared
+    /// write-lock disposal race — SemaphoreSlim.Dispose abandons a queued WaitAsync waiter without
+    /// completing it, so a transport that disposed its write lock during teardown would leave a
+    /// concurrent sender stuck for ever rather than observing the disposal in any form.
+    /// </summary>
+    [Fact(Timeout = 2000)]
+    public async Task DisposeAsync_SendQueuedOnWriteLock_CompletesRatherThanHangingForever()
+    {
+        var stream = new MemoryStream();
+        var transport = new QuicTransport(stream);
+
+        FieldInfo writeLockField = typeof(QuicTransport).GetField(
+            "_writeLock", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var writeLock = (SemaphoreSlim)writeLockField.GetValue(transport)!;
+
+        // Simulates another in-flight SendAsync already holding the lock.
+        await writeLock.WaitAsync();
+
+        Task queuedSend = transport.SendAsync(new byte[] { 1 });
+        await Task.Delay(50);
+
+        await transport.DisposeAsync();
+
+        try
+        {
+            writeLock.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Expected on the unfixed code, where DisposeAsync has already disposed the write lock;
+            // the queued send below is the thing actually under test.
+        }
+
+        Task settled = await Task.WhenAny(queuedSend, Task.Delay(TimeSpan.FromSeconds(1)));
+        Assert.Same(queuedSend, settled);
     }
 }
