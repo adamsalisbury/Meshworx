@@ -139,4 +139,9 @@ public sealed class MeshHubOptions
     /// produce per second, across every recipient combined.
     /// </summary>
     public int? MaxFanOutDeliveriesPerSecond { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether a client may subscribe to presence. Defaults to <see langword="false"/>.
+    /// </summary>
+    public bool EnablePresence { get; set; }
 }

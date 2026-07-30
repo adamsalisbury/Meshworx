@@ -1120,6 +1120,29 @@ criteria a matching client's attributes must all satisfy (AND, never OR). An emp
 connected client; see [known-issues.md](known-issues.md) KI-67 for why that is a disclosed, deliberate
 capability, not an oversight.
 
+### Presence / roster
+
+Added for issue #39. `GetClientsAsync()` returns every connected client's id and name — implemented as
+`FindClientsAsync(new AttributeQuery([]))`, so it needs none of `FindClientsAsync`'s own machinery
+duplicated, and shares its `Protocol.ClientAttributesMinVersion = 9` gate rather than needing a new one.
+`SubscribePresenceAsync`/`UnsubscribePresenceAsync` are a different, newer gate:
+`Protocol.PresenceMinVersion = 10`, via `RequirePresenceSupport` — the same shape
+`RequireTopicPubSubSupport`/`RequireClientAttributesSupport` already use.
+
+**`PresenceChanged`** fires once per join/leave the hub actually pushes — never for this client's own
+connection or disconnection (the hub excludes the subscriber the delta is about). Whether it fires for a
+session-resume identity swap the same way the hub's in-process events do is up to the hub, not the
+client: the client here only parses whatever `PresenceChanged` frames arrive and raises the event for
+each. There is no local `IsSubscribedToPresence` state to query — unlike `JoinedGroups`/
+`SubscribedTopics`, presence subscription is fire-and-forget with nothing for the client to track between
+calls, so there is nothing for a property like that to report beyond what the caller already knows from
+having called `SubscribePresenceAsync`/`UnsubscribePresenceAsync` itself.
+
+**A hub built without `enablePresence` refuses `SubscribePresenceAsync` silently** — the call itself
+succeeds (the frame was sent and accepted by the transport), but no `PresenceChanged` notification is
+ever pushed. There is no way for the client to distinguish "subscribed, nothing has happened yet" from
+"the hub silently refused" — see [hub.md](hub.md#presence--roster).
+
 ---
 
 ## `MeshClientReconnector`

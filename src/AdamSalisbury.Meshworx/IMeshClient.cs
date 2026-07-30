@@ -510,6 +510,60 @@ public interface IMeshClient : IAsyncDisposable
         AttributeQuery query, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Queries the hub for a snapshot of every currently-registered client's id and name.
+    /// </summary>
+    /// <remarks>
+    /// Equivalent to <see cref="FindClientsAsync"/> with an empty <see cref="AttributeQuery"/> — every
+    /// connected client matches an empty query — provided as its own named verb since "list everyone" is
+    /// the common roster case a caller should not have to construct an empty query object to express.
+    /// </remarks>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <returns>Every connected client's id and name, as a point-in-time snapshot.</returns>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The hub negotiated a protocol version that predates client attributes.
+    /// </exception>
+    Task<IReadOnlyList<ClientDescriptor>> GetClientsAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Subscribes to presence: this client will be pushed a <see cref="PresenceChanged"/> notification
+    /// whenever another client joins or leaves the hub, from this point until
+    /// <see cref="UnsubscribePresenceAsync"/> is called or this client disconnects.
+    /// </summary>
+    /// <remarks>
+    /// Presence is opt-in on the hub as well as the client: a hub not constructed with presence enabled
+    /// refuses the subscription silently — no error, no notification ever arrives — so a deployment that
+    /// must not leak its roster is safe by default. See <see cref="MeshHub"/>'s <c>enablePresence</c>
+    /// constructor parameter.
+    /// </remarks>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The hub negotiated a protocol version that predates presence.
+    /// </exception>
+    Task SubscribePresenceAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Unsubscribes from presence, so this client is no longer pushed a notification when another client
+    /// joins or leaves the hub.
+    /// </summary>
+    /// <remarks>Unsubscribing when not subscribed has no effect.</remarks>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    Task UnsubscribePresenceAsync(CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Raised when another client joins or leaves the hub, for a client that has called
+    /// <see cref="SubscribePresenceAsync"/> and is talking to a hub with presence enabled.
+    /// </summary>
+    /// <remarks>
+    /// Never raised for this client's own connection or disconnection. Fires for exactly the same
+    /// moments the hub's own in-process <c>IMeshHub.ClientConnected</c>/<c>ClientDisconnected</c> events
+    /// do, including the paired fire on a session resume that reclaims a different id.
+    /// </remarks>
+    event EventHandler<PresenceChangedEventArgs> PresenceChanged;
+
+    /// <summary>
     /// Sends a request to another client and awaits a correlated reply.
     /// </summary>
     /// <remarks>

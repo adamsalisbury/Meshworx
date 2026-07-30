@@ -1166,6 +1166,42 @@ collected with it — no separate cleanup path to get wrong.
 
 ---
 
+### Presence / roster
+
+Added for issue #39. `GetClientsAsync` is a snapshot of every connected client's id and name;
+`SubscribePresenceAsync`/`UnsubscribePresenceAsync` push a `PresenceChanged` notification to a client
+whenever another client joins or leaves. Opcodes `0x22`–`0x24`, gated behind
+`Protocol.PresenceMinVersion = 10` on both ends from the outset (see
+[protocol.md](protocol.md#presence-frames-issue-39)).
+
+**`GetClientsAsync` needed no new wire opcode at all.** It is `FindClientsAsync(new AttributeQuery([]))`
+under the hood (`MeshClient.GetClientsAsync`) — an empty query already matches every connected client, so
+the roster snapshot is exactly what issue #38's directory query already returns; this is client-side
+sugar over an existing call, not a new server-side capability.
+
+**Presence is opt-in on the hub, not just the client** — a new `enablePresence` constructor parameter on
+`MeshHub`, defaulting to `false`. A hub not built with it refuses a `SubscribePresence` frame silently:
+no error, no subscription, and no notification is ever pushed, whether or not the client believes it
+subscribed — the same shape as an unrecognised opcode (KI-9). This is the mitigation the issue's own text
+asked for ("presence visibility is opt-in per hub... some deployments must not leak the roster") rather
+than a separate authorisation seam layered on afterwards — contrast with topics (KI-62) and client
+attributes (KI-66), which shipped as always-on features with no equivalent hub-level switch, because
+neither issue asked for one the way this one explicitly does.
+
+**`_presenceSubscribers`** (`ConcurrentDictionary<Guid, ClientConnection>`, `MeshHub.cs`) tracks only the
+connections that actually subscribed, not a flag scanned across every connected client — connect/disconnect
+is ordinary operational churn, not an occasional directory query the way `FindClientsRequest` is, so a
+delta's cost has to scale with subscriber count, not the whole population. Removed on
+`UnsubscribePresence` and on disconnect.
+
+**Presence deltas fire from inside `RaiseClientEvent`** — the same private helper that raises the
+in-process `ClientConnected`/`ClientDisconnected` events — so a delta fires at exactly the moments those
+events do, including the paired fire a session resume produces (a `Left` for the discarded fresh identity
+immediately followed by a `Joined` for the reclaimed one). A subscriber is never notified about its own
+connection or disconnection (`PushPresenceDelta` skips the connection the delta is about).
+
+---
+
 <a id="metrics"></a>
 
 ### Metrics

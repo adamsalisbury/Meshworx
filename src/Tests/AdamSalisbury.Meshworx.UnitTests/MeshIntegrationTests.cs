@@ -528,7 +528,17 @@ public sealed class MeshIntegrationTests
 
         await client.UpdateAttributesAsync(new Dictionary<string, string> { ["role"] = "worker" });
         await client.GetClientIdByNameAsync("Seeker");
+
+        // client.DisconnectAsync() returning only proves the client's own side has torn down; the hub
+        // processes the closed connection on its own handler task, independently and on its own timing.
+        // Await the hub's own ClientDisconnected event — an in-process signal this test can see because
+        // it owns the hub — as the barrier that guarantees the hub has actually removed the client (and
+        // with it, its attributes) before the query below runs.
+        var disconnectedTcs = new TaskCompletionSource<ClientConnectionEventArgs>();
+        hub.ClientDisconnected += (_, e) => disconnectedTcs.TrySetResult(e);
+
         await client.DisconnectAsync();
+        await disconnectedTcs.Task.WaitAsync(WaitTimeout);
 
         IReadOnlyList<ClientDescriptor> matches = await seeker.FindClientsAsync(
             new AttributeQuery([new("role", "worker")]));
@@ -561,6 +571,151 @@ public sealed class MeshIntegrationTests
         Assert.Equal(2, matches.Count);
         Assert.Contains(new ClientDescriptor(first.Id, "First"), matches);
         Assert.Contains(new ClientDescriptor(second.Id, "Second"), matches);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// GetClientsAsync returns every connected client, equivalent to FindClientsAsync with an empty
+    /// query, over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_GetClientsAsyncReturnsEveryConnectedClient()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var first = CreateClient();
+        await using var second = CreateClient();
+
+        await first.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "First");
+        await second.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Second");
+        await first.GetClientIdByNameAsync("Second");
+
+        IReadOnlyList<ClientDescriptor> clients = await first.GetClientsAsync();
+
+        Assert.Equal(2, clients.Count);
+        Assert.Contains(new ClientDescriptor(first.Id, "First"), clients);
+        Assert.Contains(new ClientDescriptor(second.Id, "Second"), clients);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A client subscribed to presence on a hub with presence enabled is notified when another client
+    /// connects and when it later disconnects, but is never notified about its own connection or
+    /// disconnection, over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_PresenceSubscriberIsNotifiedOfOtherClientsJoiningAndLeaving()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener, enablePresence: true);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var observer = CreateClient();
+        await observer.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Observer");
+        await observer.SubscribePresenceAsync();
+        // Barrier: the hub processes one client's own frames in order, so a round trip on the observer's
+        // own connection guarantees the SubscribePresence frame above has been applied before the
+        // newcomer — a different connection entirely — connects below.
+        await observer.GetClientIdByNameAsync("Observer");
+
+        var joinedTcs = new TaskCompletionSource<PresenceChangedEventArgs>();
+        var leftTcs = new TaskCompletionSource<PresenceChangedEventArgs>();
+        observer.PresenceChanged += (_, e) =>
+        {
+            if (e.ChangeType == PresenceChangeType.Joined)
+            {
+                joinedTcs.TrySetResult(e);
+            }
+            else
+            {
+                leftTcs.TrySetResult(e);
+            }
+        };
+
+        var newcomer = CreateClient();
+        await newcomer.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Newcomer");
+
+        PresenceChangedEventArgs joined = await joinedTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(newcomer.Id, joined.ClientId);
+        Assert.Equal("Newcomer", joined.ClientName);
+        Assert.Equal(PresenceChangeType.Joined, joined.ChangeType);
+
+        // Captured before disconnecting: MeshClient.Id resets once disconnected, but the delta the hub
+        // already pushed still needs to be checked against the id the newcomer actually held.
+        Guid newcomerId = newcomer.Id;
+        await newcomer.DisconnectAsync();
+
+        PresenceChangedEventArgs left = await leftTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(newcomerId, left.ClientId);
+        Assert.Equal("Newcomer", left.ClientName);
+        Assert.Equal(PresenceChangeType.Left, left.ChangeType);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// After unsubscribing, a client is no longer notified of presence changes, over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_UnsubscribedPresenceObserverReceivesNoFurtherNotifications()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener, enablePresence: true);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var observer = CreateClient();
+        await observer.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Observer");
+        await observer.SubscribePresenceAsync();
+        await observer.UnsubscribePresenceAsync();
+        await observer.GetClientIdByNameAsync("Observer"); // barrier: unsubscribe applied
+
+        var presenceTcs = new TaskCompletionSource<PresenceChangedEventArgs>();
+        observer.PresenceChanged += (_, e) => presenceTcs.TrySetResult(e);
+
+        await using var newcomer = CreateClient();
+        await newcomer.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Newcomer");
+
+        // Prove the hub is otherwise healthy with a direct lookup round trip, rather than asserting on an
+        // absence alone.
+        Guid? found = await observer.GetClientIdByNameAsync("Newcomer");
+        Assert.Equal(newcomer.Id, found);
+        Assert.False(presenceTcs.Task.IsCompleted, "An unsubscribed client still received a presence notification.");
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A hub not constructed with presence enabled silently refuses a subscription: no notification is
+    /// ever pushed, even though the client sent the request and observed no error, over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_PresenceDisabledOnHub_SubscriptionIsSilentlyRefused()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener); // presence not enabled
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var observer = CreateClient();
+        await observer.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Observer");
+        await observer.SubscribePresenceAsync();
+
+        var presenceTcs = new TaskCompletionSource<PresenceChangedEventArgs>();
+        observer.PresenceChanged += (_, e) => presenceTcs.TrySetResult(e);
+
+        await using var newcomer = CreateClient();
+        await newcomer.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Newcomer");
+
+        Guid? found = await observer.GetClientIdByNameAsync("Newcomer");
+        Assert.Equal(newcomer.Id, found);
+        Assert.False(presenceTcs.Task.IsCompleted, "A presence-disabled hub still pushed a notification.");
 
         await hub.StopAsync();
     }

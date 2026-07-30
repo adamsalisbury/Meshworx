@@ -8,7 +8,7 @@ document/verify carefully when you touch it. Everything here is read from
 sites in `MeshHub.cs` / `MeshClient.cs`.
 
 - **Protocol version is a negotiated range** (`Protocol.MinSupportedVersion` = `4`,
-  `Protocol.MaxSupportedVersion` = `9`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
+  `Protocol.MaxSupportedVersion` = `10`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
   it can speak; the hub picks the highest version common to both sides — see
   [Registration handshake](#registration-handshake). Negotiation itself was introduced by PR #73
   (issue #47); PR #74 (issue #32) is the **first thing to actually widen the range and branch on the
@@ -39,7 +39,10 @@ sites in `MeshHub.cs` / `MeshClient.cs`.
   `MaxSupportedVersion` from `8` to `9` and adding `Protocol.ClientAttributesMinVersion = 9` to gate
   `SetClientAttributes`/`FindClientsRequest` — this time the gate shipped with the feature itself from the
   start, rather than needing a follow-up fix — see
-  [Client attribute frames](#client-attribute-frames-issue-38) below.
+  [Client attribute frames](#client-attribute-frames-issue-38) below. **Issue #39 is the sixth widening**,
+  raising `MaxSupportedVersion` from `9` to `10` and adding `Protocol.PresenceMinVersion = 10` to gate
+  `SubscribePresence`/`UnsubscribePresence` — again gated from the outset — see
+  [Presence frames](#presence-frames-issue-39) below.
 - **`MessageType` and `Protocol` are `internal`** — opcodes are not visible outside the assembly.
 - **Byte order:** big-endian for all multi-byte integers (`BinaryPrimitives.*BigEndian`). Ids are
   16-byte `Guid`s written with `Guid.TryWriteBytes` / read with `new Guid(span)`.
@@ -106,8 +109,11 @@ Everything in the tables below is the **message payload** (i.e. after the transp
 | `SetClientAttributes` | `0x1F` | client → hub | attribute block (rest of frame; `HeaderEnvelope`-encoded key/value pairs, no separate length prefix) |
 | `FindClientsRequest` | `0x20` | client → hub | correlation id (4, BE), criteria block (rest of frame; `HeaderEnvelope`-encoded key/value pairs) |
 | `FindClientsResponse` | `0x21` | hub → client | correlation id (4, BE), result count (2, BE), that many `[id (16)][nameLength (2, BE)][utf8 name]` entries |
+| `SubscribePresence` | `0x22` | client → hub | none |
+| `UnsubscribePresence` | `0x23` | client → hub | none |
+| `PresenceChanged` | `0x24` | hub → client | change type (1; `0x01` joined, `0x02` left), client id (16), name length (2, BE), UTF-8 name |
 
-`0x21` is the highest opcode in use; the next new one is `0x22`. Topic-based publish/subscribe (issue
+`0x24` is the highest opcode in use; the next new one is `0x25`. Topic-based publish/subscribe (issue
 #37) is covered in full in [Topic pub/sub frames](#topic-pubsub-frames-issue-37) below and
 [hub.md](hub.md#topic-based-publishsubscribe)/[client.md](client.md#topic-based-publishsubscribe). **Two
 of its six opcodes (`DeliverTopicMessage`/`DeliverTopicMessageWithHeaders`) are a further confirming
@@ -122,6 +128,12 @@ Client attributes (issue #38) — `SetClientAttributes`/`FindClientsRequest` are
 behind `Protocol.ClientAttributesMinVersion = 9` **from the outset**, learning KI-61's lesson rather than
 repeating it; `FindClientsResponse` is hub → client and additive, no gate needed. See [Client attribute
 frames](#client-attribute-frames-issue-38) below.
+
+Presence (issue #39) — `SubscribePresence`/`UnsubscribePresence` are client → hub and gated behind
+`Protocol.PresenceMinVersion = 10` from the outset, same discipline as issue #38; `PresenceChanged` is
+hub → client and additive. `GetClientsAsync` needed no new opcode at all — it reuses
+`FindClientsRequest`/`FindClientsResponse` (issue #38) with an empty criteria block. See [Presence
+frames](#presence-frames-issue-39) below.
 
 The four header-bearing opcodes
 (`0x11`–`0x14`, PR #74, issue #32) are each the existing opcode's frame with one extra
@@ -648,6 +660,33 @@ allowed to grow with the matched population.
 
 **No authorisation seam exists for either verb, and an empty-criteria query enumerates every connected
 client** — see [known-issues.md](known-issues.md) KI-66 and KI-67.
+
+<a id="presence-frames-issue-39"></a>
+
+### Presence frames (issue #39)
+
+Three opcodes, gated behind `Protocol.PresenceMinVersion = 10` from the outset — the same discipline
+issue #38 applied, not issue #37's.
+
+```
+client → hub : [0x22 SubscribePresence]                                                          # no payload
+client → hub : [0x23 UnsubscribePresence]                                                         # no payload
+hub → client : [0x24 PresenceChanged][changeType 1][clientId 16][nameLength u16 BE][utf8 name]    # needs len ≥ 20
+```
+
+`changeType` is `0x01` (joined) or `0x02` (left) — `Messages/PresenceChangeType.cs`, a public enum (unlike
+every other wire-level discriminator in this protocol, which stays `internal` alongside `MessageType`
+itself, since this one is also the shape of the public `PresenceChangedEventArgs.ChangeType` property).
+
+**`GetClientsAsync` is not a fourth opcode.** It sends the existing `FindClientsRequest` (issue #38) with
+an empty criteria block and reads back the existing `FindClientsResponse` — an empty `AttributeQuery`
+already matches every connected client, so "list everyone" needed no new frame shape at all, only a named
+client-side method. See [Client attribute frames](#client-attribute-frames-issue-38) above.
+
+**Presence is opt-in on the hub as well as gated by version** — a `MeshHub` not constructed with
+`enablePresence: true` silently ignores `SubscribePresence`/`UnsubscribePresence`, the same shape as an
+unrecognised opcode (KI-9): no error frame, and no `PresenceChanged` is ever pushed, whatever the client
+believes its subscription state to be. See [hub.md](hub.md#presence--roster).
 
 <a id="additive-opcodes-within-a-version"></a>
 

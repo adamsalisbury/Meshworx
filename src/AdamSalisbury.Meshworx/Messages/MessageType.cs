@@ -35,4 +35,7 @@ internal enum MessageType : byte
     SetClientAttributes = 0x1F,
     FindClientsRequest = 0x20,
     FindClientsResponse = 0x21,
+    SubscribePresence = 0x22,
+    UnsubscribePresence = 0x23,
+    PresenceChanged = 0x24,
 }
