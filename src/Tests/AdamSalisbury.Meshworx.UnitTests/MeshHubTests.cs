@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using System.Net.WebSockets;
 using System.Text;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
@@ -2790,6 +2791,59 @@ public sealed class MeshHubTests
 
         recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new ArgumentException("Payload size exceeds the maximum frame payload of 1048576 bytes."));
+
+        var sendPayload = new byte[1 + 16 + 3];
+        sendPayload[0] = 0x02; // SendMessage
+        recipient.Id.TryWriteBytes(sendPayload.AsSpan(1));
+        new byte[] { 1, 2, 3 }.CopyTo(sendPayload, 17);
+        sender.EnqueueMessage(sendPayload);
+
+        await recipientDisposedTcs.Task.WaitAsync(WaitTimeout);
+
+        Assert.False(fixture.Hub.IsClientRegistered(recipient.Id));
+        Assert.True(fixture.Hub.IsClientRegistered(sender.Id));
+
+        // The recipient's claimed slot must have been released too, not just its registry entry
+        // removed — otherwise a third client could never register against the 2-client cap.
+        var thirdClient = MeshHubFixture.CreateMockTransport();
+        var thirdRegisteredTcs = new TaskCompletionSource<byte[]>();
+        thirdClient.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
+            .ReturnsAsync(MeshHubFixture.CreateRegistrationRequest("Third"));
+        thirdClient.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => thirdRegisteredTcs.TrySetResult(data.ToArray()))
+            .Returns(Task.CompletedTask);
+        fixture.EnqueueClient(thirdClient.Object);
+
+        byte[] thirdResponse = await thirdRegisteredTcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(0x01, thirdResponse[0]); // RegistrationComplete, not HubAtCapacity
+
+        sender.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A transport's SendAsync can reject a delivery with a WebSocketException — as WebSocketTransport
+    /// does when a send lands on a socket that has already closed or faulted underneath it (a peer can
+    /// trigger this by timing its close against a queued send or the hub's own heartbeat Ping). This
+    /// must be treated exactly like a transport fault: the recipient is evicted with its slot, name and
+    /// group memberships released, not left to fault the send loop's awaiting task and skip that
+    /// cleanup.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.Harness)]
+    public async Task HandleClient_RecipientTransportThrowsWebSocketException_EvictsRecipientAndReleasesItsSlot()
+    {
+        var fixture = new MeshHubFixture(maxClients: 2);
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        var recipient = await fixture.RegisterMultiMessageClientAsync("Recipient");
+
+        var recipientDisposedTcs = new TaskCompletionSource();
+        recipient.Transport.Setup(t => t.DisposeAsync())
+            .Callback(() => recipientDisposedTcs.TrySetResult())
+            .Returns(ValueTask.CompletedTask);
+
+        recipient.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new WebSocketException("The remote party closed the WebSocket connection."));
 
         var sendPayload = new byte[1 + 16 + 3];
         sendPayload[0] = 0x02; // SendMessage
