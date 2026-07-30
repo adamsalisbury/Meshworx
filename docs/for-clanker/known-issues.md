@@ -41,7 +41,7 @@ the risk to a change, not a claim that the code is defective.
 | KI-30 | `AddMeshClient` was not idempotent for its hosted service, unlike `AddMeshHub` | `MeshClientServiceCollectionExtensions.cs` | medium (correctness / availability) | **fixed** — caught in review and corrected before merge in PR #70; the keyed registration-marker guard is **load-bearing**, do not remove |
 | KI-31 | Mapping the health checks to an unauthenticated HTTP endpoint leaks operational detail | `MeshHubHealthCheck.cs:37-42`, `MeshClientHealthCheckBuilderExtensions.cs:41` | medium (security / information disclosure) | open — **not a defect in this repo**, a caveat for how a consumer wires the checks up |
 | KI-32 | `messages.routed` and `messages.dropped` are not complementary — for `broadcast`/`group` sends, and (since PR #85) for an expired `direct` send too | `MeshHub.cs:2064-2067`, `:2144-2145`, `:1824`, `:2162`, `:1460-1490` | low (observability / maintainability) | open — **by design**, a documentation nuance rather than a defect; PR #74's header-bearing routing methods inherit the original asymmetry unchanged, PR #85 adds a second, distinct one that reaches `direct` |
-| KI-33 | An oversized outbound frame used to leak a client's registration slot permanently | `MeshHub.cs:1791-1807` | high (availability) | **fixed** — PR #74 (issue #32); `SendLoopAsync`'s catch now treats `ArgumentException` as a transport fault, do not narrow it back to `IOException`/`ObjectDisposedException` only |
+| KI-33 | An oversized outbound frame used to leak a client's registration slot permanently; the hub still *builds* an oversized fan-out frame in the first place | `MeshHub.cs:2124-2141` (symptom fix); `MeshHub.cs:3013-3088`, `:3342-3449`, `:3461-3601` (root cause, still open) | high (availability) | **partly addressed** — PR #74 (issue #32) fixed the crash/leak symptom; `SendLoopAsync`'s catch treats `ArgumentException` as a transport fault, do not narrow it back to `IOException`/`ObjectDisposedException` only. The root cause — `BroadcastMessage`/`SendToGroup`/`SendToGroupWithHeaders` build and enqueue a fan-out delivery frame with no check against the transport's frame cap — remains open on `main`; **PR #121 (`fix/fan-out-frame-cap`, open, unmerged) is the fix**, adding a pre-build size check that drops the single oversized message instead of failing the write after the fact. Do not document PR #121's behaviour as current until it merges |
 | KI-34 | `MessageHeaders`'s constructor throws on a duplicate key instead of last-wins | `Messages/MessageHeaders.cs:41-45` | low (usability) | open — **by design, but undocumented on the type itself**; differs from a plain `Dictionary` object initializer |
 | KI-35 | `WebSocketTransportListener` negotiates every connection off the accept path, including cleartext ones | `Transport/WebSocket/WebSocketTransportListener.cs:180-211`, `:317-373` | low (maintainability) | open — **by design**, but a real behavioural difference from `TcpTransportListener` |
 | KI-36 | Constructor's `path` doc claimed `404` for a wrong upgrade path; the code always sends `400` | `Transport/WebSocket/WebSocketTransportListener.cs:80-83`, `:420-428`, `:505-555` | low (maintainability / doc accuracy) | **fixed** — PR #78; the XML doc now says `400 Bad Request` and notes the two causes are indistinguishable |
@@ -50,7 +50,7 @@ the risk to a change, not a claim that the code is defective.
 | KI-39 | `UnixSocketTransportListener`'s `deleteExistingSocketFile` parameter silently also disables cleanup-on-dispose | `Transport/Unix/UnixSocketTransportListener.cs:59-67`, `:84-87`, `:167-170` | low (usability / test coverage) | open — **by design, correctly documented on the constructor, but untested for the `false` case** |
 | KI-40 | `QuicTransportListener`'s per-source negotiation cap mitigates, but does not eliminate, a many-source flood | `Transport/Quic/QuicTransportListener.cs:421-516` | medium (availability) | open — **by design, a documented limitation of the mitigation, not a defect in it**; see full reasoning below |
 | KI-41 | `QuicTransportListener.StartAsync` is not safe under concurrent invocation — unlike every other listener in this codebase | `Transport/Quic/QuicTransportListener.cs` | medium (correctness / resource leak) | **fixed** — same PR (#82), commit `d4de3b3`; a `_starting` flag now serialises concurrent `StartAsync` calls, mirroring `MeshHub.StartAsync`'s identical pattern; see `StartAsync_CalledConcurrently_OnlyOneSucceeds` |
-| KI-42 | `SendAsync`'s headers overload now rejects six specific header keys | `MeshClient.cs:384`, `:543-555` | low (usability / back-compat) | open — **by design**; a caller already using `"mesh.request-id"`/`"mesh.reply"` (PR #83), `"mesh.ack-id"`/`"mesh.ack-request"`/`"mesh.ack"` (PR #84) or `"mesh.expires-at"` (PR #85) as its own header key now gets `ArgumentException` where it previously succeeded |
+| KI-42 | `SendAsync`'s headers overload now rejects **thirteen** specific header keys, not six | `MeshClient.cs:840-866` (array), `:874-887` (guard), `:652`, `:898` (call sites) | low (usability / back-compat) | open — **by design**; a caller already using any of the thirteen reserved wire strings as its own header key now gets `ArgumentException` where it previously succeeded. Grown 2 (PR #83) → 5 (PR #84) → 6 (PR #85) → 7 (PR #87) → 8 (priority, `ab16567`) → 10 (tracing, feat #92) → 13 (chunking, feat #93 plus its own PR #134/issue #107 fix) — this row's "six" figure predates every PR after #85 and was never updated |
 | KI-43 | Request/response is a client-side convention the hub cannot see or protect — any inbound `mesh.reply` header is intercepted, matched or not | `MeshClient.cs:1097`, `:1439-1484` | low (correctness) | open — **by design**; only a real risk for a non-`MeshClient` peer, or code that hand-builds a `SendMessageWithHeaders` frame outside `SendAsync`; PR #84 added the identical pattern for `mesh.ack`, see KI-46 |
 | KI-44 | Delivery acknowledgement is being sent while the message hasn't necessarily been received | `MeshClient.cs:1100-1126` | low (correctness) | open — **by design**; "acknowledged" means "handed to the application", not "the handler succeeded" |
 | KI-45 | A `SendAsync(..., DeliveryOptions.RequireAck(...))` timeout does not prove the message was not delivered | `MeshClient.cs:390-443`, `:1549-1596` | low (correctness) | open — **by design**; the acknowledgement is an ordinary routed message and can be lost the same way any other send can (KI-1, KI-5) |
@@ -58,6 +58,17 @@ the risk to a change, not a claim that the code is defective.
 | KI-47 | Message time-to-live is measured against the *sender's* clock, with no hub clock authority | `MeshClient.cs:446-466`, `:1407-1422`; `MeshHub.cs:1638-1668`; `Messages/MessageExpiryHeaderKeys.cs` | medium (correctness) | open — **by design**; a documented clock-skew caveat, not a bug, but a real source of surprising drops or non-drops under an unsynchronised clock |
 | KI-48 | `DeliveryOptions.AwaitCapacity` parks the sender's whole connection, not just the one message | `MeshHub.cs:1587-1617`, `:1945-1956` | medium (performance / availability) | open — **by design**; every other message that sender addresses to any other recipient queues up behind the one being awaited, for up to `backpressureAwaitTimeout` |
 | KI-49 | `RequireAck` + `AwaitCapacity` time out independently — an ack timeout can fail a send the hub still delivers | `DeliveryOptions.cs:91-108`, `MeshClient.cs:393-464` | medium (correctness) | open — **by design**; a retrying caller can duplicate a message that was reported failed but was in fact delivered late |
+| KI-50 | A held message's recipient id stops resolving as soon as its name reconnects, so store-and-forward only bridges the gap once | `MeshHub.cs` (`TryStoreForOfflineDeliveryAsync`/`ForgetOfflineIdentity`) | medium (correctness, by design) | **mitigated** — issue #43; turning on `sessionResumptionWindow` keeps a reconnecting client's `Guid` stable, so a peer's cached id stays correct across the reconnect; not a total fix, see full entry below |
+| KI-51 | The offline store runs on a live connection's path, and a slow one is felt by clients | `MeshHub.cs` (`TryStoreForOfflineDeliveryAsync`, `DeliverStoredMessagesAsync`) | low–medium (availability), only for a custom non-in-memory store | open — **by design**, the same hazard class as the group authoriser (KI-28); `InMemoryOfflineStore` never blocks |
+| KI-52 | A resumption token is a bearer credential for an identity, and the name behind it is only as strong as your authenticator | `MeshHub.cs` (`IssueSessionToken`/`ResumeSessionAsync`) | medium (security, by design), only with `sessionResumptionWindow` set | open — **by design**; use TLS, configure a `ClientAuthenticator`, keep the window short — session resumption does not add an authentication boundary |
+| KI-53 | A resumed client's restored groups are re-authorised, which can double a mass-reconnect's authoriser load | `MeshHub.cs` (`RestoreGroupMembershipAsync`), `MeshClientReconnector.cs` | low (performance), only with a `GroupAuthoriser` configured | open — **by design**; pass `restoreGroupMembership: false` to the reconnector if the hub has resumption enabled and authoriser load matters |
+| KI-54 | Message priority is honoured only for a header-bearing direct send and a header-bearing group send — a broadcast or a plain group send is always `Normal` | `MeshHub.cs:2242-2244`, `:3066-3068`, `:3434-3437`, `:3524-3548` | low (correctness / surprise) | open — **by design**; see full entry below |
+| KI-55 | A rate-limited inbound drop is invisible to `meshworx.hub.messages.dropped` — no dropped-reason tag exists for it | `MeshHub.cs` (`ClientRateLimiter` call sites) | low–medium (observability) | open — **not a defect, a metrics gap**; see full entry below |
+| KI-56 | `SendLargeAsync`'s chunked transfer fails silently to the sender on any reassembly failure | `ChunkReassembler.cs`, `MeshClient.cs` | medium (correctness) | open — **by design**, consistent with KI-1/KI-5; see full entry below |
+| KI-57 | `JsonMessageSerializer`'s runtime-type resolution for an interface-/abstract-declared value is top-level only, and throws under an incomplete AOT `JsonSerializerContext` | `AdamSalisbury.Meshworx.Serialization/JsonMessageSerializer.cs` | medium (correctness / AOT) | open — **by design**; see full entry below |
+| KI-58 | `mesh.contract.method` is the bare method name, not contract-qualified — two different `[MeshContract]` interfaces sharing a method name are ambiguous on the wire | `AdamSalisbury.Meshworx.Contracts.Generator/MeshContractGenerator.cs`, `ContractHeaderKeys.cs` | medium (correctness), pending fix | open — **PR #120 (open, unmerged) fixes this** by qualifying the header value; see [contracts.md](contracts.md#pending-pr-120) |
+| KI-59 | `SessionResumed`'s reported-groups block silently drops an over-length group name and caps the reported count at 65,535 | `MeshHub.cs` (`BuildReportableGroupNameBytes`) | low (correctness, by design) | open — **by design**, added after a security review; the membership itself is still restored, only the reply's ability to name it is bounded; see full entry below |
+| KI-60 | `MeshClient.RestoreJoinedGroupsFromResumedReply` fully replaces `JoinedGroups` rather than merging — a group the client believed it was in that the hub does not report is silently discarded | `MeshClient.cs:511-553` | low (correctness) | open — **by design**; the hub's report is authoritative; see full entry below |
 
 ---
 
@@ -967,29 +978,58 @@ the risk to a change, not a claim that the code is defective.
   "delivered = routed − dropped" for direct sends now needs to exclude the `expired` reason specifically
   to stay accurate, since it is the one `dropped` reason that is not mutually exclusive with `routed`.
 
-### KI-33 — An oversized outbound frame used to leak a client's registration slot permanently — **FIXED (PR #74, issue #32)**
-- **Where:** `SendLoopAsync`'s `catch` clause (`MeshHub.cs:1791-1807`), which awaits
-  `transport.SendAsync` for every queued delivery frame.
-- **Severity:** was high (availability). Reachable without an adversary: any legitimate sender whose
+### KI-33 — An oversized outbound frame used to leak a client's registration slot permanently; the hub still builds one — **SYMPTOM FIXED (PR #74), ROOT CAUSE OPEN, PENDING FIX IN PR #121**
+- **Where:** the symptom fix — `SendLoopAsync`'s `catch` clause (`MeshHub.cs:2124-2141`), which awaits
+  `transport.SendAsync` for every queued delivery frame. The still-open root cause — the three fan-out
+  frame builders that allocate with no size check: `BroadcastMessage` (`MeshHub.cs:3013-3088`, the
+  delivery payload is allocated unconditionally at `:3042-3045`), `SendToGroup` (`:3342-3449`, allocated
+  at `:3412-3418`) and `SendToGroupWithHeaders` (`:3461-3601`, via `BuildDeliverGroupMessage`/
+  `BuildDeliverGroupMessageWithHeaders` at `:3566-3601`).
+- **Severity:** high (availability). Reachable without an adversary: any legitimate sender whose
   message, combined with a recipient/group name and (since PR #74) a header block, produces a frame
-  larger than the transport's cap (`TcpTransport`'s 1 MiB payload limit, notably) triggers it.
-- **What was wrong:** a transport rejecting an oversized frame throws `ArgumentException`. Before this
-  fix, `SendLoopAsync` only caught `IOException`/`ObjectDisposedException`, so that exception propagated
-  out of the send-loop task. `HandleClientAsync`'s `finally` block awaits that task as part of its own
-  teardown — an unhandled fault there aborts the `finally` **partway through**, skipping whatever cleanup
-  had not yet run: the client-slot release, the name removal, the group removal, and the connection
-  disposal. The one client that triggered it left its capacity slot permanently claimed, invisible to
-  `ClaimedClientSlots` reconciling itself, for the lifetime of the hub.
-- **The fix:** `SendLoopAsync`'s `catch` now also matches `ArgumentException` and treats it exactly like
-  a transport fault — log a warning and cancel the client's `clientCts`, letting `HandleClientAsync`'s
+  larger than the transport's cap (`StreamFramer.MaxPayloadSize`/`WebSocketTransport`'s own constant,
+  both 1 MiB) triggers it.
+- **What was wrong, and what PR #74 fixed:** a transport rejecting an oversized frame throws
+  `ArgumentException`. Before PR #74, `SendLoopAsync` only caught `IOException`/`ObjectDisposedException`,
+  so that exception propagated out of the send-loop task. `HandleClientAsync`'s `finally` block awaits
+  that task as part of its own teardown — an unhandled fault there aborts the `finally` **partway
+  through**, skipping whatever cleanup had not yet run: the client-slot release, the name removal, the
+  group removal, and the connection disposal. The one client that triggered it left its capacity slot
+  permanently claimed, invisible to `ClaimedClientSlots` reconciling itself, for the lifetime of the hub.
+  PR #74's fix: `SendLoopAsync`'s `catch` also matches `ArgumentException` and treats it exactly like a
+  transport fault — log a warning and cancel the client's `clientCts`, letting `HandleClientAsync`'s
   `finally` run to completion normally. Only the one oversized message is lost; the connection's
-  bookkeeping is unaffected.
-- **What to do:** do not narrow this catch back to `IOException`/`ObjectDisposedException` only — the
-  three-way `when` clause is load-bearing. If you add a new header-bearing or otherwise size-inflating
-  frame type, verify it can still trip a transport's cap and that this catch still covers the failure
-  mode; do not assume the sender-side length checks (`HeaderEnvelope.GetEncodedLength`'s 65 535-byte
-  cap, for instance) make an oversized *outbound* (hub → recipient) frame impossible — they bound one
-  component, not the combined frame the hub reassembles for delivery.
+  bookkeeping is unaffected — **but note the connection that gets cancelled by this catch is the
+  *recipient's*, not the sender's**, since `SendLoopAsync` runs per-recipient off the recipient's own
+  outbound queue: one sender's oversized broadcast/group send can still disconnect every recipient it was
+  fanned out to, it just no longer leaks their slots while doing so.
+- **What is still wrong, confirmed against current `main`:** the three fan-out builders above still
+  allocate `new byte[...]` from the summed component lengths (sender id + name + header block + body)
+  with **no comparison against the transport's frame cap anywhere in the method** before enqueuing to
+  every recipient. A body that is comfortably within the sender's own send-side limit can still produce a
+  fan-out delivery frame — 16 bytes larger for the appended sender id, more again for a group name and a
+  header block — that exceeds the cap once assembled. The only place the cap is actually checked on this
+  path is reactively, inside `StreamFramer`/`WebSocketTransport`'s own `SendAsync`, after the oversized
+  frame has already been built and queued to every recipient.
+- **The pending fix — PR #121 (`fix/fan-out-frame-cap`), open and unmerged as of this pass:** adds a
+  frame-size pre-check (`ExceedsFrameCap`) to all three builders, computed **before** allocating the
+  delivery payload, that drops the single oversized message via a new `DropOversizeFanOut` helper and
+  counts it on `meshworx.hub.messages.dropped` with a new `reason=frame-too-large` tag — instead of
+  building the frame, queuing it to every recipient, and letting each recipient's `SendLoopAsync` fail the
+  write and disconnect that recipient. It also adds a README table of the largest body each send shape
+  can carry (`SendAsync`/`BroadcastAsync`: 1 MiB − 17 bytes; `SendToGroupAsync`: 1 MiB − 19 bytes − the
+  group name) and closes a related gap where `InMemoryTransport` — the hub's own test double — enforced
+  no payload cap at all, which is how this defect went untested for as long as it did. **Do not document
+  PR #121's behaviour as current until it merges** — until then, the frame-size pre-check does not exist
+  on `main` and a fan-out send is exactly as exposed as this entry describes.
+- **What to do:** do not narrow `SendLoopAsync`'s catch back to `IOException`/`ObjectDisposedException`
+  only — the three-way `when` clause is load-bearing regardless of PR #121's fate. If you add a new
+  header-bearing or otherwise size-inflating fan-out frame type before PR #121 merges, assume it can
+  still trip this gap and either add your own pre-build size check or accept that it will disconnect
+  recipients under the same conditions described here; do not assume the sender-side length checks
+  (`HeaderEnvelope.GetEncodedLength`'s 65 535-byte cap, for instance) make an oversized *outbound* (hub →
+  recipient) frame impossible — they bound one component, not the combined frame the hub reassembles for
+  delivery.
 
 ### KI-34 — `MessageHeaders`'s constructor throws on a duplicate key instead of last-wins
 - **Where:** the public constructor (`Messages/MessageHeaders.cs:41-45`), which copies its input via
@@ -1054,10 +1094,12 @@ the risk to a change, not a claim that the code is defective.
   tooling that infers the cause from the status code. The behaviour (always `400`, no distinction) was
   kept as-is; only the doc was corrected to match it.
 
-### KI-37 — A pipelined first WebSocket frame ahead of the `101` response has no dedicated regression test
+### KI-37 — A pipelined first WebSocket frame ahead of the `101` response has a dedicated regression test — **FIXED (PR #78)**
 - **Where:** the leftover-handling in `NegotiateAsync` (`Transport/WebSocket/WebSocketTransportListener.cs:432-439`);
   the buffered header reader that produces it, `ReadHeaderLinesAsync` (`:575-613`); the wrapper that
-  serves it back, the private nested `LeftoverPrefixedStream` (`:658-739`).
+  serves it back, the private nested `LeftoverPrefixedStream` (`:658-739`); the regression test,
+  `WebSocketTransportLoopbackTests.ConnectAndAccept_ClientPipelinesFirstFrameAheadOfUpgradeResponse_LeftoverBytesAreNotLost`
+  (`src/Tests/AdamSalisbury.Meshworx.UnitTests/Transport/WebSocket/WebSocketTransportLoopbackTests.cs:118`).
 - **Why it matters, not "bites":** `ReadHeaderLinesAsync` reads the HTTP upgrade request in 16 KiB-bounded
   chunks looking for the terminating blank line. A peer is not required by RFC 6455 to wait for the
   `101 Switching Protocols` response before sending its first WebSocket frame, so that frame's bytes can
@@ -1065,20 +1107,20 @@ the risk to a change, not a claim that the code is defective.
   terminator in that chunk is not header data at all; `ReadHeaderLinesAsync` returns it as `leftover`
   rather than discarding it, and `NegotiateAsync` wraps the negotiated stream in `LeftoverPrefixedStream`
   whenever `leftover.Length > 0` so `SystemWebSocket.CreateFromStream` sees those bytes served back before
-  anything further is read from the socket. On inspection this looks correct.
-- **The gap:** *(inference)* no test in `WebSocketTransportLoopbackTests.cs` or elsewhere in the suite
-  drives a client that writes a WebSocket frame immediately after its upgrade request without waiting for
-  the `101` response — every test's `WebSocketTransport.ConnectAsync` call implicitly waits for
-  `ClientWebSocket` to complete the handshake before the test sends anything. This path's correctness
-  therefore rests on code inspection and RFC 6455 conformance, not on a regression test that would catch a
-  future change silently dropping those bytes (which would manifest as an intermittently missing or
-  truncated first message on a fast client, and only under a specific chunk-boundary timing — a very hard
-  bug to reproduce after the fact).
+  anything further is read from the socket.
+- **The test, confirmed by re-reading it directly:** drives a raw `TcpClient` (not `ClientWebSocket`,
+  which would implicitly wait for the handshake before sending anything) that writes the HTTP upgrade
+  request **and** a masked WebSocket binary frame back-to-back in a single `WriteAsync` — exactly the
+  pipelined case `LeftoverPrefixedStream` exists to handle — then calls `AcceptAsync` and asserts the
+  frame's payload is received correctly through the accepted `ITransport`. This is precisely the
+  regression-test shape a prior pass of this document once described as still missing; it exists on
+  `main` and passes. This entry's own table row already reflected this — only this body text was stale,
+  claiming the opposite.
 - **What to do:** if you touch the header reader or the leftover plumbing, keep returning and re-serving
-  those bytes rather than discarding them. If you want this properly regression-tested, the shape to add
-  is a test that opens a raw `TcpClient` against the listener, writes the upgrade request **and** the
-  first WebSocket frame's bytes back-to-back in one `Send` before reading the response, and asserts the
-  frame is still received correctly.
+  those bytes rather than discarding them, and keep this test's pipelined-write shape (upgrade request +
+  frame bytes in one `WriteAsync`, before any `ReceiveAsync`) as the regression guard — it is the one test
+  in the suite exercising this exact race, do not delete or weaken it while refactoring the negotiation
+  path.
 
 ### KI-38 — `UnixSocketTransport`/`NamedPipeTransport` bypass the per-remote-endpoint connection cap entirely
 - **Where:** `MeshHub.AcceptLoopAsync`'s cap check (`MeshHub.cs:772-782`) and the predicate it runs,
@@ -1086,7 +1128,7 @@ the risk to a change, not a claim that the code is defective.
   `IRemoteEndPointTransport` **and** reporting an `IPEndPoint`. Neither `UnixSocketTransport`
   (`Transport/Unix/UnixSocketTransport.cs:22`) nor `NamedPipeTransport`
   (`Transport/NamedPipes/NamedPipeTransport.cs:23`) implements `IRemoteEndPointTransport` at all — added
-  by PR #81 (issue #20). **`QuicTransport` (PR #82, issue #21, not yet merged to `main`) is *not* in this
+  by PR #81 (issue #20). **`QuicTransport` (PR #82, issue #21) is *not* in this
   bucket** — it implements `IRemoteEndPointTransport` and reports the real `QuicConnection.RemoteEndPoint`
   on both sides, so it participates in `maxConnectionsPerRemoteEndpoint` exactly as `TcpTransport` does;
   this was a deliberate correctness point confirmed during that PR's review specifically to avoid growing
@@ -1164,7 +1206,7 @@ the risk to a change, not a claim that the code is defective.
   `negotiationSlots` semaphore (`maxConcurrentNegotiations`, default 64, `:428`) and the per-source cap
   layered in front of it (`TryAdmitSource`/`ReleaseSource`/`NormaliseForSourceCap`,
   `maxConcurrentNegotiationsPerSource`, default one eighth of `maxConcurrentNegotiations`, `:572-643`).
-  Added by PR #82 (issue #21), **not yet merged to `main`**.
+  Added by PR #82 (issue #21, merged).
 - **Severity:** medium (availability). Not hypothetical against a genuinely distributed source — it is
   the residual half of a gap the per-source cap was added specifically to narrow, not close.
 - **Why it bites:** QUIC's `AcceptConnectionAsync` completes the full TLS 1.3 handshake internally
@@ -1262,36 +1304,60 @@ the risk to a change, not a claim that the code is defective.
   proof this is safe — it only ever exercised the sequential case; the race coverage above is what closes
   the gap it left open.
 
-### KI-42 — `SendAsync`'s headers overload now rejects six specific header keys — **EXTENDED (PR #84, PR #85)**
-- **Where:** `MeshClient.SendAsync(Guid, ReadOnlyMemory<byte>, MessageHeaders, CancellationToken)`
-  (`MeshClient.cs:377-387`) calls `ThrowIfReservedHeaderKeyPresent(headers)` at `:384` (method at
-  `:543-555`, guarding the `ReservedHeaderKeys` array at `:527-535`) before doing anything else with the
-  caller's `headers`.
-- **Severity:** low (usability / backward compatibility). Introduced by PR #83 for two keys, extended by
-  PR #84 to five, extended again by PR #85 to six. PR #83 added the request/response helper
-  (`RequestAsync`/`ReplyAsync`, see [client.md](client.md#request-response)) and needed two header keys —
-  `"mesh.request-id"` and `"mesh.reply"` (`Messages/RequestReplyHeaderKeys.cs`) — reserved so an
-  application header could never be silently swallowed by the receive loop's reply matcher (KI-43 below).
-  PR #84 added delivery acknowledgement (see [client.md](client.md#delivery-acknowledgement)) and needed
-  three more — `"mesh.ack-id"`, `"mesh.ack-request"` and `"mesh.ack"`
-  (`Messages/DeliveryAcknowledgementHeaderKeys.cs`) — for the identical reason (KI-46 below). PR #85 added
-  message time-to-live (see [client.md](client.md#message-expiry-time-to-live)) and needed one more —
-  `"mesh.expires-at"` (`Messages/MessageExpiryHeaderKeys.cs`) — so an application header could not be
-  silently mistaken for a real expiry value by the receive loop's expiry check.
+### KI-42 — `SendAsync`'s headers overload now rejects thirteen specific header keys, not six — **RECOUNTED THIS PASS**
+- **Where:** the guard array, `ReservedHeaderKeys` (`MeshClient.cs:840-866`), and the method that walks
+  it, `ThrowIfReservedHeaderKeyPresent` (`:874-887`), called from `SendAsync(Guid, ReadOnlyMemory<byte>,
+  MessageHeaders, CancellationToken)` (`:652`) and from `SendAsync(Guid, ReadOnlyMemory<byte>,
+  DeliveryOptions, CancellationToken)`'s headers-carrying path (`:898`) before either does anything else
+  with the caller's `headers`.
+- **Severity:** low (usability / backward compatibility). The array has grown seven times since it was
+  introduced, and this entry's own count was last updated after the fourth: 2 keys (PR #83,
+  request/response), 5 (PR #84, delivery acknowledgement), 6 (PR #85, time-to-live), 7 (PR #87,
+  backpressure), 8 (priority lanes, `ab16567` — predates the PR #90 documentation baseline and was never
+  reconciled until this pass, see the top-of-file note), 10 (distributed tracing, feat #92), and 13
+  (large-message chunking, feat #93, with its three keys only added to this guard by the follow-up fix in
+  PR #134/issue #107 — see [client.md](client.md#large-message-chunking)). **The current, authoritative
+  count is 13**, spanning seven distinct header-key classes:
+
+  | # | Constant | Wire value | Added by |
+  |---|---|---|---|
+  | 1 | `RequestReplyHeaderKeys.CorrelationId` | `"mesh.request-id"` | PR #83 |
+  | 2 | `RequestReplyHeaderKeys.Reply` | `"mesh.reply"` | PR #83 |
+  | 3 | `DeliveryAcknowledgementHeaderKeys.CorrelationId` | `"mesh.ack-id"` | PR #84 |
+  | 4 | `DeliveryAcknowledgementHeaderKeys.Request` | `"mesh.ack-request"` | PR #84 |
+  | 5 | `DeliveryAcknowledgementHeaderKeys.Ack` | `"mesh.ack"` | PR #84 |
+  | 6 | `MessageExpiryHeaderKeys.ExpiresAtUnixMilliseconds` | `"mesh.expires-at"` | PR #85 |
+  | 7 | `BackpressureHeaderKeys.AwaitCapacity` | `"mesh.await-capacity"` | PR #87 |
+  | 8 | `MessagePriorityHeaderKeys.Priority` | `"mesh.priority"` | `ab16567` |
+  | 9 | `TraceContextHeaderKeys.TraceParent` | `"traceparent"` | feat #92 |
+  | 10 | `TraceContextHeaderKeys.TraceState` | `"tracestate"` | feat #92 |
+  | 11 | `ChunkHeaderKeys.Id` | `"mesh.chunk.id"` | feat #93 / PR #134 |
+  | 12 | `ChunkHeaderKeys.Index` | `"mesh.chunk.index"` | feat #93 / PR #134 |
+  | 13 | `ChunkHeaderKeys.Count` | `"mesh.chunk.count"` | feat #93 / PR #134 |
+
+  **Two other well-known header keys exist and are *not* in this guard, deliberately**:
+  `ContractHeaderKeys.Method` (`"mesh.contract.method"`, typed contracts, see
+  [contracts.md](contracts.md)) and `SerializationHeaderKeys.ContentType` (`"mesh.content-type"`, the
+  codec layer, see [serialization.md](serialization.md)). Both are public, caller-facing well-known
+  constants rather than a client-to-client-only convention the hub must never see forged, so neither is
+  reserved against an application setting it directly — do not assume every `mesh.*`-prefixed constant in
+  the codebase is in `ReservedHeaderKeys` just because most of the newer ones are.
 - **Why it bites:** before PR #83, `MessageHeaders` was an open, uninterpreted-by-the-client namespace —
-  an application could use any string as a key, and `SendAsync` would send it unremarked. Since PR #83
-  (two keys), PR #84 (three more) and PR #85 (one more), doing so with any of these six exact strings
-  throws `ArgumentException`. Any application that happened to use one of them as its own header key
-  before the relevant PR shipped will see `SendAsync` start failing where it previously succeeded — a
-  genuine (if narrow-probability) behavioural break introduced without a protocol version bump each time,
-  because it is enforced entirely client-side and has no wire-format consequence at all.
+  an application could use any string as a key, and `SendAsync` would send it unremarked. Since PR #83,
+  doing so with any of the current 13 exact strings throws `ArgumentException`. Any application that
+  happened to use one of them as its own header key before the relevant landing commit shipped will see
+  `SendAsync` start failing where it previously succeeded — a genuine (if narrow-probability) behavioural
+  break introduced without a protocol version bump each time, because it is enforced entirely client-side
+  and has no wire-format consequence at all.
 - **What to do:** if you hit this, rename your header key. Do not work around it by constructing the
   frame yourself to bypass `SendAsync` — see KI-43/KI-46 for why that produces a worse outcome on the
   receiving end than a thrown exception on the sending end.
 - **What not to do:** do not widen the guard to reject a larger namespace "for safety" — it deliberately
-  matches only the six keys `RequestReplyHeaderKeys`/`DeliveryAcknowledgementHeaderKeys`/
-  `MessageExpiryHeaderKeys` actually define, so it does not surprise an application using an unrelated
-  `"mesh.*"`-prefixed key of its own.
+  matches only the 13 keys the seven header-key classes above actually define, so it does not surprise an
+  application using an unrelated `"mesh.*"`-prefixed key of its own. Equally, do not assume this count is
+  final — it has grown with every capability built on the header envelope so far; recount it directly from
+  `MeshClient.cs`'s `ReservedHeaderKeys` array rather than trusting this or any other document's number if
+  the two ever disagree.
 
 ### KI-43 — Request/response is a client-side convention the hub cannot see or protect
 - **Where:** `MeshClient.TryCompletePendingRequest` (`:1439-1484`), called from the receive loop's
@@ -1543,6 +1609,199 @@ the risk to a change, not a claim that the code is defective.
   `restoreGroupMembership: false` to `MeshClientReconnector` when the hub has resumption enabled and let
   the hub's restore do the work, or make the authoriser cheap for a repeat decision on the same
   (client, group) pair.
+
+**Three session-resumption identity-swap bugs were fixed since this section was written (KI-50–53), all
+in the correctness sweep between this pass's baseline and `f277e60` — no residual caveat, recorded here
+for context rather than as new entries.** `5b875ef` removed the resuming connection's own now-orphaned
+registration entry from the session table (issue #97) — before this fix, every successful resume left an
+unreachable entry behind, growing the table indefinitely. `31880be` made the receive loop's `finally`
+tear down the client registry entry by the connection's **current** id rather than a local that could go
+stale if `ResumeSessionAsync` threw partway through — before this fix, a `SessionResumed` reply-send
+failure could leak the reclaimed id's registry entry permanently. `8a1b557` paired `ClientConnected` and
+`ClientDisconnected` across the identity swap (issue #105) — before this fix, a resumed connection's
+`ClientConnected(freshId)` from registration was never balanced by a matching disconnect, so a subscriber
+tracking connected ids would leak the fresh id forever. None of the three change what KI-50/KI-52/KI-53
+above assert; see [hub.md](hub.md#session-resumption) for where they're described in context.
+
+### KI-54 — Message priority is honoured only for a header-bearing direct send and a header-bearing group send
+- **Where:** `RouteMessageWithHeaders` reads and honours the sender's priority (`MeshHub.cs:2303-2304`,
+  via `ReadPriority`, `:2970-2981`). `RouteMessage` (the plain, headerless direct opcode) always enqueues
+  `MessagePriority.Normal` (`:2242-2244`) — "the plain opcode carries no priority hint". `BroadcastMessage`
+  always enqueues `Normal`, unconditionally — there is no header-bearing broadcast opcode at all
+  (`:3066-3068`). `SendToGroup` (the plain, headerless group opcode) always enqueues `Normal`
+  (`:3434-3437`); `SendToGroupWithHeaders` reads priority once per fan-out and applies it identically to
+  every recipient's enqueue (`:3524-3548`).
+- **Severity:** low (correctness / surprise), by design — not a defect, but genuinely easy to assume
+  priority is a property of the message rather than of which opcode carried it.
+- **Why it bites:** `DeliveryOptions.AtPriority`/`WithPriority` only take effect via
+  `SendAsync(recipientId, payload, DeliveryOptions, ct)`, which writes the `mesh.priority` header and
+  therefore always routes through the header-bearing path — so a direct send set at a priority always
+  gets it honoured. But `BroadcastAsync` has **no** priority parameter or overload at all, and
+  `SendToGroupAsync(name, payload)` (the plain overload) is headerless and therefore always `Normal` —
+  only `SendToGroupAsync(name, payload, priority)` (which internally builds a one-header
+  `MessageHeaders` and takes the header-bearing path, short-circuiting back to the plain overload when
+  `priority == Normal`) gets priority honoured. A caller who assumes "I called something with `priority`
+  in scope, therefore it took effect" for a broadcast will be wrong — there is nothing to call. Internal
+  hub traffic (heartbeat pings, `MeshHub.cs:2198`; NACKs, `:1921`; group-join refusals, `:3267`) is always
+  enqueued `High`, deliberately overtaking application backlog so liveness/control traffic never starves
+  behind it — this is intentional, not a bug, but worth knowing if you are debugging why control frames
+  seem to jump the queue.
+- **What to do:** for a priority that must be honoured, use `SendAsync(..., DeliveryOptions.AtPriority(...))`
+  for a direct message or `SendToGroupAsync(name, payload, priority)` for a group message — never assume a
+  broadcast or a plain group send respects it. `SendLargeAsync` (chunking) has no priority parameter
+  either — every chunk lands on the `Normal` lane regardless of what priority the logical transfer might
+  deserve. See [client.md](client.md#message-priority) and [hub.md](hub.md#priority-lanes).
+
+### KI-55 — A rate-limited inbound drop is invisible to `meshworx.hub.messages.dropped`
+- **Where:** `ClientRateLimiter`'s four `TokenBucket`-backed budgets
+  (`src/AdamSalisbury.Meshworx/RateLimiting/ClientRateLimiter.cs`), checked in the hub's receive loop —
+  the general per-frame budget (`MeshHub.cs:1339-1355`), the fan-out frequency budget (`:1371-1385`), and
+  the fan-out delivery-volume budget at its three call sites (`BroadcastMessage` `:3013-3038`,
+  `SendToGroup` `:3387-3407`, `SendToGroupWithHeaders` `:3498-3519`).
+- **Severity:** low–medium (observability), added by issue #69. Not a correctness defect — a rate-limited
+  drop behaves exactly like every other silent drop this library makes (KI-1, KI-4) — but the existing
+  `meshworx.hub.messages.dropped` counter's `reason` tag only ever carries `unknown-recipient`,
+  `queue-full`, `expired` or `offline-queue-full`; none of the rate-limiter's drop sites call
+  `_messagesDroppedCounter.Add(...)` at all.
+- **Why it bites:** a hub operator watching `meshworx.hub.messages.dropped` by `reason` to understand why
+  traffic is being lost will see nothing when a client is rate-limited — the only signal is a
+  `LogWarning`, and it is deliberately throttled to roughly once per second **across the whole hub**
+  (`RateLimiting/SharedLogThrottle.cs`), specifically so N simultaneously-throttled clients cannot each
+  log N lines per second — which also means the log line cannot be used to count how many frames were
+  actually dropped, only that *some* rate limiting is happening somewhere.
+- **What to do:** do not build alerting or dashboards against `messages.dropped` expecting it to reflect
+  rate-limit activity — it will not. If you need this observable, that is a real, currently-unimplemented
+  gap: a `reason=rate-limited` tag would need adding at each of the four call sites above. Until then, the
+  only signal is the throttled warning log, present but not quantifiable via metrics. See
+  [hub.md](hub.md#rate-limiting) for the budgets themselves.
+
+### KI-56 — `SendLargeAsync`'s chunked transfer fails silently to the sender on any reassembly failure
+- **Where:** `ChunkReassembler`'s three independent failure modes — a chunk that would push the running
+  total over `maxReassemblyBytes` abandons the **whole** transfer, not just that chunk
+  (`ChunkReassembler.cs:83-91`); a duplicate chunk index or a `count` that disagrees with the value the
+  transfer started under also drops the whole transfer (`:98-105`); an idle transfer older than
+  `chunkTransferTimeout` is reclaimed on the next `TryAddChunk` call (`:168-196`). None of these notify
+  the sender — documented explicitly on the interface (`IMeshClient.cs:256-260`): "dropped without
+  notifying the sender, so a caller that must know the message arrived should pair this with an
+  application-level acknowledgement."
+- **Severity:** medium (correctness), by design — consistent with the rest of this library's
+  fire-and-forget-by-default posture (KI-1, KI-5), but a genuinely easy trap for a caller reaching for
+  `SendLargeAsync` and assuming it inherits `DeliveryOptions.RequireAck`'s guarantee, which it cannot:
+  `SendLargeAsync` takes no `DeliveryOptions` parameter at all, so it cannot be combined with an
+  acknowledgement or a priority.
+- **Why it bites:** a large transfer that arrives out of order, races another concurrent large transfer
+  from the same sender (each keyed independently by a fresh `Guid.NewGuid()` per `SendLargeAsync` call,
+  so this is not itself a bug — see [client.md](client.md#large-message-chunking)), or simply takes longer
+  than `chunkTransferTimeout` on a slow connection, is dropped with nothing observable at the sender and
+  only a discarded partial buffer at the recipient. A straggler chunk arriving for an already-reclaimed
+  transfer silently starts a *new* transfer under the same id rather than completing or erroring the old
+  one — it will itself eventually time out incomplete, compounding the silence.
+- **What to do:** if a caller needs delivery confidence for a chunked send, build an application-level
+  acknowledgement on top (e.g. the recipient sends a small confirmation message once
+  `MessageReceived` fires for the reassembled payload) — do not assume the absence of an error means
+  success. Size `maxReassemblyBytes`/`chunkTransferTimeout` generously enough for your real transfer sizes
+  and network conditions, since either bound firing discards the whole transfer, not just the excess.
+
+### KI-57 — `JsonMessageSerializer`'s runtime-type resolution for an interface-/abstract-declared value is top-level only, and can throw under an incomplete AOT `JsonSerializerContext`
+- **Where:** `JsonMessageSerializer.Serialize<TValue>` (`AdamSalisbury.Meshworx.Serialization/JsonMessageSerializer.cs:82-90`).
+- **Severity:** medium (correctness / AOT), by design — fixed a real data-loss bug (PR #136, issue #111)
+  but the fix has a scope boundary worth knowing before relying on it.
+- **Why it bites:** `Serialize` now resolves against `value.GetType()` rather than the declared `TValue`
+  when `TValue` is `interface` or `abstract`, so a concrete implementation's own members are no longer
+  silently dropped at the **top level**. It does **not** reach a nested interface- or abstract-typed
+  *property* on a concrete type passed by its concrete type — `System.Text.Json` decides serialization
+  per-property against each property's own declared type, and this codec has no custom converter to widen
+  that; a concrete type with an `IPayload Payload { get; }` property still serializes `Payload` by `IPayload`'s
+  contract, dropping its concrete members, exactly as before the fix. Separately, under a
+  source-generated `JsonSerializerContext` (used for AOT/trimming) that registers metadata only for the
+  declared interface/abstract type and not for `value.GetType()`, `Serialize` now throws
+  `NotSupportedException` rather than silently falling back to the lossy declared-type behaviour — this is
+  the correct failure mode (loud rather than silent data loss) but it is a new way for a previously-working
+  call to start throwing once trimming/AOT is introduced to a project that was not compiled that way
+  before. `Deserialize<TValue>` was, and still is, unaffected in behaviour — deserializing into an
+  interface- or abstract-declared `TValue` has always thrown `NotSupportedException` (`System.Text.Json`'s
+  own behaviour, since it cannot construct an instance of a type it cannot instantiate); the fix only added
+  the `<exception>` XML doc entry documenting this truthfully.
+- **What to do:** if you construct your own `JsonSerializerOptions` with a source-generated
+  `JsonSerializerContext` for AOT/trimming, register **every concrete type that can appear behind** an
+  interface- or abstract-declared value you might pass to `Serialize`, not just the declared
+  interface/abstract type itself — otherwise a previously-working reflection-based call becomes a runtime
+  `NotSupportedException` under AOT. If you need a nested interface-typed property serialized by its
+  runtime type too, you need your own `JsonConverter`; this codec does not provide one. See
+  [serialization.md](serialization.md#jsonmessageserializer).
+
+### KI-58 — `mesh.contract.method` is the bare method name, not contract-qualified — pending fix in PR #120
+- **Where:** the generated proxy/dispatcher wire value (`AdamSalisbury.Meshworx.Contracts.Generator/MeshContractGenerator.cs:295-297,398`),
+  and its documented reasoning, which only covers uniqueness *within one interface*
+  (`AdamSalisbury.Meshworx.Contracts/ContractHeaderKeys.cs:19-23`).
+- **Severity:** medium (correctness), pending fix — open on `main` as of this pass.
+- **Why it bites:** two unrelated `[MeshContract]` interfaces that happen to declare a same-named method
+  (e.g. two different contracts each with a `GetTotalAsync`) produce an **identical**
+  `mesh.contract.method` wire value, because the generator writes only `method.Name`, never the
+  interface's own identity. A `MeshClient` with both contracts' dispatchers wired to `MessageReceived`
+  cannot tell them apart from the header alone. Separately, and worth knowing regardless of which contract
+  a message belongs to: on current `main`, a generated proxy method that returns `Task<T>` (i.e. expects a
+  reply) serializes its body and calls `IMeshClient.RequestAsync(recipientId, body, timeout,
+  cancellationToken)` directly — `RequestAsync` has **no overload accepting `MessageHeaders`** on `main`,
+  so the `mesh.contract.method` header the proxy builds is discarded before the call, never reaches the
+  wire, and the dispatcher's `TryGetValue(...Method, ...)` lookup always fails for a real end-to-end
+  result-returning contract call. This defect is easy to miss because the shipped test suite
+  (`GeneratedContractTests.cs`) exercises the dispatcher's `Task<T>` path by hand-constructing a
+  `MessageReceivedEventArgs` with the header pre-set, never through the real proxy's `RequestAsync` call —
+  so the gap was never exercised end-to-end before this pass found it.
+- **The pending fix — PR #120 (`fix/typed-contract-defects`), open and unmerged as of this pass:** adds
+  `MessageHeaders`-carrying overloads to `IMeshClient.RequestAsync`/`ReplyAsync` (closing the discarded-header
+  defect above), qualifies `mesh.contract.method` to `Namespace.IInterface.Method` via a new
+  `ContractModel.ContractIdentity` (closing the cross-contract collision), and makes the generated
+  dispatcher's constructor take its reply client as a required argument for any contract with at least one
+  result-returning method — replacing `TryDispatchAsync`'s current per-call, optional `replyClient`
+  parameter. **None of this is true of `main` as it stands** — do not document PR #120's constructor
+  shape, header qualification, or `RequestAsync`/`ReplyAsync` overloads as current until it merges. See
+  [contracts.md](contracts.md#pending-pr-120) for the full pending-change list.
+- **What to do:** until PR #120 merges, do not register two `[MeshContract]` interfaces that share a
+  method name on dispatchers wired to the same client, and be aware that a result-returning
+  (`Task<T>`-declared) contract method's generated proxy does not actually reach a matching dispatcher on
+  `main` today — only a `Task`-returning (one-way) contract method's proxy path is exercised end-to-end
+  correctly right now.
+
+### KI-59 — `SessionResumed`'s reported-groups block silently drops an over-length group name and caps the reported count at 65,535
+- **Where:** `MeshHub.BuildReportableGroupNameBytes` — the oversized-name guard drops a group whose UTF-8
+  encoding exceeds `ushort.MaxValue` bytes, logging a warning ("...is too long to report in the
+  SessionResumed reply; the membership is real, but this reply cannot name it"); the count guard breaks
+  the loop once 65,535 groups have been reported, logging a warning naming the
+  `MaxReportableGroups` cap.
+- **Severity:** low (correctness), by design — added deliberately after a security review flagged the
+  original, unbounded version as a length-prefix truncation risk.
+- **Why it bites:** both guards only affect the `SessionResumed` **reply's own ability to name** a
+  restored group — `RestoreGroupMembershipAsync` has already restored the membership server-side by the
+  time either guard runs, so the hub's own state is correct either way. A version-7+ client relying on
+  `RestoreJoinedGroupsFromResumedReply` (KI-60 below) to repopulate `JoinedGroups`, though, will end up
+  with a `JoinedGroups` that under-reports reality in either edge case: a group name too long to fit the
+  block's `ushort` length prefix, or a client somehow restored into more than 65,535 groups, silently
+  vanish from the client's own view even though the hub still has the client as a genuine member.
+- **What to do:** in practice neither bound is likely to matter — a 65,535-byte UTF-8 group name or
+  65,535 simultaneous group memberships for one client are both extreme. If you do operate near either
+  ceiling, do not rely on a version-7 client's `JoinedGroups` as a complete picture after a resume;
+  query the hub directly if you need certainty. See [hub.md](hub.md#session-resumption).
+
+### KI-60 — `MeshClient.RestoreJoinedGroupsFromResumedReply` fully replaces `JoinedGroups`, it does not merge
+- **Where:** `MeshClient.cs:511-553`.
+- **Severity:** low (correctness), by design.
+- **Why it bites:** on a successful resume against a hub negotiated at protocol version 7+, the method
+  clears `_joinedGroups` and repopulates it entirely from the wire data the `SessionResumed` reply
+  carries — a full **replace**, not a merge with whatever the client believed beforehand. Any group the
+  client thought it was in that the hub does not report — one joined mid-disconnect that never landed
+  before the drop, or one restored server-side but then refused by a `GroupAuthoriser` on re-authorisation
+  — is discarded outright, with no distinction between "never actually joined" and "was a member and got
+  silently corrected". Below protocol version 7, or on a truncated/malformed group block, the method bails
+  out without mutating `_joinedGroups` at all — so this replace-not-merge behaviour is itself
+  version-gated and only ever happens for a version-7+ resume that parses cleanly.
+- **What to do:** treat the hub's `SessionResumed` report as authoritative after a version-7+ resume —
+  do not assume a group your application believed it was in before the drop survives untouched. If your
+  application needs to know specifically *which* groups it lost versus which it never had, diff your own
+  pre-disconnect snapshot against `JoinedGroups` immediately after `SessionResumed` fires, rather than
+  trusting `JoinedGroups` alone to carry that distinction. See [client.md](client.md#session-resumption)
+  and [hub.md](hub.md#session-resumption).
 
 ---
 

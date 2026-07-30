@@ -550,6 +550,53 @@ Gotchas when writing an authenticator:
 - `maxConcurrentAuthentications` is **ignored when no authenticator is supplied**; a non-positive value
   throws `ArgumentOutOfRangeException` (`MeshHub.cs:284-289`).
 
+### Rate limiting
+
+Added by issue #69, to bound the amplification a single client can force through a broadcast or group
+send. A `ClientRateLimiter` (`RateLimiting/ClientRateLimiter.cs`) is constructed **per connection**, only
+after registration succeeds — registration itself is never rate-limited — and stored on
+`ClientConnection.RateLimiter`. Four independent `TokenBucket`s (`RateLimiting/TokenBucket.cs`), each a
+continuous-refill bucket where the single `refillPerSecond` constructor parameter **also is** the
+capacity, so burst allowance is exactly one second's worth of budget and no more:
+
+| Constructor param | Default | Gates | Charged by |
+|---|---|---|---|
+| `maxInboundMessagesPerSecond` | 200 | every inbound frame, any opcode | 1 token per frame |
+| `maxInboundBytesPerSecond` | 4 MiB | every inbound frame | the frame's byte length |
+| `maxFanOutMessagesPerSecond` | 20 | how *often* a client may trigger a broadcast/group send | 1 token per fan-out attempt |
+| `maxFanOutDeliveriesPerSecond` | 20,000 | the *volume* a fan-out actually amplifies to | `Math.Max(1, recipientCount)` tokens, charged once up front against the full recipient count |
+
+All four are validated at construction (`<= 0` throws `ArgumentOutOfRangeException`); pass `int.MaxValue`
+to opt any one of them out. `MeshHubOptions` mirrors all four as nullable-int properties for the DI
+package.
+
+**Gating points, in receive-loop order:**
+1. **Every inbound frame** is charged against the general message/byte budgets first
+   (`TryAdmitFrame`), deliberately **before** any opcode or length check — including a zero-length frame —
+   so an empty-frame flood cannot bypass the budget for free.
+2. Only `BroadcastMessage`, `GroupMessage` and `GroupMessageWithHeaders` additionally charge the fan-out
+   **frequency** budget (`TryAdmitFanOut`) — a header-bearing group send is included deliberately, so a
+   client cannot dodge the budget by attaching an empty header block.
+3. `TryAdmitFanOutDelivery(recipientCount)` is charged once per fan-out, at each of the three fan-out call
+   sites in [Routing helpers](#routing-helpers) below, **up front against the full recipient count** — a
+   broadcast/group send either clears the whole delivery-volume budget or is dropped in its entirety;
+   there is no partial delivery to some recipients and drop for others.
+
+**On exceeding any bucket, the frame is silently dropped** — no error frame, no disconnect, the sender is
+never told, matching the existing full-outbound-queue drop shape (KI-1). The only observable signal is a
+hub-wide `LogWarning`, deliberately throttled to roughly once per second across **every** connection
+(`RateLimiting/SharedLogThrottle.cs`) rather than per-connection, specifically so many simultaneously
+rate-limited clients cannot each log independently. **There is no `reason=rate-limited` tag on
+`meshworx.hub.messages.dropped`** — a rate-limited drop is invisible to the metrics, observable only via
+the throttled log line. See [known-issues.md](known-issues.md) KI-55.
+
+```csharp
+await using var hub = new MeshHub(
+    logger, listener,
+    maxInboundMessagesPerSecond: 500,
+    maxFanOutDeliveriesPerSecond: 50_000);
+```
+
 ### Routing helpers
 
 | Method | Opcode in | Behaviour | Source |
@@ -581,6 +628,60 @@ Note the empty-group early return is **gone**: a group with no members can no lo
 non-member send anyway, and a lone member sending to itself still short-circuits further down
 (`MeshHub.cs:2360-2364`). A send to a group that does not exist at all still returns at the
 `_groups.TryGetValue` miss (`MeshHub.cs:2327`).
+
+<a id="priority-lanes"></a>
+
+### Priority lanes
+
+Every `ClientConnection.OutboundQueue` is a `PriorityOutboundQueue` (`PriorityOutboundQueue.cs`), not a
+plain channel — landed in commit `ab16567`, chronologically before the PR #90 documentation baseline and
+never reconciled until this pass (see the freshness narrative at the top of
+[for-clanker.md](../for-clanker.md)). `MessagePriority` (`Messages/MessagePriority.cs`) is a three-value
+enum, `Normal`/`Low`/`High`; see [client.md](client.md#message-priority) for how a sender sets one.
+
+**Three fixed lanes, one shared capacity gate.** High/Normal/Low each get their own unbounded
+`Channel<byte[]>`, but a single `SemaphoreSlim` capacity gate shared across all three enforces the same
+total-1024-per-client budget a plain single-lane queue always had (`OutboundQueueCapacity = 1024`,
+`MeshHub.cs:3623`) — priority changes *ordering*, not total memory.
+
+**Drain order is strict-with-burst-caps, not pure strict-priority and not weighted-fair** (`ReadAllAsync`,
+`PriorityOutboundQueue.cs:229-292`): up to 8 high-priority frames (`HighBurstLimit`), then up to 4
+normal-priority frames (`NormalBurstLimit`), then **exactly one** low-priority frame, looping immediately
+if anything was serviced. This guarantees the low lane a turn every cycle regardless of high/normal
+backlog size — it cannot be starved indefinitely — at the cost of a small, bounded latency: a high-priority
+frame arriving mid-burst can wait up to `NormalBurstLimit` (4) frames before being recognised, never more.
+
+**`ReadPriority(ReadOnlyMemory<byte> headerBlock)` (`MeshHub.cs:2970-2981`) is the one narrow,
+single-key `HeaderEnvelope.TryReadValue` scan that decides the lane** — the same "read one key, don't
+decode the rest" shape as the TTL/backpressure scans (PR #85/#87). Malformed or absent `mesh.priority`
+resolves to `Normal`, mirroring the sender-side parse. **Only the header-bearing routing paths read it —
+the plain/headerless paths and both fan-out-without-headers paths always use `Normal`:**
+
+| Path | Priority honoured? | Source |
+|---|---|---|
+| `RouteMessageWithHeaders` (direct, header-bearing) | **Yes** — read per send | `MeshHub.cs:2303-2304` |
+| `RouteMessage` (direct, headerless) | No — always `Normal`, "the plain opcode carries no priority hint" | `MeshHub.cs:2242-2244` |
+| `SendToGroupWithHeaders` | **Yes** — read once per fan-out, applied to every recipient | `MeshHub.cs:3524-3548` |
+| `SendToGroup` (headerless) | No — always `Normal` | `MeshHub.cs:3434-3437` |
+| `BroadcastMessage` | No — always `Normal`; there is no header-bearing broadcast opcode at all | `MeshHub.cs:3066-3068` |
+
+See [known-issues.md](known-issues.md) KI-54 for the consequence — a caller reaching for priority on a
+broadcast has nothing to call.
+
+**Internal hub-originated traffic always enqueues `High`, deliberately, so control/liveness traffic never
+queues behind an application backlog:** heartbeat pings (`MeshHub.cs:2198`), NACKs (`:1921`) and
+group-join refusals (`:3267`).
+
+**A held offline message is drained onto the same lane it would have used live.** The offline-delivery
+drain (see [Offline delivery](#offline-delivery) below) reuses `BuildDeliverMessage`/
+`BuildDeliverMessageWithHeaders` and this same `ReadPriority` scan, so a held message's priority is
+preserved across the hold — this was, before this pass, the *only* trace of priority lanes anywhere in
+this docs set.
+
+**A capacity wait honours priority too.** `TryAwaitCapacityAsync` forwards the resolved priority straight
+into `OutboundQueue.TryEnqueueAsync(priority, ...)` — a high-priority sender that hits a saturated queue
+and opted into `AwaitCapacity` still waits at high priority once room appears; priority orders the lane,
+it does not let a sender skip the capacity gate itself.
 
 <a id="backpressure-signalling-and-awaiting-capacity"></a>
 
@@ -660,11 +761,19 @@ one was addressing nothing, and the client's group memberships were gone. Settin
 **The exchange is post-registration and that is not a style choice** — see
 [protocol.md](protocol.md#session-resumption) for why a token in the registration frame would have been
 misparsed as credential bytes by any older hub. The consequences for this file: the resume arrives as
-an ordinary frame in the client's dispatch ladder, *after* the connection is fully registered, and its
-handler reassigns `HandleClientAsync`'s own `clientId` local so everything downstream — the sender id on
-routed frames, and the registry keys the `finally` removes — follows the reclaimed identity.
+an ordinary frame in the client's dispatch ladder, *after* the connection is fully registered.
 
-**Four methods, in lifecycle order:**
+> **The receive loop's `finally` tears down the client registry entry by the connection's *current* id,
+> not a local captured earlier — fixed by `31880be`, after this section previously described the
+> opposite.** `ResumeSessionAsync` reassigns the connection's own `Id` as part of the swap, but the
+> `finally` block (`MeshHub.cs:1574`) does `_clients.TryRemove(connection.Id, out _)` rather than trusting
+> a `clientId` local that could go stale: if `ResumeSessionAsync` throws (or its reply-send fails) before
+> a local assignment completes, a `clientId` local frozen at the discarded fresh id would leave the
+> reclaimed id's registry entry behind forever, pointing at a connection about to be disposed. Reading
+> `connection.Id` fresh at teardown time closes that gap regardless of where in `ResumeSessionAsync` a
+> failure happens.
+
+**Five methods, in lifecycle order** (a fifth was added by PR #135/issue #109, see below):
 
 1. **`IssueSessionToken(connection)`** — at registration. 32 bytes from `RandomNumberGenerator`;
    only `HashSessionToken` of it is retained, on the connection (`SessionTokenHash`) and as the
@@ -679,8 +788,21 @@ routed frames, and the registry keys the `finally` removes — follows the recla
 3. **`ResumeSessionAsync(connection, token, ct)`** — validates, then rebinds. The ordering of the swap
    is deliberate: publish under the reclaimed id, `Rebind`, update `_clientNames`, *then* withdraw the
    fresh id — so a peer addressing either reaches the connection throughout, rather than falling into a
-   gap where neither resolves. Both resolving for an instant is harmless; neither is not.
-4. **`RestoreGroupMembershipAsync(connection, groups, ct)`** — **re-authorises, never reinstates.**
+   gap where neither resolves. Both resolving for an instant is harmless; neither is not. **Also removes
+   the resuming connection's own, now-orphaned fresh-registration `_sessions` entry** (fixed by `5b875ef`,
+   issue #97) — before this fix, that entry became unreachable the instant the swap happened (not the
+   fresh id's entry any more, not the spent token either) and sat in the table forever with
+   `DormantUntil == null`, growing it on every successful resume; `PurgeExpiredSessions` now also sweeps
+   any entry with `DormantUntil == null` whose `ClientId` is no longer in `_clients`, as a backstop.
+   **Raises `ClientDisconnected(freshId)` immediately followed by `ClientConnected(resumedId)`** around
+   the identity swap (fixed by `8a1b557`, issue #105) — before this fix, a resumed connection's
+   `ClientConnected(freshId)` from registration was never balanced by a matching disconnect, so a
+   subscriber tracking connected ids would leak the fresh id forever and later see an unmatched
+   `ClientDisconnected(resumedId)` at real teardown.
+4. **`RestoreGroupMembershipAsync(connection, groups, ct)`** — **re-authorises, never reinstates.** Since
+   PR #135/issue #109 this also **returns** the subset of `groups` it actually restored
+   (`IReadOnlyList<string>`), for step 5 to report back to the client.
+5. **`BuildSessionResumedReply` / `BuildReportableGroupNameBytes`** — new, PR #135/issue #109. See below.
 
 > **The re-authorisation is the load-bearing part, and it is why this is not a two-line state restore.**
 > `JoinGroup_AfterReconnect_IsAuthorisedAgainRatherThanRestored` pins that a reconnect cannot bypass a
@@ -706,6 +828,26 @@ routed frames, and the registry keys the `finally` removes — follows the recla
 - Dormant only (a live session is never resumable), within the window, and the reclaimed id must not
   currently be in `_clients`.
 
+**Since PR #135 (issue #109), a version-7+ `SessionResumed` reply also reports which groups the hub
+actually restored — protocol version bumped `6` → `7`, new `Protocol.SessionResumedGroupsMinVersion = 7`.**
+Gated on `connection.NegotiatedProtocolVersion >= Protocol.SessionResumedGroupsMinVersion`: below `7`, the
+reply is the byte-identical pre-#109 18-byte-header-plus-token shape, unchanged; at `7`+, a
+`[groupCount u16 BE]([nameLength u16 BE][utf8 name])×groupCount` block is appended below the token. See
+[protocol.md](protocol.md#session-resumption) for the exact wire layout and
+[client.md](client.md#session-resumption) for how `MeshClient` consumes it.
+
+**`BuildReportableGroupNameBytes` bounds what the reply *can name*, not what the hub actually
+restored** — added after a security review flagged the original, unbounded version as a length-prefix
+truncation risk:
+- A group name whose UTF-8 encoding exceeds `ushort.MaxValue` bytes is **dropped from the reply**, with a
+  warning log ("...is too long to report in the SessionResumed reply; the membership is real, but this
+  reply cannot name it") — the membership itself is untouched, only the reply cannot describe it.
+- The reported group count is capped at `MaxReportableGroups = ushort.MaxValue` (65,535); beyond that the
+  loop `break`s, with a warning log naming the cap, and the remainder go unreported.
+
+In both cases `RestoreGroupMembershipAsync` has already restored the membership server-side by the time
+either guard runs — see [known-issues.md](known-issues.md) KI-59 for the client-visible consequence.
+
 **Gotchas:**
 - **`ClientConnection.Id` is mutable for this one purpose.** Only the connection's own receive loop
   writes it, while dispatching the resume; routing only ever looks the connection up by whichever id it
@@ -715,6 +857,10 @@ routed frames, and the registry keys the `finally` removes — follows the recla
 - **`StopAsync` clears `_sessions`** along with the registries — a session only means anything on the hub
   that issued its token, and a stopped hub should not still be holding material that reclaims identities
   on it.
+- **`MeshClient.RestoreJoinedGroupsFromResumedReply` fully replaces its `JoinedGroups`, it does not
+  merge** — a group the client believed it was in that this reply does not report (including one dropped
+  by the two guards above) is silently discarded from the client's own view. See
+  [known-issues.md](known-issues.md) KI-60.
 
 <a id="offline-delivery"></a>
 
@@ -891,6 +1037,13 @@ name). See `MetricsCapture<T>` in [testing.md](testing.md#metrics-tests).
 | `meshworx.hub.messages.dropped` | `Counter<long>` | `reason`: `unknown-recipient` / `queue-full` / `expired` (PR #85) / `offline-queue-full` (issue #28) | created `:410`; recorded at every drop site — `RouteMessage` unknown-recipient (`:1883`) and queue-full (`:1898`), `RouteMessageWithHeaders` the same pair (`:1937`, `:1964`), `BroadcastMessage` queue-full (`:2055`), `SendToGroup` queue-full (`:2398`), `SendToGroupWithHeaders` queue-full (`:2482`), `SendLoopAsync` expired (`:1666`, via `IsExpiredFrame` — see [dropping expired frames](#dropping-expired-frames)). **Every one of the five queue-full sites also raises `QueueSaturated` immediately alongside this counter add (PR #87) — see [Backpressure signalling](#backpressure-signalling-and-awaiting-capacity) below; the counter itself gained no new tag** |
 | `meshworx.hub.messages.offline_queued` | `Counter<long>` | — | issue #28; incremented in `TryStoreForOfflineDeliveryAsync` once a store has accepted a message. The same message is counted on `messages.routed` (`direction=direct`) **later**, when the recipient returns and `DeliverStoredMessagesAsync` queues it — so a held message is counted once here and once there, never twice on the same instrument |
 | `meshworx.hub.outbound_queue.depth` | `ObservableGauge<int>` | — | created `:415`; callback `ObserveOutboundQueueDepth` (`:433-442`) sums `ClientConnection.OutboundQueue.Reader.Count` across every entry in `_clients` on each collection pass |
+
+> **A rate-limited drop (see [Rate limiting](#rate-limiting) above, issue #69) is not counted on
+> `messages.dropped` at all — none of `ClientRateLimiter`'s four budget checks call
+> `_messagesDroppedCounter.Add(...)`.** The `reason` tag's values above (`unknown-recipient`, `queue-full`,
+> `expired`, `offline-queue-full`) are the complete current set; do not assume a `reason=rate-limited`
+> value exists. The only observable signal for a rate-limited drop is the throttled `LogWarning` described
+> in [Rate limiting](#rate-limiting). See [known-issues.md](known-issues.md) KI-55.
 
 > **Several of this table's own citations, and the bullets below it, were found to be stale by roughly
 > 40–130 lines each — pre-dating PR #87 and not caused by it — and are corrected in place by this pass**

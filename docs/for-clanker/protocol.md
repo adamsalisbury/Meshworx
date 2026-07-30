@@ -8,7 +8,7 @@ document/verify carefully when you touch it. Everything here is read from
 sites in `MeshHub.cs` / `MeshClient.cs`.
 
 - **Protocol version is a negotiated range** (`Protocol.MinSupportedVersion` = `4`,
-  `Protocol.MaxSupportedVersion` = `6`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
+  `Protocol.MaxSupportedVersion` = `7`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
   it can speak; the hub picks the highest version common to both sides — see
   [Registration handshake](#registration-handshake). Negotiation itself was introduced by PR #73
   (issue #47); PR #74 (issue #32) is the **first thing to actually widen the range and branch on the
@@ -25,7 +25,11 @@ sites in `MeshHub.cs` / `MeshClient.cs`.
   issue #30) is a second opcode added the same way, within version 5, no bump needed. **Issue #43 is the
   second widening**, raising `MaxSupportedVersion` from `5` to `6` to gate session resumption
   (`Protocol.SessionResumptionMinVersion = 6`): one of its three opcodes travels client → hub, which
-  rules out the additive route — see [Session resumption](#session-resumption) below.
+  rules out the additive route — see [Session resumption](#session-resumption) below. **PR #135/issue
+  #109 is the third widening**, raising `MaxSupportedVersion` from `6` to `7`
+  (`Protocol.SessionResumedGroupsMinVersion = 7`) so a `SessionResumed` reply can report which group
+  memberships the hub actually restored — see [Session resumption](#session-resumption) below for the
+  wire layout this adds.
 - **`MessageType` and `Protocol` are `internal`** — opcodes are not visible outside the assembly.
 - **Byte order:** big-endian for all multi-byte integers (`BinaryPrimitives.*BigEndian`). Ids are
   16-byte `Guid`s written with `Guid.TryWriteBytes` / read with `new Guid(span)`.
@@ -36,7 +40,7 @@ sites in `MeshHub.cs` / `MeshClient.cs`.
 
 1. **Transport framing** (owned by the transport). For `TcpTransport`: `[4-byte big-endian length N][N
    payload bytes]`, `N ≤ 1 MiB`. `UnixSocketTransport`/`NamedPipeTransport` (PR #81, issue #20) and, since
-   PR #82 (issue #21, **not yet merged to `main`**), `QuicTransport` frame **identically** — all three
+   PR #82 (issue #21), `QuicTransport` frame **identically** — all three
    (plus TCP) wrap a stream-oriented channel (a socket stream, a pipe stream, or a single QUIC stream)
    exactly the same way, and all four now share one internal `StreamFramer` helper
    (`Transport/Framing/StreamFramer.cs`) rather than each reimplementing the length prefix and its bounds
@@ -81,7 +85,7 @@ Everything in the tables below is the **message payload** (i.e. after the transp
 | `DeliverGroupMessageWithHeaders` | `0x14` | hub → client | sender id (16), name length (2, BE), UTF-8 group name, header-block length (2, BE), header block, message bytes |
 | `QueueSaturated` | `0x15` | hub → client | recipient id (16) — the direct-send recipient whose queue was full |
 | `ResumeSession` | `0x16` | client → hub | resumption token (rest of frame; 32 bytes in practice) |
-| `SessionResumed` | `0x17` | hub → client | reclaimed client id (16), token length (2, BE), renewed token |
+| `SessionResumed` | `0x17` | hub → client | reclaimed client id (16), token length (2, BE), renewed token, and — version 7+ only, PR #135/issue #109 — group count (2, BE) followed by that many `[nameLength (2, BE)][utf8 name]` restored-group entries |
 | `SessionResumeRefused` | `0x18` | hub → client | none |
 
 `0x18` is the highest opcode in use; the next new one is `0x19`. The four header-bearing opcodes
@@ -131,8 +135,10 @@ the negotiated version is below 6 or the hub has resumption switched off, which 
 earlier build produced.
 
 `versionMin`/`versionMax` is the client's supported range; `MeshClient` always sends
-`Protocol.MinSupportedVersion`/`Protocol.MaxSupportedVersion` (`4`/`5` as of PR #74), so a hub and client
-both built from this codebase negotiate `5`, but the wire and the hub's negotiation both treat it as a
+`Protocol.MinSupportedVersion`/`Protocol.MaxSupportedVersion` (`4`/`7` as of PR #135/issue #109 — this
+figure was already stale at `4`/`5` before this pass, left over from the PR #74 reconciliation and never
+updated across the PR #85/issue #43/PR #135 widenings in between), so a hub and client both built from
+this codebase negotiate `7`, but the wire and the hub's negotiation both treat it as a
 real range — a client built against an older copy of the library (advertising `4`/`4`) still
 interoperates, negotiating down to `4` and losing only the header envelope — see
 [Versioning](#versioning). The **credential is everything after the name** — its length is implied by
@@ -394,20 +400,95 @@ handling). **Only `RouteMessageWithHeaders` calls it** — `RouteMessage` (the h
 and the three fan-out routing methods never do, since only a direct send with headers can have its
 capacity wait honoured; see [hub.md](hub.md#backpressure-signalling-and-awaiting-capacity).
 
+<a id="priority-header"></a>
+
+### Priority header (`ab16567`)
+
+Message priority (see [client.md](client.md#message-priority) and [hub.md](hub.md#priority-lanes)) rides
+the same header-envelope route: an ordinary `SendMessageWithHeaders`/`GroupMessageWithHeaders`
+(`0x11`/`0x13`) frame carrying one new well-known key, `Messages/MessagePriorityHeaderKeys.cs` (`internal`):
+
+| Key | Value | Wire string | Present on |
+|---|---|---|---|
+| `MessagePriorityHeaderKeys.Priority` | `"high"` / `"low"` / `"normal"` | `"mesh.priority"` | only written when the priority is not `Normal` — a `Normal`-priority send costs nothing extra on the wire |
+
+**This is a third exception to "the hub only ever reads a header block's length, never its content"** —
+`ReadPriority` (`MeshHub.cs:2970-2981`) uses the identical `HeaderEnvelope.TryReadValue` single-key scan
+as expiry and backpressure. Parsing is total: an absent, malformed, or unrecognised value resolves to
+`Normal`, never throws. Read at **enqueue** time by `RouteMessageWithHeaders`/`SendToGroupWithHeaders`
+only — the plain/headerless direct and group paths and `BroadcastMessage` (no header-bearing broadcast
+opcode exists) always enqueue at `Normal`, regardless of anything the sender does. See
+[known-issues.md](known-issues.md) KI-54.
+
+<a id="trace-context-headers"></a>
+
+### Trace context headers (feat #92)
+
+Opt-in distributed tracing (see [client.md](client.md#distributed-tracing)) rides the same route, carrying
+two new well-known keys, `Messages/TraceContextHeaderKeys.cs` (`internal`) — deliberately **not**
+`mesh.`-prefixed, so a bridge into HTTP/gRPC/a message broker sees the standard W3C names:
+
+| Key | Wire string | Present on |
+|---|---|---|
+| `TraceContextHeaderKeys.TraceParent` | `"traceparent"` | any header-bearing send made inside an active trace (a library-owned `Meshworx.Send` span with a listener attached, or ambient `Activity.Current`) |
+| `TraceContextHeaderKeys.TraceState` | `"tracestate"` | the same sends, only when the W3C `tracestate` value is non-empty |
+
+**The hub never reads these** — unlike priority/expiry/backpressure, trace context is passed through
+completely opaque, exactly like an application's own header. Both keys are still reserved (an application
+cannot set them directly) purely so a traced send's own values are never overwritten by, or confused with,
+a caller-supplied header of the same name.
+
+<a id="chunk-headers"></a>
+
+### Chunk headers (feat #93, reserved by PR #134/issue #107)
+
+Large-message chunking (see [client.md](client.md#large-message-chunking)) splits a payload across
+multiple ordinary `SendMessageWithHeaders` (`0x11`) frames, each carrying three well-known keys,
+`Messages/ChunkHeaderKeys.cs` (`internal`):
+
+| Key | Value | Wire string |
+|---|---|---|
+| `ChunkHeaderKeys.Id` | a `Guid` ("D" format), fresh per `SendLargeAsync` call | `"mesh.chunk.id"` |
+| `ChunkHeaderKeys.Index` | zero-based chunk index | `"mesh.chunk.index"` |
+| `ChunkHeaderKeys.Count` | total chunk count for this transfer (≤ `ChunkHeaderKeys.MaxChunksPerMessage`, 4096) | `"mesh.chunk.count"` |
+
+**The hub has no awareness of chunking at all — each chunk is routed as an ordinary opaque header-bearing
+frame**, unlike priority/expiry/backpressure; reassembly is purely a `MeshClient`-side concern
+(`ChunkReassembler`). **These three keys were not originally reserved** — PR #93's first landing let an
+application set them directly, and a completed reassembly left them on the delivered message's headers
+unstripped. Both were fixed by the follow-up `144ab0b` (issue #107): the three keys were added to
+`ReservedHeaderKeys`, and the reassembled message's headers now have them stripped
+(`ChunkHeaderKeys.WithoutChunkHeaders`) before `MessageReceived`/`GroupMessageReceived` fires.
+
 <a id="session-resumption"></a>
 
-### Session resumption (issue #43)
+### Session resumption (issue #43, extended by PR #135/issue #109)
 
 Three opcodes and one conditional field, gated on `Protocol.SessionResumptionMinVersion` (`6`). This is
 the second capability to widen `MaxSupportedVersion`, and the shape of the exchange is the interesting
-part.
+part. A fourth widening, `Protocol.SessionResumedGroupsMinVersion` (`7`, PR #135/issue #109), appends a
+conditional group-membership block to the accepted reply — see below.
 
 ```
 hub → client : [0x01 RegistrationComplete][clientId 16][negotiatedVersion][tokenLen u16 BE][token]
 client → hub : [0x16 ResumeSession][token...]
-hub → client : [0x17 SessionResumed][reclaimedClientId 16][tokenLen u16 BE][renewedToken]   # accepted
+hub → client : [0x17 SessionResumed][reclaimedClientId 16][tokenLen u16 BE][renewedToken]   # accepted, version 6
+             | [0x17 SessionResumed][reclaimedClientId 16][tokenLen u16 BE][renewedToken]
+                                     [groupCount u16 BE]([nameLength u16 BE][utf8 name])×groupCount
+                                                                                    # accepted, version 7+
              | [0x18 SessionResumeRefused]                                                  # refused
 ```
+
+**The group block is purely additive and version-gated the same way the token tail is.** A connection
+negotiated at exactly `6` gets the byte-identical pre-#109 reply — `MeshHub` never appends the block below
+`SessionResumedGroupsMinVersion`. At `7`+, `MeshHub.BuildReportableGroupNameBytes` builds the block from
+whatever `RestoreGroupMembershipAsync` actually restored, with two bounds: a group name whose UTF-8
+encoding would overflow the `ushort` `nameLength` prefix is dropped from the block entirely (the
+membership itself is unaffected — only the reply cannot name it), and the reported group count is capped
+at `ushort.MaxValue` (65,535), with any remainder silently unreported. `MeshClient.RestoreJoinedGroupsFromResumedReply`
+parses this block and **replaces** `JoinedGroups` wholesale from it — see
+[client.md](client.md#session-resumption), [hub.md](hub.md#session-resumption) and
+[known-issues.md](known-issues.md) KI-59/KI-60.
 
 **Resumption happens *after* registration, not inside it, and that is forced by the handshake's own
 ordering.** The obvious design — carry the token in the `RegistrationRequest` frame — cannot work: the
@@ -548,9 +629,12 @@ Version negotiation gates the handshake only; there is no per-message version ta
 version-gated capability is instead gated by **opcode** (does this peer even send/recognise it) plus, on
 the hub, by **`ClientConnection.NegotiatedProtocolVersion`** (does *this* peer's own negotiated version
 support it). `Protocol.cs` (`Messages/Protocol.cs`) declares `MinSupportedVersion` (`4`) and
-`MaxSupportedVersion` (`6`) bounding the range this build of the hub/client will speak, plus
-`HeaderEnvelopeMinVersion` (`5`) marking the version at which the header envelope became available and
-`SessionResumptionMinVersion` (`6`) marking the same for session resumption.
+`MaxSupportedVersion` (`7`) bounding the range this build of the hub/client will speak, plus
+`HeaderEnvelopeMinVersion` (`5`) marking the version at which the header envelope became available,
+`SessionResumptionMinVersion` (`6`) marking the same for session resumption, and
+`SessionResumedGroupsMinVersion` (`7`, PR #135/issue #109) marking the version at which a `SessionResumed`
+reply reports the group memberships the hub actually restored — see [Session resumption](#session-resumption)
+above.
 `MeshClient.ConnectAsync` always advertises its own `[MinSupportedVersion, MaxSupportedVersion]`;
 `MeshHub.TryNegotiateProtocolVersion` (`MeshHub.cs:1381-1403`) intersects that with its own range and, on
 overlap, picks the **highest** version common to both — a peer never has to downgrade further than

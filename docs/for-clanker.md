@@ -1,8 +1,8 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: d89891d (branch feat/backpressure-signalling, PR #87, closing issue #30) — three commits on top of main at 43362b4 (which is PR #85, feature/message-ttl-expiry, merged); working tree clean throughout this pass
-reconciled-to-date: 2026-07-28
+reconciled-to-commit: f277e60 (main, HEAD) — 21 commits on top of the previous reconciliation point, d89891d/PR #87; working tree clean throughout this pass (git status --porcelain empty at start and end; main, origin/main and the working branch all resolve to f277e60)
+reconciled-to-date: 2026-07-30
 mode: update
 -->
 
@@ -12,7 +12,90 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree, this pass:** branch `feat/backpressure-signalling` (**PR #87**, closing issue #30),
+> **Documented tree, this pass: `main` at `f277e60`, reconciling every commit between the previous
+> documentation baseline (`d89891d`, PR #87) and here.** The docs set was last touched by PR #90 (session
+> resumption, commit `2a2377d`) — everything from `2a2377d` (exclusive) to `f277e60` was unreconciled
+> before this pass, 21 commits: `b74c699` (per-client inbound rate limiting, issue #69), `6596726`
+> (pluggable serialization codec, feat #91), `603d3c8` (distributed-tracing header propagation, feat #92),
+> `7b93c7f` (large-message chunking, feat #93), `b09f719` (strongly-typed client contracts, feat #94),
+> then `5b875ef`/`31880be`/`8a1b557`/`972dd83`/`b6ec5c6`/`58aefb4`/`fc66529`/`6c09297`/`d466535`/
+> `573ccff`/`d9b3a76` (eleven correctness fixes, mostly to session resumption and connection lifecycle —
+> see below), `144ab0b` (reserve and strip the chunk header keys, issue #107), `fbcd25c` (carry restored
+> group memberships in the `SessionResumed` reply, PR #135/issue #109), and `f277e60` (serialize an
+> interface-/abstract-declared payload by its runtime type, PR #136/issue #111). This is the largest
+> reconciliation this docs set has done in one pass: five wholly new capabilities, none previously
+> documented at all, plus a protocol version bump (6 → 7) and a correctness sweep across session
+> resumption and the hub's send loop.
+>
+> **A sixth capability was found undocumented that predates this whole commit range and was never
+> reconciled by any prior pass: message priority lanes.** `MessagePriority`, `PriorityOutboundQueue`,
+> `DeliveryOptions.Priority`/`AtPriority`/`WithPriority`, the `SendToGroupAsync(name, payload, priority)`
+> overload and the reserved `mesh.priority` header key all landed in commit `ab16567`, which is
+> **chronologically before** `2a2377d` — so the PR #90 pass should have caught it and did not. Verified
+> directly against the current code (`PriorityOutboundQueue.cs`, `MessagePriority.cs`,
+> `DeliveryOptions.cs`, `MessagePriorityHeaderKeys.cs`) rather than trusted from the gap report: before
+> this pass, the *only* trace of this capability anywhere in the docs tree was a single passing mention
+> in [hub.md](for-clanker/hub.md#offline-delivery) — "the drain reuses `BuildDeliverMessage`/
+> `BuildDeliverMessageWithHeaders` and `ReadPriority`, so a held message lands on the same lane" — with no
+> section anywhere explaining what a lane is, what values priority takes, or how to set one. Given full
+> first-class coverage this pass in [client.md](for-clanker/client.md#message-priority),
+> [hub.md](for-clanker/hub.md#priority-lanes) and [protocol.md](for-clanker/protocol.md#priority-header).
+>
+> **Two open, unmerged PRs exist on this repo and are deliberately *not* documented as current behaviour
+> anywhere in this pass: PR #120 (`fix/typed-contract-defects`) and PR #121
+> (`fix/fan-out-frame-cap`).** Both were fetched and read (`gh pr diff 120`/`121`) specifically to confirm
+> what they change, so that the *current* typed-contracts and fan-out-cap behaviour documented below is
+> not accidentally contaminated with their unmerged fixes. Each has a clearly marked "pending" note where
+> it is relevant — [contracts.md](for-clanker/contracts.md#pending-pr-120) for #120,
+> [known-issues.md](for-clanker/known-issues.md) KI-33 for #121 — rather than being silently absent or
+> silently assumed merged. Neither PR's changes appear anywhere else in this document set as fact.
+>
+> **New area files added this pass:** [serialization.md](for-clanker/serialization.md) (the pluggable
+> `IMessageSerializer` codec layer, `AdamSalisbury.Meshworx.Serialization`) and
+> [contracts.md](for-clanker/contracts.md) (the `[MeshContract]` source generator and its typed
+> proxy/dispatcher pattern, `AdamSalisbury.Meshworx.Contracts` + `.Contracts.Generator`) — both are
+> separate NuGet-shaped assemblies with public API surfaces substantial enough to warrant their own file,
+> the same reasoning [dependency-injection.md](for-clanker/dependency-injection.md) already follows for
+> the DI package. Both are new to the index in [§3](#3-architecture) below.
+>
+> **The eleven correctness-fix commits, summarised** (full detail in the relevant area file): three repair
+> the hub's fan-out send loop and inbound processing under load or teardown (`972dd83` tolerates a
+> recipient's outbound queue disposing mid-route rather than faulting the sender; `b6ec5c6` stops
+> transport disposal from abandoning a queued `SendAsync` waiter; `fc66529` paces the accept loop's retry
+> after a failed accept); three are WebSocket/TCP/host-startup hardening (`58aefb4` serialises WebSocket
+> close-frame writes against concurrent sends; `6c09297` starts the listener negotiation pumps and hub
+> lifecycle tasks on the thread pool; `d466535`/`573ccff`/`d9b3a76` fix `MeshHubOptions`/`MeshClientOptions`
+> mirroring their constructors, bound/retry the initial connect in `MeshClientHostedService`, and make the
+> hosted service stop what it actually started); and three repair session-resumption's identity-swap edge
+> cases (`5b875ef` removes the resuming connection's own now-orphaned registration entry from the session
+> table, issue #97; `31880be` tears down the client registry entry by the connection's *current* id rather
+> than a possibly-stale local, closing a leak when the `SessionResumed` reply-send itself fails; `8a1b557`
+> pairs `ClientConnected`/`ClientDisconnected` across the identity swap, issue #105, so a subscriber
+> tracking connected ids doesn't leak the discarded fresh id forever). None of these needed a
+> `known-issues.md` entry of their own — they are bug fixes with no remaining caveat, not standing
+> limitations — but the session-resumption fixes are described in
+> [hub.md](for-clanker/hub.md#session-resumption) since they change what the section asserted as fact.
+>
+> **Coordinate-sweep scope for this pass, stated plainly rather than silently left ambiguous: `MeshHub.cs`
+> grew from roughly 2638 lines (PR #87 baseline) to 3745, `MeshClient.cs` from roughly 1676 to 2228,
+> `IMeshClient.cs` from roughly 406 to 491, and `Messages/Protocol.cs` gained two new version-gated
+> constants.** That is a near-doubling of the two largest files in the library, driven by six feature
+> areas landing across 21 commits with no doc reconciliation in between. Given the "REQUIRED FIXES"
+> priority for this pass explicitly ranks a full line-number sweep last and permits leaving pre-existing,
+> untouched citations for a dedicated follow-up, **this pass re-derived coordinates fresh, from the
+> current source, only for the sections it was actively writing or correcting** (the six new-capability
+> sections, the known-wrong claims listed below, and the known-issues.md entries it touched) — it did
+> **not** attempt a wholesale re-point of every pre-existing citation elsewhere in
+> [client.md](for-clanker/client.md), [hub.md](for-clanker/hub.md), [protocol.md](for-clanker/protocol.md),
+> [types.md](for-clanker/types.md) or [testing.md](for-clanker/testing.md) that this pass's own edits did
+> not touch. Any citation in those files pointing at `MeshHub.cs`/`MeshClient.cs`/`IMeshClient.cs` that
+> this pass did not visibly correct should be treated as **unverified against the current, doubled file
+> lengths** until a dedicated coordinate-hygiene pass re-derives it — this is a materially larger gap than
+> any prior pass has left, and worth budgeting for explicitly rather than assuming "mostly right".
+>
+> ---
+>
+> **Documented tree (prior pass):** branch `feat/backpressure-signalling` (**PR #87**, closing issue #30),
 > three commits (`67d744c`, `752e14e`, `d89891d`) on top of `main` at `43362b4` (`git merge-base main
 > feat/backpressure-signalling` confirmed equal to `main`'s own tip — `main` has advanced to `43362b4`,
 > "feat: per-message time-to-live (TTL) and expiry", which **is** the previous pass's PR #85 merged),
@@ -337,7 +420,7 @@ rather than read directly, it says so.
 > those six citations is deferred to a pass that opens `testing.md` for its own reasons.
 >
 > **Documented tree (prior pass):** branch `feat/issue-21-quic-transport` (open **PR #82**, closing
-> issue #21, **not yet merged to `main`**), two commits on top of `main` at `84fd51f`
+> issue #21), two commits on top of `main` at `84fd51f`
 > (`git merge-base main feat/issue-21-quic-transport` confirmed equal to `main`'s own tip), clean
 > working tree. Diffed with `git diff main...feat/issue-21-quic-transport --stat`: 9 files, 2016
 > insertions — two new source files (`Transport/Quic/QuicTransport.cs`,
@@ -783,7 +866,7 @@ direct-send to any id it holds. Treat the transport boundary as the trust bounda
 | Target framework | `net10.0` | `AdamSalisbury.Meshworx.csproj:4` |
 | Language level | C# with `ImplicitUsings` + `Nullable` enabled | `AdamSalisbury.Meshworx.csproj:5-6` |
 | Only runtime dependency | `Microsoft.Extensions.Logging` | `AdamSalisbury.Meshworx.csproj:734` |
-| Wire protocol version | Negotiated range, currently `4`–`6` (was a fixed `3`, then a `4`–`4` range from PR #73; widened to `5` by PR #74 for the header envelope, and to `6` by issue #43 for session resumption) | `Messages/Protocol.cs:8`, `:14`, `:21` |
+| Wire protocol version | Negotiated range, currently `4`–`7` (was a fixed `3`, then a `4`–`4` range from PR #73; widened to `5` by PR #74 for the header envelope, to `6` by issue #43 for session resumption, and to `7` by PR #135/issue #109 so a `SessionResumed` reply can report the group memberships the hub actually restored) | `Messages/Protocol.cs:8`, `:14`, `:21`, `:27`, `:38` |
 | Max frame payload | 1 MiB (`1024*1024`). `TcpTransport`/`UnixSocketTransport`/`NamedPipeTransport`/`QuicTransport` share **one** constant (`StreamFramer.MaxPayloadSize`, PR #81, extended to `QuicTransport` by PR #82); `WebSocketTransport` keeps its own independent constant of the same value | `Transport/Framing/StreamFramer.cs:28`, `Transport/WebSocket/WebSocketTransport.cs:25` |
 | Transport encryption | TCP/WebSocket: optional TLS, **off by default**. `UnixSocketTransport`/`NamedPipeTransport` (PR #81): **no TLS option at all** — local-only, access controlled by filesystem/ACL permissions instead. `QuicTransport` (PR #82): TLS **mandatory** — QUIC requires it at the protocol level, so there is no cleartext mode | `Transport/Tcp/TcpTransport.cs:142`, `TcpTransportListener.cs:110`, `Transport/WebSocket/WebSocketTransportListener.cs:112`, `Transport/Quic/QuicTransport.cs:126-141` |
 | Max client-name length | 256 (chars, see gotcha) | `Messages/Protocol.cs:23` |
@@ -898,6 +981,11 @@ use the manual sequence directly; they do not go through the DI package.
 | Present a credential | `ConnectAsync(transport, name, credential)` | Opaque bytes; only meaningful if the hub has an `authenticator` |
 | Learn a join was refused | `GroupJoinRefused` event | Group already removed from `JoinedGroups` when it fires; not retried |
 | Learn a direct send was dropped for a full queue | `SendRejected` event | PR #87; only raised when the hub was constructed with `notifyOnQueueSaturation`, and only for a **direct** send — a broadcast/group drop never raises it, see KI-1; see [client.md](for-clanker/client.md#backpressure-signalling) |
+| Group message at a priority | `SendToGroupAsync(name, payload, priority)` | `MessagePriority`; only honoured for a **header-bearing** group send — a plain group send or a broadcast is always `Normal`, see KI-54; see [client.md](for-clanker/client.md#message-priority) |
+| Direct message at a priority | `SendAsync(recipientId, payload, DeliveryOptions.AtPriority(priority))` | Combine with `.WithPriority(priority)` on a `RequireAck`/`AwaitingCapacity` options value; only honoured for a header-bearing direct send, same caveat as above; see [client.md](for-clanker/client.md#message-priority) |
+| Send a payload larger than the 1 MiB frame cap | `SendLargeAsync(recipientId, payload, headers)` | Chunking, issue #93; splits into ≤4096 chunks reassembled at the recipient, bounded by `maxReassemblyBytes`/`chunkTransferTimeout`; silent to the sender on any reassembly failure, no priority/ack support; see [client.md](for-clanker/client.md#large-message-chunking) |
+| Send/receive a typed payload | `client.SendAsync<T>(recipientId, value, serializer)` etc. | Extension methods, `AdamSalisbury.Meshworx.Serialization`; see [serialization.md](for-clanker/serialization.md) |
+| Call/handle a typed contract method | generated `{Contract}Proxy` / `{Contract}Dispatcher` | `[MeshContract]` source generator, `AdamSalisbury.Meshworx.Contracts`; see [contracts.md](for-clanker/contracts.md) |
 
 ---
 
@@ -945,11 +1033,17 @@ receive loops never block on a slow recipient's socket; they just enqueue. See
 |---|---|---|
 | Hub: routing, groups, heartbeat, lifecycle, metrics | `MeshHub`, `IMeshHub` | [hub.md](for-clanker/hub.md#metrics) |
 | Client + reconnection + metrics | `MeshClient`, `IMeshClient`, `MeshClientReconnector` | [client.md](for-clanker/client.md#metrics) |
-| Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `IRemoteEndPointTransport`, `StreamFramer` (PR #81), `TcpTransport(Listener)`, `WebSocketTransport(Listener)` (PR #78), `UnixSocketTransport(Listener)` (PR #81), `NamedPipeTransport(Listener)` (PR #81), `QuicTransport(Listener)` (PR #82, open), `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
+| Transports (incl. TLS) | `ITransport`, `ITransportListener`, `IBatchSendTransport`, `IRemoteEndPointTransport`, `StreamFramer` (PR #81), `TcpTransport(Listener)`, `WebSocketTransport(Listener)` (PR #78), `UnixSocketTransport(Listener)` (PR #81), `NamedPipeTransport(Listener)` (PR #81), `QuicTransport(Listener)` (PR #82), `InMemoryTransport(Listener)` | [transport.md](for-clanker/transport.md) |
 | Wire protocol & framing | `MessageType`, `Protocol`, handshake, opcode payloads | [protocol.md](for-clanker/protocol.md) |
 | Public value types | event args, `MessageHeaders`, `DisconnectReason`, `RegistrationErrorCode`, `ClientAuthenticator`, `RegistrationContext`, `GroupAuthoriser`, `GroupJoinContext`, `RegistrationRefusedException` | [types.md](for-clanker/types.md) |
 | Offline delivery (store and forward) | `IOfflineStore`, `OfflineMessage`, `InMemoryOfflineStore` (issue #28) | [hub.md](for-clanker/hub.md#offline-delivery), [types.md](for-clanker/types.md#offline-delivery-types) |
-| Session resumption | `sessionResumptionWindow`, `IMeshClient.SessionResumed`, opcodes `0x16`–`0x18` (issue #43) | [hub.md](for-clanker/hub.md#session-resumption), [protocol.md](for-clanker/protocol.md#session-resumption) |
+| Session resumption (incl. restored-group reporting) | `sessionResumptionWindow`, `IMeshClient.SessionResumed`, opcodes `0x16`–`0x18` (issue #43, extended by PR #135/issue #109) | [hub.md](for-clanker/hub.md#session-resumption), [client.md](for-clanker/client.md#session-resumption), [protocol.md](for-clanker/protocol.md#session-resumption) |
+| Message priority lanes | `MessagePriority`, `PriorityOutboundQueue`, `DeliveryOptions.AtPriority`/`.WithPriority` (`ab16567`) | [client.md](for-clanker/client.md#message-priority), [hub.md](for-clanker/hub.md#priority-lanes), [protocol.md](for-clanker/protocol.md#priority-header) |
+| Per-client inbound rate limiting | `ClientRateLimiter`, `TokenBucket` (issue #69) | [hub.md](for-clanker/hub.md#rate-limiting) |
+| Distributed tracing propagation | `MeshworxActivitySource`, `TraceContextHeaderKeys` (feat #92) | [client.md](for-clanker/client.md#distributed-tracing), [protocol.md](for-clanker/protocol.md#trace-context-headers) |
+| Large-message chunking | `SendLargeAsync`, `ChunkReassembler`, `ChunkHeaderKeys` (feat #93) | [client.md](for-clanker/client.md#large-message-chunking), [protocol.md](for-clanker/protocol.md#chunk-headers) |
+| Pluggable serialization codec | `IMessageSerializer`, `JsonMessageSerializer` (feat #91, `AdamSalisbury.Meshworx.Serialization`) | [serialization.md](for-clanker/serialization.md) |
+| Typed client contracts | `[MeshContract]` generator, generated proxy/dispatcher (feat #94, `AdamSalisbury.Meshworx.Contracts`) | [contracts.md](for-clanker/contracts.md) |
 | DI & generic-host integration | `AddMeshHub`, `AddMeshClient`, `MeshHubOptions`, `MeshClientOptions` | [dependency-injection.md](for-clanker/dependency-injection.md) |
 | Tests, fixtures, build/CI | xUnit + Moq suite, `MeshHubFixture`, `MeshClientFixture`, `MetricsCapture` | [testing.md](for-clanker/testing.md) |
 | **Known issues register** | consolidated foot-guns and limitations | [known-issues.md](for-clanker/known-issues.md) |
@@ -1072,6 +1166,10 @@ through constructor parameters. The only ambient dependency is an `ILogger<T>` y
 | `maxConnectionsPerRemoteEndpoint` | **100** (new in PR #68) | Caps connections accepted from one remote address at once, checked in the accept loop before any handshake — covers the pre-registration window `maxClients` does not. Only enforced for a transport reporting `IRemoteEndPointTransport.RemoteEndPoint`; an IPv6 address is masked to its `/64` first. Pass `int.MaxValue` to opt out. See [hub.md](for-clanker/hub.md#per-remote-endpoint-connection-cap) |
 | `notifyOnQueueSaturation` | `false` (new in PR #87) | Whether a direct-send sender is also told over the wire (`0x15 QueueSaturated`) when its recipient's queue was full. The in-process `QueueSaturated` event fires regardless of this flag; broadcast/group drops never produce the wire frame whatever this is set to. See [hub.md](for-clanker/hub.md#backpressure-signalling-and-awaiting-capacity) |
 | `backpressureAwaitTimeout` | 30 s (new in PR #87) | How long `RouteMessageWithHeaders` awaits free capacity for a sender that opted into `DeliveryOptions.AwaitCapacity`, before falling back to dropping. Pass `Timeout.InfiniteTimeSpan` to wait forever — logs a constructor warning, since a parked sender is exempt from idle eviction and this removes the only other bound. See KI-48 |
+| `maxInboundMessagesPerSecond` | 200 (issue #69) | Per-client token-bucket cap on every inbound frame, any opcode. Pass `int.MaxValue` to opt out. See [hub.md](for-clanker/hub.md#rate-limiting) |
+| `maxInboundBytesPerSecond` | 4 MiB (issue #69) | Per-client token-bucket cap on inbound bytes, independent of the message-count budget above |
+| `maxFanOutMessagesPerSecond` | 20 (issue #69) | Per-client token-bucket cap on how *often* a broadcast/group send may be attempted |
+| `maxFanOutDeliveriesPerSecond` | 20,000 (issue #69) | Per-client token-bucket cap on the *volume* a fan-out amplifies to — charged once, up front, against the full recipient count. All four rate-limit drops are silent and **not** counted on `meshworx.hub.messages.dropped` — see KI-55 |
 
 > **Every `MeshHub` default is now finite (PR #68, issue #16).** A hub constructed with no arguments at
 > all — `new MeshHub(logger, listener)` — used to admit an unlimited number of clients and never evict an
@@ -1080,11 +1178,14 @@ through constructor parameters. The only ambient dependency is an `ILogger<T>` y
 > relying on the old unlimited/disabled defaults** — pass `int.MaxValue` / `Timeout.InfiniteTimeSpan`
 > explicitly to keep the old behaviour. See [known-issues.md](for-clanker/known-issues.md) KI-29.
 
-**`MeshClient` options** (`MeshClient.cs:77`): `idleTimeout` (default `null`), `sendTimeout`
+**`MeshClient` options** (`MeshClient.cs:139-147`): `idleTimeout` (default `null`), `sendTimeout`
 (default `null`), `maxSendAttempts` (default `1` — the first attempt counts, so `1` disables retrying;
-only transient I/O errors are retried) and `sendRetryDelay` (default `100 ms`, linear back-off). Set
-`idleTimeout` **above** the hub's `heartbeatInterval` so the hub's pings reset it; a genuinely silent
-hub then trips it and raises `Disconnected(ConnectionLost)`.
+only transient I/O errors are retried), `sendRetryDelay` (default `100 ms`, linear back-off),
+`maxReassemblyBytes` (default 64 MiB, feat #93 — the cap on an in-flight chunked reassembly), and
+`chunkTransferTimeout` (default 1 minute, feat #93 — how long an idle chunked transfer is held before
+being reclaimed). Set `idleTimeout` **above** the hub's `heartbeatInterval` so the hub's pings reset it; a
+genuinely silent hub then trips it and raises `Disconnected(ConnectionLost)`. See
+[client.md](for-clanker/client.md#large-message-chunking) for the chunking parameters.
 
 **`MeshClientReconnector` options** (`MeshClientReconnector.cs:86`): `retryDelay` (1 s), `connectTimeout`
 (10 s), `restoreGroupMembership`, optional `ILogger`, and `credential` (empty; replayed on every
@@ -1120,7 +1221,7 @@ timeouts/counts and `ArgumentException` if `tlsOptions` carries no certificate, 
 certificate-selection callback.
 
 **`UnixSocketTransportListener` options** (`Transport/Unix/UnixSocketTransportListener.cs:59-67`, all
-optional, added by PR #81 / issue #20, **not yet merged to `main`**):
+optional, added by PR #81 / issue #20):
 
 | Param | Default | Effect |
 |---|---|---|
@@ -1133,7 +1234,7 @@ Client-side: `UnixSocketTransport.ConnectAsync(path, ct)`. **Does not implement
 this transport — see [known-issues.md](for-clanker/known-issues.md) KI-38.
 
 **`NamedPipeTransportListener` options** (`Transport/NamedPipes/NamedPipeTransportListener.cs:53-67`,
-all optional, added by PR #81 / issue #20, **not yet merged to `main`**):
+all optional, added by PR #81 / issue #20):
 
 | Param | Default | Effect |
 |---|---|---|
@@ -1147,7 +1248,7 @@ API runs. Also does **not** implement `IRemoteEndPointTransport` — see
 [known-issues.md](for-clanker/known-issues.md) KI-38.
 
 **`QuicTransportListener` options** (`Transport/Quic/QuicTransportListener.cs:129-134`, all but the
-first two optional, added by PR #82 / issue #21, **not yet merged to `main`**):
+first two optional, added by PR #82 / issue #21):
 
 | Param | Default | Effect |
 |---|---|---|
@@ -1267,6 +1368,40 @@ describes, the same route `GroupJoinRefused` took. **A single PR combining both 
 PRs each committed to one route or the other; this is the worked example for a capability whose
 notification needs a real opcode while its request-side flag does not.
 
+**Message priority lanes (`ab16567`) are a fifth fourth-route example, following the "hub acts on a
+narrow scan" shape PR #85/#87 established.** One new reserved header key (`mesh.priority`,
+`Messages/MessagePriorityHeaderKeys.cs`), no opcode, no version bump; the hub's `ReadPriority` is the same
+single-key `HeaderEnvelope.TryReadValue` shape as `IsExpiredFrame`/`WantsAwaitCapacity`, deciding which of
+three lanes a `PriorityOutboundQueue` enqueues to. See [hub.md](for-clanker/hub.md#priority-lanes).
+
+**Distributed tracing (feat #92) is the fourth route at its purest — the hub genuinely never touches
+either header.** Two reserved keys (`traceparent`/`tracestate`), no opcode, no version bump, and no hub
+scan of any kind — they pass through exactly like an application's own header. Deliberately **not**
+`mesh.`-prefixed, so a bridge into HTTP/gRPC/a broker sees the standard W3C names. See
+[client.md](for-clanker/client.md#distributed-tracing).
+
+**Large-message chunking (feat #93) is a variant of the fourth route where the hub is blind but the
+*client* gains new stateful machinery.** Each chunk travels as an ordinary header-bearing frame with three
+reserved keys (`mesh.chunk.id`/`.index`/`.count`); the hub has zero chunk awareness, but the
+**sending and receiving `MeshClient`** now carry real state (`ChunkReassembler`) across multiple frames for
+what the application sees as one logical send — the first fourth-route capability where "no opcode, no
+version bump" does not also mean "no new moving parts". See
+[client.md](for-clanker/client.md#large-message-chunking).
+
+**Per-client inbound rate limiting (issue #69) is not a message-header capability at all — a different,
+sixth shape: hub-side admission control on the receive loop, orthogonal to the opcode/header-envelope
+distinction above.** It gates *whether an already-decoded frame is processed further*, not what the frame
+carries — worth knowing if you are adding a similar per-connection budget: it does not need a header key,
+an opcode, or a version bump, only a check early in `HandleClientAsync`'s dispatch. See
+[hub.md](for-clanker/hub.md#rate-limiting).
+
+**Two open, unmerged PRs touch this checklist's own subject matter and are deliberately not reflected
+above as shipped:** PR #120 changes the typed-contracts generator's dispatch identity and adds headers
+overloads to `RequestAsync`/`ReplyAsync` (see [contracts.md](for-clanker/contracts.md#pending-pr-120));
+PR #121 adds a pre-build frame-size check to the three fan-out routing methods, closing the root cause
+[known-issues.md](for-clanker/known-issues.md) KI-33 still describes as open. Neither is current on
+`main` — check their status before assuming either shipped.
+
 **"Done" means:** `dotnet build Meshworx.slnx -c Release` clean (warnings are errors) **and**
 `dotnet test Meshworx.slnx` green. CI runs exactly this on push/PR to `main`
 (`.github/workflows/ci.yml`).
@@ -1330,23 +1465,58 @@ there is no publish step in CI — CI only builds and tests.
   on the wire and works at any version. See [client.md](for-clanker/client.md#sending-headers).
 - **`MessageHeaders`'s constructor throws on a duplicate key** rather than keeping the last value like a
   plain `Dictionary` initializer would. De-duplicate your source before constructing one. KI-34.
-- **Seven `MessageHeaders` keys are reserved — two for `RequestAsync`/`ReplyAsync` (PR #83), three more
-  for delivery acknowledgement (PR #84), one more for time-to-live (PR #85), one more for backpressure
-  (PR #87) — and none of them can be set through `SendAsync`.**
+- **Thirteen `MessageHeaders` keys are reserved, not seven — two for `RequestAsync`/`ReplyAsync` (PR #83),
+  three more for delivery acknowledgement (PR #84), one more for time-to-live (PR #85), one more for
+  backpressure (PR #87), one more for priority (`ab16567`), two more for trace context (feat #92) and
+  three more for chunking (feat #93/PR #134) — and none of them can be set through `SendAsync`.**
   `"mesh.request-id"`/`"mesh.reply"` (`RequestReplyHeaderKeys`),
   `"mesh.ack-id"`/`"mesh.ack-request"`/`"mesh.ack"` (`DeliveryAcknowledgementHeaderKeys`),
-  `"mesh.expires-at"` (`MessageExpiryHeaderKeys`) and `"mesh.await-capacity"` (`BackpressureHeaderKeys`)
-  now make `SendAsync`'s headers overload throw `ArgumentException` if your own headers happen to use any
-  of the seven — a narrow but real breaking change for any caller that already did. Request/response and
-  delivery acknowledgement are pure client-to-client conventions the hub cannot see or protect at all, and
-  any inbound frame carrying `mesh.reply=1` or `mesh.ack=1` is intercepted before `MessageReceived`
-  whether or not it came from a real `RequestAsync`/`RequireAck` call. **Time-to-live and backpressure are
-  the two exceptions to "the hub never decodes header content"** — since PR #85 the hub scans (without
-  fully decoding) for `mesh.expires-at` to drop an already-expired frame before sending it, and since
-  PR #87 it scans for `mesh.await-capacity`, at enqueue rather than dequeue time, to decide whether to
-  park a sender awaiting room instead of dropping; see the time-to-live and backpressure bullets below.
-  See [client.md](for-clanker/client.md#request-response),
+  `"mesh.expires-at"` (`MessageExpiryHeaderKeys`), `"mesh.await-capacity"` (`BackpressureHeaderKeys`),
+  `"mesh.priority"` (`MessagePriorityHeaderKeys`), `"traceparent"`/`"tracestate"`
+  (`TraceContextHeaderKeys`) and `"mesh.chunk.id"`/`".index"`/`".count"` (`ChunkHeaderKeys`) now make
+  `SendAsync`'s headers overload throw `ArgumentException` if your own headers happen to use any of the
+  13 — a narrow but real breaking change for any caller that already did; recount from
+  `MeshClient.cs`'s `ReservedHeaderKeys` array before trusting any older figure, including this one, since
+  it has grown with every capability built on the header envelope so far. Request/response and delivery
+  acknowledgement are pure client-to-client conventions the hub cannot see or protect at all, and any
+  inbound frame carrying `mesh.reply=1` or `mesh.ack=1` is intercepted before `MessageReceived` whether or
+  not it came from a real `RequestAsync`/`RequireAck` call. **Time-to-live, backpressure and priority are
+  the exceptions to "the hub never decodes header content"** — since PR #85 the hub scans (without fully
+  decoding) for `mesh.expires-at` to drop an already-expired frame before sending it, since PR #87 it
+  scans for `mesh.await-capacity` at enqueue time to decide whether to park a sender awaiting room instead
+  of dropping, and since priority lanes it scans for `mesh.priority` to pick an outbound lane — see the
+  time-to-live, backpressure and priority-lanes bullets below. Trace context and the chunk headers are
+  **not** exceptions — the hub passes both through completely opaque, same as an application's own
+  header. See [client.md](for-clanker/client.md#request-response),
   [client.md](for-clanker/client.md#delivery-acknowledgement), KI-42, KI-43, KI-44, KI-45, KI-46.
+- **Message priority is honoured only for a header-bearing direct send and a header-bearing group send —
+  a broadcast or a plain group send is always `Normal`, regardless of anything the sender does.**
+  `SendAsync(recipientId, payload, DeliveryOptions.AtPriority(priority))` and
+  `SendToGroupAsync(name, payload, priority)` reach the hub's three-lane `PriorityOutboundQueue`;
+  `BroadcastAsync` has no priority parameter or overload at all. The low lane cannot be starved
+  indefinitely (guaranteed a turn every drain cycle); a high-priority frame arriving mid-burst can be
+  delayed by up to 4 frames, never more. See [client.md](for-clanker/client.md#message-priority),
+  [hub.md](for-clanker/hub.md#priority-lanes), KI-54.
+- **Per-client inbound rate limiting (issue #69) drops silently, and the drop is invisible to metrics.**
+  Four independent token buckets per connection bound inbound message rate, inbound byte rate, fan-out
+  attempt frequency, and fan-out delivery volume (charged once, up front, against the full recipient
+  count). Exceeding any of them drops the frame with no error frame, no disconnect, and — unlike every
+  other drop reason on `meshworx.hub.messages.dropped` — no metrics tag at all; the only signal is a
+  hub-wide, throttled (~1/s) warning log. See [hub.md](for-clanker/hub.md#rate-limiting), KI-55.
+- **`SendLargeAsync` (chunking, feat #93) fails silently to the sender on every failure mode**, and cannot
+  be combined with `DeliveryOptions` at all. A byte-budget breach, a duplicate/inconsistent chunk index,
+  or an idle-transfer timeout each discard the whole in-flight transfer with nothing reported back to the
+  sender. Pair it with an application-level acknowledgement if delivery confidence matters. See
+  [client.md](for-clanker/client.md#large-message-chunking), KI-56.
+- **`JsonMessageSerializer` (feat #91) now resolves an interface-/abstract-declared value's runtime type,
+  but only at the top level, and can throw `NotSupportedException` under an incomplete AOT
+  `JsonSerializerContext` where it previously would not have needed one.** A source-generated context used
+  for trimming/AOT must register every concrete type that can appear behind such a value, not just the
+  declared interface/abstract type. See [serialization.md](for-clanker/serialization.md), KI-57.
+- **Typed contracts (`[MeshContract]`, feat #94): a result-returning contract method does not reach a
+  dispatcher end to end on `main` today, and two differently-named contracts sharing a method name are
+  ambiguous on the wire.** Both are fixed by the still-open, unmerged PR #120 — do not assume either is
+  fixed until it merges. See [contracts.md](for-clanker/contracts.md#pending-pr-120), KI-58.
 - **A direct send can opt into a time-to-live (PR #85, issue #29), and the expiry clock is the sender's,
   not the hub's.** `SendAsync(recipientId, payload, timeToLive)` computes an absolute expiry from the
   *sending client's own clock* and attaches it as a header; both the hub (at send-loop dequeue) and the
@@ -1395,11 +1565,11 @@ there is no publish step in CI — CI only builds and tests.
   only over a Unix domain socket or a named pipe has no per-source connection cap short of `maxClients`
   itself — a single local peer with access to the path can claim the whole budget. Deliberately deferred,
   not a bug to silently "fix" by changing `MeshHub.cs` — see KI-38 before touching this. **`QuicTransport`
-  (PR #82, issue #21, open) is deliberately *not* in this bucket** — it implements
+  (PR #82, issue #21) is deliberately *not* in this bucket** — it implements
   `IRemoteEndPointTransport` and reports a real address, so it **is** capped the same way TCP/WebSocket
   are.
 - **QUIC has no cleartext mode, and its negotiation pool's per-source cap mitigates rather than
-  eliminates a many-source flood.** `QuicTransport`/`QuicTransportListener` (PR #82, issue #21, open)
+  eliminates a many-source flood.** `QuicTransport`/`QuicTransportListener` (PR #82, issue #21)
   always require TLS — there is no cleartext overload to reach for the way there is on TCP/WebSocket.
   Because QUIC's handshake completes fully before a connection is ever handed back, there is no cheap
   pre-check to gate a negotiation slot on the way TCP/WebSocket's pumps do; the per-source cap
