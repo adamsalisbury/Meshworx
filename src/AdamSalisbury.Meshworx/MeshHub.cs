@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics.Metrics;
 using System.Net;
 using System.Net.Sockets;
+using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
 using AdamSalisbury.Meshworx.Diagnostics;
@@ -2123,17 +2124,21 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             // Expected during shutdown.
         }
-        catch (Exception ex) when (ex is IOException or ObjectDisposedException or ArgumentException)
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or ArgumentException or WebSocketException)
         {
             // ArgumentException here means a transport (TcpTransport, notably) rejected a delivery
             // frame as oversized — the routing methods above can grow a near-maximum-size inbound
             // payload past the transport's cap by adding the sender id, group name and, for a
-            // header-bearing frame, the header block. Left uncaught, this would fault the task that
-            // HandleClientAsync's own cleanup awaits from inside its finally block, aborting that
-            // finally partway through and skipping the slot release, name removal, group removal and
-            // disposal that follow it — leaking the client's registration permanently rather than
-            // merely losing the one oversized message. Treating it exactly like a transport fault, by
-            // cancelling the client here instead of letting it propagate, keeps that cleanup intact.
+            // header-bearing frame, the header block. WebSocketException means WebSocketTransport's
+            // SendAsync hit a socket that had already closed or faulted underneath it — a peer can
+            // trigger this by timing its close against a queued send or the hub's own heartbeat Ping.
+            // Left uncaught, either would fault the task that HandleClientAsync's own cleanup awaits
+            // from inside its finally block, aborting that finally partway through and skipping the
+            // slot release, name removal, group removal and disposal that follow it — leaking the
+            // client's registration permanently rather than merely losing the one message. Treating it
+            // exactly like a transport fault, by cancelling the client here instead of letting it
+            // propagate, keeps that cleanup intact. See known-issues.md KI-33: do not narrow this
+            // filter back to a subset of these four exception types.
             _logger.LogWarning(
                 ex,
                 "Send loop for client {ClientId} terminated due to transport error",
