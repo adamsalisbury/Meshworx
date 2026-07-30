@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -284,6 +285,56 @@ public sealed class WebSocketTransportLoopbackTests
 
             byte[]? received = await serverTransport.ReceiveAsync().ConfigureAwait(false);
             Assert.Null(received);
+        }
+        finally
+        {
+            await listener.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Acknowledging a peer's close frame is a write, exactly like SendAsync, so it must serialise
+    /// against a concurrent SendAsync on the same write lock (issue #116) rather than transmitting an
+    /// overlapping close frame while another send is still in flight. Pinned by holding the write lock
+    /// to simulate a send in progress, triggering a peer close, and requiring ReceiveAsync to stay
+    /// pending until the lock is released rather than acknowledging immediately regardless of it.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task ReceiveAsync_PeerClosesWhileWriteLockHeld_WaitsForTheLockBeforeAcknowledging()
+    {
+        var listener = new WebSocketTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await listener.StartAsync().ConfigureAwait(false);
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        try
+        {
+            var connectTask = WebSocketTransport.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/"));
+            var acceptTask = listener.AcceptAsync();
+
+            WebSocketTransport clientTransport = await connectTask.ConfigureAwait(false);
+            await using var serverTransport = await acceptTask.ConfigureAwait(false);
+
+            FieldInfo writeLockField = typeof(WebSocketTransport).GetField(
+                "_writeLock", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            var serverWriteLock = (SemaphoreSlim)writeLockField.GetValue(serverTransport)!;
+
+            // Simulates SendLoopAsync mid-send on the server's transport.
+            await serverWriteLock.WaitAsync().ConfigureAwait(false);
+
+            Task<byte[]?> receiveTask = serverTransport.ReceiveAsync();
+
+            // The client closes gracefully; the server's ReceiveAsync observes the close frame and must
+            // try to acknowledge it with a close-output write of its own.
+            await clientTransport.DisposeAsync().ConfigureAwait(false);
+
+            Task settled = await Task.WhenAny(receiveTask, Task.Delay(TimeSpan.FromMilliseconds(300)))
+                .ConfigureAwait(false);
+            Assert.NotSame(receiveTask, settled);
+
+            serverWriteLock.Release();
+
+            byte[]? result = await receiveTask.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            Assert.Null(result);
         }
         finally
         {

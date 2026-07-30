@@ -287,8 +287,22 @@ public sealed class WebSocketTransport : ITransport, IBatchSendTransport, IRemot
             if (_webSocket.State is WebSocketState.Open or WebSocketState.CloseReceived)
             {
                 using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, closeCts.Token)
-                    .ConfigureAwait(false);
+
+                // CloseAsync transmits a close frame, exactly like SendAsync does — System.Net.WebSockets
+                // permits only one outstanding send per instance, so this must serialise against a
+                // concurrent SendAsync on the write lock the same way, or the two overlapping sends either
+                // throw InvalidOperationException (undocumented and uncaught by callers) or, at best,
+                // silently queue behind whichever ManagedWebSocket happens to serialise internally.
+                await _writeLock.WaitAsync(closeCts.Token).ConfigureAwait(false);
+                try
+                {
+                    await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, null, closeCts.Token)
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    _writeLock.Release();
+                }
             }
         }
         catch (OperationCanceledException)
@@ -305,16 +319,47 @@ public sealed class WebSocketTransport : ITransport, IBatchSendTransport, IRemot
         }
     }
 
+    /// <summary>
+    /// Sends a close-output frame in reply to a close frame this transport has just received, serialised
+    /// against any concurrent <see cref="SendAsync(ReadOnlyMemory{byte}, CancellationToken)"/> on the same
+    /// write lock every other outbound frame uses.
+    /// </summary>
+    /// <remarks>
+    /// Best-effort in the fullest sense: the peer that just closed may already be gone
+    /// (<see cref="WebSocketException"/>), a concurrent <see cref="DisposeAsync"/> may already have torn
+    /// the socket down (<see cref="ObjectDisposedException"/>), or the socket may already be past the
+    /// state this call is valid in (<see cref="InvalidOperationException"/>) — none of that changes the
+    /// fact that a close was observed and <c>null</c> is the correct result to <see cref="ReceiveAsync"/>'s
+    /// caller either way.
+    /// </remarks>
     private async Task CloseOutputBestEffortAsync(CancellationToken cancellationToken)
     {
         try
         {
-            await _webSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, cancellationToken)
-                .ConfigureAwait(false);
+            await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await _webSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
         }
         catch (WebSocketException)
         {
             // The peer may already have torn down the connection; nothing more to do.
+        }
+        catch (ObjectDisposedException)
+        {
+            // A concurrent DisposeAsync already tore the socket down; the close this method exists to
+            // acknowledge has already been superseded by the transport's own teardown.
+        }
+        catch (InvalidOperationException)
+        {
+            // The socket has already moved past the state a close-output write is valid in — another
+            // concurrent close already won the race. Either way, a close was observed.
         }
     }
 }
