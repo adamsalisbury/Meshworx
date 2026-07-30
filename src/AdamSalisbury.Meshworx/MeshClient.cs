@@ -42,6 +42,12 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private PendingLookup? _pendingLookup;
     private int _lookupCorrelationId;
 
+    // Single-slot pending client-attribute query, the same shape as _pendingLookup/_lookupLock above but
+    // kept separate since it answers a different request type with a different reply shape.
+    private readonly SemaphoreSlim _findClientsLock = new(1, 1);
+    private PendingFindClients? _pendingFindClients;
+    private int _findClientsCorrelationId;
+
     // Concurrent, unlike the single-slot lookup above: multiple RequestAsync calls may be in flight
     // together, each tracked independently by its own correlation id until its reply arrives, it times
     // out, or the connection tears down.
@@ -1512,6 +1518,112 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public async Task UpdateAttributesAsync(
+        IReadOnlyDictionary<string, string> attributes, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(attributes);
+        ValidateAttributes(attributes);
+
+        ITransport transport = GetConnectedTransport();
+        RequireClientAttributesSupport(NegotiatedProtocolVersion);
+
+        var headers = new MessageHeaders(attributes);
+        int blockLength = HeaderEnvelope.GetEncodedLength(headers);
+        var payload = new byte[1 + blockLength];
+        payload[0] = (byte)MessageType.SetClientAttributes;
+        HeaderEnvelope.Write(headers, payload.AsSpan(1, blockLength));
+
+        await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Validates an attribute bag against the same bounds the hub enforces, so a caller learns
+    /// immediately and locally that a bag is too large rather than having it silently dropped by the hub.
+    /// </summary>
+    private static void ValidateAttributes(IReadOnlyDictionary<string, string> attributes)
+    {
+        if (attributes.Count > Protocol.MaxClientAttributeCount)
+        {
+            throw new ArgumentException(
+                $"An attribute bag cannot hold more than {Protocol.MaxClientAttributeCount} entries.",
+                nameof(attributes));
+        }
+
+        foreach (KeyValuePair<string, string> attribute in attributes)
+        {
+            if (Encoding.UTF8.GetByteCount(attribute.Key) > Protocol.MaxClientAttributeKeyLength)
+            {
+                throw new ArgumentException(
+                    $"Attribute key '{attribute.Key}' exceeds the maximum length of "
+                    + $"{Protocol.MaxClientAttributeKeyLength} UTF-8 bytes.",
+                    nameof(attributes));
+            }
+
+            if (Encoding.UTF8.GetByteCount(attribute.Value) > Protocol.MaxClientAttributeValueLength)
+            {
+                throw new ArgumentException(
+                    $"The value for attribute key '{attribute.Key}' exceeds the maximum length of "
+                    + $"{Protocol.MaxClientAttributeValueLength} UTF-8 bytes.",
+                    nameof(attributes));
+            }
+        }
+    }
+
+    private static void RequireClientAttributesSupport(byte negotiatedProtocolVersion)
+    {
+        if (negotiatedProtocolVersion < Protocol.ClientAttributesMinVersion)
+        {
+            throw new NotSupportedException(
+                $"Client attributes require a negotiated protocol version of at least "
+                + $"{Protocol.ClientAttributesMinVersion}; this connection negotiated version "
+                + $"{negotiatedProtocolVersion}.");
+        }
+    }
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<ClientDescriptor>> FindClientsAsync(
+        AttributeQuery query, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+
+        ITransport transport = GetConnectedTransport();
+        RequireClientAttributesSupport(NegotiatedProtocolVersion);
+
+        await _findClientsLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // _findClientsLock serialises queries, so a plain increment is sufficient.
+            int correlationId = unchecked(_findClientsCorrelationId++);
+            var completion = new TaskCompletionSource<IReadOnlyList<ClientDescriptor>>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingFindClients = new PendingFindClients(correlationId, completion);
+
+            var criteria = new MessageHeaders(query);
+            int blockLength = HeaderEnvelope.GetEncodedLength(criteria);
+            var payload = new byte[1 + 4 + blockLength];
+            payload[0] = (byte)MessageType.FindClientsRequest;
+            BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(1, 4), correlationId);
+            HeaderEnvelope.Write(criteria, payload.AsSpan(5, blockLength));
+            await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+
+            return await completion.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _pendingFindClients = null;
+
+            try
+            {
+                _findClientsLock.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The semaphore was disposed during a concurrent DisposeAsync call.
+            }
+        }
+    }
+
+    /// <inheritdoc/>
     public Task<ReadOnlyMemory<byte>> RequestAsync(
         Guid recipientId,
         ReadOnlyMemory<byte> message,
@@ -1656,6 +1768,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     {
         await DisconnectAsync().ConfigureAwait(false);
         _lookupLock.Dispose();
+        _findClientsLock.Dispose();
     }
 
     private async Task CleanUpAsync()
@@ -2067,6 +2180,28 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         pending.Completion.TrySetResult(null);
                     }
                 }
+                else if (data.Length >= 7
+                    && (MessageType)data[0] == MessageType.FindClientsResponse)
+                {
+                    int correlationId = BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(1, 4));
+                    PendingFindClients? pending = _pendingFindClients;
+
+                    if (pending is null || pending.CorrelationId != correlationId)
+                    {
+                        // Stale or unsolicited response (e.g. from a cancelled query); discard.
+                        _logger.LogDebug(
+                            "Discarding find-clients response with unmatched correlation id {CorrelationId}",
+                            correlationId);
+                    }
+                    else if (TryReadClientDescriptors(data.AsSpan(5), out List<ClientDescriptor>? results))
+                    {
+                        pending.Completion.TrySetResult(results);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Discarding a malformed find-clients response");
+                    }
+                }
                 else if (data.Length >= 17
                     && (MessageType)data[0] == MessageType.QueueSaturated)
                 {
@@ -2167,6 +2302,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             // so the held _lookupLock is released, unblocking subsequent lookups.
             _pendingLookup?.Completion.TrySetException(
                 new InvalidOperationException("The connection was closed before the lookup completed."));
+
+            // Likewise the only thing that completes a pending FindClientsAsync query.
+            _pendingFindClients?.Completion.TrySetException(
+                new InvalidOperationException("The connection was closed before the query completed."));
 
             // Likewise the only thing that completes a pending RequestAsync call: fault every
             // still-outstanding request so a caller awaiting with a non-cancellable token is not left
@@ -2289,6 +2428,60 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 ex, "Discarding a message from {SenderId} with a malformed header block", senderId);
             return null;
         }
+    }
+
+    /// <summary>
+    /// Parses a <see cref="MessageType.FindClientsResponse"/> body:
+    /// <c>[resultCount(2)][for each: id(16)][nameLength(2)][name]]</c>.
+    /// </summary>
+    /// <param name="body">The frame content immediately after the correlation id.</param>
+    /// <param name="results">
+    /// The parsed descriptors, or <see langword="null"/> if the body was not well formed.
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> and the parsed descriptors if the body is well formed; otherwise
+    /// <see langword="false"/>, leaving <paramref name="results"/> <see langword="null"/>.
+    /// </returns>
+    private static bool TryReadClientDescriptors(
+        ReadOnlySpan<byte> body, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out List<ClientDescriptor>? results)
+    {
+        results = null;
+
+        if (body.Length < 2)
+        {
+            return false;
+        }
+
+        int count = BinaryPrimitives.ReadUInt16BigEndian(body[..2]);
+        int offset = 2;
+        var parsed = new List<ClientDescriptor>(count);
+
+        for (int i = 0; i < count; i++)
+        {
+            if (offset + 16 + 2 > body.Length)
+            {
+                return false;
+            }
+
+            var id = new Guid(body.Slice(offset, 16));
+            offset += 16;
+
+            int nameLength = BinaryPrimitives.ReadUInt16BigEndian(body.Slice(offset, 2));
+            offset += 2;
+
+            if (offset + nameLength > body.Length)
+            {
+                return false;
+            }
+
+            string name = Encoding.UTF8.GetString(body.Slice(offset, nameLength));
+            offset += nameLength;
+
+            parsed.Add(new ClientDescriptor(id, name));
+        }
+
+        results = parsed;
+        return true;
     }
 
     /// <summary>
@@ -2520,6 +2713,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     private sealed record PendingLookup(int CorrelationId, TaskCompletionSource<Guid?> Completion);
+
+    private sealed record PendingFindClients(
+        int CorrelationId, TaskCompletionSource<IReadOnlyList<ClientDescriptor>> Completion);
 
     /// <summary>
     /// A <see cref="RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/> call awaiting a reply. <see cref="ExpectedResponderId"/> is checked

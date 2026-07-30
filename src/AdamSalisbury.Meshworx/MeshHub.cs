@@ -1378,18 +1378,27 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 // here for exactly the same reason as GroupMessage — the header block changes what each
                 // recipient's copy carries, not how many recipients there are — so leaving it out would
                 // let a client opt out of the fan-out budget simply by attaching an empty header.
+                // FindClientsRequest belongs here too, for a related but distinct reason: it does not fan
+                // a delivery out to many recipients, but answering it scans every connected client, so its
+                // hub-side cost scales with population size in exactly the way this budget exists to
+                // bound — a client whose query frame is dropped here has its FindClientsAsync call left
+                // waiting rather than failing outright, mirroring the same unbounded-wait characteristic
+                // GetClientIdByNameAsync already has when its own frame is rate-limited away; callers that
+                // need a hard bound should pass a cancellation token with a deadline, exactly as they
+                // already must for that call.
                 if (messageType is MessageType.BroadcastMessage
                         or MessageType.GroupMessage
                         or MessageType.GroupMessageWithHeaders
                         or MessageType.PublishTopicMessage
                         or MessageType.PublishTopicMessageWithHeaders
+                        or MessageType.FindClientsRequest
                     && !connection.RateLimiter.TryAdmitFanOut())
                 {
                     if (_rateLimitLogThrottle.ShouldLog())
                     {
                         _logger.LogWarning(
-                            "Client {ClientId} exceeded its fan-out rate limit; broadcast, group or topic "
-                            + "message dropped",
+                            "Client {ClientId} exceeded its fan-out rate limit; broadcast, group, topic or "
+                            + "find-clients message dropped",
                             clientId);
                     }
 
@@ -1546,6 +1555,20 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                                 body);
                         }
                     }
+                }
+                else if (data.Length >= 1
+                    && connection.NegotiatedProtocolVersion >= Protocol.ClientAttributesMinVersion
+                    && (MessageType)data[0] == MessageType.SetClientAttributes)
+                {
+                    SetClientAttributes(connection, data.AsMemory(1));
+                }
+                else if (data.Length >= 5
+                    && connection.NegotiatedProtocolVersion >= Protocol.ClientAttributesMinVersion
+                    && (MessageType)data[0] == MessageType.FindClientsRequest)
+                {
+                    int correlationId = BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(1, 4));
+                    await SendFindClientsResponseAsync(
+                        transport, correlationId, data.AsMemory(5), clientCts.Token).ConfigureAwait(false);
                 }
                 else if (data.Length >= 5
                     && (MessageType)data[0] == MessageType.ClientLookupRequest)
@@ -4030,6 +4053,163 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         return frame;
     }
 
+    /// <summary>
+    /// Decodes a <see cref="MessageType.SetClientAttributes"/> frame and, if it is well formed and within
+    /// bounds, replaces the connection's attribute bag wholesale.
+    /// </summary>
+    /// <remarks>
+    /// An oversized or malformed bag is rejected in its entirety rather than partially applied — the
+    /// client learns nothing either way, since this frame has no reply, but a partial application would
+    /// leave the directory in a state neither the client nor the hub's own validation actually approved.
+    /// Client builds of this library validate client-side before ever sending (see
+    /// <c>MeshClient.ValidateAttributes</c>), so reaching this rejection means either an older/non-library
+    /// client or a version skew; either way, dropping silently here mirrors how every other
+    /// fire-and-forget control frame in this hub already handles a malformed or oversized input.
+    /// </remarks>
+    private void SetClientAttributes(ClientConnection connection, ReadOnlyMemory<byte> attributeBlock)
+    {
+        MessageHeaders decoded;
+        try
+        {
+            decoded = HeaderEnvelope.Read(attributeBlock.Span, attributeBlock.Length);
+        }
+        catch (FormatException ex)
+        {
+            _logger.LogDebug(
+                ex, "Client {ClientId} sent a malformed attribute block; update ignored", connection.Id);
+            return;
+        }
+
+        if (decoded.Count > Protocol.MaxClientAttributeCount)
+        {
+            _logger.LogDebug(
+                "Client {ClientId} sent {Count} attributes, exceeding the maximum of {Max}; update ignored",
+                connection.Id,
+                decoded.Count,
+                Protocol.MaxClientAttributeCount);
+            return;
+        }
+
+        var attributes = new Dictionary<string, string>(decoded.Count, StringComparer.Ordinal);
+        foreach (KeyValuePair<string, string> attribute in decoded)
+        {
+            if (Encoding.UTF8.GetByteCount(attribute.Key) > Protocol.MaxClientAttributeKeyLength
+                || Encoding.UTF8.GetByteCount(attribute.Value) > Protocol.MaxClientAttributeValueLength)
+            {
+                _logger.LogDebug(
+                    "Client {ClientId} sent an oversized attribute key or value; update ignored",
+                    connection.Id);
+                return;
+            }
+
+            attributes[attribute.Key] = attribute.Value;
+        }
+
+        connection.Attributes = attributes;
+    }
+
+    /// <summary>
+    /// Answers a <see cref="MessageType.FindClientsRequest"/> by scanning every currently-registered
+    /// client for one whose attribute bag satisfies every criterion in the query.
+    /// </summary>
+    /// <remarks>
+    /// A directory query is rare compared to the routing hot path a hub actually lives or dies by, so a
+    /// plain O(connected clients) scan is deliberate here rather than a secondary index — nothing about
+    /// bounding it further the way <see cref="TopicSubscriptionTrie"/> must for a per-message hot path
+    /// applies to an occasional administrative lookup. The reply itself is still bounded: entries stop
+    /// being added the moment the frame would exceed <see cref="StreamFramer.MaxPayloadSize"/>, mirroring
+    /// how a <see cref="MessageType.SessionResumed"/> reply's group-membership block is already bounded
+    /// rather than allowed to grow with an unbounded population.
+    /// </remarks>
+    private async Task SendFindClientsResponseAsync(
+        ITransport transport, int correlationId, ReadOnlyMemory<byte> queryBlock, CancellationToken cancellationToken)
+    {
+        MessageHeaders criteria;
+        try
+        {
+            criteria = HeaderEnvelope.Read(queryBlock.Span, queryBlock.Length);
+        }
+        catch (FormatException ex)
+        {
+            _logger.LogDebug(ex, "Discarding a find-clients query with a malformed criteria block");
+            criteria = MessageHeaders.Empty;
+        }
+
+        // Fixed 7-byte header: type(1) + correlationId(4) + resultCount(2). Client names are already
+        // capped at registration (Protocol.MaxClientNameLength), so a single entry is at most a few
+        // hundred bytes — this budget is what stops the whole reply growing without limit as the matched
+        // population does, not any one oversized entry.
+        const int HeaderLength = 7;
+        int budget = StreamFramer.MaxPayloadSize - HeaderLength;
+        var entries = new List<byte[]>();
+        int entriesLength = 0;
+
+        foreach (ClientConnection candidate in _clients.Values)
+        {
+            if (!MatchesQuery(candidate.Attributes, criteria))
+            {
+                continue;
+            }
+
+            if (entries.Count >= ushort.MaxValue)
+            {
+                break;
+            }
+
+            byte[] nameBytes = Encoding.UTF8.GetBytes(candidate.Name);
+            int entryLength = 16 + 2 + nameBytes.Length;
+
+            if (entryLength > budget)
+            {
+                // The reply is truncated here rather than skipping ahead for a smaller match: a query
+                // result that stops partway through is a documented, bounded outcome, not one whose
+                // membership depends on iteration order over the rest of the client set.
+                break;
+            }
+
+            var entry = new byte[entryLength];
+            candidate.Id.TryWriteBytes(entry.AsSpan(0, 16));
+            BinaryPrimitives.WriteUInt16BigEndian(entry.AsSpan(16, 2), (ushort)nameBytes.Length);
+            nameBytes.CopyTo(entry.AsSpan(18));
+            entries.Add(entry);
+            budget -= entryLength;
+            entriesLength += entryLength;
+        }
+
+        var response = new byte[HeaderLength + entriesLength];
+        response[0] = (byte)MessageType.FindClientsResponse;
+        BinaryPrimitives.WriteInt32BigEndian(response.AsSpan(1, 4), correlationId);
+        BinaryPrimitives.WriteUInt16BigEndian(response.AsSpan(5, 2), (ushort)entries.Count);
+
+        int offset = HeaderLength;
+        foreach (byte[] entry in entries)
+        {
+            entry.CopyTo(response, offset);
+            offset += entry.Length;
+        }
+
+        await transport.SendAsync(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Determines whether a client's attribute bag satisfies every criterion in a query — an "and" match,
+    /// never an "or": a criterion the query specifies must be present with an equal value, but a client's
+    /// own attributes may hold additional keys the query does not mention.
+    /// </summary>
+    private static bool MatchesQuery(IReadOnlyDictionary<string, string> attributes, MessageHeaders criteria)
+    {
+        foreach (KeyValuePair<string, string> criterion in criteria)
+        {
+            if (!attributes.TryGetValue(criterion.Key, out string? value)
+                || !string.Equals(value, criterion.Value, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     // A single group's membership, guarded by its own lock. Removed is set true under Lock when the
     // group is taken out of _groups so a concurrent join that already fetched this instance retries
     // against a fresh one rather than resurrecting a dead group.
@@ -4054,6 +4234,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         private int _disposed;
         private long _activitySequence;
         private int _awaitingCapacityDepth;
+
+        private static readonly IReadOnlyDictionary<string, string> EmptyAttributes =
+            new Dictionary<string, string>(0, StringComparer.Ordinal);
 
         /// <summary>
         /// The id this connection is registered under. Assigned fresh at registration and, for a
@@ -4166,6 +4349,26 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         /// lock.
         /// </summary>
         public HashSet<string> Topics { get; } = new(StringComparer.Ordinal);
+
+        // IDE0032 wants the field/property pair below collapsed to a plain auto property; that would
+        // lose the explicit Volatile semantics the property's own remarks depend on for lock-free
+        // cross-thread visibility, so it is suppressed across both rather than actioned.
+#pragma warning disable IDE0032
+        private IReadOnlyDictionary<string, string> _attributes = EmptyAttributes;
+
+        /// <summary>
+        /// This client's directory attribute bag, as last set by <see cref="MessageType.SetClientAttributes"/>.
+        /// Empty until the client sets one. Replaced wholesale, never mutated in place, so a directory
+        /// query scanning every connection from a <em>different</em> connection's receive loop can read
+        /// the reference once and see a consistent snapshot without taking a lock — reference assignment
+        /// is atomic, and nothing here ever hands out the dictionary instance for external mutation.
+        /// </summary>
+        public IReadOnlyDictionary<string, string> Attributes
+        {
+            get => Volatile.Read(ref _attributes);
+            set => Volatile.Write(ref _attributes, value);
+        }
+#pragma warning restore IDE0032
 
         public PriorityOutboundQueue OutboundQueue { get; } = new(OutboundQueueCapacity);
 

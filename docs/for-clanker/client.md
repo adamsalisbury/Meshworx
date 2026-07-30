@@ -1089,6 +1089,37 @@ each has its own, separate `ConcurrentDictionary`-backed table: `_pendingRequest
   calls, concurrent `RequestAsync` calls, and the single receive loop all touch their respective tables
   independently — none of the three shares a lock with either of the others.
 
+### Client attributes & directory queries
+
+Added for issue #38. `UpdateAttributesAsync(IReadOnlyDictionary<string, string>)` replaces this client's
+whole attribute bag on the hub (never a partial "set one key" update); `FindClientsAsync(AttributeQuery)`
+queries every connected client whose bag matches all of a set of criteria, returning
+`IReadOnlyList<ClientDescriptor>` (`Id`, `Name`). Both are gated behind
+`Protocol.ClientAttributesMinVersion = 9` via `RequireClientAttributesSupport`, throwing
+`NotSupportedException` below that version — the same shape `RequireTopicPubSubSupport` uses for topics,
+applied from the outset this time rather than added after the fact (see KI-61).
+
+**`UpdateAttributesAsync` validates client-side before ever sending** (`ValidateAttributes`): more than
+`Protocol.MaxClientAttributeCount` (32) entries, or a key/value over
+`Protocol.MaxClientAttributeKeyLength`/`MaxClientAttributeValueLength` (128/512 UTF-8 bytes), raises
+`ArgumentException` immediately and locally — the hub enforces the identical bounds server-side too, but a
+`MeshClient` caller never has to find that out by having an update silently dropped, learning the lesson
+KI-61/the topic client-side-validation gap already taught.
+
+**`FindClientsAsync` follows `GetClientIdByNameAsync`'s exact correlation pattern**, but through its own,
+separate single-slot state — `_findClientsLock` (`SemaphoreSlim(1,1)`), `_pendingFindClients`
+(`PendingFindClients(correlationId, TaskCompletionSource<IReadOnlyList<ClientDescriptor>>)`) and its own
+`_findClientsCorrelationId` counter — rather than sharing `_lookupLock`/`_pendingLookup`, since the two
+answer different request opcodes with different reply shapes. As with `GetClientIdByNameAsync`, if the
+connection tears down while a query is outstanding, the receive loop's teardown path faults the pending
+`TaskCompletionSource` with an `InvalidOperationException` rather than leaving a non-cancellable caller
+hanging forever.
+
+**`AttributeQuery`** (`AttributeQuery.cs`) is a thin `IReadOnlyDictionary<string, string>` wrapper — the
+criteria a matching client's attributes must all satisfy (AND, never OR). An empty query matches every
+connected client; see [known-issues.md](known-issues.md) KI-67 for why that is a disclosed, deliberate
+capability, not an oversight.
+
 ---
 
 ## `MeshClientReconnector`

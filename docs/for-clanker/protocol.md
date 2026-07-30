@@ -8,7 +8,7 @@ document/verify carefully when you touch it. Everything here is read from
 sites in `MeshHub.cs` / `MeshClient.cs`.
 
 - **Protocol version is a negotiated range** (`Protocol.MinSupportedVersion` = `4`,
-  `Protocol.MaxSupportedVersion` = `8`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
+  `Protocol.MaxSupportedVersion` = `9`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
   it can speak; the hub picks the highest version common to both sides — see
   [Registration handshake](#registration-handshake). Negotiation itself was introduced by PR #73
   (issue #47); PR #74 (issue #32) is the **first thing to actually widen the range and branch on the
@@ -35,7 +35,11 @@ sites in `MeshHub.cs` / `MeshClient.cs`.
   (`SubscribeTopic`/`UnsubscribeTopic`/`PublishTopicMessage`/`PublishTopicMessageWithHeaders`) were
   reachable at any negotiated version for that one commit, breaking this file's own additive-opcode rule —
   see [Topic pub/sub frames](#topic-pubsub-frames-issue-37) below and
-  [known-issues.md](known-issues.md) KI-61 (now fixed).
+  [known-issues.md](known-issues.md) KI-61 (now fixed). **Issue #38 is the fifth widening**, raising
+  `MaxSupportedVersion` from `8` to `9` and adding `Protocol.ClientAttributesMinVersion = 9` to gate
+  `SetClientAttributes`/`FindClientsRequest` — this time the gate shipped with the feature itself from the
+  start, rather than needing a follow-up fix — see
+  [Client attribute frames](#client-attribute-frames-issue-38) below.
 - **`MessageType` and `Protocol` are `internal`** — opcodes are not visible outside the assembly.
 - **Byte order:** big-endian for all multi-byte integers (`BinaryPrimitives.*BigEndian`). Ids are
   16-byte `Guid`s written with `Guid.TryWriteBytes` / read with `new Guid(span)`.
@@ -99,8 +103,11 @@ Everything in the tables below is the **message payload** (i.e. after the transp
 | `PublishTopicMessageWithHeaders` | `0x1C` | client → hub | topic length (2, BE), UTF-8 topic, header-block length (2, BE), header block, message bytes |
 | `DeliverTopicMessage` | `0x1D` | hub → client | sender id (16), topic length (2, BE), UTF-8 topic, message bytes |
 | `DeliverTopicMessageWithHeaders` | `0x1E` | hub → client | sender id (16), topic length (2, BE), UTF-8 topic, header-block length (2, BE), header block, message bytes |
+| `SetClientAttributes` | `0x1F` | client → hub | attribute block (rest of frame; `HeaderEnvelope`-encoded key/value pairs, no separate length prefix) |
+| `FindClientsRequest` | `0x20` | client → hub | correlation id (4, BE), criteria block (rest of frame; `HeaderEnvelope`-encoded key/value pairs) |
+| `FindClientsResponse` | `0x21` | hub → client | correlation id (4, BE), result count (2, BE), that many `[id (16)][nameLength (2, BE)][utf8 name]` entries |
 
-`0x1E` is the highest opcode in use; the next new one is `0x1F`. Topic-based publish/subscribe (issue
+`0x21` is the highest opcode in use; the next new one is `0x22`. Topic-based publish/subscribe (issue
 #37) is covered in full in [Topic pub/sub frames](#topic-pubsub-frames-issue-37) below and
 [hub.md](hub.md#topic-based-publishsubscribe)/[client.md](client.md#topic-based-publishsubscribe). **Two
 of its six opcodes (`DeliverTopicMessage`/`DeliverTopicMessageWithHeaders`) are a further confirming
@@ -110,6 +117,11 @@ hub and, by this section's own rule, needed one — for one commit they shipped 
 `fb2f9a0` added `Protocol.TopicPubSubMinVersion = 8` and gated all four on both ends** — see
 [Additive opcodes within a version](#additive-opcodes-within-a-version) below and
 [known-issues.md](known-issues.md) KI-61 (fixed) for the full write-up of that history.
+
+Client attributes (issue #38) — `SetClientAttributes`/`FindClientsRequest` are client → hub and gated
+behind `Protocol.ClientAttributesMinVersion = 9` **from the outset**, learning KI-61's lesson rather than
+repeating it; `FindClientsResponse` is hub → client and additive, no gate needed. See [Client attribute
+frames](#client-attribute-frames-issue-38) below.
 
 The four header-bearing opcodes
 (`0x11`–`0x14`, PR #74, issue #32) are each the existing opcode's frame with one extra
@@ -597,6 +609,45 @@ dispatch branches). The failure mode the gap briefly created was silent and spec
 `SubscribeAsync`/`PublishAsync` against a hub built without the feature got no exception, no refusal, and
 `SubscribeAsync` still returned with the pattern appearing in `SubscribedTopics`, but no message ever
 arrived — see [known-issues.md](known-issues.md) KI-61 (fixed) for the full write-up.
+
+<a id="client-attribute-frames-issue-38"></a>
+
+### Client attribute frames (issue #38)
+
+Three opcodes, gated behind `Protocol.ClientAttributesMinVersion = 9` **from the outset** — the lesson
+KI-61 taught the topic pub/sub feature the hard way, applied here without needing a follow-up commit.
+
+```
+client → hub : [0x1F SetClientAttributes][attributeBlock...]                                        # whole remainder is the block
+client → hub : [0x20 FindClientsRequest][correlationId 4][criteriaBlock...]                          # needs len ≥ 5
+hub → client : [0x21 FindClientsResponse][correlationId 4][resultCount u16 BE][entries...]           # needs len ≥ 7
+```
+
+Each `entries` item is `[id 16][nameLength u16 BE][utf8 name]`, repeated `resultCount` times.
+
+The attribute and criteria blocks reuse the `HeaderEnvelope` codec [Message headers](#message-headers)
+already defined — attributes are, on the wire, exactly the same shape as headers, a small string-keyed
+map — rather than a second, parallel encoding. Neither block carries its own length prefix the way a
+header block does elsewhere in this file (`[headerLen u16 BE][headerBlock]`); it consumes the rest of the
+frame instead, the same shape `SubscribeTopic`'s pattern already uses, since there is nothing else in
+either frame that needs to follow it.
+
+**`SetClientAttributes` has no reply.** A bag rejected for exceeding `Protocol.MaxClientAttributeCount`/
+`MaxClientAttributeKeyLength`/`MaxClientAttributeValueLength` is dropped silently, the same shape as every
+other malformed-or-oversized fire-and-forget frame in this protocol — see
+[Length-guard behaviour](#length-guard-behaviour-why-malformed-frames-do-nothing) below. `MeshClient`
+itself never sends one that would be rejected, since `UpdateAttributesAsync` validates the identical
+bounds client-side first.
+
+**`FindClientsRequest`/`FindClientsResponse` follow `ClientLookupRequest`/`ClientLookupResponse`'s
+correlation-id shape** almost exactly, with one difference: the response can carry many entries rather
+than at most one, so it needs its own `resultCount` field the lookup reply does not. Answering the query
+scans every connected client — see [hub.md](hub.md#client-attributes--directory-queries) for why that is
+an acceptable cost for this call specifically, and why the reply itself is still bounded rather than
+allowed to grow with the matched population.
+
+**No authorisation seam exists for either verb, and an empty-criteria query enumerates every connected
+client** — see [known-issues.md](known-issues.md) KI-66 and KI-67.
 
 <a id="additive-opcodes-within-a-version"></a>
 

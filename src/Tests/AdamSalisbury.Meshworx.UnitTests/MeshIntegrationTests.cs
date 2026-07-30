@@ -441,6 +441,131 @@ public sealed class MeshIntegrationTests
     }
 
     /// <summary>
+    /// A client that sets attributes is found by a query matching all of them, and excluded by a query
+    /// asking for one it does not hold — proving the "and" semantics over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_FindClientsMatchesOnEveryAttributeAndExcludesPartialMatches()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var worker = CreateClient();
+        await using var other = CreateClient();
+        await using var seeker = CreateClient();
+
+        await worker.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Worker");
+        await other.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Other");
+        await seeker.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Seeker");
+
+        await worker.UpdateAttributesAsync(new Dictionary<string, string> { ["role"] = "worker", ["region"] = "eu" });
+        await other.UpdateAttributesAsync(new Dictionary<string, string> { ["role"] = "worker", ["region"] = "us" });
+        // Barrier: the seeker's own round trip only proves its own connection is processed in order, so
+        // query the hub for something on the worker's connection instead, forcing this test to wait for
+        // that connection's own SetClientAttributes frame to have been applied before continuing.
+        await worker.GetClientIdByNameAsync("Other");
+
+        IReadOnlyList<ClientDescriptor> matches = await seeker.FindClientsAsync(
+            new AttributeQuery([new("role", "worker"), new("region", "eu")]));
+
+        Assert.Equal([new ClientDescriptor(worker.Id, "Worker")], matches);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A later call to UpdateAttributesAsync replaces the whole bag rather than merging into it, over the
+    /// real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_UpdateAttributesReplacesThePreviousBagWholesale()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var client = CreateClient();
+        await using var seeker = CreateClient();
+
+        await client.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Client");
+        await seeker.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Seeker");
+
+        await client.UpdateAttributesAsync(new Dictionary<string, string> { ["role"] = "worker" });
+        await client.UpdateAttributesAsync(new Dictionary<string, string> { ["role"] = "leader" });
+        await client.GetClientIdByNameAsync("Seeker");
+
+        IReadOnlyList<ClientDescriptor> stillWorker = await seeker.FindClientsAsync(
+            new AttributeQuery([new("role", "worker")]));
+        IReadOnlyList<ClientDescriptor> nowLeader = await seeker.FindClientsAsync(
+            new AttributeQuery([new("role", "leader")]));
+
+        Assert.Empty(stillWorker);
+        Assert.Equal([new ClientDescriptor(client.Id, "Client")], nowLeader);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// A disconnected client's attributes are gone: a query that matched it before disconnecting matches
+    /// nothing afterwards, over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_AttributesAreClearedOnDisconnect()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        var client = CreateClient();
+        await using var seeker = CreateClient();
+
+        await client.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Client");
+        await seeker.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Seeker");
+
+        await client.UpdateAttributesAsync(new Dictionary<string, string> { ["role"] = "worker" });
+        await client.GetClientIdByNameAsync("Seeker");
+        await client.DisconnectAsync();
+
+        IReadOnlyList<ClientDescriptor> matches = await seeker.FindClientsAsync(
+            new AttributeQuery([new("role", "worker")]));
+
+        Assert.Empty(matches);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// An empty query matches every connected client, over the real protocol.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_EmptyQueryMatchesEveryConnectedClient()
+    {
+        var listener = new TcpTransportListener(new IPEndPoint(IPAddress.Loopback, 0));
+        await using var hub = CreateHub(listener);
+        await hub.StartAsync();
+        int port = ((IPEndPoint)listener.LocalEndPoint!).Port;
+
+        await using var first = CreateClient();
+        await using var second = CreateClient();
+
+        await first.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "First");
+        await second.ConnectAsync(await TcpTransport.ConnectAsync("127.0.0.1", port), "Second");
+        await first.GetClientIdByNameAsync("Second");
+
+        IReadOnlyList<ClientDescriptor> matches = await first.FindClientsAsync(new AttributeQuery([]));
+
+        Assert.Equal(2, matches.Count);
+        Assert.Contains(new ClientDescriptor(first.Id, "First"), matches);
+        Assert.Contains(new ClientDescriptor(second.Id, "Second"), matches);
+
+        await hub.StopAsync();
+    }
+
+    /// <summary>
     /// With heartbeats enabled, a responsive client (one that replies to pings) stays connected across
     /// several heartbeat intervals, exercised end-to-end over the in-memory transport.
     /// </summary>

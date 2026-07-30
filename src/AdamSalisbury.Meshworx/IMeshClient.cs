@@ -467,6 +467,49 @@ public interface IMeshClient : IAsyncDisposable
     Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Replaces this client's attribute bag — small, hub-held directory metadata other clients can find
+    /// it by, such as <c>role</c> or <c>region</c> — with the values supplied.
+    /// </summary>
+    /// <remarks>
+    /// This replaces the whole bag; there is no incremental "set one key" call. Passing an empty
+    /// dictionary clears every attribute this client previously set. Attributes are directory metadata
+    /// held by the hub — they are never inspected as message content — and are discarded the moment this
+    /// client disconnects, whether by this call or implicitly.
+    /// </remarks>
+    /// <param name="attributes">The complete set of attributes this client should be known by.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The hub negotiated a protocol version that predates client attributes.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="attributes"/> holds more than the maximum number of entries, or a key or value
+    /// exceeds the maximum length either allows.
+    /// </exception>
+    Task UpdateAttributesAsync(
+        IReadOnlyDictionary<string, string> attributes, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Queries the hub for every currently-registered client whose attribute bag matches
+    /// <paramref name="query"/>.
+    /// </summary>
+    /// <remarks>
+    /// The hub scans its live client set at the moment the query is received — the result is a
+    /// point-in-time snapshot, not a subscription, and does not include this client itself unless it
+    /// also set matching attributes on itself. A client with no matching attributes is excluded, and an
+    /// empty <paramref name="query"/> matches everyone currently connected.
+    /// </remarks>
+    /// <param name="query">The attribute criteria every returned client must satisfy.</param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <returns>Every matching client's id and name. Empty, never <see langword="null"/>, if none match.</returns>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// The hub negotiated a protocol version that predates client attributes.
+    /// </exception>
+    Task<IReadOnlyList<ClientDescriptor>> FindClientsAsync(
+        AttributeQuery query, CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Sends a request to another client and awaits a correlated reply.
     /// </summary>
     /// <remarks>

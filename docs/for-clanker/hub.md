@@ -1115,6 +1115,57 @@ kind.
 
 ---
 
+### Client attributes & directory queries
+
+Added for issue #38. A small key/value bag a client can attach to itself (`role=worker`, `region=eu`) and
+a query verb, `FindClientsAsync`, that scans the currently-connected population for every client whose bag
+satisfies an **AND** match against a set of criteria. Opcodes `0x1F`–`0x21` (see
+[protocol.md](protocol.md#client-attribute-frames-issue-38)), gated behind
+`Protocol.ClientAttributesMinVersion = 9` on both ends from the outset — this feature did not repeat
+KI-61's mistake.
+
+**`ClientConnection.Attributes`** (`IReadOnlyDictionary<string, string>`, `MeshHub.cs`) holds the bag,
+default empty. Unlike `Groups`/`Topics`, which are only ever touched by their own connection's receive
+loop, `Attributes` is *read* by every other connection's `FindClientsRequest` handler — so, unlike those
+two, it cannot get away with no synchronisation at all. It gets away with something almost as cheap
+instead: the whole bag is replaced wholesale (`SetClientAttributes`, never an in-place mutation) via a
+`Volatile.Write`, and read via `Volatile.Read` — reference assignment is atomic, so a concurrent reader
+always sees either the old bag or the new one in full, never a partial update, with no lock at all.
+
+**`SetClientAttributes`** decodes the frame's attribute block with the same `HeaderEnvelope` codec the
+message-header envelope already uses (headers and attributes are both "a small string-keyed map" on the
+wire, so this reuses the encoder rather than duplicating it) and rejects the *whole* update — not a
+partial one — if it exceeds `Protocol.MaxClientAttributeCount` (32), or any key/value exceeds
+`Protocol.MaxClientAttributeKeyLength`/`MaxClientAttributeValueLength` (128/512 UTF-8 bytes). A rejected
+update is logged `Debug` and silently dropped, same shape as a malformed topic pattern. `MeshClient.
+UpdateAttributesAsync` validates the same bounds client-side first (`ValidateAttributes`), so this
+hub-side rejection is reachable only from a non-`MeshClient` peer.
+
+**`SendFindClientsResponseAsync`** answers a query with a plain `O(connected clients)` scan of
+`_clients.Values` — deliberately not a secondary index the way `TopicSubscriptionTrie` is for the publish
+hot path, because a directory query is a rare, occasional call, not a per-message routing decision. The
+reply itself is still bounded: entries stop being added the instant the frame would exceed
+`StreamFramer.MaxPayloadSize`, mirroring how a `SessionResumed` reply's group-membership block is already
+bounded (KI-59) rather than left to grow with an unbounded population. `FindClientsRequest` is charged
+against the same fan-out **frequency** budget (`TryAdmitFanOut`) as broadcast/group/topic sends, even
+though it does not fan a delivery out to many recipients — answering it scans the whole population, which
+is exactly the cost shape that budget already exists to bound.
+
+**No authorisation seam exists for either verb** — a client may set any attribute bag on itself (there is
+nothing stopping it claiming `role=admin`) and query anyone else's, mirroring [Topic-based
+publish/subscribe](#topic-based-publishsubscribe)'s identical gap one feature later. See
+[known-issues.md](known-issues.md) KI-66. **An empty-criteria query is a full directory enumeration
+primitive** — every connected client's id and name, with no prior knowledge required, a capability
+`GetClientIdByNameAsync` never offered. See [known-issues.md](known-issues.md) KI-67.
+
+**Attributes are cleared on disconnect for free** — unlike groups and topics, which need an explicit
+`RemoveFromAllGroups`/`RemoveFromAllTopics` teardown call because the hub-level `_groups`/`_topics`
+structures outlive any one connection, `Attributes` lives entirely on the `ClientConnection` object
+itself. Once that object is removed from `_clients` and disposed, its attribute bag is unreachable and
+collected with it — no separate cleanup path to get wrong.
+
+---
+
 <a id="metrics"></a>
 
 ### Metrics
