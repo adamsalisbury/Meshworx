@@ -216,4 +216,45 @@ public sealed class PriorityOutboundQueueTests
 
         Assert.False(queued);
     }
+
+    /// <summary>
+    /// A caller racing a recipient's teardown can still reach <see cref="PriorityOutboundQueue.TryEnqueue"/>
+    /// after the queue has already been disposed — routing looks the recipient up and enqueues as two
+    /// separate steps, with nothing serialising the second against the recipient's own disposal (issue
+    /// #108). A disposed queue is definitionally one that will never be drained, so this must report that
+    /// the same way a full one does, rather than throwing <see cref="ObjectDisposedException"/> out into
+    /// an unrelated sender's own handler.
+    /// </summary>
+    [Fact]
+    public void TryEnqueue_QueueAlreadyDisposed_ReturnsFalseRatherThanThrowing()
+    {
+        var queue = new PriorityOutboundQueue(capacity: 1);
+        queue.Complete();
+        queue.Dispose();
+
+        bool queued = queue.TryEnqueue(MessagePriority.Normal, [1]);
+
+        Assert.False(queued);
+    }
+
+    /// <summary>
+    /// The asynchronous counterpart of
+    /// <see cref="TryEnqueue_QueueAlreadyDisposed_ReturnsFalseRatherThanThrowing"/>: a call that starts
+    /// after the queue is already disposed reads <see cref="PriorityOutboundQueue.DisposalToken"/> before
+    /// there is anything to await, which throws <see cref="ObjectDisposedException"/> on a disposed
+    /// <see cref="CancellationTokenSource"/> rather than the graceful cancellation an in-flight caller
+    /// would have observed.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task TryEnqueueAsync_QueueAlreadyDisposed_ReturnsFalseRatherThanThrowing()
+    {
+        var queue = new PriorityOutboundQueue(capacity: 1);
+        queue.Complete();
+        queue.Dispose();
+
+        bool queued = await queue.TryEnqueueAsync(
+            MessagePriority.Normal, [1], TimeSpan.FromSeconds(1), CancellationToken.None);
+
+        Assert.False(queued);
+    }
 }

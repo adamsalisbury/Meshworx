@@ -85,9 +85,30 @@ internal sealed class PriorityOutboundQueue : IDisposable
     /// Queues a frame on the given priority's lane if a capacity slot is free; otherwise drops it
     /// immediately without waiting. Mirrors a bounded <see cref="Channel{T}"/>'s own <c>TryWrite</c>.
     /// </summary>
+    /// <remarks>
+    /// Called from whichever connection's receive loop is routing a message to this queue's owner, which
+    /// may be a different connection from the one tearing this queue down — so, unlike
+    /// <see cref="TryEnqueueAsync"/>, a caller can still be inside this method after <see cref="Dispose"/>
+    /// has already run: nothing that awaits <see cref="TryEnqueueAsync"/>'s cancellation gates this
+    /// synchronous path. A disposed queue is, definitionally, one that will never be drained, so this
+    /// treats <see cref="ObjectDisposedException"/> from the capacity gate exactly like the queue being
+    /// full: the frame is dropped and the caller is told so, rather than the sender's own handler faulting
+    /// over a recipient's unrelated teardown.
+    /// </remarks>
     public bool TryEnqueue(MessagePriority priority, byte[] frame)
     {
-        if (!_capacityGate.Wait(0))
+        bool acquired;
+
+        try
+        {
+            acquired = _capacityGate.Wait(0);
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+
+        if (!acquired)
         {
             return false;
         }
@@ -116,32 +137,58 @@ internal sealed class PriorityOutboundQueue : IDisposable
     /// <see langword="true"/> if the frame was queued before the timeout elapsed, the caller's token was
     /// cancelled, or this queue was disposed; otherwise <see langword="false"/>.
     /// </returns>
+    /// <remarks>
+    /// An in-flight call is safe by construction — <see cref="DisposalToken"/> cancels every waiter before
+    /// <see cref="Dispose"/> ever runs. A call that starts after <see cref="Dispose"/> has already
+    /// completed is not: the very first thing this method does is read <see cref="DisposalToken"/>, which
+    /// throws <see cref="ObjectDisposedException"/> once the backing source is disposed, before there is
+    /// any cancellation to observe. Treated the same as a disposed capacity gate: the frame cannot be
+    /// queued, so this reports that the ordinary way rather than faulting the caller.
+    /// </remarks>
     public async Task<bool> TryEnqueueAsync(
         MessagePriority priority, byte[] frame, TimeSpan timeout, CancellationToken cancellationToken)
     {
-        using CancellationTokenSource linkedCts =
-            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, DisposalToken);
-        linkedCts.CancelAfter(timeout);
+        CancellationTokenSource linkedCts;
 
         try
         {
-            await _capacityGate.WaitAsync(linkedCts.Token).ConfigureAwait(false);
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, DisposalToken);
         }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        catch (ObjectDisposedException)
         {
-            // Either the timeout elapsed or this queue was disposed while waiting; either way there is
-            // no slot to write into. The caller falls back to its ordinary drop-on-full path.
             return false;
         }
 
-        if (LaneFor(priority).Writer.TryWrite(frame))
+        using (linkedCts)
         {
-            _readySignal.Release();
-            return true;
-        }
+            linkedCts.CancelAfter(timeout);
 
-        _capacityGate.Release();
-        return false;
+            try
+            {
+                await _capacityGate.WaitAsync(linkedCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Either the timeout elapsed or this queue was disposed while waiting; either way there is
+                // no slot to write into. The caller falls back to its ordinary drop-on-full path.
+                return false;
+            }
+            catch (ObjectDisposedException)
+            {
+                // The gate was disposed between the link above and this wait starting — vanishingly
+                // narrow, but the same "cannot be queued" outcome as every other disposal path here.
+                return false;
+            }
+
+            if (LaneFor(priority).Writer.TryWrite(frame))
+            {
+                _readySignal.Release();
+                return true;
+            }
+
+            _capacityGate.Release();
+            return false;
+        }
     }
 
     /// <summary>
