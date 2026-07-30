@@ -29,6 +29,12 @@ public static class MeshHubServiceCollectionExtensions
     /// not already provide one. Only the first call on a given collection registers the hub and its hosted
     /// service; a later call still layers its <paramref name="configureOptions"/> onto the same options
     /// pipeline.
+    /// <para>
+    /// Call this <em>before</em> <c>AddMeshClient</c> when the same host also runs one of this hub's own
+    /// clients: <see cref="Microsoft.Extensions.Hosting.IHostedService"/> instances start one at a time, in
+    /// registration order, so a client registered first would otherwise start connecting before this
+    /// hub's listener has started accepting.
+    /// </para>
     /// </remarks>
     public static IServiceCollection AddMeshHub(
         this IServiceCollection services,

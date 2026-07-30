@@ -24,20 +24,34 @@ namespace AdamSalisbury.Meshworx.Extensions.DependencyInjection;
 /// <see cref="MeshClientReconnector.DisposeAsync"/> is idempotent, so the later container disposal of the
 /// same singleton is a safe no-op once this has already run.
 /// </para>
+/// <para>
+/// The initial connection — on either path — is retried with a back-off delay under the host's own start
+/// token, rather than failing <see cref="StartAsync"/> on the first attempt. Two failure modes this
+/// closes: a plain connection attempt had no timeout of its own, relying entirely on the host's start
+/// token, which by default (<c>HostOptions.StartupTimeout</c>) never fires — so host startup could hang
+/// for the underlying transport's own connect timeout (on TCP, the OS default of roughly two minutes), or
+/// for ever against a custom <see cref="MeshClientOptions.TransportFactory"/> with none. And registering
+/// <c>AddMeshClient</c> before <c>AddMeshHub</c> — a natural reading order for "this app has a client, and
+/// also hosts the hub" — otherwise fails host startup outright, since <see cref="IHostedService"/> start
+/// order is registration order and the hub's listener is not accepting connections yet. Retrying tolerates
+/// both: a hub that has not finished starting, in the same process or another, converges within a few
+/// attempts rather than killing the host.
+/// </para>
 /// </remarks>
 internal sealed class MeshClientHostedService(
     string clientName,
     IServiceProvider serviceProvider,
     IOptionsMonitor<MeshClientOptions> optionsMonitor) : IHostedService
 {
+    private static readonly TimeSpan DefaultConnectTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan DefaultConnectRetryDelay = TimeSpan.FromSeconds(1);
+
     /// <inheritdoc/>
     public Task StartAsync(CancellationToken cancellationToken)
     {
         MeshClientOptions options = optionsMonitor.Get(clientName);
 
-        return options.UseReconnector
-            ? serviceProvider.GetRequiredKeyedService<MeshClientReconnector>(clientName).StartAsync(cancellationToken)
-            : ConnectAsync(options, cancellationToken);
+        return ConnectWithRetryAsync(options, cancellationToken);
     }
 
     /// <inheritdoc/>
@@ -53,6 +67,59 @@ internal sealed class MeshClientHostedService(
 
         IMeshClient client = serviceProvider.GetRequiredKeyedService<IMeshClient>(clientName);
         return client.DisconnectAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Attempts the client's initial connection, retrying with a back-off delay under
+    /// <paramref name="cancellationToken"/> until it succeeds or that token is cancelled.
+    /// </summary>
+    /// <remarks>
+    /// On the reconnector path, a failed <see cref="MeshClientReconnector.StartAsync"/> call resets the
+    /// reconnector's own started flag specifically so it can be retried — calling it again here is the
+    /// intended recovery, not a workaround. On the plain path, each attempt is bounded by
+    /// <see cref="MeshClientOptions.ConnectTimeout"/> directly, since <see cref="ConnectAsync"/> otherwise
+    /// has no timeout of its own; the reconnector path needs no equivalent wrapping here because
+    /// <see cref="MeshClientReconnector.StartAsync"/> already bounds its own first attempt with
+    /// <see cref="MeshClientOptions.ReconnectConnectTimeout"/>.
+    /// </remarks>
+    private async Task ConnectWithRetryAsync(MeshClientOptions options, CancellationToken cancellationToken)
+    {
+        TimeSpan retryDelay = options.ConnectRetryDelay ?? DefaultConnectRetryDelay;
+
+        while (true)
+        {
+            try
+            {
+                if (options.UseReconnector)
+                {
+                    await serviceProvider.GetRequiredKeyedService<MeshClientReconnector>(clientName)
+                        .StartAsync(cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    TimeSpan connectTimeout = options.ConnectTimeout ?? DefaultConnectTimeout;
+                    using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    attemptCts.CancelAfter(connectTimeout);
+                    await ConnectAsync(options, attemptCts.Token).ConfigureAwait(false);
+                }
+
+                return;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // The host itself is shutting down, or has given up on startup entirely
+                // (HostOptions.StartupTimeout) — propagate rather than retrying into a host that no
+                // longer wants us to.
+                throw;
+            }
+            catch
+            {
+                // Either this attempt's own timeout fired, or it failed outright (connection refused, DNS
+                // failure, and the like). Either way the hub may simply not be up yet — in a real
+                // deployment it is very often a separate process — so retry rather than killing the host.
+                await Task.Delay(retryDelay, cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 
     private async Task ConnectAsync(MeshClientOptions options, CancellationToken cancellationToken)

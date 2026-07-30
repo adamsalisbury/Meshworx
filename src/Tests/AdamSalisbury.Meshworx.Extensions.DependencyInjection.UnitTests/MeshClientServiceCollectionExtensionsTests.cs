@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Reflection;
 using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.Transport.InMemory;
@@ -121,6 +122,11 @@ public sealed class MeshClientServiceCollectionExtensionsTests
         var diPlumbingPropertyNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "ClientName", "Host", "Port", "TransportFactory", "UseReconnector",
+
+            // Govern MeshClientHostedService's own initial-connect retry loop (issue #100/#112) rather
+            // than mirroring a MeshClient/MeshClientReconnector constructor parameter — neither type's
+            // constructor knows anything about retrying its own construction.
+            "ConnectTimeout", "ConnectRetryDelay",
         };
 
         var actualPropertyNames = typeof(MeshClientOptions)
@@ -355,6 +361,90 @@ public sealed class MeshClientServiceCollectionExtensionsTests
         await host.StopAsync();
         Assert.False(client.IsConnected);
 
+        await hub.StopAsync();
+    }
+
+    // Initial connect retry (issue #100)
+
+    /// <summary>
+    /// A transport factory that never succeeds must not block host startup indefinitely — each attempt
+    /// is bounded by <see cref="MeshClientOptions.ConnectTimeout"/>, so cancelling the host's own start
+    /// token is observed within roughly one attempt-plus-retry-delay, rather than only once some far
+    /// longer, unbounded operation eventually gives up on its own.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task AddMeshClient_HostStart_TransportFactoryNeverSucceeds_RespectsCancellationRatherThanHangingIndefinitely()
+    {
+        var builder = new HostBuilder();
+        builder.ConfigureServices(services =>
+        {
+            services.AddLogging();
+            services.AddMeshClient("Alice", options =>
+            {
+                options.ConnectTimeout = TimeSpan.FromMilliseconds(50);
+                options.ConnectRetryDelay = TimeSpan.FromMilliseconds(50);
+                options.TransportFactory = _ => Task.FromException<ITransport>(new IOException("unreachable"));
+            });
+        });
+
+        using IHost host = builder.Build();
+
+        using var startCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+        var stopwatch = Stopwatch.StartNew();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => host.StartAsync(startCts.Token));
+
+        stopwatch.Stop();
+
+        // Generous relative to the 500ms cancellation deadline, but tight relative to what an unbounded
+        // single attempt would take (TCP's own connect timeout is on the order of two minutes) — proving
+        // this returned because cancellation was observed promptly, not because some much longer
+        // operation eventually unwound on its own.
+        Assert.True(
+            stopwatch.Elapsed < TimeSpan.FromSeconds(5),
+            $"Expected host.StartAsync to observe cancellation promptly, took {stopwatch.Elapsed.TotalMilliseconds}ms");
+    }
+
+    /// <summary>
+    /// A transport factory that fails a few times before succeeding — standing in for a hub that has not
+    /// finished starting yet, very often true of a separate process in a real deployment — must still let
+    /// the client connect once it becomes reachable, rather than the first failure killing host startup
+    /// (issue #100).
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task AddMeshClient_HostStart_TransportFactoryFailsThenSucceeds_ConnectsOnceReachable()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(new Mock<ILogger<MeshHub>>().Object, listener);
+        await hub.StartAsync();
+
+        var attempt = 0;
+
+        var builder = new HostBuilder();
+        builder.ConfigureServices(services =>
+        {
+            services.AddLogging();
+            services.AddMeshClient("Alice", options =>
+            {
+                options.ConnectRetryDelay = TimeSpan.FromMilliseconds(20);
+                options.TransportFactory = _ =>
+                {
+                    Interlocked.Increment(ref attempt);
+                    return attempt <= 2
+                        ? Task.FromException<ITransport>(new IOException("hub not up yet"))
+                        : Task.FromResult<ITransport>(listener.Connect());
+                };
+            });
+        });
+
+        using IHost host = builder.Build();
+        await host.StartAsync();
+
+        IMeshClient client = host.Services.GetRequiredKeyedService<IMeshClient>("Alice");
+        Assert.True(client.IsConnected);
+        Assert.True(attempt >= 3);
+
+        await host.StopAsync();
         await hub.StopAsync();
     }
 }
