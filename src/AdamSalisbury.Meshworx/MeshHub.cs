@@ -2604,6 +2604,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return connection.Id;
         }
 
+        // This connection's own registration already issued it a token and recorded an entry for it,
+        // which becomes unreachable the moment the identity swap below moves it onto the resumed id.
+        // Left in place, that entry would never be revisited by anything — it is not the fresh id's
+        // registration entry any more, nor the spent token above — and its DormantUntil would stay null
+        // for ever, making it permanently unreclaimable by PurgeExpiredSessions. Removed alongside the
+        // spent token so a successful resume never grows the table.
+        if (connection.SessionTokenHash is { } freshTokenHash)
+        {
+            _sessions.TryRemove(freshTokenHash, out _);
+        }
+
         Guid freshId = connection.Id;
         Guid resumedId = session.ClientId;
 
@@ -2685,13 +2696,24 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// Drops every session whose resumption window has closed. Only called when the table is at its
     /// bound, since a hub below it has nothing to gain from the sweep.
     /// </summary>
+    /// <remarks>
+    /// A <c>null</c> <see cref="ResumableSession.DormantUntil"/> ordinarily means the session's
+    /// connection is still live and must not be reclaimed. An entry can only end up with a
+    /// <c>null</c> <see cref="ResumableSession.DormantUntil"/> and no live connection behind it if a
+    /// bug orphaned it — <see cref="ResumeSessionAsync"/> is careful not to — so this is a backstop:
+    /// such an entry is stale rather than protected, and is swept alongside the genuinely expired ones
+    /// rather than pinning the table shut for ever.
+    /// </remarks>
     private void PurgeExpiredSessions()
     {
         DateTimeOffset now = DateTimeOffset.UtcNow;
 
         foreach (KeyValuePair<string, ResumableSession> entry in _sessions)
         {
-            if (entry.Value.DormantUntil is { } dormantUntil && dormantUntil <= now)
+            bool expired = entry.Value.DormantUntil is { } dormantUntil && dormantUntil <= now;
+            bool orphaned = entry.Value.DormantUntil is null && !_clients.ContainsKey(entry.Value.ClientId);
+
+            if (expired || orphaned)
             {
                 _sessions.TryRemove(entry);
             }

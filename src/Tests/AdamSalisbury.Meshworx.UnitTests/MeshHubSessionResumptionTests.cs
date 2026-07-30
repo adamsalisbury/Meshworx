@@ -1,3 +1,5 @@
+using System.Collections;
+using System.Reflection;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.UnitTests.Fixtures;
 
@@ -377,6 +379,53 @@ public sealed class MeshHubSessionResumptionTests
     {
         Assert.Throws<ArgumentOutOfRangeException>(
             () => new MeshHubFixture(sessionResumptionWindow: TimeSpan.FromSeconds(seconds)));
+    }
+
+    /// <summary>
+    /// A resume spends the session it reclaims but also, less obviously, the entry the resuming
+    /// connection's own registration was issued moments earlier — that entry becomes unreachable the
+    /// instant the identity swap happens, and would otherwise sit in the table for ever with a
+    /// <see langword="null"/> <c>DormantUntil</c> (issue #97). One successful resume must leave the
+    /// session table no larger than it was — one entry for the resumed identity's renewed token — never
+    /// carrying forward an orphan from the connection it replaced.
+    /// </summary>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task ResumeSession_ValidToken_DoesNotLeaveTheRegistrationEntryOrphaned()
+    {
+        var fixture = new MeshHubFixture(sessionResumptionWindow: Window);
+        await fixture.Hub.StartAsync();
+
+        (_, byte[] token) = await RegisterThenDisconnectAsync(fixture, "Worker");
+        Assert.Equal(1, GetSessionCount(fixture.Hub));
+
+        var returning = await fixture.RegisterMultiMessageClientAsync("Worker", versionMax: 0x06);
+        var frames = new FrameRecorder(returning.Transport);
+
+        // Registration alone issued the resuming connection its own token, so the table already holds
+        // two entries for this one logical client: the dormant one being reclaimed, and the fresh one
+        // just minted.
+        Assert.Equal(2, GetSessionCount(fixture.Hub));
+
+        returning.EnqueueMessage(MeshHubFixture.CreateResumeSessionRequest(token));
+        await frames.WaitForAsync(f => f[0] == 0x17).WaitAsync(WaitTimeout);
+
+        // Exactly one entry survives: the renewed token for the now-resumed identity. Anything more is
+        // the fresh registration's entry, orphaned and unreclaimable.
+        Assert.Equal(1, GetSessionCount(fixture.Hub));
+
+        returning.Disconnect();
+        await fixture.Hub.StopAsync();
+    }
+
+    /// <summary>
+    /// Reads the hub's private session table by reflection, as a count rather than by content, so the
+    /// test does not need to know about the private <c>ResumableSession</c> type.
+    /// </summary>
+    private static int GetSessionCount(MeshHub hub)
+    {
+        var field = typeof(MeshHub).GetField("_sessions", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var sessions = (IDictionary)field.GetValue(hub)!;
+        return sessions.Count;
     }
 
     private static byte[] ExtractToken(byte[] registrationResponse)
