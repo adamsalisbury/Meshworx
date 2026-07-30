@@ -891,7 +891,29 @@ both accept an optional `name` — `AddMeshHub` defaults to `"meshhub"`, `AddMes
 
 ## Large messages
 
-A single frame is capped at 1 MiB. `SendLargeAsync` sends a payload of any size by splitting it across
+### Message size limits
+
+A single frame is capped at 1 MiB (1,048,576 bytes), and a delivery frame carries the sender's id and,
+for a group message, the group name. Those bytes come out of the same budget, so the largest **body**
+each send shape can carry differs:
+
+| Send | Largest body |
+|---|---|
+| `SendAsync` | 1 MiB − 17 bytes |
+| `BroadcastAsync` | 1 MiB − 17 bytes |
+| `SendToGroupAsync` | 1 MiB − 19 bytes − the group name |
+
+A direct send is size-neutral, because the recipient id in the inbound frame is replaced by the sender
+id on the way out. A broadcast or group send has no such field to give back, so its delivery frame is
+16 bytes larger than the frame the sender wrote — which is why a fan-out body just inside the client's
+own limit can still be too large to deliver. The hub drops such a message and counts it as
+`frame-too-large`; the sending client is not told, because there is no wire frame to tell it with.
+
+Use `SendLargeAsync` for anything near these limits.
+
+### Chunking beyond the cap
+
+`SendLargeAsync` sends a payload of any size by splitting it across
 as many frames as it needs, with the receiving client reassembling it:
 
 ```csharp
@@ -1059,7 +1081,7 @@ component recorded it:
 | `meshworx.hub.clients.connected` | up/down counter | — | Clients currently registered with the hub. |
 | `meshworx.hub.messages.routed` | counter | `direction`: `direct`, `broadcast`, `group` | Messages the hub has routed. A broadcast or group send counts once per call that reaches at least one recipient, not once per recipient — it is the message the hub routed, not the number of deliveries it fanned out to — and not at all when there was nobody to receive it (the sender was the only client, or the group's only member). |
 | `meshworx.hub.bytes.routed` | counter | `direction`: `direct`, `broadcast`, `group` | Message payload bytes the hub has routed, tagged the same way. |
-| `meshworx.hub.messages.dropped` | counter | `reason`: `unknown-recipient`, `queue-full`, `expired`, `offline-queue-full` | Messages the hub could not deliver: a direct send to a Guid nobody is registered under, a write to a recipient's outbound queue that was already full, a frame whose time-to-live had lapsed by the time it was dequeued for sending, or a message the configured offline store refused to hold. |
+| `meshworx.hub.messages.dropped` | counter | `reason`: `unknown-recipient`, `queue-full`, `expired`, `offline-queue-full`, `frame-too-large` | Messages the hub could not deliver: a direct send to a Guid nobody is registered under, a write to a recipient's outbound queue that was already full, a frame whose time-to-live had lapsed by the time it was dequeued for sending, a message the configured offline store refused to hold, or a fan-out whose delivery frame would exceed the 1 MiB frame cap (see [Message size limits](#message-size-limits)). |
 | `meshworx.hub.messages.offline_queued` | counter | — | Messages held in the offline store for a disconnected client instead of being dropped. They are counted as `routed` (`direction=direct`) later, when the client returns and they are queued for it. |
 | `meshworx.hub.outbound_queue.depth` | observable gauge | — | The total number of frames currently queued for delivery, summed across every connected client's outbound queue. A single aggregate rather than one series per client, since tagging by client id would give the gauge unbounded cardinality over the hub's lifetime. |
 | `meshworx.client.reconnects` | counter | — | The number of times a `MeshClientReconnector` has re-established a connection after an unexpected drop. Does not count the initial connection `StartAsync` makes. |

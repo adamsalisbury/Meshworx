@@ -772,4 +772,34 @@ public sealed class MeshHubMetricsTests
 
         await fixture.Hub.StopAsync();
     }
+
+    /// <summary>
+    /// A broadcast whose delivery frame would exceed the transport's frame cap increments the
+    /// dropped-messages counter with reason "frame-too-large" rather than being routed.
+    /// </summary>
+    /// <remarks>
+    /// The drop is otherwise invisible to the sender — the hub accepts the message and answers nothing —
+    /// so the counter is the only signal an operator has that a client is sending fan-outs just past
+    /// what a delivery frame can carry.
+    /// </remarks>
+    [Fact(Timeout = TestTimeouts.ExtendedHarness)]
+    public async Task BroadcastMessage_DeliveryFrameOverTheCap_IncrementsDroppedCounterTaggedFrameTooLarge()
+    {
+        var fixture = new MeshHubFixture();
+        using var droppedCapture = new MetricsCapture<long>(
+            fixture.Hub.GetMeterForTesting(), "meshworx.hub.messages.dropped");
+
+        await fixture.Hub.StartAsync();
+        var sender = await fixture.RegisterMultiMessageClientAsync("Sender");
+        await fixture.RegisterClientAsync("Recipient");
+
+        // Sixteen bytes inside what the sending client's own framing accepts, one byte past what the
+        // delivery frame — which prepends the sender id with no field to give back — can carry.
+        sender.EnqueueMessage(MeshHubFixture.CreateBroadcastMessage(new byte[(1024 * 1024) - 16]));
+
+        await WaitUntilAsync(() => droppedCapture.Values.Count > 0, WaitTimeout);
+
+        int droppedIndex = droppedCapture.Values.ToList().IndexOf(1L);
+        Assert.Equal("frame-too-large", TagValue(droppedCapture.Tags[droppedIndex], "reason"));
+    }
 }

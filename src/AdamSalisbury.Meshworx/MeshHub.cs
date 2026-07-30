@@ -9,6 +9,7 @@ using AdamSalisbury.Meshworx.Diagnostics;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.RateLimiting;
 using AdamSalisbury.Meshworx.Transport;
+using AdamSalisbury.Meshworx.Transport.Framing;
 using Microsoft.Extensions.Logging;
 
 namespace AdamSalisbury.Meshworx;
@@ -180,6 +181,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private static readonly KeyValuePair<string, object?> QueueFullDropTag = new("reason", "queue-full");
     private static readonly KeyValuePair<string, object?> ExpiredDropTag = new("reason", "expired");
     private static readonly KeyValuePair<string, object?> OfflineQueueFullDropTag = new("reason", "offline-queue-full");
+    private static readonly KeyValuePair<string, object?> FrameTooLargeDropTag = new("reason", "frame-too-large");
 
     // How many client slots are currently claimed. This, rather than _clients.Count, is what maxClients
     // is enforced against: a slot is claimed by a single atomic operation before the client is put into
@@ -3039,7 +3041,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         // Build the delivery frame once and share it across every recipient's queue. The send
         // loops only read the array, so concurrent reads of this never-mutated buffer are safe.
-        var deliveryPayload = new byte[1 + 16 + messageData.Length];
+        int frameLength = 1 + 16 + messageData.Length;
+
+        if (ExceedsFrameCap(frameLength))
+        {
+            DropOversizeFanOut(senderId, frameLength, "broadcast");
+            return;
+        }
+
+        var deliveryPayload = new byte[frameLength];
         deliveryPayload[0] = (byte)MessageType.DeliverMessage;
         senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
         messageData.CopyTo(deliveryPayload.AsMemory(17));
@@ -3410,7 +3420,15 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         // BroadcastMessage). The frame carries the group name so recipients know its origin. The
         // name bytes are copied straight from the inbound frame rather than re-encoding the string.
         int nameLength = groupNameBytes.Length;
-        var deliveryPayload = new byte[1 + 16 + 2 + nameLength + messageData.Length];
+        int frameLength = 1 + 16 + 2 + nameLength + messageData.Length;
+
+        if (ExceedsFrameCap(frameLength))
+        {
+            DropOversizeFanOut(senderId, frameLength, "group message");
+            return;
+        }
+
+        var deliveryPayload = new byte[frameLength];
         deliveryPayload[0] = (byte)MessageType.DeliverGroupMessage;
         senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
         BinaryPrimitives.WriteUInt16BigEndian(deliveryPayload.AsSpan(17, 2), (ushort)nameLength);
@@ -3518,6 +3536,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             }
         }
 
+        // Judged against the largest frame this fan-out can build — the header-carrying one — so that
+        // whether a group send is accepted does not depend on which members happen to be connected on
+        // which protocol version. A rule the sender cannot predict is worse than a stricter one.
+        int frameLength = 1 + 16 + 2 + groupNameBytes.Length + 2 + headerBlock.Length + body.Length;
+
+        if (ExceedsFrameCap(frameLength))
+        {
+            DropOversizeFanOut(senderId, frameLength, "group message");
+            return;
+        }
+
         _messagesRoutedCounter.Add(1, GroupDirectionTag);
         _bytesRoutedCounter.Add(body.Length, GroupDirectionTag);
 
@@ -3557,6 +3586,45 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 RaiseQueueSaturated(senderId, recipientId);
             }
         }
+    }
+
+    /// <summary>
+    /// Whether a delivery frame the hub is about to build is larger than the transport will write.
+    /// </summary>
+    /// <remarks>
+    /// A fan-out frame is bigger than the inbound frame that produced it. A direct send is size-neutral
+    /// — the recipient id is replaced by the sender id — but a broadcast or group delivery
+    /// <i>prepends</i> the 16-byte sender id with no field to give back, so a body that the sending
+    /// client's own validation accepted, and that the receive side accepted right up to
+    /// <see cref="StreamFramer.MaxPayloadSize"/>, can still produce a delivery frame over the cap.
+    /// <para>
+    /// Building it anyway costs the recipients, not the sender: the oversize write fails inside
+    /// <c>SendLoopAsync</c>, which treats a write failure as a transport fault and cancels that
+    /// client's own token — so one sender's message disconnects every client it was being delivered to.
+    /// Refusing here drops the single message instead, and leaves the transport-fault catch as the
+    /// belt-and-braces guard it was meant to be rather than the live mechanism.
+    /// </para>
+    /// </remarks>
+    private static bool ExceedsFrameCap(int frameLength)
+    {
+        return frameLength > StreamFramer.MaxPayloadSize;
+    }
+
+    /// <summary>
+    /// Records a fan-out refused because its delivery frame would not fit in a transport frame.
+    /// </summary>
+    private void DropOversizeFanOut(Guid senderId, int frameLength, string shape)
+    {
+        _logger.LogWarning(
+            "Fan-out {Shape} from {SenderId} dropped: its delivery frame would be {FrameLength} bytes, "
+            + "over the {MaxFrameLength}-byte maximum. A fan-out frame is larger than the frame the "
+            + "sender sent, so a body just inside the cap can still exceed it on delivery",
+            shape,
+            senderId,
+            frameLength,
+            StreamFramer.MaxPayloadSize);
+
+        _messagesDroppedCounter.Add(1, FrameTooLargeDropTag);
     }
 
     /// <summary>
