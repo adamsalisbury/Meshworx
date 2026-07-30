@@ -447,4 +447,36 @@ public sealed class MeshClientServiceCollectionExtensionsTests
         await host.StopAsync();
         await hub.StopAsync();
     }
+
+    /// <summary>
+    /// A client name that MeshClient.ConnectAsync itself rejects as too long is a configuration error,
+    /// not a transient connection failure — retrying can never fix it, since every retry presents the
+    /// same invalid name and throws the identical exception. The retry loop must propagate this
+    /// immediately rather than spinning forever behind a back-off delay that hides a genuine
+    /// misconfiguration as an endless "hub not up yet".
+    /// </summary>
+    [Fact(Timeout = 5000)]
+    public async Task AddMeshClient_HostStart_ClientNameTooLong_FailsImmediatelyRatherThanRetryingForever()
+    {
+        var builder = new HostBuilder();
+        builder.ConfigureServices(services =>
+        {
+            services.AddLogging();
+            services.AddMeshClient(new string('A', 300), options =>
+            {
+                options.ConnectRetryDelay = TimeSpan.FromMilliseconds(50);
+                options.TransportFactory = _ => Task.FromResult<ITransport>(new Mock<ITransport>().Object);
+            });
+        });
+
+        using IHost host = builder.Build();
+
+        var stopwatch = Stopwatch.StartNew();
+        await Assert.ThrowsAsync<ArgumentException>(() => host.StartAsync());
+        stopwatch.Stop();
+
+        Assert.True(
+            stopwatch.Elapsed < TimeSpan.FromSeconds(2),
+            $"Expected an immediate failure rather than a retry loop, took {stopwatch.Elapsed.TotalMilliseconds}ms");
+    }
 }

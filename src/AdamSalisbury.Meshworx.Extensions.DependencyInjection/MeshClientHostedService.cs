@@ -112,6 +112,16 @@ internal sealed class MeshClientHostedService(
                 // longer wants us to.
                 throw;
             }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException)
+            {
+                // MeshClient.ConnectAsync's own precondition checks — an oversized or empty client name,
+                // or an unexpected connection state — throw exactly these two types. Retrying cannot fix
+                // a configuration error: calling ConnectAsync again with the same invalid clientName just
+                // throws the identical exception for ever, spinning the loop uselessly instead of
+                // surfacing a clear, actionable failure. Propagate immediately, the same as the host's own
+                // cancellation above.
+                throw;
+            }
             catch
             {
                 // Either this attempt's own timeout fired, or it failed outright (connection refused, DNS
