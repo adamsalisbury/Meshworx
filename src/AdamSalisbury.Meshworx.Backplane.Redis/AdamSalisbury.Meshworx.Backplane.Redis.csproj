@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Package">
+    <Version>0.1.0</Version>
+    <Authors>Adam Salisbury</Authors>
+    <Company>Adam Salisbury</Company>
+    <Product>Meshworx</Product>
+    <Description>A Redis-backed IHubBackplane for Meshworx: lets several MeshHub instances behind a load balancer share registration and routing state via Redis pub/sub and a directory hash. Optional — the core library takes no Redis dependency; this package is the pluggable default the scale-out backplane seam was built for.</Description>
+    <PackageTags>messaging;hub;mesh;networking;tcp;redis;backplane;scale-out</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/adamsalisbury/Meshworx</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/adamsalisbury/Meshworx</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AdamSalisbury.Meshworx.Backplane.Redis.UnitTests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="StackExchange.Redis" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AdamSalisbury.Meshworx\AdamSalisbury.Meshworx.csproj" />
+  </ItemGroup>
+
+</Project>

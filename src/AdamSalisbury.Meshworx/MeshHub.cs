@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
+using AdamSalisbury.Meshworx.Backplane;
 using AdamSalisbury.Meshworx.Diagnostics;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.RateLimiting;
@@ -92,6 +93,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // the very client the store exists to serve. 10 seconds matches the registration and group
     // authorisation timeouts.
     private static readonly TimeSpan DefaultOfflineStoreTimeout = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan DefaultBackplaneTimeout = TimeSpan.FromSeconds(10);
 
     // Applied only after a failed AcceptAsync, never after a successful one, so a healthy burst of
     // incoming connections is never throttled. Matches TcpTransportListener's own AcceptRetryDelay: a
@@ -243,6 +245,14 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private readonly ConcurrentDictionary<string, (Guid Id, PeerLink Peer)> _remoteNames =
         new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<Guid, PeerLink> _remoteIdsToPeer = new();
+
+    // Scale-out backplane (issue #41). Null means disabled — every path this touches is behind a null
+    // check, so a hub without one behaves exactly as it did before the feature existed. Unlike _peers,
+    // this is not this hub's own state to tear down on stop: the backplane object is shared by every
+    // instance using it, so this hub only ever starts/stops its own subscription against it (HubId is
+    // reused as the instance id), never disposes the object itself — see IHubBackplane's own remarks.
+    private readonly IHubBackplane? _backplane;
+    private readonly TimeSpan _backplaneTimeout;
 
     // Guards every lifecycle field below. Starting, stopping and disposing can each be called from a
     // different thread, so each of them takes the state it needs in one critical section and then works
@@ -452,6 +462,20 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// for truthfulness, exactly as an admitted client's group and topic sends are already trusted not
     /// to be forged.
     /// </param>
+    /// <param name="backplane">
+    /// An optional shared channel that lets several hub instances — typically several processes behind
+    /// a load balancer — behave as one logical hub, so a client connected to a <em>different</em>
+    /// instance is still reachable. Unlike federation (<paramref name="allowIncomingPeerLinks"/>), which
+    /// links autonomous hubs, a backplane makes interchangeable instances of the same hub share
+    /// registration and routing state. Left <see langword="null"/> — the default — the single-instance
+    /// path is entirely unchanged. See <see cref="AdamSalisbury.Meshworx.Backplane.IHubBackplane"/>.
+    /// </param>
+    /// <param name="backplaneTimeout">
+    /// How long a single backplane operation (a publish, a directory lookup) is given before this hub
+    /// gives up on it, so a slow or hanging backplane cannot stall a client's send or a registration
+    /// indefinitely. Defaults to 10 seconds, matching <paramref name="offlineStoreTimeout"/>. Ignored
+    /// when <paramref name="backplane"/> is <see langword="null"/>.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
@@ -476,7 +500,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         bool enablePresence = false,
         Guid? hubId = null,
         bool allowIncomingPeerLinks = false,
-        PeerAuthenticator? peerAuthenticator = null)
+        PeerAuthenticator? peerAuthenticator = null,
+        IHubBackplane? backplane = null,
+        TimeSpan? backplaneTimeout = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -549,6 +575,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 nameof(offlineStoreTimeout), "The offline store timeout must be positive.");
         }
 
+        if (backplaneTimeout is { } backplaneWaitTimeout && backplaneWaitTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(backplaneTimeout), "The backplane timeout must be positive.");
+        }
+
         if (sessionResumptionWindow is { } resumptionWindow && resumptionWindow <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(
@@ -604,6 +636,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _backpressureAwaitTimeout = backpressureAwaitTimeout ?? DefaultBackpressureAwaitTimeout;
         _offlineStore = offlineStore;
         _offlineStoreTimeout = offlineStoreTimeout ?? DefaultOfflineStoreTimeout;
+        _backplane = backplane;
+        _backplaneTimeout = backplaneTimeout ?? DefaultBackplaneTimeout;
         _sessionResumptionWindow = sessionResumptionWindow;
         _maxInboundMessagesPerSecond = maxInboundMessagesPerSecond ?? DefaultMaxInboundMessagesPerSecond;
         _maxInboundBytesPerSecond = maxInboundBytesPerSecond ?? DefaultMaxInboundBytesPerSecond;
@@ -756,6 +790,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         try
         {
             await _listener.StartAsync(cancellationToken).ConfigureAwait(false);
+
+            if (_backplane is not null)
+            {
+                await _backplane.StartAsync(HubId, HandleBackplaneMessageAsync, cancellationToken)
+                    .ConfigureAwait(false);
+            }
         }
         catch
         {
@@ -921,6 +961,20 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             _sessions.Clear();
             _offlineNamesById.Clear();
             _offlineIdsByName.Clear();
+
+            if (_backplane is not null)
+            {
+                try
+                {
+                    await _backplane.StopAsync(HubId, cancellationToken).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Best-effort: the hub is stopping regardless, and the backplane object itself is
+                    // shared and not this hub's to tear down — see IHubBackplane's own remarks.
+                    _logger.LogWarning(ex, "Failed to stop this hub's backplane subscription cleanly");
+                }
+            }
 
             cts.Dispose();
         }
@@ -1710,6 +1764,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                         BinaryPrimitives.WriteInt32BigEndian(lookupResponse.AsSpan(1, 4), correlationId);
                         lookupResponse[5] = 0x01;
                         remote.Id.TryWriteBytes(lookupResponse.AsSpan(6));
+                    }
+                    else if (await TryResolveViaBackplaneAsync(lookupName, clientCts.Token).ConfigureAwait(false)
+                        is { } backplaneId)
+                    {
+                        // Likewise for a name resolved via the backplane's shared directory — it may
+                        // belong to a client connected to a different hub instance entirely.
+                        lookupResponse = new byte[22];
+                        lookupResponse[0] = (byte)MessageType.ClientLookupResponse;
+                        BinaryPrimitives.WriteInt32BigEndian(lookupResponse.AsSpan(1, 4), correlationId);
+                        lookupResponse[5] = 0x01;
+                        backplaneId.TryWriteBytes(lookupResponse.AsSpan(6));
                     }
                     else
                     {
@@ -2848,6 +2913,270 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
     }
 
+    // ---- Scale-out backplane (issue #41) ----
+
+    /// <summary>
+    /// Handles a message published across the backplane by any instance sharing it — including, when
+    /// <see cref="BackplaneMessage.OriginInstanceId"/> matches <see cref="HubId"/>, this one's own,
+    /// which is skipped: this instance already materialised whatever local delivery its own publish
+    /// produced at the point it published, and processing its own echo again would deliver twice.
+    /// </summary>
+    private Task HandleBackplaneMessageAsync(BackplaneMessage message, CancellationToken cancellationToken)
+    {
+        if (message.OriginInstanceId == HubId)
+        {
+            return Task.CompletedTask;
+        }
+
+        switch (message.Kind)
+        {
+            case BackplaneMessageKind.Direct:
+                DeliverBackplaneDirectMessage(message);
+                break;
+            case BackplaneMessageKind.Group:
+                DeliverBackplaneGroupMessage(message);
+                break;
+            case BackplaneMessageKind.Topic:
+                DeliverBackplaneTopicMessage(message);
+                break;
+        }
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Delivers a backplane-published direct message to this instance's own local recipient, if it holds
+    /// one — most instances sharing a backplane will not, for any given message, and silently ignore it.
+    /// </summary>
+    private void DeliverBackplaneDirectMessage(BackplaneMessage message)
+    {
+        if (!_clients.TryGetValue(message.RecipientId, out ClientConnection? recipient))
+        {
+            return;
+        }
+
+        int frameLength = 1 + 16 + message.Body.Length;
+
+        // A real backplane implementation carries its own payload limits, but nothing in this interface
+        // guarantees one — an unbounded Body reaching this far would otherwise build a frame that faults
+        // the recipient's send loop on write, the same hazard every other fan-out path in this file
+        // already guards its own delivery frame against.
+        if (ExceedsFrameCap(frameLength))
+        {
+            DropOversizeFanOut(message.SenderId, frameLength, "backplane direct message");
+            return;
+        }
+
+        var deliveryPayload = new byte[frameLength];
+        deliveryPayload[0] = (byte)MessageType.DeliverMessage;
+        message.SenderId.TryWriteBytes(deliveryPayload.AsSpan(1));
+        message.Body.CopyTo(deliveryPayload.AsMemory(17));
+
+        if (!recipient.OutboundQueue.TryEnqueue(MessagePriority.Normal, deliveryPayload))
+        {
+            _logger.LogWarning(
+                "Outbound queue for {RecipientId} is full, backplane message dropped", message.RecipientId);
+            _messagesDroppedCounter.Add(1, QueueFullDropTag);
+        }
+    }
+
+    private void DeliverBackplaneGroupMessage(BackplaneMessage message)
+    {
+        if (message.GroupName is null || !_groups.TryGetValue(message.GroupName, out Group? group))
+        {
+            return;
+        }
+
+        Guid[] recipients;
+        lock (group.Lock)
+        {
+            recipients = new Guid[group.Members.Count];
+            group.Members.CopyTo(recipients);
+        }
+
+        if (recipients.Length == 0)
+        {
+            return;
+        }
+
+        byte[] groupNameBytes = Encoding.UTF8.GetBytes(message.GroupName);
+        int frameLength = 1 + 16 + 2 + groupNameBytes.Length + message.Body.Length;
+
+        if (ExceedsFrameCap(frameLength))
+        {
+            DropOversizeFanOut(message.SenderId, frameLength, "backplane group message");
+            return;
+        }
+
+        byte[] deliveryPayload = BuildDeliverGroupMessage(message.SenderId, groupNameBytes, message.Body);
+
+        foreach (Guid recipientId in recipients)
+        {
+            if (_clients.TryGetValue(recipientId, out ClientConnection? recipient)
+                && !recipient.OutboundQueue.TryEnqueue(MessagePriority.Normal, deliveryPayload))
+            {
+                _messagesDroppedCounter.Add(1, QueueFullDropTag);
+            }
+        }
+    }
+
+    private void DeliverBackplaneTopicMessage(BackplaneMessage message)
+    {
+        if (message.Topic is null)
+        {
+            return;
+        }
+
+        IReadOnlySet<Guid> recipients;
+        try
+        {
+            recipients = _topics.Match(message.Topic);
+        }
+        catch (ArgumentException)
+        {
+            return;
+        }
+
+        if (recipients.Count == 0)
+        {
+            return;
+        }
+
+        byte[] topicBytes = Encoding.UTF8.GetBytes(message.Topic);
+        int frameLength = 1 + 16 + 2 + topicBytes.Length + message.Body.Length;
+
+        if (ExceedsFrameCap(frameLength))
+        {
+            DropOversizeFanOut(message.SenderId, frameLength, "backplane topic message");
+            return;
+        }
+
+        byte[] deliveryPayload = BuildDeliverTopicMessage(message.SenderId, topicBytes, message.Body);
+
+        foreach (Guid recipientId in recipients)
+        {
+            if (_clients.TryGetValue(recipientId, out ClientConnection? recipient)
+                && !recipient.OutboundQueue.TryEnqueue(MessagePriority.Normal, deliveryPayload))
+            {
+                _messagesDroppedCounter.Add(1, QueueFullDropTag);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Publishes a message to the backplane with this hub's own bounded timeout, logging rather than
+    /// throwing on failure — every call site is fire-and-forget from a synchronous dispatch method
+    /// (<see cref="SendToGroup"/>, <see cref="PublishToTopic"/>) that cannot itself await this.
+    /// </summary>
+    private void PublishToBackplane(BackplaneMessage message)
+    {
+        if (_backplane is null)
+        {
+            return;
+        }
+
+        _ = PublishToBackplaneCoreAsync(message);
+    }
+
+    private async Task PublishToBackplaneCoreAsync(BackplaneMessage message)
+    {
+        try
+        {
+            using var timeoutCts = new CancellationTokenSource(_backplaneTimeout);
+            await _backplane!.PublishAsync(message, timeoutCts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to publish a message to the backplane");
+        }
+    }
+
+    /// <summary>
+    /// Attempts a direct message via the backplane when the recipient is not a local client — unlike
+    /// <see cref="TryForwardToPeer"/>, there is no directory telling this hub whether any other instance
+    /// actually holds the recipient, so this always publishes when a backplane is configured and treats
+    /// the send as handled either way, rather than also falling back to the offline store. See
+    /// <c>known-issues.md</c> for this trade-off.
+    /// </summary>
+    private bool TryPublishDirectToBackplane(Guid recipientId, Guid senderId, ReadOnlyMemory<byte> body)
+    {
+        if (_backplane is null)
+        {
+            return false;
+        }
+
+        PublishToBackplane(new BackplaneMessage
+        {
+            OriginInstanceId = HubId,
+            Kind = BackplaneMessageKind.Direct,
+            RecipientId = recipientId,
+            SenderId = senderId,
+            Body = body,
+        });
+
+        return true;
+    }
+
+    /// <summary>
+    /// Registers or removes a client's entry in the backplane's shared directory, called from
+    /// <see cref="RaiseClientEvent"/> at exactly the moments a client becomes reachable or stops being
+    /// so — the same hook <see cref="PropagateRouteChange"/> and <see cref="PushPresenceDelta"/> already
+    /// use. Fire-and-forget: <see cref="RaiseClientEvent"/> is synchronous.
+    /// </summary>
+    private void UpdateBackplaneDirectory(Guid clientId, string clientName, PresenceChangeType changeType)
+    {
+        if (_backplane is null)
+        {
+            return;
+        }
+
+        _ = UpdateBackplaneDirectoryCoreAsync(clientId, clientName, changeType);
+    }
+
+    private async Task UpdateBackplaneDirectoryCoreAsync(Guid clientId, string clientName, PresenceChangeType changeType)
+    {
+        try
+        {
+            using var timeoutCts = new CancellationTokenSource(_backplaneTimeout);
+            if (changeType == PresenceChangeType.Joined)
+            {
+                await _backplane!.RegisterClientAsync(clientName, clientId, timeoutCts.Token).ConfigureAwait(false);
+            }
+            else
+            {
+                await _backplane!.UnregisterClientAsync(clientName, timeoutCts.Token).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to update the backplane directory for {ClientName}", clientName);
+        }
+    }
+
+    /// <summary>
+    /// Resolves a name via the backplane's shared directory, bounded by <see cref="_backplaneTimeout"/>
+    /// so a slow or hanging backplane cannot stall a client's lookup indefinitely.
+    /// </summary>
+    private async Task<Guid?> TryResolveViaBackplaneAsync(string name, CancellationToken cancellationToken)
+    {
+        if (_backplane is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(_backplaneTimeout);
+            return await _backplane.TryResolveClientAsync(name, timeoutCts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning(ex, "Failed to resolve {Name} via the backplane", name);
+            return null;
+        }
+    }
+
     private async Task<bool> AuthenticateAsync(
         Guid clientId,
         string clientName,
@@ -2957,6 +3286,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         PushPresenceDelta(clientId, clientName, presenceChangeType);
         PropagateRouteChange(clientId, clientName, presenceChangeType);
+        UpdateBackplaneDirectory(clientId, clientName, presenceChangeType);
     }
 
     /// <summary>
@@ -3373,6 +3703,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         if (!_clients.TryGetValue(recipientId, out ClientConnection? recipient))
         {
             if (TryForwardToPeer(recipientId, senderId, messageData))
+            {
+                return;
+            }
+
+            if (TryPublishDirectToBackplane(recipientId, senderId, messageData))
             {
                 return;
             }
@@ -4552,6 +4887,19 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         // federation boundary yet.
         ForwardGroupMessageToPeers(senderId, groupNameBytes, messageData);
 
+        // Likewise published to the backplane, if configured, so every other instance sharing it can
+        // deliver to whichever of its own local members this instance has none of. This hub's own
+        // publish is skipped when it echoes back (HandleBackplaneMessageAsync checks OriginInstanceId)
+        // since the local delivery below already covers this instance's own members.
+        PublishToBackplane(new BackplaneMessage
+        {
+            OriginInstanceId = HubId,
+            Kind = BackplaneMessageKind.Group,
+            GroupName = groupName,
+            SenderId = senderId,
+            Body = messageData,
+        });
+
         if (recipients.Length == 1 && recipients[0] == senderId)
         {
             // The sender is the only local member; nothing to deliver locally and no local frame to
@@ -4892,6 +5240,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         // beyond the topic itself being well formed. Headerless only in this version; see
         // ForwardTopicMessageToPeers's own remarks.
         ForwardTopicMessageToPeers(senderId, topicBytes, messageData);
+
+        // Likewise published to the backplane, if configured — see the equivalent call in SendToGroup
+        // for why this instance's own echo is safely skipped rather than double-delivering.
+        PublishToBackplane(new BackplaneMessage
+        {
+            OriginInstanceId = HubId,
+            Kind = BackplaneMessageKind.Topic,
+            Topic = topic,
+            SenderId = senderId,
+            Body = messageData,
+        });
 
         if (recipients.Count == 0)
         {

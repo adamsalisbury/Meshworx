@@ -5,6 +5,7 @@
     <Project Path="src/AdamSalisbury.Meshworx.Serialization/AdamSalisbury.Meshworx.Serialization.csproj" />
     <Project Path="src/AdamSalisbury.Meshworx.Contracts/AdamSalisbury.Meshworx.Contracts.csproj" />
     <Project Path="src/AdamSalisbury.Meshworx.Contracts.Generator/AdamSalisbury.Meshworx.Contracts.Generator.csproj" />
+    <Project Path="src/AdamSalisbury.Meshworx.Backplane.Redis/AdamSalisbury.Meshworx.Backplane.Redis.csproj" />
   </Folder>
   <Folder Name="/src/AdamSalisbury.Meshworx.TestApps/">
     <Project Path="src/AdamSalisbury.Meshworx.TestApps/ClientApp/ClientApp.csproj" />
@@ -15,5 +16,6 @@
     <Project Path="src/Tests/AdamSalisbury.Meshworx.Contracts.UnitTests/AdamSalisbury.Meshworx.Contracts.UnitTests.csproj" />
     <Project Path="src/Tests/AdamSalisbury.Meshworx.Serialization.UnitTests/AdamSalisbury.Meshworx.Serialization.UnitTests.csproj" />
     <Project Path="src/Tests/AdamSalisbury.Meshworx.UnitTests/AdamSalisbury.Meshworx.UnitTests.csproj" />
+    <Project Path="src/Tests/AdamSalisbury.Meshworx.Backplane.Redis.UnitTests/AdamSalisbury.Meshworx.Backplane.Redis.UnitTests.csproj" />
   </Folder>
 </Solution>
