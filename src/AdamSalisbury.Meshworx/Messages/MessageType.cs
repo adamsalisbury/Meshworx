@@ -38,4 +38,16 @@ internal enum MessageType : byte
     SubscribePresence = 0x22,
     UnsubscribePresence = 0x23,
     PresenceChanged = 0x24,
+
+    // Hub-to-hub federation (issue #40). These opcodes are never sent or understood by MeshClient — they
+    // are spoken only between two MeshHub instances over a peer link established via LinkPeerAsync, and
+    // share this byte space purely because MessageType is the one place every wire opcode in this
+    // library is enumerated, not because a client connection and a peer link are the same protocol.
+    PeerHello = 0x25,
+    PeerHelloAck = 0x26,
+    PeerRouteAdvertise = 0x27,
+    PeerRouteWithdraw = 0x28,
+    PeerDeliverMessage = 0x29,
+    PeerDeliverGroupMessage = 0x2A,
+    PeerDeliverTopicMessage = 0x2B,
 }

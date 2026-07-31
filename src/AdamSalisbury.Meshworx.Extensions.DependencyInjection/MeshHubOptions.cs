@@ -144,4 +144,22 @@ public sealed class MeshHubOptions
     /// Gets or sets whether a client may subscribe to presence. Defaults to <see langword="false"/>.
     /// </summary>
     public bool EnablePresence { get; set; }
+
+    /// <summary>
+    /// Gets or sets this hub's own identifier on a peer link. Defaults to a fresh
+    /// <see cref="Guid.NewGuid"/> when unset.
+    /// </summary>
+    public Guid? HubId { get; set; }
+
+    /// <summary>
+    /// Gets or sets whether an incoming connection may become a peer link. Defaults to
+    /// <see langword="false"/>.
+    /// </summary>
+    public bool AllowIncomingPeerLinks { get; set; }
+
+    /// <summary>
+    /// Gets or sets the callback that decides whether to admit an incoming peer link, once
+    /// <see cref="AllowIncomingPeerLinks"/> is set.
+    /// </summary>
+    public PeerAuthenticator? PeerAuthenticator { get; set; }
 }

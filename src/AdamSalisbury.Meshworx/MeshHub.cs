@@ -21,6 +21,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     private static readonly TimeSpan DefaultGroupAuthorisationTimeout = TimeSpan.FromSeconds(10);
     private const int DefaultMaxConcurrentAuthentications = 64;
 
+    // A peer link's outbound queue aggregates every message forwarded across it — potentially on behalf
+    // of many local clients at once — rather than one client's own traffic, so it is given more headroom
+    // than ClientConnection.OutboundQueueCapacity by default.
+    private const int PeerOutboundQueueCapacity = 4096;
+
     // A hub with no configured ceiling used to admit clients without limit. That is never a safe
     // default: an unauthenticated peer could open connections until the process ran out of sockets,
     // threads or memory. 1000 is the figure the README has always used as its worked example, so it
@@ -219,6 +224,26 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // finding "who cares about this" has to scale with the subscriber count, not the whole population.
     private readonly ConcurrentDictionary<Guid, ClientConnection> _presenceSubscribers = new();
 
+    // Federation (issue #40). Whether an incoming connection may become a peer link, and the optional
+    // callback that decides which ones — see the constructor's own remarks on both.
+    private readonly bool _allowIncomingPeerLinks;
+    private readonly PeerAuthenticator? _peerAuthenticator;
+
+    // Every linked peer, keyed by the hub id it declared in PeerHello. A peer link this hub initiated
+    // (LinkPeerAsync) and one it accepted (an incoming PeerHello) end up in the same table and are
+    // indistinguishable from that point on — federation is symmetric once established.
+    private readonly ConcurrentDictionary<Guid, PeerLink> _peers = new();
+
+    // The routing directory this hub has learned from its peers: a name or id not found locally is
+    // checked here before falling back to the offline store or dropping. Both keyed independently for
+    // O(1) lookup either way — ClientLookupRequest resolves by name, RouteMessage forwards by id.
+    // Populated and depopulated only by PeerReceiveLoopAsync processing PeerRouteAdvertise/
+    // PeerRouteWithdraw from the peer that owns each entry; see PeerLink.AdvertisedRoutes for the
+    // per-peer reverse index that makes a peer-loss teardown able to remove exactly what it added.
+    private readonly ConcurrentDictionary<string, (Guid Id, PeerLink Peer)> _remoteNames =
+        new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<Guid, PeerLink> _remoteIdsToPeer = new();
+
     // Guards every lifecycle field below. Starting, stopping and disposing can each be called from a
     // different thread, so each of them takes the state it needs in one critical section and then works
     // only from locals: reading a field twice is what let a concurrent stop null the token source
@@ -403,6 +428,30 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// do to any client that can complete the connection handshake — see
     /// <see cref="ClientAuthenticator"/> to restrict who that is.
     /// </param>
+    /// <param name="hubId">
+    /// This hub's own identifier on a peer link — the value it declares in <c>PeerHello</c> and that a
+    /// peer's routing table keys entries it learns from this hub by. Defaults to a fresh
+    /// <see cref="Guid.NewGuid"/>. Pass an explicit, stable value for a hub that is expected to be
+    /// recognisable across restarts (log correlation, an operator-facing topology view); the library
+    /// itself never persists or compares it against anything beyond the lifetime of one process.
+    /// </param>
+    /// <param name="allowIncomingPeerLinks">
+    /// Whether an incoming connection may become a peer link by sending <c>PeerHello</c> instead of a
+    /// client registration. Defaults to <see langword="false"/>: such a connection is refused, exactly
+    /// as an unrecognised opcode would be. Federation this hub itself initiates via
+    /// <see cref="LinkPeerAsync"/> is unaffected by this flag either way — it governs only what this
+    /// hub's own listener accepts. A hub with no reason to accept inbound federation should leave this
+    /// off even if it links out to others.
+    /// </param>
+    /// <param name="peerAuthenticator">
+    /// An optional callback invoked for each incoming peer link, once <paramref name="allowIncomingPeerLinks"/>
+    /// is set, to decide whether to admit it. When <see langword="null"/> (the default) any peer is
+    /// admitted once the flag is set — the flag alone is then the whole trust boundary. A configured
+    /// peer link is trusted completely once admitted: this library validates a peer's route
+    /// advertisements for shape and volume (see <see cref="Protocol.MaxRemoteRoutesPerPeer"/>) but not
+    /// for truthfulness, exactly as an admitted client's group and topic sends are already trusted not
+    /// to be forged.
+    /// </param>
     public MeshHub(
         ILogger<MeshHub> logger,
         ITransportListener listener,
@@ -424,7 +473,10 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         int? maxInboundBytesPerSecond = null,
         int? maxFanOutMessagesPerSecond = null,
         int? maxFanOutDeliveriesPerSecond = null,
-        bool enablePresence = false)
+        bool enablePresence = false,
+        Guid? hubId = null,
+        bool allowIncomingPeerLinks = false,
+        PeerAuthenticator? peerAuthenticator = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(listener);
@@ -558,6 +610,9 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         _maxFanOutMessagesPerSecond = maxFanOutMessagesPerSecond ?? DefaultMaxFanOutMessagesPerSecond;
         _maxFanOutDeliveriesPerSecond = maxFanOutDeliveriesPerSecond ?? DefaultMaxFanOutDeliveriesPerSecond;
         _enablePresence = enablePresence;
+        HubId = hubId ?? Guid.NewGuid();
+        _allowIncomingPeerLinks = allowIncomingPeerLinks;
+        _peerAuthenticator = peerAuthenticator;
 
         if (authenticator is not null)
         {
@@ -909,7 +964,13 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     public int MaxClients { get; }
 
     /// <inheritdoc/>
+    public Guid HubId { get; }
+
+    /// <inheritdoc/>
     public int ClaimedClientSlots => Volatile.Read(ref _reservedClientSlots);
+
+    /// <inheritdoc/>
+    public int LinkedPeerCount => _peers.Count;
 
     /// <inheritdoc/>
     public bool IsClientRegistered(Guid clientId)
@@ -1215,6 +1276,18 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                         _registrationTimeout);
                     return;
                 }
+            }
+
+            // A connecting peer hub sends PeerHello instead of a client registration on the very same
+            // listener — checked before the RegistrationRequest branch below so a peer link never
+            // consumes a client slot or touches any client-only state. This whole handler task becomes
+            // the peer link's lifetime from here; nothing below this branch runs for a peer.
+            if (registrationData is not null
+                && registrationData.Length >= 1
+                && (MessageType)registrationData[0] == MessageType.PeerHello)
+            {
+                await HandleIncomingPeerAsync(transport, registrationData, cancellationToken).ConfigureAwait(false);
+                return;
             }
 
             // Registration frame: [type][versionMin][versionMax][name length (2, big-endian)][name][credential].
@@ -1627,6 +1700,17 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                         lookupResponse[5] = 0x01;
                         found.Id.TryWriteBytes(lookupResponse.AsSpan(6));
                     }
+                    else if (_remoteNames.TryGetValue(lookupName, out (Guid Id, PeerLink Peer) remote))
+                    {
+                        // A name federation learned from a peer resolves exactly like a local one — the
+                        // caller cannot tell, and should not need to, whether the id it gets back names a
+                        // client on this hub or one reachable only by forwarding through a peer link.
+                        lookupResponse = new byte[22];
+                        lookupResponse[0] = (byte)MessageType.ClientLookupResponse;
+                        BinaryPrimitives.WriteInt32BigEndian(lookupResponse.AsSpan(1, 4), correlationId);
+                        lookupResponse[5] = 0x01;
+                        remote.Id.TryWriteBytes(lookupResponse.AsSpan(6));
+                    }
                     else
                     {
                         lookupResponse = new byte[6];
@@ -1891,6 +1975,879 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         return true;
     }
 
+    private static bool TryNegotiateFederationVersion(
+        byte peerMinVersion, byte peerMaxVersion, out byte negotiatedVersion)
+    {
+        if (peerMinVersion > peerMaxVersion)
+        {
+            negotiatedVersion = 0;
+            return false;
+        }
+
+        int overlapMin = Math.Max(peerMinVersion, Protocol.MinFederationVersion);
+        int overlapMax = Math.Min(peerMaxVersion, Protocol.MaxFederationVersion);
+
+        if (overlapMin > overlapMax)
+        {
+            negotiatedVersion = 0;
+            return false;
+        }
+
+        negotiatedVersion = (byte)overlapMax;
+        return true;
+    }
+
+    /// <inheritdoc/>
+    /// <exception cref="ObjectDisposedException">The hub has been disposed.</exception>
+    public async Task LinkPeerAsync(
+        ITransport transport, ReadOnlyMemory<byte> credential = default, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(transport);
+
+        // Captured once, under the same lock IsRunning itself reads under, and used for the link's whole
+        // remaining lifetime — not just the handshake — so a hub that stops after this returns tears the
+        // link down with it, exactly as it already does for a client connection or an inbound peer link.
+        // Reading the field directly rather than calling IsRunning is what lets this capture the token
+        // atomically with the running check: IsRunning alone would report true/false accurately but hand
+        // back nothing this caller could actually wait on.
+        CancellationTokenSource? hubCts;
+        lock (_stateLock)
+        {
+            hubCts = _cts;
+        }
+
+        if (hubCts is null)
+        {
+            await transport.DisposeAsync().ConfigureAwait(false);
+            throw new InvalidOperationException("The hub is not running.");
+        }
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, hubCts.Token);
+        CancellationToken linkedToken = linkedCts.Token;
+
+        byte[] credentialBytes = credential.ToArray();
+        var hello = new byte[1 + 16 + 1 + 1 + credentialBytes.Length];
+        hello[0] = (byte)MessageType.PeerHello;
+        HubId.TryWriteBytes(hello.AsSpan(1, 16));
+        hello[17] = Protocol.MinFederationVersion;
+        hello[18] = Protocol.MaxFederationVersion;
+        credentialBytes.CopyTo(hello, 19);
+
+        await transport.SendAsync(hello, linkedToken).ConfigureAwait(false);
+
+        byte[]? ackData = await transport.ReceiveAsync(linkedToken).ConfigureAwait(false);
+        if (ackData is null
+            || ackData.Length < 18
+            || (MessageType)ackData[0] != MessageType.PeerHelloAck)
+        {
+            await transport.DisposeAsync().ConfigureAwait(false);
+            throw new InvalidOperationException("The peer refused the link or sent an unrecognised reply.");
+        }
+
+        var peerHubId = new Guid(ackData.AsSpan(1, 16));
+        byte negotiatedVersion = ackData[17];
+
+        if (!TryRegisterPeerLink(peerHubId, transport, negotiatedVersion, out PeerLink link))
+        {
+            await transport.DisposeAsync().ConfigureAwait(false);
+            throw new InvalidOperationException($"A peer link to {peerHubId} already exists.");
+        }
+
+        // Run for the rest of the link's life on hubCts.Token specifically, not the linkedCts this method
+        // disposes on return — the link must outlive this call, and must keep running for as long as the
+        // hub does even if the caller's own cancellationToken has a shorter lifetime than that (a caller
+        // that only meant to bound the handshake, not the link itself). Tracked in _handlerTasks exactly
+        // as the accept loop tracks a client handler, so hub shutdown waits for this link to unwind too.
+        Task linkTask = RunPeerLinkAsync(link, hubCts.Token);
+        _handlerTasks.TryAdd(linkTask, 0);
+        _ = linkTask.ContinueWith(
+            t =>
+            {
+                _handlerTasks.TryRemove(t, out _);
+                if (t.IsFaulted)
+                {
+                    _logger.LogError(t.Exception, "Unhandled exception in peer link handler");
+                }
+            },
+            TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// Handles an incoming connection that identified itself as a peer hub by sending
+    /// <see cref="MessageType.PeerHello"/> instead of a client registration.
+    /// </summary>
+    /// <remarks>
+    /// Called from <see cref="HandleClientAsync"/> once its own registration-timeout read has already
+    /// produced the hello frame, so this owns the connection's whole remaining lifetime from that point —
+    /// including its own teardown — rather than returning control to the caller.
+    /// </remarks>
+    private async Task HandleIncomingPeerAsync(
+        ITransport transport, byte[] helloData, CancellationToken cancellationToken)
+    {
+        if (!_allowIncomingPeerLinks)
+        {
+            _logger.LogDebug("Refusing an incoming peer link: allowIncomingPeerLinks is not set");
+            await DisposeRefusedTransportAsync(transport).ConfigureAwait(false);
+            return;
+        }
+
+        if (helloData.Length < 19)
+        {
+            await DisposeRefusedTransportAsync(transport).ConfigureAwait(false);
+            return;
+        }
+
+        var peerHubId = new Guid(helloData.AsSpan(1, 16));
+
+        if (!TryNegotiateFederationVersion(helloData[17], helloData[18], out byte negotiatedVersion))
+        {
+            await DisposeRefusedTransportAsync(transport).ConfigureAwait(false);
+            return;
+        }
+
+        ReadOnlyMemory<byte> credential = helloData.AsMemory(19);
+
+        if (_peerAuthenticator is not null)
+        {
+            var context = new PeerLinkContext { PeerHubId = peerHubId, Credential = credential };
+            bool authenticated;
+            try
+            {
+                authenticated = await _peerAuthenticator(context, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // A throwing authenticator must refuse the link, not fault the handler. Callback boundary.
+                _logger.LogError(ex, "The peer authenticator threw for peer {PeerHubId}; refusing the link", peerHubId);
+                authenticated = false;
+            }
+
+            if (!authenticated)
+            {
+                _logger.LogWarning("Refusing peer {PeerHubId}: peer authentication failed", peerHubId);
+                await DisposeRefusedTransportAsync(transport).ConfigureAwait(false);
+                return;
+            }
+        }
+
+        byte[] ack = new byte[18];
+        ack[0] = (byte)MessageType.PeerHelloAck;
+        HubId.TryWriteBytes(ack.AsSpan(1, 16));
+        ack[17] = negotiatedVersion;
+
+        try
+        {
+            await transport.SendAsync(ack, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or SocketException)
+        {
+            await DisposeRefusedTransportAsync(transport).ConfigureAwait(false);
+            return;
+        }
+
+        if (!TryRegisterPeerLink(peerHubId, transport, negotiatedVersion, out PeerLink link))
+        {
+            await transport.DisposeAsync().ConfigureAwait(false);
+            return;
+        }
+
+        // Awaited directly: this whole method is already the connection's handler task, tracked in
+        // _handlerTasks by the accept loop exactly as a client connection's handler is.
+        await RunPeerLinkAsync(link, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Registers a newly handshaken peer link, exchanges the initial route snapshot, and runs the link
+    /// until it ends — shared by both <see cref="LinkPeerAsync"/> (this hub initiated) and
+    /// <see cref="HandleIncomingPeerAsync"/> (this hub accepted), which differ only in how the handshake
+    /// itself was conducted.
+    /// </summary>
+    /// <summary>
+    /// Registers a newly handshaken peer link and sends it the initial route snapshot. Synchronous and
+    /// fast (the snapshot is only enqueued, never awaited over the network) so both
+    /// <see cref="LinkPeerAsync"/> and <see cref="HandleIncomingPeerAsync"/> can complete this step
+    /// before returning or moving on to running the link's loops, matching <see cref="LinkPeerAsync"/>'s
+    /// own documented "returns once the initial handshake and the first route exchange have completed".
+    /// </summary>
+    /// <returns>
+    /// <see langword="false"/> if a link to this peer already exists, in which case
+    /// <paramref name="link"/> was never added and the caller owns disposing it.
+    /// </returns>
+    private bool TryRegisterPeerLink(
+        Guid peerHubId, ITransport transport, byte negotiatedVersion, out PeerLink link)
+    {
+        link = new PeerLink(peerHubId, transport, negotiatedVersion);
+
+        if (!_peers.TryAdd(peerHubId, link))
+        {
+            // Two links to the same peer at once — a duplicate dial, or both sides linked to each other
+            // concurrently. Keeping the first and refusing the second is simpler and safer than replacing
+            // a link still in use by whatever already holds a reference to it.
+            _logger.LogWarning("A peer link to {PeerHubId} already exists; refusing the duplicate", peerHubId);
+            return false;
+        }
+
+        _logger.LogInformation("Peer hub {PeerHubId} linked", peerHubId);
+        SendFullRouteSnapshotToPeer(link);
+        return true;
+    }
+
+    /// <summary>
+    /// Runs an already-registered peer link's send and receive loops until it ends, then tears it down —
+    /// withdrawing every route it advertised and removing it from <see cref="_peers"/>. Awaited directly
+    /// by <see cref="HandleIncomingPeerAsync"/> (which already owns this connection's whole handler
+    /// task); tracked in <see cref="_handlerTasks"/> like any other handler when started from
+    /// <see cref="LinkPeerAsync"/>, which returns before this begins.
+    /// </summary>
+    private async Task RunPeerLinkAsync(PeerLink link, CancellationToken cancellationToken)
+    {
+        Task? sendLoopTask = null;
+
+        try
+        {
+            sendLoopTask = PeerSendLoopAsync(link, cancellationToken);
+            await PeerReceiveLoopAsync(link, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _peers.TryRemove(new KeyValuePair<Guid, PeerLink>(link.HubId, link));
+            WithdrawAllRoutesFromPeer(link);
+
+            link.OutboundQueue.Complete();
+
+            if (sendLoopTask is not null)
+            {
+                try
+                {
+                    await sendLoopTask.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Expected during shutdown.
+                }
+            }
+
+            await link.DisposeAsync().ConfigureAwait(false);
+            _logger.LogInformation("Peer hub {PeerHubId} unlinked", link.HubId);
+        }
+    }
+
+    /// <summary>
+    /// Sends every currently-registered local client as one <see cref="MessageType.PeerRouteAdvertise"/>
+    /// batch, so a newly linked peer's routing table starts consistent rather than empty until the next
+    /// individual client happens to register or disconnect.
+    /// </summary>
+    private void SendFullRouteSnapshotToPeer(PeerLink link)
+    {
+        if (_clientNames.IsEmpty)
+        {
+            return;
+        }
+
+        var entries = new List<(Guid Id, string Name)>(_clientNames.Count);
+        foreach (KeyValuePair<string, Guid> entry in _clientNames)
+        {
+            entries.Add((entry.Value, entry.Key));
+        }
+
+        EnqueueRouteAdvertise(link, entries);
+    }
+
+    private async Task PeerSendLoopAsync(PeerLink link, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await foreach (byte[] payload in link.OutboundQueue.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                await link.Transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when the link is torn down.
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or SocketException)
+        {
+            _logger.LogWarning(ex, "Peer link {PeerHubId} send loop failed", link.HubId);
+        }
+    }
+
+    private async Task PeerReceiveLoopAsync(PeerLink link, CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                byte[]? data = await link.Transport.ReceiveAsync(cancellationToken).ConfigureAwait(false);
+                if (data is null || data.Length == 0)
+                {
+                    break;
+                }
+
+                switch ((MessageType)data[0])
+                {
+                    case MessageType.PeerRouteAdvertise:
+                        HandlePeerRouteAdvertise(link, data);
+                        break;
+                    case MessageType.PeerRouteWithdraw:
+                        HandlePeerRouteWithdraw(link, data);
+                        break;
+                    case MessageType.PeerDeliverMessage when data.Length >= 33:
+                        HandlePeerDeliverMessage(data);
+                        break;
+                    case MessageType.PeerDeliverGroupMessage when data.Length >= 19:
+                        HandlePeerDeliverGroupMessage(data);
+                        break;
+                    case MessageType.PeerDeliverTopicMessage when data.Length >= 19:
+                        HandlePeerDeliverTopicMessage(data);
+                        break;
+                    default:
+                        // Malformed or unrecognised — dropped silently, mirroring how the client
+                        // dispatch ladder treats an opcode or length it does not recognise (KI-9).
+                        break;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when the hub is shutting down or the link is being torn down.
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or SocketException)
+        {
+            _logger.LogDebug(ex, "Peer link {PeerHubId} receive loop ended", link.HubId);
+        }
+    }
+
+    /// <summary>
+    /// Builds and enqueues a <see cref="MessageType.PeerRouteAdvertise"/> frame for the given entries.
+    /// Truncated, like <see cref="SendFindClientsResponseAsync"/>'s reply, once it would exceed the
+    /// transport's frame cap or the <see cref="ushort"/> entry-count field — never split across more
+    /// than one frame, so a peer's routing table is always updated from a whole, self-consistent batch.
+    /// </summary>
+    private static void EnqueueRouteAdvertise(PeerLink link, List<(Guid Id, string Name)> entries)
+    {
+        if (entries.Count == 0)
+        {
+            return;
+        }
+
+        const int HeaderLength = 3; // type(1) + entryCount(2)
+        int budget = StreamFramer.MaxPayloadSize - HeaderLength;
+        var encodedEntries = new List<byte[]>();
+
+        foreach ((Guid id, string name) in entries)
+        {
+            if (encodedEntries.Count >= ushort.MaxValue)
+            {
+                break;
+            }
+
+            byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+            int entryLength = 16 + 2 + nameBytes.Length;
+
+            if (entryLength > budget)
+            {
+                break;
+            }
+
+            var entry = new byte[entryLength];
+            id.TryWriteBytes(entry.AsSpan(0, 16));
+            BinaryPrimitives.WriteUInt16BigEndian(entry.AsSpan(16, 2), (ushort)nameBytes.Length);
+            nameBytes.CopyTo(entry.AsSpan(18));
+            encodedEntries.Add(entry);
+            budget -= entryLength;
+        }
+
+        if (encodedEntries.Count == 0)
+        {
+            return;
+        }
+
+        int frameLength = HeaderLength;
+        foreach (byte[] entry in encodedEntries)
+        {
+            frameLength += entry.Length;
+        }
+
+        var frame = new byte[frameLength];
+        frame[0] = (byte)MessageType.PeerRouteAdvertise;
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(1, 2), (ushort)encodedEntries.Count);
+
+        int offset = HeaderLength;
+        foreach (byte[] entry in encodedEntries)
+        {
+            entry.CopyTo(frame, offset);
+            offset += entry.Length;
+        }
+
+        link.OutboundQueue.TryEnqueue(MessagePriority.Normal, frame);
+    }
+
+    /// <summary>
+    /// Builds and enqueues a <see cref="MessageType.PeerRouteWithdraw"/> frame for the given ids.
+    /// </summary>
+    private static void EnqueueRouteWithdraw(PeerLink link, IReadOnlyList<Guid> ids)
+    {
+        if (ids.Count == 0)
+        {
+            return;
+        }
+
+        int count = Math.Min(ids.Count, ushort.MaxValue);
+        var frame = new byte[3 + (count * 16)];
+        frame[0] = (byte)MessageType.PeerRouteWithdraw;
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(1, 2), (ushort)count);
+
+        int offset = 3;
+        for (int i = 0; i < count; i++)
+        {
+            ids[i].TryWriteBytes(frame.AsSpan(offset, 16));
+            offset += 16;
+        }
+
+        link.OutboundQueue.TryEnqueue(MessagePriority.Normal, frame);
+    }
+
+    /// <summary>
+    /// Propagates a local client's registration or disconnection to every linked peer, so each peer's
+    /// routing table stays consistent with this hub's client set as it changes — the incremental
+    /// counterpart to the full snapshot <see cref="SendFullRouteSnapshotToPeer"/> sends when a peer first
+    /// links. Called from <see cref="RaiseClientEvent"/>, at exactly the same moments presence deltas are
+    /// pushed, including the paired fire a session resume produces.
+    /// </summary>
+    private void PropagateRouteChange(Guid clientId, string clientName, PresenceChangeType changeType)
+    {
+        if (_peers.IsEmpty)
+        {
+            return;
+        }
+
+        foreach (PeerLink peer in _peers.Values)
+        {
+            if (changeType == PresenceChangeType.Joined)
+            {
+                EnqueueRouteAdvertise(peer, [(clientId, clientName)]);
+            }
+            else
+            {
+                EnqueueRouteWithdraw(peer, [clientId]);
+            }
+        }
+    }
+
+    private void HandlePeerRouteAdvertise(PeerLink link, byte[] data)
+    {
+        if (data.Length < 3)
+        {
+            return;
+        }
+
+        int count = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(1, 2));
+        int offset = 3;
+
+        for (int i = 0; i < count; i++)
+        {
+            if (offset + 16 + 2 > data.Length)
+            {
+                break;
+            }
+
+            var id = new Guid(data.AsSpan(offset, 16));
+            offset += 16;
+
+            int nameLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(offset, 2));
+            offset += 2;
+
+            if (offset + nameLength > data.Length)
+            {
+                break;
+            }
+
+            string name = Encoding.UTF8.GetString(data.AsSpan(offset, nameLength));
+            offset += nameLength;
+
+            TryAddRemoteRoute(link, id, name);
+        }
+    }
+
+    /// <summary>
+    /// Admits one route a peer advertised, applying this hub's conflict policy: a local name always
+    /// wins over a remote advertisement for the same name, and between two peers contesting the same
+    /// name, whichever advertised it first keeps it — see <c>known-issues.md</c> for why this is a
+    /// per-hub, not federation-wide, tie-break.
+    /// </summary>
+    private void TryAddRemoteRoute(PeerLink link, Guid id, string name)
+    {
+        if (_clientNames.ContainsKey(name))
+        {
+            _logger.LogDebug(
+                "Ignoring route for {Name} advertised by peer {PeerHubId}: a local client already holds that name",
+                name,
+                link.HubId);
+            return;
+        }
+
+        if (link.AdvertisedRoutes.Count >= Protocol.MaxRemoteRoutesPerPeer
+            && !link.AdvertisedRoutes.ContainsKey(id))
+        {
+            _logger.LogWarning(
+                "Peer {PeerHubId} exceeded the maximum of {Max} advertised routes; further routes ignored",
+                link.HubId,
+                Protocol.MaxRemoteRoutesPerPeer);
+            return;
+        }
+
+        if (_remoteNames.TryGetValue(name, out (Guid Id, PeerLink Peer) existing)
+            && !ReferenceEquals(existing.Peer, link))
+        {
+            _logger.LogDebug(
+                "Ignoring route for {Name} advertised by peer {PeerHubId}: already claimed by peer {ExistingPeerHubId}",
+                name,
+                link.HubId,
+                existing.Peer.HubId);
+            return;
+        }
+
+        _remoteNames[name] = (id, link);
+        _remoteIdsToPeer[id] = link;
+        link.AdvertisedRoutes[id] = name;
+    }
+
+    private void HandlePeerRouteWithdraw(PeerLink link, byte[] data)
+    {
+        if (data.Length < 3)
+        {
+            return;
+        }
+
+        int count = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(1, 2));
+        int offset = 3;
+
+        for (int i = 0; i < count; i++)
+        {
+            if (offset + 16 > data.Length)
+            {
+                break;
+            }
+
+            var id = new Guid(data.AsSpan(offset, 16));
+            offset += 16;
+
+            RemoveRemoteRoute(link, id);
+        }
+    }
+
+    private void RemoveRemoteRoute(PeerLink link, Guid id)
+    {
+        if (!link.AdvertisedRoutes.TryGetValue(id, out string? name))
+        {
+            // This peer never actually claimed this id — withdrawing something it does not own is a
+            // no-op, whether the peer is confused or malicious.
+            return;
+        }
+
+        link.AdvertisedRoutes.Remove(id);
+        _remoteIdsToPeer.TryRemove(id, out _);
+
+        // Only remove the name entry if it still points at this exact id: it may already have moved on
+        // (this same peer re-advertising under a new id) or never been claimed at all (refused as a
+        // conflict when it was first advertised).
+        if (_remoteNames.TryGetValue(name, out (Guid Id, PeerLink Peer) existing) && existing.Id == id)
+        {
+            _remoteNames.TryRemove(new KeyValuePair<string, (Guid Id, PeerLink Peer)>(name, existing));
+        }
+    }
+
+    /// <summary>
+    /// Withdraws every route a peer had advertised, called once its link ends for any reason — the
+    /// "peer loss withdraws routes" half of federation's acceptance criteria.
+    /// </summary>
+    private void WithdrawAllRoutesFromPeer(PeerLink link)
+    {
+        foreach (Guid id in new List<Guid>(link.AdvertisedRoutes.Keys))
+        {
+            RemoveRemoteRoute(link, id);
+        }
+    }
+
+    /// <summary>
+    /// Delivers a message forwarded by a peer to one of this hub's own local clients.
+    /// </summary>
+    /// <remarks>
+    /// Never re-forwarded to another peer under any circumstances — this, not a hop-count check, is what
+    /// makes federation loop-free by construction: a frame that arrived over one peer link is only ever
+    /// delivered locally or dropped, never sent onward across a second link.
+    /// </remarks>
+    private void HandlePeerDeliverMessage(byte[] data)
+    {
+        var recipientId = new Guid(data.AsSpan(1, 16));
+        var senderId = new Guid(data.AsSpan(17, 16));
+        ReadOnlyMemory<byte> body = data.AsMemory(33);
+
+        if (!_clients.TryGetValue(recipientId, out ClientConnection? recipient))
+        {
+            _logger.LogDebug(
+                "Peer-forwarded message for {RecipientId} dropped: no longer a local client", recipientId);
+            _messagesDroppedCounter.Add(1, UnknownRecipientDropTag);
+            return;
+        }
+
+        var deliveryPayload = new byte[1 + 16 + body.Length];
+        deliveryPayload[0] = (byte)MessageType.DeliverMessage;
+        senderId.TryWriteBytes(deliveryPayload.AsSpan(1));
+        body.CopyTo(deliveryPayload.AsMemory(17));
+
+        if (!recipient.OutboundQueue.TryEnqueue(MessagePriority.Normal, deliveryPayload))
+        {
+            _logger.LogWarning(
+                "Outbound queue for {RecipientId} is full, peer-forwarded message dropped", recipientId);
+            _messagesDroppedCounter.Add(1, QueueFullDropTag);
+            return;
+        }
+
+        _messagesRoutedCounter.Add(1, DirectDirectionTag);
+        _bytesRoutedCounter.Add(body.Length, DirectDirectionTag);
+    }
+
+    /// <summary>
+    /// Delivers a group message forwarded by a peer to this hub's own local members of that group, never
+    /// re-forwarded onward — see <see cref="HandlePeerDeliverMessage"/>'s remarks on why that is what
+    /// prevents a routing loop.
+    /// </summary>
+    private void HandlePeerDeliverGroupMessage(byte[] data)
+    {
+        int nameLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(1, 2));
+        int senderOffset = 3 + nameLength;
+
+        if (data.Length < senderOffset + 16)
+        {
+            return;
+        }
+
+        string groupName = Encoding.UTF8.GetString(data.AsSpan(3, nameLength));
+        var senderId = new Guid(data.AsSpan(senderOffset, 16));
+        ReadOnlyMemory<byte> body = data.AsMemory(senderOffset + 16);
+
+        if (!_groups.TryGetValue(groupName, out Group? group))
+        {
+            return;
+        }
+
+        Guid[] recipients;
+        lock (group.Lock)
+        {
+            recipients = new Guid[group.Members.Count];
+            group.Members.CopyTo(recipients);
+        }
+
+        if (recipients.Length == 0)
+        {
+            return;
+        }
+
+        byte[] deliveryPayload = BuildDeliverGroupMessage(senderId, data.AsMemory(3, nameLength), body);
+
+        _messagesRoutedCounter.Add(1, GroupDirectionTag);
+        _bytesRoutedCounter.Add(body.Length, GroupDirectionTag);
+
+        foreach (Guid recipientId in recipients)
+        {
+            if (_clients.TryGetValue(recipientId, out ClientConnection? recipient)
+                && !recipient.OutboundQueue.TryEnqueue(MessagePriority.Normal, deliveryPayload))
+            {
+                _messagesDroppedCounter.Add(1, QueueFullDropTag);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Delivers a topic message forwarded by a peer to this hub's own local subscribers whose pattern
+    /// matches, never re-forwarded onward — see <see cref="HandlePeerDeliverMessage"/>'s remarks on why
+    /// that is what prevents a routing loop.
+    /// </summary>
+    private void HandlePeerDeliverTopicMessage(byte[] data)
+    {
+        int topicLength = BinaryPrimitives.ReadUInt16BigEndian(data.AsSpan(1, 2));
+        int senderOffset = 3 + topicLength;
+
+        if (data.Length < senderOffset + 16)
+        {
+            return;
+        }
+
+        string topic = Encoding.UTF8.GetString(data.AsSpan(3, topicLength));
+        var senderId = new Guid(data.AsSpan(senderOffset, 16));
+        ReadOnlyMemory<byte> body = data.AsMemory(senderOffset + 16);
+
+        IReadOnlySet<Guid> recipients;
+        try
+        {
+            recipients = _topics.Match(topic);
+        }
+        catch (ArgumentException)
+        {
+            return;
+        }
+
+        if (recipients.Count == 0)
+        {
+            return;
+        }
+
+        byte[] deliveryPayload = BuildDeliverTopicMessage(senderId, data.AsMemory(3, topicLength), body);
+
+        _messagesRoutedCounter.Add(1, TopicDirectionTag);
+        _bytesRoutedCounter.Add(body.Length, TopicDirectionTag);
+
+        foreach (Guid recipientId in recipients)
+        {
+            if (_clients.TryGetValue(recipientId, out ClientConnection? recipient)
+                && !recipient.OutboundQueue.TryEnqueue(MessagePriority.Normal, deliveryPayload))
+            {
+                _messagesDroppedCounter.Add(1, QueueFullDropTag);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Forwards a direct send to the peer that owns its recipient, if this hub's routing table knows of
+    /// one — the federated counterpart to <see cref="RouteMessage"/> falling back to the offline store or
+    /// dropping an unknown recipient.
+    /// </summary>
+    /// <remarks>
+    /// Headerless sends only. A header-bearing send (<c>SendAsync(..., MessageHeaders, ...)</c>, a
+    /// time-to-live, a priority, <see cref="DeliveryOptions.RequireAck"/>, or a
+    /// <see cref="IMeshClient.RequestAsync(Guid, ReadOnlyMemory{byte}, TimeSpan, CancellationToken)"/> —
+    /// every one of which rides on the header envelope) to a recipient that turns out to live on a peer
+    /// hub is deliberately <em>not</em> forwarded in this version: silently stripping the headers to
+    /// forward the body alone would break the semantics the caller asked for without telling it, which is
+    /// worse than the existing unknown-recipient fallback. See <c>known-issues.md</c> for this disclosed
+    /// limitation and what it takes to lift it.
+    /// </remarks>
+    /// <returns>
+    /// <see langword="true"/> if the recipient is known to belong to a peer, whether or not the forward
+    /// itself succeeded — either way <see cref="RouteMessage"/> must not also fall back to the offline
+    /// store or an unknown-recipient drop for a recipient this hub knows is simply on another hub.
+    /// </returns>
+    private bool TryForwardToPeer(Guid recipientId, Guid senderId, ReadOnlyMemory<byte> body)
+    {
+        if (!_remoteIdsToPeer.TryGetValue(recipientId, out PeerLink? peer))
+        {
+            return false;
+        }
+
+        int frameLength = 1 + 16 + 16 + body.Length;
+
+        // The forwarded frame carries both the recipient and sender ids, 16 bytes more than the inbound
+        // SendMessage frame it was built from — the same "larger than what produced it" hazard every
+        // other fan-out path in this file already guards against before it can fault a send loop.
+        if (ExceedsFrameCap(frameLength))
+        {
+            DropOversizeFanOut(senderId, frameLength, "peer-forwarded direct message");
+            return true;
+        }
+
+        var frame = new byte[frameLength];
+        frame[0] = (byte)MessageType.PeerDeliverMessage;
+        recipientId.TryWriteBytes(frame.AsSpan(1, 16));
+        senderId.TryWriteBytes(frame.AsSpan(17, 16));
+        body.CopyTo(frame.AsMemory(33));
+
+        if (!peer.OutboundQueue.TryEnqueue(MessagePriority.Normal, frame))
+        {
+            _logger.LogWarning(
+                "Outbound queue for peer {PeerHubId} is full, message to {RecipientId} dropped",
+                peer.HubId,
+                recipientId);
+            _messagesDroppedCounter.Add(1, QueueFullDropTag);
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Forwards a group send to every linked peer as a <see cref="MessageType.PeerDeliverGroupMessage"/>,
+    /// once per peer. Headerless only, for the same reason as <see cref="TryForwardToPeer"/>.
+    /// </summary>
+    private void ForwardGroupMessageToPeers(
+        Guid senderId, ReadOnlyMemory<byte> groupNameBytes, ReadOnlyMemory<byte> messageData)
+    {
+        if (_peers.IsEmpty)
+        {
+            return;
+        }
+
+        int nameLength = groupNameBytes.Length;
+        int frameLength = 1 + 2 + nameLength + 16 + messageData.Length;
+
+        // The forwarded frame carries an extra sender id the original inbound frame did not, exactly the
+        // same "a fan-out frame is larger than the frame that produced it" hazard ExceedsFrameCap already
+        // guards SendToGroup's own local delivery frame against — an unguarded write here would fault the
+        // peer link's send loop instead of dropping one oversize message.
+        if (ExceedsFrameCap(frameLength))
+        {
+            DropOversizeFanOut(senderId, frameLength, "peer-forwarded group message");
+            return;
+        }
+
+        var frame = new byte[frameLength];
+        frame[0] = (byte)MessageType.PeerDeliverGroupMessage;
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(1, 2), (ushort)nameLength);
+        groupNameBytes.Span.CopyTo(frame.AsSpan(3));
+        senderId.TryWriteBytes(frame.AsSpan(3 + nameLength, 16));
+        messageData.CopyTo(frame.AsMemory(3 + nameLength + 16));
+
+        foreach (PeerLink peer in _peers.Values)
+        {
+            if (!peer.OutboundQueue.TryEnqueue(MessagePriority.Normal, frame))
+            {
+                _logger.LogWarning(
+                    "Outbound queue for peer {PeerHubId} is full, forwarded group message dropped",
+                    peer.HubId);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Forwards a topic publish to every linked peer as a
+    /// <see cref="MessageType.PeerDeliverTopicMessage"/>, once per peer. Headerless only, for the same
+    /// reason as <see cref="TryForwardToPeer"/>.
+    /// </summary>
+    private void ForwardTopicMessageToPeers(
+        Guid senderId, ReadOnlyMemory<byte> topicBytes, ReadOnlyMemory<byte> messageData)
+    {
+        if (_peers.IsEmpty)
+        {
+            return;
+        }
+
+        int topicLength = topicBytes.Length;
+        int frameLength = 1 + 2 + topicLength + 16 + messageData.Length;
+
+        if (ExceedsFrameCap(frameLength))
+        {
+            DropOversizeFanOut(senderId, frameLength, "peer-forwarded topic message");
+            return;
+        }
+
+        var frame = new byte[frameLength];
+        frame[0] = (byte)MessageType.PeerDeliverTopicMessage;
+        BinaryPrimitives.WriteUInt16BigEndian(frame.AsSpan(1, 2), (ushort)topicLength);
+        topicBytes.Span.CopyTo(frame.AsSpan(3));
+        senderId.TryWriteBytes(frame.AsSpan(3 + topicLength, 16));
+        messageData.CopyTo(frame.AsMemory(3 + topicLength + 16));
+
+        foreach (PeerLink peer in _peers.Values)
+        {
+            if (!peer.OutboundQueue.TryEnqueue(MessagePriority.Normal, frame))
+            {
+                _logger.LogWarning(
+                    "Outbound queue for peer {PeerHubId} is full, forwarded topic message dropped",
+                    peer.HubId);
+            }
+        }
+    }
+
     private async Task<bool> AuthenticateAsync(
         Guid clientId,
         string clientName,
@@ -1999,6 +2956,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         }
 
         PushPresenceDelta(clientId, clientName, presenceChangeType);
+        PropagateRouteChange(clientId, clientName, presenceChangeType);
     }
 
     /// <summary>
@@ -2414,6 +3372,11 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     {
         if (!_clients.TryGetValue(recipientId, out ClientConnection? recipient))
         {
+            if (TryForwardToPeer(recipientId, senderId, messageData))
+            {
+                return;
+            }
+
             if (await TryStoreForOfflineDeliveryAsync(
                     senderId, recipientId, ReadOnlyMemory<byte>.Empty, messageData, cancellationToken)
                 .ConfigureAwait(false))
@@ -3581,9 +4544,18 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             return;
         }
 
+        // Forwarded to every linked peer regardless of how many local members exist — a peer hub may
+        // have members of the same group this hub has none of. Membership was just confirmed above on
+        // this hub's own authority; a peer trusts that the same way it trusts any other forwarded frame
+        // (see PeerLink's own remarks on the federation trust boundary). Headerless only in this
+        // version — see ForwardGroupMessageToPeers's own remarks for why headers do not cross a
+        // federation boundary yet.
+        ForwardGroupMessageToPeers(senderId, groupNameBytes, messageData);
+
         if (recipients.Length == 1 && recipients[0] == senderId)
         {
-            // The sender is the only member; nothing to deliver and no frame to build.
+            // The sender is the only local member; nothing to deliver locally and no local frame to
+            // build, but the forward above may still have reached a peer's own members.
             return;
         }
 
@@ -3914,6 +4886,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             _logger.LogDebug(ex, "Client {SenderId} published to an invalid topic; message dropped", senderId);
             return;
         }
+
+        // Forwarded to every linked peer regardless of local subscriber count — unlike a group send,
+        // publishing needs no local membership of the sender's own, so there is nothing to gate this on
+        // beyond the topic itself being well formed. Headerless only in this version; see
+        // ForwardTopicMessageToPeers's own remarks.
+        ForwardTopicMessageToPeers(senderId, topicBytes, messageData);
 
         if (recipients.Count == 0)
         {
@@ -4306,6 +5284,44 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         public Lock Lock { get; } = new();
         public HashSet<Guid> Members { get; } = new();
         public bool Removed { get; set; }
+    }
+
+    // A single peer hub link. Mirrors ClientConnection's own shape deliberately — an outbound queue and
+    // a dedicated send-loop task, rather than a lock around direct transport writes — for the same
+    // reason: a synchronous caller (SendToGroup, PublishToTopic) needs to hand a peer-bound frame off
+    // without awaiting the write itself, and ITransport.SendAsync is not safe to call concurrently from
+    // more than one place at once.
+    private sealed class PeerLink(Guid hubId, ITransport transport, byte negotiatedVersion) : IAsyncDisposable
+    {
+        private int _disposed;
+
+        public Guid HubId { get; } = hubId;
+
+        public ITransport Transport { get; } = transport;
+
+        public byte NegotiatedVersion { get; } = negotiatedVersion;
+
+        public PriorityOutboundQueue OutboundQueue { get; } = new(PeerOutboundQueueCapacity);
+
+        /// <summary>
+        /// Every route (client id → name) this peer has advertised to this hub, so a peer-loss teardown
+        /// can withdraw exactly what this peer added — and nothing another peer separately claimed, in
+        /// the event two peers raced to advertise the same id (which should never legitimately happen,
+        /// ids being process-unique <see cref="Guid"/>s, but a misbehaving peer is not assumed honest).
+        /// Only ever touched by this link's own <c>PeerReceiveLoopAsync</c> task, so — like
+        /// <see cref="ClientConnection.Groups"/> — it needs no lock.
+        /// </summary>
+        public Dictionary<Guid, string> AdvertisedRoutes { get; } = new();
+
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                OutboundQueue.Complete();
+                await Transport.DisposeAsync().ConfigureAwait(false);
+                OutboundQueue.Dispose();
+            }
+        }
     }
 
     private sealed class ClientConnection(
