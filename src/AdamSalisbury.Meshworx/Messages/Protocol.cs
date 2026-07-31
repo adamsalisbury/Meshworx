@@ -112,4 +112,25 @@ internal static class Protocol
     /// real federated deployment; pass nothing to accept the default.
     /// </summary>
     internal const int MaxRemoteRoutesPerPeer = 100_000;
+
+    /// <summary>
+    /// The maximum size, in bytes, of a message body the hub will retain as a group's or topic's
+    /// last-value message. Deliberately far smaller than <see cref="AdamSalisbury.Meshworx.Transport.Framing.StreamFramer.MaxPayloadSize"/>
+    /// — an ordinary fan-out frame passes through once, but a retained value persists indefinitely and is
+    /// replayed to every future joiner or subscriber, so it is bounded far more tightly than a message
+    /// that is only ever in flight momentarily.
+    /// </summary>
+    internal const int MaxRetainedMessageBytes = 64 * 1024;
+
+    /// <summary>
+    /// The maximum number of distinct topics the hub will hold a retained value for at once.
+    /// </summary>
+    /// <remarks>
+    /// Needed only for topics, not groups: a group's retained value piggybacks on the already-unbounded-
+    /// by-precedent <c>_groups</c> dictionary (see KI-63), so it adds no new dimension of growth. A
+    /// topic's retained value has no such existing container to ride alongside — <c>_retainedTopics</c> is
+    /// a new top-level dictionary that could otherwise grow without bound purely from retained publishes,
+    /// even with zero live subscribers to any of them.
+    /// </remarks>
+    internal const int MaxRetainedTopicCount = 10_000;
 }

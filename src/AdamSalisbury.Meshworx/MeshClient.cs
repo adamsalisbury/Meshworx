@@ -1139,6 +1139,27 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public Task SendToGroupAsync(
+        string groupName,
+        ReadOnlyMemory<byte> message,
+        bool retain,
+        CancellationToken cancellationToken = default)
+    {
+        if (!retain)
+        {
+            // No header block is written at all — byte-for-byte identical to the headerless overload.
+            return SendToGroupAsync(groupName, message, cancellationToken);
+        }
+
+        var headers = new MessageHeaders(
+        [
+            new KeyValuePair<string, string>(RetainHeaderKeys.Retain, "1"),
+        ]);
+
+        return SendToGroupAsync(groupName, message, headers, cancellationToken);
+    }
+
+    /// <inheritdoc/>
     public async Task SubscribeAsync(string pattern, CancellationToken cancellationToken = default)
     {
         TopicSubscriptionTrie.ValidatePattern(pattern);
@@ -1256,6 +1277,27 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
 
         await SendWithPolicyAsync(transport, payload, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc/>
+    public Task PublishAsync(
+        string topic,
+        ReadOnlyMemory<byte> message,
+        bool retain,
+        CancellationToken cancellationToken = default)
+    {
+        if (!retain)
+        {
+            // No header block is written at all — byte-for-byte identical to the headerless overload.
+            return PublishAsync(topic, message, cancellationToken);
+        }
+
+        var headers = new MessageHeaders(
+        [
+            new KeyValuePair<string, string>(RetainHeaderKeys.Retain, "1"),
+        ]);
+
+        return PublishAsync(topic, message, headers, cancellationToken);
     }
 
     private static async Task SendTopicSubscriptionAsync(

@@ -138,6 +138,63 @@ internal sealed class TopicSubscriptionTrie : IDisposable
     }
 
     /// <summary>
+    /// Tests whether a single subscription pattern matches a single concrete topic, without touching the
+    /// trie at all.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Match"/> answers "which subscribers match this topic" by walking the whole trie once;
+    /// this answers the opposite question — "does this one new pattern match this one already-retained
+    /// topic" — cheaply enough to run once per retained topic when a client subscribes, without needing a
+    /// scratch trie built and torn down just to ask it. Recursion depth is bounded by both
+    /// <paramref name="pattern"/>'s and <paramref name="topic"/>'s segment counts, each already capped at
+    /// <see cref="MaxSegmentCount"/> by <see cref="SplitAndValidate"/> before this is ever reached.
+    /// </remarks>
+    /// <param name="pattern">The subscription pattern to test.</param>
+    /// <param name="topic">The concrete topic to test it against.</param>
+    /// <returns><see langword="true"/> if <paramref name="pattern"/> matches <paramref name="topic"/>.</returns>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="pattern"/> is not a valid pattern, or <paramref name="topic"/> is not a valid
+    /// concrete topic.
+    /// </exception>
+    internal static bool PatternMatches(string pattern, string topic)
+    {
+        string[] patternSegments = SplitAndValidate(pattern, isPattern: true, nameof(pattern));
+        string[] topicSegments = SplitAndValidate(topic, isPattern: false, nameof(topic));
+
+        return SegmentsMatch(patternSegments, 0, topicSegments, 0);
+    }
+
+    private static bool SegmentsMatch(string[] pattern, int patternIndex, string[] topic, int topicIndex)
+    {
+        if (patternIndex == pattern.Length)
+        {
+            return topicIndex == topic.Length;
+        }
+
+        string segment = pattern[patternIndex];
+
+        if (segment == MultiSegmentWildcard)
+        {
+            // Only ever the final pattern segment — enforced by SplitAndValidate — and swallows every
+            // remaining topic segment, including zero of them, mirroring Collect's own treatment of '#'.
+            return true;
+        }
+
+        if (topicIndex == topic.Length)
+        {
+            // The pattern still has a concrete or '+' segment to satisfy but the topic has run out.
+            return false;
+        }
+
+        if (segment == SingleSegmentWildcard || segment == topic[topicIndex])
+        {
+            return SegmentsMatch(pattern, patternIndex + 1, topic, topicIndex + 1);
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Releases the underlying <see cref="ReaderWriterLockSlim"/>. Safe to call more than once.
     /// </summary>
     public void Dispose()

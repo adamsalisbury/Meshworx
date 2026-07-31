@@ -214,4 +214,46 @@ public sealed class TopicSubscriptionTrieTests
         Assert.Empty(trie.Match("orders.eu.region.created"));
         Assert.Equal([second], trie.Match("orders.eu.other"));
     }
+
+    [Theory]
+    [InlineData("orders.created", "orders.created", true)]
+    [InlineData("orders.created", "orders.updated", false)]
+    [InlineData("orders.created", "orders", false)]
+    [InlineData("orders.created", "orders.created.eu", false)]
+    [InlineData("orders.+", "orders.eu", true)]
+    [InlineData("orders.+", "orders.eu.region", false)]
+    [InlineData("orders.+", "orders", false)]
+    [InlineData("orders.+.created", "orders.eu.created", true)]
+    [InlineData("orders.+.created", "orders.eu.region.created", false)]
+    [InlineData("+.created", "orders.created", true)]
+    [InlineData("+.created", "created", false)]
+    [InlineData("sensors.#", "sensors.temperature", true)]
+    [InlineData("sensors.#", "sensors.temperature.eu", true)]
+    [InlineData("sensors.#", "sensors", true)]
+    [InlineData("sensors.#", "other.temperature", false)]
+    [InlineData("#", "anything.at.all", true)]
+    public void PatternMatches_MirrorsSubscribeThenMatchForTheSamePatternAndTopic(
+        string pattern, string topic, bool expectMatch)
+    {
+        // PatternMatches answers the same question Subscribe-then-Match does, without a trie at all —
+        // proved here by checking the two never disagree for the same inputs already exercised above.
+        Assert.Equal(expectMatch, TopicSubscriptionTrie.PatternMatches(pattern, topic));
+
+        var trie = new TopicSubscriptionTrie();
+        Guid subscriber = Guid.NewGuid();
+        trie.Subscribe(pattern, subscriber);
+        Assert.Equal(expectMatch, trie.Match(topic).Contains(subscriber));
+    }
+
+    [Fact]
+    public void PatternMatches_MalformedPattern_ThrowsArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() => TopicSubscriptionTrie.PatternMatches("orders.", "orders.created"));
+    }
+
+    [Fact]
+    public void PatternMatches_TopicContainingWildcardSegment_ThrowsArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() => TopicSubscriptionTrie.PatternMatches("orders.+", "orders.+"));
+    }
 }
