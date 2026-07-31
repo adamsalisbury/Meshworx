@@ -15,4 +15,11 @@ public sealed class ClientConnectionEventArgs : EventArgs
     /// Gets the unique name the client registered with.
     /// </summary>
     public required string ClientName { get; init; }
+
+    /// <summary>
+    /// Gets the reason given when this disconnection was initiated by <see cref="IMeshHub.DisconnectClient"/>,
+    /// or <see langword="null"/> for an ordinary disconnect, or for <see cref="IMeshHub.ClientConnected"/>,
+    /// which never carries one.
+    /// </summary>
+    public string? Reason { get; init; }
 }

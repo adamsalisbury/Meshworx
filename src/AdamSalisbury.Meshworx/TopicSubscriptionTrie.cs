@@ -224,6 +224,68 @@ internal sealed class TopicSubscriptionTrie : IDisposable
     }
 
     /// <summary>
+    /// Gets a snapshot of every subscription currently held in the trie, as (pattern, subscriber ids)
+    /// pairs, for administrative inspection.
+    /// </summary>
+    /// <remarks>
+    /// Reconstructs each pattern string by walking every path from the root that ends at a node holding
+    /// at least one subscriber — the same segments <see cref="Subscribe"/> descended to register it,
+    /// walked in the same order. Depth is bounded by <see cref="MaxSegmentCount"/> exactly as every other
+    /// traversal in this class is, since no path the trie holds can be deeper than that. Not on any hot
+    /// path — only ever called for an administrative snapshot — so, unlike <see cref="Match"/>, this is
+    /// not tuned to avoid allocation.
+    /// </remarks>
+    /// <returns>Every subscribed pattern, paired with the clients currently holding it, in no particular order.</returns>
+    internal IReadOnlyList<(string Pattern, IReadOnlyList<Guid> SubscriberIds)> Snapshot()
+    {
+        var results = new List<(string, IReadOnlyList<Guid>)>();
+
+        _lock.EnterReadLock();
+        try
+        {
+            CollectSnapshot(_root, new List<string>(), results);
+        }
+        finally
+        {
+            _lock.ExitReadLock();
+        }
+
+        return results;
+    }
+
+    private static void CollectSnapshot(Node node, List<string> segments, List<(string, IReadOnlyList<Guid>)> results)
+    {
+        if (node.Subscribers is { Count: > 0 })
+        {
+            results.Add((string.Join('.', segments), node.Subscribers.ToArray()));
+        }
+
+        if (node.Literal is not null)
+        {
+            foreach (KeyValuePair<string, Node> child in node.Literal)
+            {
+                segments.Add(child.Key);
+                CollectSnapshot(child.Value, segments, results);
+                segments.RemoveAt(segments.Count - 1);
+            }
+        }
+
+        if (node.Plus is not null)
+        {
+            segments.Add(SingleSegmentWildcard);
+            CollectSnapshot(node.Plus, segments, results);
+            segments.RemoveAt(segments.Count - 1);
+        }
+
+        if (node.Hash is not null)
+        {
+            segments.Add(MultiSegmentWildcard);
+            CollectSnapshot(node.Hash, segments, results);
+            segments.RemoveAt(segments.Count - 1);
+        }
+    }
+
+    /// <summary>
     /// Releases the underlying <see cref="ReaderWriterLockSlim"/>. Safe to call more than once.
     /// </summary>
     public void Dispose()
