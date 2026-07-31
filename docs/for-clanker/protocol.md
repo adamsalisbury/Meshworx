@@ -688,6 +688,54 @@ client-side method. See [Client attribute frames](#client-attribute-frames-issue
 unrecognised opcode (KI-9): no error frame, and no `PresenceChanged` is ever pushed, whatever the client
 believes its subscription state to be. See [hub.md](hub.md#presence--roster).
 
+<a id="peer-link-frames-issue-40"></a>
+
+### Peer link frames (issue #40)
+
+**A separate protocol from everything above.** Every opcode from here on is spoken only between two
+`MeshHub` instances over a link established by `LinkPeerAsync`, never by `MeshClient` — versioned
+independently via `Protocol.MinFederationVersion`/`MaxFederationVersion` (currently a fixed `1`, no range
+to negotiate yet), not via `Protocol.MinSupportedVersion`/`MaxSupportedVersion`. There is no reason for
+the two protocols to move in step, and this one shares the `MessageType` byte space purely because that
+enum is where every wire opcode in this library happens to be listed.
+
+```
+peer → peer : [0x25 PeerHello][hubId 16][versionMin 1][versionMax 1][credential...]                  # rest of frame is the credential
+peer → peer : [0x26 PeerHelloAck][hubId 16][negotiatedVersion 1]
+peer → peer : [0x27 PeerRouteAdvertise][entryCount u16 BE][{id 16}{nameLen u16 BE}{utf8 name}]*
+peer → peer : [0x28 PeerRouteWithdraw][entryCount u16 BE][{id 16}]*
+peer → peer : [0x29 PeerDeliverMessage][recipientId 16][senderId 16][body...]                        # needs len ≥ 33
+peer → peer : [0x2A PeerDeliverGroupMessage][nameLen u16 BE][utf8 groupName][senderId 16][body...]   # needs len ≥ 19
+peer → peer : [0x2B PeerDeliverTopicMessage][topicLen u16 BE][utf8 topic][senderId 16][body...]      # needs len ≥ 19
+```
+
+`PeerHello` mirrors `RegistrationRequest`'s own shape (a version range plus an opaque, unbounded
+credential trailing the frame) rather than inventing a different negotiation pattern; `PeerHelloAck`
+mirrors `RegistrationComplete`. Both `PeerRouteAdvertise`/`PeerRouteWithdraw` and
+`PeerDeliverGroupMessage`/`PeerDeliverTopicMessage` are bounded the same way `FindClientsResponse`
+(issue #38) is: entries stop being added the instant the frame would exceed
+`StreamFramer.MaxPayloadSize`, via `EnqueueRouteAdvertise`, and the three `PeerDeliver*` builders are
+each preceded by the same `ExceedsFrameCap`/`DropOversizeFanOut` guard `SendToGroup`/`PublishToTopic`
+already use for their own local delivery frame, since a forwarded frame is larger than the one that
+produced it in exactly the same way a fan-out delivery frame already is.
+
+**Headerless only.** None of the three `PeerDeliver*` frames carry a header block — `RouteMessageWithHeaders`,
+`SendToGroupWithHeaders` and `PublishToTopicWithHeaders` are not wired into peer forwarding at all. See
+[known-issues.md](known-issues.md) KI-69.
+
+**Loop prevention is structural, not a hop-count field.** A `PeerRouteAdvertise` this hub receives is only
+ever written into its own `_remoteNames`/`_remoteIdsToPeer` tables, never re-sent to a different peer; a
+`PeerDeliverMessage`/`PeerDeliverGroupMessage`/`PeerDeliverTopicMessage` this hub receives is only ever
+delivered to a local recipient or dropped, never forwarded again. Nothing in the wire format needs a hop
+count because nothing in the code ever takes a second hop. See [known-issues.md](known-issues.md) KI-70
+for what this means for a federation of more than two hubs.
+
+**Trust.** `senderId` in a `PeerDeliver*` frame is taken on trust — the receiving hub does not check it
+against the sending peer's own advertised routes before handing it to a local recipient's
+`MessageReceived`/`GroupMessageReceived`/`TopicMessageReceived`. See
+[known-issues.md](known-issues.md) KI-68 and [hub.md](hub.md#hub-to-hub-federation) for the trust model
+this is part of.
+
 <a id="additive-opcodes-within-a-version"></a>
 
 ### Additive opcodes within a version

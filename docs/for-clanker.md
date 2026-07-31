@@ -1,8 +1,8 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: a3d20a3 (feature/presence-roster — issue #39, presence/roster API, on top of the merged issue #38 client-attributes work on main)
-reconciled-to-date: 2026-07-30
+reconciled-to-commit: 9ad380f (feature/hub-federation — issue #40, hub-to-hub federation, on top of the merged issue #39 presence/roster work on main)
+reconciled-to-date: 2026-07-31
 mode: update
 -->
 
@@ -1214,6 +1214,9 @@ itself, builds a shared `[DeliverTopicMessage][senderId(16)][topicLen(2)][topic]
 | Offline delivery (store and forward) | `IOfflineStore`, `OfflineMessage`, `InMemoryOfflineStore` (issue #28) | [hub.md](for-clanker/hub.md#offline-delivery), [types.md](for-clanker/types.md#offline-delivery-types) |
 | Session resumption (incl. restored-group reporting) | `sessionResumptionWindow`, `IMeshClient.SessionResumed`, opcodes `0x16`–`0x18` (issue #43, extended by PR #135/issue #109) | [hub.md](for-clanker/hub.md#session-resumption), [client.md](for-clanker/client.md#session-resumption), [protocol.md](for-clanker/protocol.md#session-resumption) |
 | Topic-based publish/subscribe (wildcard) | `TopicSubscriptionTrie`, `IMeshClient.SubscribeAsync`/`UnsubscribeAsync`/`PublishAsync`/`TopicMessageReceived`, opcodes `0x19`–`0x1E` (issue #37) | [client.md](for-clanker/client.md#topic-based-publishsubscribe), [hub.md](for-clanker/hub.md#topic-based-publishsubscribe), [protocol.md](for-clanker/protocol.md#topic-pubsub-frames-issue-37) |
+| Client attributes & directory queries | `AttributeQuery`, `ClientDescriptor`, `IMeshClient.UpdateAttributesAsync`/`FindClientsAsync`, opcodes `0x1F`–`0x21` (issue #38) | [client.md](for-clanker/client.md#client-attributes--directory-queries), [hub.md](for-clanker/hub.md#client-attributes--directory-queries), [protocol.md](for-clanker/protocol.md#client-attribute-frames-issue-38) |
+| Presence / roster | `PresenceChangeType`, `IMeshClient.GetClientsAsync`/`SubscribePresenceAsync`/`UnsubscribePresenceAsync`/`PresenceChanged`, `enablePresence`, opcodes `0x22`–`0x24` (issue #39) | [client.md](for-clanker/client.md#presence--roster), [hub.md](for-clanker/hub.md#presence--roster), [protocol.md](for-clanker/protocol.md#presence-frames-issue-39) |
+| Hub-to-hub federation | `IMeshHub.LinkPeerAsync`/`HubId`/`LinkedPeerCount`, `PeerAuthenticator`, `allowIncomingPeerLinks`, opcodes `0x25`–`0x2B` on an independent version range (issue #40) | [hub.md](for-clanker/hub.md#hub-to-hub-federation), [protocol.md](for-clanker/protocol.md#peer-link-frames-issue-40) |
 | Message priority lanes | `MessagePriority`, `PriorityOutboundQueue`, `DeliveryOptions.AtPriority`/`.WithPriority` (`ab16567`) | [client.md](for-clanker/client.md#message-priority), [hub.md](for-clanker/hub.md#priority-lanes), [protocol.md](for-clanker/protocol.md#priority-header) |
 | Per-client inbound rate limiting | `ClientRateLimiter`, `TokenBucket` (issue #69) | [hub.md](for-clanker/hub.md#rate-limiting) |
 | Distributed tracing propagation | `MeshworxActivitySource`, `TraceContextHeaderKeys` (feat #92) | [client.md](for-clanker/client.md#distributed-tracing), [protocol.md](for-clanker/protocol.md#trace-context-headers) |

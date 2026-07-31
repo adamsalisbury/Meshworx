@@ -1202,6 +1202,62 @@ connection or disconnection (`PushPresenceDelta` skips the connection the delta 
 
 ---
 
+### Hub-to-hub federation
+
+Added for issue #40. Two or more `MeshHub` instances link as peers so a client on one can address a
+client, group or topic that lives only on another — a client → hub concern (`SendAsync`,
+`SendToGroupAsync`, `PublishAsync`) becomes reachable across hubs with no code change on the client
+side, only on the hub side (`LinkPeerAsync`). This is a **separate wire protocol** from the client-facing
+one — `PeerHello` onward, opcodes `0x25`–`0x2B`, versioned independently
+(`Protocol.MinFederationVersion`/`MaxFederationVersion`, currently fixed at `1`) — see
+[protocol.md](protocol.md#peer-link-frames-issue-40).
+
+**`LinkPeerAsync(transport, credential, cancellationToken)`** takes ownership of an already-connected
+transport (the caller dials the peer's listener itself, mirroring `IMeshClient.ConnectAsync`), performs
+the handshake, and returns once the link is registered and the initial route snapshot has been sent — the
+link's own send/receive loops then run as background tasks tracked in the hub's existing `_handlerTasks`
+table, exactly like a client connection's handler, so hub shutdown waits for every peer link to unwind
+too. An **incoming** connection becomes a peer link by sending `PeerHello` instead of a client
+registration — `HandleClientAsync` branches on this before it ever touches client-only state (no client
+slot claimed, no name reserved), and is refused outright unless the hub was constructed with
+`allowIncomingPeerLinks: true` (default `false`) and, if configured, an optional `peerAuthenticator`
+approves it.
+
+**Routing is single-hop, and that is what prevents loops** — not a hop-count field. A route this hub
+learns from one peer (`PeerRouteAdvertise`/`PeerRouteWithdraw`, keeping `_remoteNames`/`_remoteIdsToPeer`
+in step with each linked peer's own client set) is never re-advertised to another peer, and a message
+forwarded across one peer link (`PeerDeliverMessage`/`PeerDeliverGroupMessage`/`PeerDeliverTopicMessage`)
+is never forwarded again across a second. See [known-issues.md](known-issues.md) KI-70 for what this
+means for a deployment with more than two hubs: full reachability needs every pair directly linked, not a
+chain.
+
+**Conflict policy** (the issue's own explicit requirement to document one): a local client's name always
+wins over a same-named client a peer advertises, and between two peers both claiming an unclaimed name,
+whichever advertised it first keeps it on *this hub's own view* — there is no cluster-wide consensus, so
+a different hub in the same federation may resolve the same contested name to a different owner. See
+`TryAddRemoteRoute`'s own remarks and [known-issues.md](known-issues.md) for the full write-up.
+
+**Trust model.** Once a peer link is admitted, this hub trusts it completely for routing *and* for sender
+identity — a forwarded frame's claimed `senderId` is never checked against the peer's own advertised
+client set, so a compromised or misconfigured peer can forge who a message appears to be from. See
+[known-issues.md](known-issues.md) KI-68. Route advertisements are bounded per peer
+(`Protocol.MaxRemoteRoutesPerPeer`, default 100,000) so a misbehaving peer cannot exhaust memory, but a
+trusted peer's routes are otherwise believed outright.
+
+**Headers do not cross a federation boundary in this version** — `RouteMessageWithHeaders`,
+`SendToGroupWithHeaders` and `PublishToTopicWithHeaders` were deliberately left unmodified rather than
+wired into peer forwarding, so a header-bearing send (TTL, priority, `DeliveryOptions.RequireAck`,
+`RequestAsync`/`ReplyAsync`) to a recipient that turns out to be on a peer hub falls back to the offline
+store or drops, exactly as it would without federation, rather than silently forwarding the body with the
+headers stripped. See [known-issues.md](known-issues.md) KI-69.
+
+**`PeerLink`** (private, nested in `MeshHub`, mirrors `ClientConnection`'s own shape) gives each peer its
+own outbound queue and dedicated send-loop task, for the same reason `ClientConnection` does: a
+synchronous caller (`SendToGroup`, `PublishToTopic`) needs to hand a peer-bound frame off without
+awaiting the write, and `ITransport.SendAsync` is not safe to call concurrently.
+
+---
+
 <a id="metrics"></a>
 
 ### Metrics

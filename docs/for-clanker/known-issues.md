@@ -76,6 +76,9 @@ the risk to a change, not a claim that the code is defective.
 | KI-65 | Session resumption restores group membership but never topic subscriptions | `MeshHub.cs` (`ResumableSession`, `MakeSessionDormant`, `ResumeSessionAsync`), `MeshClient.cs` (`RestoreJoinedGroupsFromResumedReply`, no topic counterpart) | medium (correctness) | open — **deliberately deferred**, a disclosed follow-up beyond issue #37; see full entry below |
 | KI-66 | No authorisation hook exists for client attributes or `FindClientsAsync`, mirroring KI-62's gap for topics | `MeshHub.cs` (`SetClientAttributes`, `SendFindClientsResponseAsync`), `IMeshClient.cs` (`UpdateAttributesAsync`, `FindClientsAsync`) | medium (security) | open — **by design**; extends KI-2/KI-62; see full entry below |
 | KI-67 | An empty-criteria `FindClientsAsync` query lets any connected client enumerate every other connected client's id and name — a new capability `GetClientIdByNameAsync` never offered | `MeshHub.cs` (`SendFindClientsResponseAsync`), `IMeshClient.cs` (`FindClientsAsync`) | medium (security) | open — **by design**, disclosed in issue #38's PR; see full entry below |
+| KI-68 | An admitted peer link is trusted to report sender identity truthfully — a forwarded message's claimed senderId is never verified against the peer's own client set | `MeshHub.cs` (`HandlePeerDeliverMessage`, `HandlePeerDeliverGroupMessage`, `HandlePeerDeliverTopicMessage`) | high (security) | open — **by design**, the federation trust boundary; see full entry below |
+| KI-69 | Structured headers (and everything built on them — TTL, priority, `DeliveryOptions.RequireAck`, `RequestAsync`/`ReplyAsync`) do not cross a federation boundary; a header-bearing send to a recipient that turns out to be on a peer hub falls back to the offline store or drops, rather than silently losing the headers | `MeshHub.cs` (`RouteMessageWithHeaders` has no peer-forward fallback; `SendToGroupWithHeaders`/`PublishToTopicWithHeaders` are not hooked into `ForwardGroupMessageToPeers`/`ForwardTopicMessageToPeers`) | medium (correctness) | open — **deliberately deferred**, disclosed in issue #40's PR; see full entry below |
+| KI-70 | Federation has no transitive multi-hop routing — a route learned from one peer is never re-advertised to another, so reaching a client on hub C from hub A requires a direct A↔C link, not just A↔B↔C | `MeshHub.cs` (`HandlePeerRouteAdvertise` only ever adds to local tables, never re-broadcasts; `HandlePeerDeliverMessage`/`HandlePeerDeliverGroupMessage`/`HandlePeerDeliverTopicMessage` only ever deliver locally, never re-forward) | medium (correctness), by design | open — **by design**, this is also what makes the topology loop-free without needing a hop-count budget; see full entry below |
 
 ---
 
@@ -2024,6 +2027,67 @@ above assert; see [hub.md](hub.md#session-resumption) for where they're describe
   on obscurity — assume any connected client can enumerate every other one. Restrict who may connect at
   all via `ClientAuthenticator` (KI-2) rather than trying to hide the directory once connected; there is no
   narrower control available today.
+
+### KI-68 — An admitted peer link is trusted to report sender identity truthfully
+- **Where:** `MeshHub.cs` — `HandlePeerDeliverMessage`, `HandlePeerDeliverGroupMessage` and
+  `HandlePeerDeliverTopicMessage` all read a `senderId` straight out of the peer-forwarded frame and hand
+  it to the local recipient's `MessageReceived`/`GroupMessageReceived`/`TopicMessageReceived` event with
+  no check against anything the peer actually told this hub about its own client set.
+- **Severity:** high (security), open — by design, this is the federation trust boundary itself, not an
+  oversight within it.
+- **Why it bites:** within a single hub, a recipient's `SenderId` is trustworthy by construction — the hub
+  itself stamps every delivered frame with the sender's own hub-assigned id, taken from the connection
+  that sent it, so a client cannot forge who a message came from. Federation extends that guarantee only
+  as far as the peer hub's own honesty: once a peer link is admitted (`allowIncomingPeerLinks` and,
+  optionally, a `peerAuthenticator` — see [Hub-to-hub federation](hub.md#hub-to-hub-federation)), this
+  hub accepts whatever `senderId` a `PeerDeliverMessage`/`PeerDeliverGroupMessage`/
+  `PeerDeliverTopicMessage` frame claims, unconditionally. A compromised or misconfigured peer can forge
+  any sender id in a forwarded frame — including one that names a real client on a *third*, unrelated
+  hub, or a fabricated `Guid` that names no client anywhere — and this hub's local recipients have no way
+  to tell the difference from a genuine cross-hub message. This is the same shape of trust NATS
+  super-clusters and XMPP server-to-server federation place in an admitted peer, not a gap specific to
+  this implementation, but it is worth stating plainly rather than leaving implicit.
+- **What to do:** admit a peer link only over a transport and credential you actually trust — mutual TLS
+  (this library's own `TcpTransport`/`TlsTransport` already supports server-side TLS; a `peerAuthenticator`
+  can additionally validate a credential presented in `PeerHello`) is the real mitigation, the same way it
+  would be for any hub-to-hub federation protocol. Do not treat `senderId` on a message that arrived via a
+  peer link as more trustworthy than the peer link itself is.
+
+### KI-69 — Structured headers do not cross a federation boundary
+- **Where:** `MeshHub.cs` — `RouteMessageWithHeaders` has no equivalent of `RouteMessage`'s
+  `TryForwardToPeer` fallback; `SendToGroupWithHeaders`/`PublishToTopicWithHeaders` are never hooked into
+  `ForwardGroupMessageToPeers`/`ForwardTopicMessageToPeers` the way `SendToGroup`/`PublishToTopic` are.
+- **Severity:** medium (correctness), open — deliberately deferred, disclosed in issue #40's PR.
+- **Why it bites:** every higher-level feature built on the header envelope — a time-to-live, a priority,
+  `DeliveryOptions.RequireAck`, `RequestAsync`/`ReplyAsync`'s correlation id — rides on structured
+  headers. Silently stripping them to forward the body alone across a federation boundary would make
+  those features fail in confusing ways (a `RequestAsync` call that never resolves because its correlation
+  id never arrived, say) rather than failing honestly. Instead, a header-bearing send to a recipient this
+  hub cannot find locally simply falls back to the offline store or an unknown-recipient drop, exactly as
+  it would if federation did not exist at all — the header-bearing send paths were deliberately left
+  unmodified rather than wired into peer forwarding.
+- **What to do:** a federated deployment that needs `RequestAsync`/delivery acknowledgement/TTL/priority
+  to work between clients on *different* hubs cannot rely on this version of federation for that traffic.
+  Plain `SendAsync`/`SendToGroupAsync`/`PublishAsync` (no headers) and `BroadcastAsync` are unaffected.
+
+### KI-70 — No transitive multi-hop routing across federation
+- **Where:** `MeshHub.cs` — `HandlePeerRouteAdvertise` only ever writes into `_remoteNames`/
+  `_remoteIdsToPeer`, never re-advertises what it just learned to any *other* peer;
+  `HandlePeerDeliverMessage`/`HandlePeerDeliverGroupMessage`/`HandlePeerDeliverTopicMessage` only ever
+  deliver to a local recipient or drop, never call `TryForwardToPeer`/`ForwardGroupMessageToPeers`/
+  `ForwardTopicMessageToPeers` themselves.
+- **Severity:** medium (correctness), by design.
+- **Why it bites:** federation here is single-hop only. Hub A linked to hub B, and hub B linked to hub C,
+  does **not** let a client on A reach a client on C — A never learns C's routes (B does not re-advertise
+  them) and even if it somehow did, a message forwarded from A to B would not be forwarded again from B to
+  C. Reaching a client on hub C from hub A requires a direct A↔C link. This is a deliberate simplification
+  with a real benefit: it is what makes the topology loop-free by construction, without needing a
+  hop-count budget, a withdrawal-ordering protocol, or any of the machinery a real transitive routing
+  mesh (BGP-style, or NATS's own gateway routing) needs to stay loop-free and consistent.
+- **What to do:** for federation to reach every pair of hubs in a deployment, link every pair directly (a
+  full mesh) rather than assuming a chain or a hub-and-spoke topology will transit. `N` hubs need up to
+  `N × (N − 1) / 2` links for full reachability. A future issue could add transitive routing on top of
+  this — the single-hop version is a safe, complete substrate to build it on, not a dead end.
 
 ---
 
