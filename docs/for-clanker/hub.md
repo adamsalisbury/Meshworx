@@ -574,13 +574,19 @@ package.
 1. **Every inbound frame** is charged against the general message/byte budgets first
    (`TryAdmitFrame`), deliberately **before** any opcode or length check — including a zero-length frame —
    so an empty-frame flood cannot bypass the budget for free.
-2. Only `BroadcastMessage`, `GroupMessage`, `GroupMessageWithHeaders`, `PublishTopicMessage` and
+2. `BroadcastMessage`, `GroupMessage`, `GroupMessageWithHeaders`, `PublishTopicMessage` and
    `PublishTopicMessageWithHeaders` additionally charge the fan-out **frequency** budget
-   (`TryAdmitFanOut`, `MeshHub.cs:1381-1389`) — a header-bearing group or topic send is included
-   deliberately, so a client cannot dodge the budget by attaching an empty header block. **Topic
-   subscribe/unsubscribe (`0x19`/`0x1A`) are not charged against this budget at all** — only the fan-out
-   *send* opcodes are; see [known-issues.md](known-issues.md) KI-63 for the separate, standing-state gap
-   this leaves (subscription count itself has no cap of any kind, budget or otherwise).
+   (`TryAdmitFanOut`, `MeshHub.cs:1557-1564`) — a header-bearing group or topic send is included
+   deliberately, so a client cannot dodge the budget by attaching an empty header block. **`SubscribeTopic`
+   (`0x19`) now charges the same budget too**, added alongside [retained messages](#retained-messages): a
+   successful subscribe scans every retained topic looking for one the new pattern matches
+   (`ReplayRetainedTopicMessages`), so its worst-case hub-side cost scales with
+   `Protocol.MaxRetainedTopicCount` regardless of how many, if any, entries actually match — the same
+   "does not itself fan out, but its hub-side cost scales with population/state size" reasoning already
+   applied to `FindClientsRequest`. **`UnsubscribeTopic` (`0x1A`) is still not charged against this
+   budget** — it neither fans out nor scans retained state; see [known-issues.md](known-issues.md) KI-63
+   for the separate, standing-state gap this leaves (subscription count itself has no cap of any kind,
+   budget or otherwise).
 3. `TryAdmitFanOutDelivery(recipientCount)` is charged once per fan-out, at each of the three fan-out call
    sites in [Routing helpers](#routing-helpers) below, **up front against the full recipient count** — a
    broadcast/group send either clears the whole delivery-volume budget or is dropped in its entirety;
@@ -590,6 +596,12 @@ package.
    repeat, refactored into one place because topic delivery has to compute the chargeable recipient count
    from a `TopicSubscriptionTrie.Match` result first (excluding the publisher itself, if it also
    subscribes) rather than reading a fixed connection list.
+4. **A retained-topic replay on subscribe is charged against the same delivery-volume budget**
+   (`TryAdmitFanOutDelivery(1)`, `ReplayRetainedTopicMessages`, `MeshHub.cs:5654`), but per matching topic
+   as it is about to be replayed, rather than as one lump sum computed up front — a wildcard subscription
+   matching thousands of retained topics stops building further replay frames the instant the budget is
+   exhausted, rather than either building all of them regardless or refusing the subscribe outright. See
+   [Retained messages](#retained-messages) below.
 
 **On exceeding any bucket, the frame is silently dropped** — no error frame, no disconnect, the sender is
 never told, matching the existing full-outbound-queue drop shape (KI-1). The only observable signal is a
@@ -614,14 +626,14 @@ await using var hub = new MeshHub(
 | `RouteMessageWithHeaders` | `SendMessageWithHeaders` | As `RouteMessage` — including the offline-store offer on an unknown recipient, which carries the header block through so it survives the wait — but the outgoing frame shape is chosen from **the recipient's own** `NegotiatedProtocolVersion`: `DeliverMessageWithHeaders` (header block forwarded unchanged) if `>= Protocol.HeaderEnvelopeMinVersion`, else the plain `DeliverMessage` with the header block stripped. The header block is never decoded beyond one well-known key. **`async` since PR #87** (issue #30): if the initial `TryWrite` fails and the sender set `BackpressureHeaderKeys.AwaitCapacity` (via `DeliveryOptions.AwaitCapacity`), it awaits free capacity on the recipient's queue, bounded by `backpressureAwaitTimeout`, before falling back to the same drop/notify/`QueueSaturated` path as `RouteMessage`. | `MeshHub.cs:1924` |
 | `BroadcastMessage` | `BroadcastMessage` | Build one shared `DeliverMessage` frame; `TryWrite` to every client **except the sender**. Each full-queue drop raises `QueueSaturated`, but — deliberately, since PR #87 — sends **no** wire frame: the dropped recipient's id comes from the hub's own client registry, not from the sender, so echoing it back would let a sender enumerate every connected client's id by broadcasting until somebody's queue filled. | `MeshHub.cs:2021` |
 | `JoinGroupAsync` | `JoinGroup` | **`async`, and awaited by the receive loop.** Empty name ignored. With a `groupAuthoriser`: copies the inbound name bytes, asks the authoriser, and on refusal calls `LeaveGroup` then `RefuseGroupJoin`. Otherwise, or on approval, calls `AddToGroup`. | `MeshHub.cs:2079` |
-| `AddToGroup` | — | The former `JoinGroup` body: `GetOrAdd` the `Group`, add member under its lock. Retries if the group was concurrently removed (`Removed` flag). | `MeshHub.cs:2255` |
+| `AddToGroup` | — | The former `JoinGroup` body: `GetOrAdd` the `Group`, add member under its lock. Retries if the group was concurrently removed (`Removed` flag). Since issue #42, also snapshots `Group.Retained` inside that same locked section and replays it to the new member afterwards (`ReplayRetainedGroupMessage`) — see [Retained messages](#retained-messages) below. | `MeshHub.cs:4819` |
 | `AuthoriseGroupJoinAsync` | — | Invokes the authoriser behind a `WaitAsync(_groupAuthorisationTimeout)`, with a sync fast path. Refuses on `false`, throw, self-cancellation or timeout. | `MeshHub.cs:2145` |
 | `RefuseGroupJoin` | — | Builds `[0x10][echoed name bytes]` and `TryWrite`s it to the client's own queue. Full queue → logged `Warning`, **dropped**. | `MeshHub.cs:2232` |
 | `LeaveGroup` | `LeaveGroup` | Remove member; if the group is now empty, mark `Removed` and drop it from `_groups`. Also called by `JoinGroupAsync` on refusal and by `RemoveFromAllGroups` (`:2291`) at teardown. | `MeshHub.cs:2278` |
 | `SendToGroup` | `GroupMessage` | **Requires the sender to be a member.** Tests `group.Members.Contains(senderId)` *inside* the group lock (`:2341`); a non-member is logged `Debug` and **dropped** (`:2351-2357`). A member snapshots the ids, then one shared `DeliverGroupMessage` frame is `TryWrite`n to each member **except the sender**. A full-queue drop raises `QueueSaturated` only — same reasoning as `BroadcastMessage` above, since the recipient's id comes from the group's own membership set, not the sender. | `MeshHub.cs:2321` |
-| `SendToGroupWithHeaders` | `GroupMessageWithHeaders` | As `SendToGroup`, but each recipient's own `NegotiatedProtocolVersion` picks its frame shape, exactly like `RouteMessageWithHeaders`. At most **two** shared frames are built regardless of group size — one with the header block, one without — each lazily built (`??=`) only if some member actually needs that shape. A full-queue drop raises `QueueSaturated` only, same as `SendToGroup`. **Does not** honour `DeliveryOptions.AwaitCapacity` — only the two direct-send paths above do. | `MeshHub.cs:2416` |
-| `PublishToTopic` | `PublishTopicMessage` | issue #37. Matches the topic against `TopicSubscriptionTrie`; **no membership/subscription of the sender's own required** (unlike `SendToGroup`). Charges the fan-out delivery budget via `ChargeFanOutDelivery`, checks the built frame against the transport frame cap (`ExceedsFrameCap`/`DropOversizeFanOut`, same guard `SendToGroup` uses), then enqueues one shared frame to every match except the sender. A full-queue drop raises `QueueSaturated` only, same reasoning as `BroadcastMessage`/`SendToGroup`. See [Topic-based publish/subscribe](#topic-based-publishsubscribe) below. | `MeshHub.cs:3786` |
-| `PublishToTopicWithHeaders` | `PublishTopicMessageWithHeaders` | As `PublishToTopic`, but each recipient's own `NegotiatedProtocolVersion` picks its frame shape (at most two shared frames, lazily built, exactly like `SendToGroupWithHeaders`), and `ReadPriority` selects the delivery lane. **Does not** honour `DeliveryOptions.AwaitCapacity` — no fan-out path does. | `MeshHub.cs:3839` |
+| `SendToGroupWithHeaders` | `GroupMessageWithHeaders` | As `SendToGroup`, but each recipient's own `NegotiatedProtocolVersion` picks its frame shape, exactly like `RouteMessageWithHeaders`. At most **two** shared frames are built regardless of group size — one with the header block, one without — each lazily built (`??=`) only if some member actually needs that shape. A full-queue drop raises `QueueSaturated` only, same as `SendToGroup`. **Does not** honour `DeliveryOptions.AwaitCapacity` — only the two direct-send paths above do. Since issue #42, also checks `RetainHeaderKeys.Retain` (`WantsRetain`) and, if set, stores the group's retained value (`SetRetainedGroupMessage`) inside the **same** locked section as the recipient snapshot — see [Retained messages](#retained-messages) below. | `MeshHub.cs:5170` |
+| `PublishToTopic` | `PublishTopicMessage` | issue #37. Matches the topic against `TopicSubscriptionTrie`; **no membership/subscription of the sender's own required** (unlike `SendToGroup`). Charges the fan-out delivery budget via `ChargeFanOutDelivery`, checks the built frame against the transport frame cap (`ExceedsFrameCap`/`DropOversizeFanOut`, same guard `SendToGroup` uses), then enqueues one shared frame to every match except the sender. A full-queue drop raises `QueueSaturated` only, same reasoning as `BroadcastMessage`/`SendToGroup`. See [Topic-based publish/subscribe](#topic-based-publishsubscribe) below. | `MeshHub.cs:5419` |
+| `PublishToTopicWithHeaders` | `PublishTopicMessageWithHeaders` | As `PublishToTopic`, but each recipient's own `NegotiatedProtocolVersion` picks its frame shape (at most two shared frames, lazily built, exactly like `SendToGroupWithHeaders`), and `ReadPriority` selects the delivery lane. **Does not** honour `DeliveryOptions.AwaitCapacity` — no fan-out path does. Since issue #42, also checks `RetainHeaderKeys.Retain` and, if set, stores the topic's retained value (`SetRetainedTopicMessage`) **before** calling `Match` — not inside a shared lock, unlike the group path, since a topic has none; see [Retained messages](#retained-messages) below and [known-issues.md](known-issues.md) KI-73 for the narrower race this ordering leaves. | `MeshHub.cs:5489` |
 
 **Shared delivery frames:** broadcast and group sends allocate the delivery buffer **once** (or, for the
 two header-bearing group/direct paths, once per distinct frame shape actually needed) and hand the same
@@ -1112,6 +1124,87 @@ is now `8` and `Protocol.TopicPubSubMinVersion = 8` gates the four client → hu
 never negotiated high enough — an older client or hub built before commit `fb2f9a0` — falls through the
 dispatch ladder exactly like any other unrecognised opcode (KI-9), silently, with no error reply of any
 kind.
+
+---
+
+<a id="retained-messages"></a>
+
+### Retained messages
+
+Added for issue #42. An opt-in last-value message per group and per topic, layered on top of both
+addressing modes above: a client sends or publishes with `retain: true`, and the hub keeps that message as
+the group's or topic's retained value, replayed once to a client that joins the group — or subscribes with
+a matching pattern — afterwards, as though it had arrived the moment membership or the subscription took
+effect. Mirrors MQTT's own retained-message semantics.
+
+**Built entirely on the header envelope — the same "fourth route" as priority, backpressure, message
+expiry and delivery acknowledgement: no new opcode, no protocol version bump.** One new well-known key,
+`Messages/RetainHeaderKeys.cs` (`internal`): `RetainHeaderKeys.Retain`, wire string `"mesh.retain"`, value
+`"1"`. `WantsRetain` (`MeshHub.cs:4481-4487`) reads it with the same single-key
+`HeaderEnvelope.TryReadValue` scan as `WantsAwaitCapacity`/`ReadPriority`/`IsExpiredFrame` — a malformed
+header block is tolerated as "not requested", never faulted. **Only `SendToGroupWithHeaders` and
+`PublishToTopicWithHeaders` ever check it** — the headerless `SendToGroup`/`PublishToTopic` and
+`BroadcastMessage` have no way to retain at all. Client-side convenience overloads,
+`IMeshClient.SendToGroupAsync`/`PublishAsync` with a trailing `bool retain`, build the one-header
+`MessageHeaders` internally the same way `SendToGroupAsync(..., MessagePriority, ...)` builds a
+single-header set for anything but `Normal` — see [client.md](client.md#retained-messages).
+
+**An empty body clears the retained value rather than storing an empty one** — there is no separate
+"clear" signal, mirroring MQTT. A body over `Protocol.MaxRetainedMessageBytes` (64 KiB) is refused and
+logged rather than stored, deliberately far smaller than the transport's own frame cap: an ordinary
+fan-out frame passes through once, but a retained value persists indefinitely and is replayed to every
+future joiner or subscriber. **A group or topic newly starting to retain a value is additionally capped by
+count, independently of size:** `Protocol.MaxRetainedGroupCount`/`MaxRetainedTopicCount` (10,000 each)
+bound how many groups/topics may simultaneously hold one — replacing or clearing an already-retained value
+never counts against this cap, only a group or topic transitioning from "not retaining" to "retaining"
+does. This is a materially larger amplification than the pre-existing, never-capped group-membership and
+topic-subscription counts (see [known-issues.md](known-issues.md) KI-63) — a retained value turns an
+already-unbounded count into up to 64 KiB each, so it is bounded independently rather than riding on those
+existing gaps.
+
+**Storage.** A group's retained value is a new nullable field on the existing `Group` object —
+`Retained` (`(Guid SenderId, byte[] Body)?`, `MeshHub.cs:6060`) — set and cleared under the same
+`Group.Lock` as `Members`, by `SetRetainedGroupMessage` (`:4933`). A topic has no equivalent existing
+per-node container, so its retained values live in a new top-level
+`ConcurrentDictionary<string, (Guid SenderId, byte[] Body)>` (`_retainedTopics`, `:222`), written by
+`SetRetainedTopicMessage` (`:5599`).
+
+**Group-side replay is fully atomic with membership; topic-side is not, and cannot be without a
+disproportionate cost.** `AddToGroup` (`:4819`) snapshots `Retained` inside the *same* locked section that
+adds the new member, so a join can never land in the gap between "recipient snapshot taken" and "retained
+value read" — it always resolves to exactly one outcome (live delivery, or replay reflecting whatever was
+retained immediately before this join), never both, never neither. A topic has no single lock shared
+between publishing and subscribing — `TopicSubscriptionTrie`'s own lock guards only its subscriber state,
+entirely separate from `_retainedTopics` — so `PublishToTopicWithHeaders` cannot make its recipient
+snapshot (`Match`) and its retained-value write one atomic critical section the way the group path can,
+short of serialising every topic publish against every other one hub-wide, judged disproportionate for
+this feature. It stores the retained value **before** calling `Match`, deliberately — this eliminates the
+possibility of a silent, permanent miss, but leaves a narrower window where a subscribe landing between the
+store and the match receives a duplicate: once live, once via its own replay. See
+[known-issues.md](known-issues.md) KI-73 for the full trade-off.
+
+**Replay reuses the existing delivery opcodes, not a dedicated replay frame.**
+`ReplayRetainedGroupMessage` (`:4857`) and `ReplayRetainedTopicMessage` (`:5721`) build a
+`DeliverGroupMessage`/`DeliverGroupMessageWithHeaders` or `DeliverTopicMessage`/
+`DeliverTopicMessageWithHeaders` frame — exactly what an ordinary live send already produces — carrying
+`mesh.retain=1` on the header-bearing shape for a recipient negotiated at
+`Protocol.HeaderEnvelopeMinVersion` or above; a recipient below that version still receives the retained
+body, just without the marker, the same "payload survives, header does not" treatment any other
+header-bearing send already gets for an older peer (see [Message headers](protocol.md#message-headers)).
+Both replay paths go through the same `ExceedsFrameCap`/`DropOversizeFanOut` guard and outbound-queue-full
+drop as a live delivery. A group join replays at most one value; a topic subscribe may replay many —
+`ReplayRetainedTopicMessages` (`:5654`) uses the new `TopicSubscriptionTrie.PatternMatches`/
+`SplitAndValidatePattern` static helpers (`TopicSubscriptionTrie.cs:159-206`) to test the newly-subscribed
+pattern against every currently-retained topic directly, without building and tearing down a scratch trie
+just to ask the question — `SplitAndValidatePattern` splits and validates the pattern once per subscribe;
+`PatternMatches` is then called once per retained topic against that already-split pattern.
+
+**Rate limiting changed as a direct consequence — see [Rate limiting](#rate-limiting) above for the full
+gating rules.** `SubscribeTopic` now charges the fan-out **frequency** budget, since a successful subscribe
+must scan every retained topic for a match; a subscribe's own retained-topic replay is separately charged
+against the fan-out **delivery-volume** budget, per topic as it is actually replayed, so a wildcard
+subscription matching a large number of retained topics stops building further replay frames the moment
+the budget is exhausted rather than building all of them regardless.
 
 ---
 

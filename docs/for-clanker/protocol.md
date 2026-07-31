@@ -736,6 +736,49 @@ against the sending peer's own advertised routes before handing it to a local re
 [known-issues.md](known-issues.md) KI-68 and [hub.md](hub.md#hub-to-hub-federation) for the trust model
 this is part of.
 
+<a id="retained-message-header-issue-42"></a>
+
+### Retained message header (issue #42)
+
+Retained messages (see [client.md](client.md#retained-messages) and
+[hub.md](hub.md#retained-messages)) ride the same header-envelope route as request/response, delivery
+acknowledgement, expiry, backpressure and priority above — **no new opcode, no protocol version bump.**
+One new well-known key, `Messages/RetainHeaderKeys.cs` (`internal`):
+
+| Key | Value | Wire string | Present on |
+|---|---|---|---|
+| `RetainHeaderKeys.Retain` | `"1"` | `"mesh.retain"` | a `GroupMessageWithHeaders` (`0x13`) or `PublishTopicMessageWithHeaders` (`0x1C`) frame that asks the hub to retain it; also echoed on the hub's own `DeliverGroupMessageWithHeaders`/`DeliverTopicMessageWithHeaders` replay of a retained value to a version-5+ recipient |
+
+**This is a fourth exception to "the hub only ever reads a header block's length, never its content"**
+(after message expiry, backpressure and priority above) — `WantsRetain` uses the identical
+`HeaderEnvelope.TryReadValue` single-key scan, called from `SendToGroupWithHeaders`/
+`PublishToTopicWithHeaders` at the point a header-bearing group send or topic publish is processed. Unlike
+those three, this is not the only mechanism that reads header content on this path any more — it is simply
+the newest of a now-established pattern for a capability that needs the hub to notice one flag without
+decoding the rest of the block.
+
+**Retention has no reply/acknowledgement frame of its own.** The hub replays a retained value using the
+*existing* delivery opcodes a live send already produces (`DeliverGroupMessage`/
+`DeliverGroupMessageWithHeaders`, `DeliverTopicMessage`/`DeliverTopicMessageWithHeaders`) rather than a
+dedicated replay frame — a recipient cannot distinguish a replay from a live send by opcode alone, only by
+the presence of `mesh.retain=1` on the header-bearing shape, and only if it negotiated
+`Protocol.HeaderEnvelopeMinVersion` or above. A recipient below that version still receives the retained
+body on the plain `DeliverGroupMessage`/`DeliverTopicMessage` frame, with no way to tell it apart from an
+ordinary send — the same "payload survives, header does not" treatment every other header-bearing frame
+already gets for an older peer (see [Message headers](#message-headers) above).
+
+**An empty body clears the retained value rather than storing an empty one.** There is no separate "clear"
+opcode or header value — sending `retain: true` with a zero-length body is itself the clear signal,
+mirroring MQTT's own retained-message semantics.
+
+**Retention is capped independently of any existing group/topic-count limit.** A retained value over
+`Protocol.MaxRetainedMessageBytes` (64 KiB) is refused; a group or topic newly starting to retain a value
+is additionally refused once `Protocol.MaxRetainedGroupCount`/`MaxRetainedTopicCount` (10,000 each) already
+hold one — see [hub.md](hub.md#retained-messages) for the full storage and cap mechanics, and
+[known-issues.md](known-issues.md) KI-73 for the one disclosed race this feature carries: a topic subscribe
+landing in a narrow window around a retained publish can receive a duplicate delivery of the same content
+(never a loss — group-side retention has no equivalent window at all).
+
 <a id="additive-opcodes-within-a-version"></a>
 
 ### Additive opcodes within a version

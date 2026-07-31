@@ -81,6 +81,7 @@ the risk to a change, not a claim that the code is defective.
 | KI-70 | Federation has no transitive multi-hop routing — a route learned from one peer is never re-advertised to another, so reaching a client on hub C from hub A requires a direct A↔C link, not just A↔B↔C | `MeshHub.cs` (`HandlePeerRouteAdvertise` only ever adds to local tables, never re-broadcasts; `HandlePeerDeliverMessage`/`HandlePeerDeliverGroupMessage`/`HandlePeerDeliverTopicMessage` only ever deliver locally, never re-forward) | medium (correctness), by design | open — **by design**, this is also what makes the topology loop-free without needing a hop-count budget; see full entry below |
 | KI-71 | A direct send published to the backplane for an unknown-local recipient is always treated as handled, even though the backplane gives no confirmation any instance actually holds the recipient — it never also falls back to the offline store | `MeshHub.cs` (`TryPublishDirectToBackplane`, called from `RouteMessage` before the offline-store fallback) | medium (correctness), by design | open — **by design**, see full entry below |
 | KI-72 | Structured headers do not cross a backplane, mirroring KI-69's identical limitation for federation | `MeshHub.cs` (`RouteMessageWithHeaders`, `SendToGroupWithHeaders`, `PublishToTopicWithHeaders` are not wired into backplane publishing) | medium (correctness) | open — **deliberately deferred**, disclosed in issue #41's PR; see full entry below |
+| KI-73 | Topic retention stores the retained value before matching subscribers, so a subscribe racing a retained publish can receive a live delivery and its own replay of the same content | `MeshHub.cs` (`PublishToTopicWithHeaders`, `SetRetainedTopicMessage`, `ReplayRetainedTopicMessages`) | low (correctness) | open — **by design**, see full entry below |
 
 ---
 
@@ -2125,6 +2126,35 @@ above assert; see [hub.md](hub.md#session-resumption) for where they're describe
 - **What to do:** as KI-69 — plain `SendAsync`/`SendToGroupAsync`/`PublishAsync` (no headers) and
   `BroadcastAsync` are unaffected; anything built on the header envelope is not reachable across
   instances via the backplane in this version.
+
+### KI-73 — Topic retention's store-before-match ordering trades a silent miss for a rare duplicate delivery
+
+- **Where:** `MeshHub.cs` — `PublishToTopicWithHeaders` (`:5489`) calls `SetRetainedTopicMessage` (`:5599`)
+  before calling `Match` to find live recipients; `ReplayRetainedTopicMessages` (`:5654`), reached from
+  `SubscribeTopic`'s inline dispatch handler, replays a matching retained value to a newly-subscribed
+  client.
+- **Severity:** low (correctness), open — by design, disclosed in issue #42's PR.
+- **Why it bites:** group-side retention is fully race-free — `AddToGroup` (`:4819`) snapshots
+  `Group.Retained` in the *same* locked section that adds the new member, and `SendToGroupWithHeaders`
+  (`:5170`) writes it under the identical `Group.Lock`, so a join can never land in the gap between
+  "recipient list captured" and "retained value read": it always resolves to exactly one outcome, live
+  delivery or replay, never both and never neither. A topic has no equivalent single lock shared between
+  publishing and subscribing — `TopicSubscriptionTrie`'s own lock guards only its subscriber state,
+  entirely separate from the `_retainedTopics` dictionary — so `PublishToTopicWithHeaders` cannot make
+  its recipient snapshot (`Match`) and its retained-value write one atomic critical section the way the
+  group path can, without serialising every topic publish against every other one hub-wide, judged
+  disproportionate for this feature. It stores the retained value **before** calling `Match`, deliberately:
+  this eliminates the possibility of a silent, permanent miss (the failure mode the original store-after-
+  `Match` ordering would have had — a subscribe landing in the gap would see neither the live delivery,
+  already excluded from the snapshot, nor the retained value, read before the store lands), but leaves a
+  narrower window: a subscribe that lands after the store but before `Match` receives **both** the live
+  delivery and its own subscribe-time replay of the same content — a duplicate, not a loss.
+- **What to do:** treat a topic delivery around a `retain: true` publish that races a concurrent subscribe
+  as at-least-once, not exactly-once — application code that cannot tolerate an occasional duplicate in
+  this narrow window should de-duplicate on its own (for example, a message id carried in the payload).
+  Do not "fix" this by reordering the store after `Match` — that reintroduces the strictly worse silent-
+  miss case this ordering was deliberately chosen to avoid. Group-side retention
+  (`SetRetainedGroupMessage`, `:4933`) has no equivalent window and needs no such caveat.
 
 ---
 
