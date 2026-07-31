@@ -383,6 +383,37 @@ public interface IMeshClient : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends a message to every other member of the named group, optionally retaining it as the group's
+    /// last-value message.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget, mirroring
+    /// <see cref="SendToGroupAsync(string, ReadOnlyMemory{byte}, CancellationToken)"/>. Passing
+    /// <see langword="true"/> for <paramref name="retain"/> asks the hub to keep this message as the
+    /// group's retained value: a client that joins the group afterwards receives it immediately, as
+    /// though it had been sent the moment membership took effect, before anything sent since. A later
+    /// retained send replaces the group's retained value; retaining an empty <paramref name="message"/>
+    /// clears it without setting a replacement. Passing <see langword="false"/> is equivalent to calling
+    /// the overload without a retain flag and leaves any existing retained value untouched.
+    /// </remarks>
+    /// <param name="groupName">The name of the group to send to.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="retain">
+    /// Whether the hub should keep this send as the group's retained value for future joiners.
+    /// </param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="retain"/> is <see langword="true"/> but the hub negotiated a protocol version that
+    /// predates the header envelope.
+    /// </exception>
+    Task SendToGroupAsync(
+        string groupName,
+        ReadOnlyMemory<byte> message,
+        bool retain,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Subscribes to a topic pattern, so that a message published to any topic the pattern matches is
     /// delivered to this client.
     /// </summary>
@@ -455,6 +486,38 @@ public interface IMeshClient : IAsyncDisposable
         string topic,
         ReadOnlyMemory<byte> message,
         MessageHeaders headers,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Publishes a message to a topic, optionally retaining it as that topic's last-value message.
+    /// </summary>
+    /// <remarks>
+    /// Delivery is best-effort and fire-and-forget, mirroring
+    /// <see cref="PublishAsync(string, ReadOnlyMemory{byte}, CancellationToken)"/>. Passing
+    /// <see langword="true"/> for <paramref name="retain"/> asks the hub to keep this message as the
+    /// topic's retained value: a client that subscribes to a pattern matching this topic afterwards
+    /// receives it immediately upon subscribing, as though it had been published the moment the
+    /// subscription took effect. A later retained publish to the same topic replaces its retained value;
+    /// retaining an empty <paramref name="message"/> clears it without setting a replacement. Passing
+    /// <see langword="false"/> is equivalent to calling the overload without a retain flag and leaves any
+    /// existing retained value for the topic untouched.
+    /// </remarks>
+    /// <param name="topic">The concrete topic to publish to. Cannot contain a wildcard segment.</param>
+    /// <param name="message">The message payload to deliver.</param>
+    /// <param name="retain">
+    /// Whether the hub should keep this publish as the topic's retained value for future subscribers.
+    /// </param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The client is not connected to a hub.</exception>
+    /// <exception cref="ArgumentException"><paramref name="topic"/> is not a valid concrete topic.</exception>
+    /// <exception cref="NotSupportedException">
+    /// <paramref name="retain"/> is <see langword="true"/> but the hub negotiated a protocol version that
+    /// predates the header envelope.
+    /// </exception>
+    Task PublishAsync(
+        string topic,
+        ReadOnlyMemory<byte> message,
+        bool retain,
         CancellationToken cancellationToken = default);
 
     /// <summary>

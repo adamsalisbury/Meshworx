@@ -215,6 +215,19 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     // and the concurrency model.
     private readonly TopicSubscriptionTrie _topics = new();
 
+    // A topic's retained value, keyed by the concrete topic it was published to. Unlike a group's
+    // Retained field, which piggybacks on the already-unbounded-by-precedent _groups dictionary (see
+    // KI-63), this is a new top-level container with nothing else bounding its growth, so it is capped at
+    // Protocol.MaxRetainedTopicCount — see SetRetainedTopicMessage.
+    private readonly ConcurrentDictionary<string, (Guid SenderId, byte[] Body)> _retainedTopics =
+        new(StringComparer.Ordinal);
+
+    // The number of groups currently holding a non-null Group.Retained value, maintained with
+    // Interlocked rather than any one group's own lock — this is a hub-wide total spanning every group's
+    // independent lock, so no single group.Lock could guard it correctly. Bounds the same amplification
+    // Protocol.MaxRetainedTopicCount bounds for topics, but for groups: see SetRetainedGroupMessage.
+    private int _retainedGroupCount;
+
     // Whether SubscribePresence is honoured at all — see the constructor's own remarks on enablePresence
     // for why this defaults to false.
     private readonly bool _enablePresence;
@@ -1536,20 +1549,25 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 // waiting rather than failing outright, mirroring the same unbounded-wait characteristic
                 // GetClientIdByNameAsync already has when its own frame is rate-limited away; callers that
                 // need a hard bound should pass a cancellation token with a deadline, exactly as they
-                // already must for that call.
+                // already must for that call. SubscribeTopic belongs here for the identical reason as
+                // FindClientsRequest: it does not itself fan a delivery out, but a successful subscribe
+                // scans every retained topic looking for one this new pattern matches (see
+                // ReplayRetainedTopicMessages), so its worst-case hub-side cost scales with
+                // Protocol.MaxRetainedTopicCount regardless of how many, if any, actually match.
                 if (messageType is MessageType.BroadcastMessage
                         or MessageType.GroupMessage
                         or MessageType.GroupMessageWithHeaders
                         or MessageType.PublishTopicMessage
                         or MessageType.PublishTopicMessageWithHeaders
                         or MessageType.FindClientsRequest
+                        or MessageType.SubscribeTopic
                     && !connection.RateLimiter.TryAdmitFanOut())
                 {
                     if (_rateLimitLogThrottle.ShouldLog())
                     {
                         _logger.LogWarning(
-                            "Client {ClientId} exceeded its fan-out rate limit; broadcast, group, topic or "
-                            + "find-clients message dropped",
+                            "Client {ClientId} exceeded its fan-out rate limit; broadcast, group, topic, "
+                            + "find-clients or subscribe message dropped",
                             clientId);
                     }
 
@@ -1650,6 +1668,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     {
                         _topics.Subscribe(pattern, connection.Id);
                         connection.Topics.Add(pattern);
+                        ReplayRetainedTopicMessages(connection, pattern);
                     }
                     catch (ArgumentException ex)
                     {
@@ -4451,6 +4470,29 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     }
 
     /// <summary>
+    /// Checks the one well-known <see cref="RetainHeaderKeys.Retain"/> header, without decoding the rest
+    /// of the block, to decide whether a group or topic send should update the retained value replayed to
+    /// future joiners or subscribers.
+    /// </summary>
+    /// <remarks>
+    /// A malformed block is tolerated as "not requested", mirroring <see cref="WantsAwaitCapacity"/> —
+    /// the header block is sender-supplied and must never be able to fault the routing path that reads it.
+    /// </remarks>
+    private static bool WantsRetain(ReadOnlyMemory<byte> headerBlock)
+    {
+        try
+        {
+            return HeaderEnvelope.TryReadValue(
+                    headerBlock.Span, headerBlock.Length, RetainHeaderKeys.Retain, out string? value)
+                && value == "1";
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Reads the one well-known <see cref="MessagePriorityHeaderKeys.Priority"/> header, without decoding
     /// the rest of the block, to decide which outbound lane a frame is queued on.
     /// </summary>
@@ -4779,6 +4821,7 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         while (true)
         {
             Group group = _groups.GetOrAdd(groupName, static _ => new Group());
+            (Guid SenderId, byte[] Body)? retained;
             lock (group.Lock)
             {
                 if (group.Removed)
@@ -4790,11 +4833,146 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
                 group.Members.Add(connection.Id);
                 connection.Groups.Add(groupName);
+
+                // Snapshotted under the same lock that guards Retained everywhere else, so this can never
+                // observe a value mid-write; read once here rather than re-locking after the fact.
+                retained = group.Retained;
             }
 
             _logger.LogDebug("Client {ClientId} joined group {GroupName}", connection.Id, groupName);
+
+            if (retained is { } value)
+            {
+                ReplayRetainedGroupMessage(connection, groupName, value.SenderId, value.Body);
+            }
+
             return;
         }
+    }
+
+    /// <summary>
+    /// Delivers a group's retained value to a client that has just joined it, so the new member sees the
+    /// group's last-value message immediately rather than waiting for the next live send.
+    /// </summary>
+    private void ReplayRetainedGroupMessage(ClientConnection connection, string groupName, Guid senderId, byte[] body)
+    {
+        byte[] groupNameBytes = Encoding.UTF8.GetBytes(groupName);
+
+        byte[] frame;
+        int frameLength;
+        if (connection.NegotiatedProtocolVersion >= Protocol.HeaderEnvelopeMinVersion)
+        {
+            var headers = new MessageHeaders(
+            [
+                new KeyValuePair<string, string>(RetainHeaderKeys.Retain, "1"),
+            ]);
+            int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+            var headerBlock = new byte[headerLength];
+            HeaderEnvelope.Write(headers, headerBlock);
+
+            frameLength = 1 + 16 + 2 + groupNameBytes.Length + 2 + headerBlock.Length + body.Length;
+            if (ExceedsFrameCap(frameLength))
+            {
+                DropOversizeFanOut(senderId, frameLength, "retained group message replay");
+                return;
+            }
+
+            frame = BuildDeliverGroupMessageWithHeaders(senderId, groupNameBytes, headerBlock, body);
+        }
+        else
+        {
+            // The joining client predates the header envelope, so the retain marker cannot be carried —
+            // it still receives the retained body itself, mirroring how a header-bearing live send is
+            // stripped rather than withheld from an older peer elsewhere in this class.
+            frameLength = 1 + 16 + 2 + groupNameBytes.Length + body.Length;
+            if (ExceedsFrameCap(frameLength))
+            {
+                DropOversizeFanOut(senderId, frameLength, "retained group message replay");
+                return;
+            }
+
+            frame = BuildDeliverGroupMessage(senderId, groupNameBytes, body);
+        }
+
+        if (!connection.OutboundQueue.TryEnqueue(MessagePriority.Normal, frame))
+        {
+            _logger.LogWarning(
+                "Outbound queue for {ClientId} is full, retained group message for {GroupName} dropped",
+                connection.Id,
+                ForLog(groupName));
+        }
+    }
+
+    /// <summary>
+    /// Stores or clears a group's retained value, per the <see cref="RetainHeaderKeys.Retain"/> header on
+    /// a header-bearing group send.
+    /// </summary>
+    /// <remarks>
+    /// The caller must already hold <paramref name="group"/>'s own <see cref="Group.Lock"/> — this must
+    /// never be a second, separate lock acquisition of its own. See <see cref="SendToGroupWithHeaders"/>'s
+    /// remarks on why the recipient snapshot and the retained-value write must be one atomic critical
+    /// section rather than two.
+    /// <para>
+    /// An empty <paramref name="body"/> clears the retained value rather than storing an empty one,
+    /// mirroring MQTT's own retained-message semantics — there is no separate "clear" signal, since
+    /// clearing is itself never something a group's future joiners need replayed. A body over
+    /// <see cref="Protocol.MaxRetainedMessageBytes"/> is refused rather than stored, since a retained
+    /// value persists indefinitely rather than passing through once like an ordinary fan-out frame.
+    /// </para>
+    /// <para>
+    /// A group newly starting to retain a value — as opposed to replacing or clearing one it already
+    /// held — is refused once <see cref="Protocol.MaxRetainedGroupCount"/> groups already hold one. A
+    /// group's own membership is already unbounded by precedent (see KI-63), but only by a few hundred
+    /// bytes each; a retained value turns that same unbounded count into up to
+    /// <see cref="Protocol.MaxRetainedMessageBytes"/> each, which is a materially different amplification
+    /// and is bounded independently of group count itself. <see cref="_retainedGroupCount"/> is
+    /// maintained with <see cref="Interlocked"/> rather than under this lock, since it is a hub-wide
+    /// total spanning every group's own independent lock, not this one group's state.
+    /// </para>
+    /// </remarks>
+    private void SetRetainedGroupMessage(Group group, Guid senderId, ReadOnlyMemory<byte> body)
+    {
+        if (body.Length > Protocol.MaxRetainedMessageBytes)
+        {
+            _logger.LogWarning(
+                "Retained group message from {SenderId} dropped: {BodyLength} bytes exceeds the "
+                + "{MaxRetainedMessageBytes}-byte maximum for a retained value",
+                senderId,
+                body.Length,
+                Protocol.MaxRetainedMessageBytes);
+            return;
+        }
+
+        bool wasRetainedBefore = group.Retained is not null;
+
+        if (body.Length == 0)
+        {
+            if (wasRetainedBefore)
+            {
+                group.Retained = null;
+                Interlocked.Decrement(ref _retainedGroupCount);
+            }
+
+            return;
+        }
+
+        if (!wasRetainedBefore)
+        {
+            // Only a group newly starting to retain a value grows the hub-wide total; replacing an
+            // already-retained value does not, so it is never refused by this cap.
+            if (Interlocked.Increment(ref _retainedGroupCount) > Protocol.MaxRetainedGroupCount)
+            {
+                Interlocked.Decrement(ref _retainedGroupCount);
+                _logger.LogWarning(
+                    "Retained group message from {SenderId} dropped: the hub already holds "
+                    + "{MaxRetainedGroupCount} groups with a retained value",
+                    senderId,
+                    Protocol.MaxRetainedGroupCount);
+                return;
+            }
+        }
+
+        group.Retained = (senderId, body.ToArray());
     }
 
     private void LeaveGroup(ClientConnection connection, string groupName)
@@ -5008,6 +5186,26 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             {
                 recipients = new Guid[group.Members.Count];
                 group.Members.CopyTo(recipients);
+
+                // Retention is captured in the very same locked section as the recipient snapshot,
+                // never a second, separate lock acquisition afterwards. AddToGroup adds a member and
+                // reads Retained together under this same group.Lock — if the snapshot and the store
+                // were two separate critical sections here, a join landing in the gap between them
+                // would see neither the live delivery (already excluded from the snapshot taken first)
+                // nor the correct retained value (read before this write lands): a silent, permanent
+                // miss until the next retained send. Held atomic against AddToGroup like this, a join
+                // that races this send always resolves to exactly one outcome — either it fully
+                // precedes this section (so it is in recipients and gets the live delivery, and its own
+                // earlier replay correctly reflected whatever was retained before this send) or it
+                // fully follows it (so it is excluded from recipients but its own replay correctly
+                // reflects this send's just-committed retained value) — never both, never neither.
+                // Retention is independent of how many members exist to fan out to right now — a group
+                // with only the sender in it, or none besides, can still retain a value for whoever
+                // joins later — so this runs before the "only the sender" early return just below.
+                if (WantsRetain(headerBlock))
+                {
+                    SetRetainedGroupMessage(group, senderId, body);
+                }
             }
         }
 
@@ -5295,6 +5493,42 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         ReadOnlyMemory<byte> headerBlock,
         ReadOnlyMemory<byte> body)
     {
+        // Retention is independent of whether anybody is subscribed right now, mirroring
+        // SendToGroupWithHeaders — a topic with no subscribers yet can still retain a value for whoever
+        // subscribes later. Stored before Match is called below, and validated here rather than relying
+        // on Match's own validation, specifically so the store happens first.
+        //
+        // Unlike a group send, a topic has no single lock shared between publishing and subscribing —
+        // the trie guards its own subscriber state with its own internal lock, entirely separate from
+        // _retainedTopics — so the store and the Match snapshot below cannot be made one atomic critical
+        // section the way SendToGroupWithHeaders's recipient snapshot and retained-value write now are.
+        // Storing first rather than after Match (as originally written) trades one race for a strictly
+        // better one: with Match first, a subscribe landing between the snapshot and the store would see
+        // neither the live delivery (already excluded from the snapshot) nor the retained value (read
+        // before the store lands) — a silent, permanent miss. With the store moved first, that specific
+        // interleaving cannot occur — a subscribe that misses this publish's live delivery (because it
+        // lands after Match's snapshot) can only do so once the store has already committed, since the
+        // store now always precedes Match — so it always finds the retained value on its own subscribe-
+        // time replay. The remaining possible interleaving is a subscribe that lands after the store but
+        // before Match, which then receives both the live delivery and its own replay of the same
+        // content — a rare duplicate, not a loss, and consistent with the best-effort, fire-and-forget
+        // delivery this class already documents for every other send. See KI-73.
+        if (WantsRetain(headerBlock))
+        {
+            try
+            {
+                TopicSubscriptionTrie.ValidateTopic(topic);
+            }
+            catch (ArgumentException ex)
+            {
+                _logger.LogDebug(
+                    ex, "Client {SenderId} published to an invalid topic; message dropped", senderId);
+                return;
+            }
+
+            SetRetainedTopicMessage(topic, senderId, body);
+        }
+
         IReadOnlySet<Guid> recipients;
         try
         {
@@ -5353,6 +5587,180 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 _messagesDroppedCounter.Add(1, QueueFullDropTag);
                 RaiseQueueSaturated(senderId, recipientId);
             }
+        }
+    }
+
+    /// <summary>
+    /// Stores or clears a topic's retained value, per the <see cref="RetainHeaderKeys.Retain"/> header on
+    /// a header-bearing topic publish. Mirrors <see cref="SetRetainedGroupMessage"/> exactly, except that
+    /// a topic has no existing per-node storage object to piggyback on, so a new topic's retained value is
+    /// capped by count as well as by size — see <see cref="Protocol.MaxRetainedTopicCount"/>.
+    /// </summary>
+    private void SetRetainedTopicMessage(string topic, Guid senderId, ReadOnlyMemory<byte> body)
+    {
+        if (body.Length > Protocol.MaxRetainedMessageBytes)
+        {
+            _logger.LogWarning(
+                "Retained topic message from {SenderId} dropped: {BodyLength} bytes exceeds the "
+                + "{MaxRetainedMessageBytes}-byte maximum for a retained value",
+                senderId,
+                body.Length,
+                Protocol.MaxRetainedMessageBytes);
+            return;
+        }
+
+        if (body.Length == 0)
+        {
+            _retainedTopics.TryRemove(topic, out _);
+            return;
+        }
+
+        // Checked before the add rather than after, so a flood of distinct retained topics is refused
+        // once the cap is reached rather than merely bounded loosely by a post-hoc trim. An update to a
+        // topic already holding a retained value is never refused by the cap, since it replaces an
+        // existing entry rather than growing the dictionary.
+        if (!_retainedTopics.ContainsKey(topic) && _retainedTopics.Count >= Protocol.MaxRetainedTopicCount)
+        {
+            _logger.LogWarning(
+                "Retained topic message from {SenderId} dropped: the hub already holds "
+                + "{MaxRetainedTopicCount} distinct retained topics",
+                senderId,
+                Protocol.MaxRetainedTopicCount);
+            return;
+        }
+
+        _retainedTopics[topic] = (senderId, body.ToArray());
+    }
+
+    /// <summary>
+    /// Delivers every retained topic value that matches a client's newly added subscription pattern, so
+    /// the new subscriber sees each topic's last-value message immediately rather than waiting for the
+    /// next live publish. Mirrors <see cref="ReplayRetainedGroupMessage"/>, except that one new pattern
+    /// may match many retained topics at once, where one group join replays at most one value.
+    /// </summary>
+    /// <remarks>
+    /// Scanning <c>_retainedTopics</c> costs the hub regardless of how many, if any, entries actually
+    /// match — exactly the reason <see cref="MessageType.FindClientsRequest"/> is gated behind
+    /// <see cref="RateLimiting.ClientRateLimiter.TryAdmitFanOut"/> despite not itself being a fan-out —
+    /// so <see cref="MessageType.SubscribeTopic"/> is gated behind that same budget at the receive loop's
+    /// dispatch site for the identical reason. That bounds how <i>often</i> a client may trigger this
+    /// scan; it does not bound how much any one call can actually replay, which is what the delivery-
+    /// volume charge below is for: a wildcard pattern matching thousands of retained topics is exactly
+    /// the amplification <see cref="RateLimiting.ClientRateLimiter.TryAdmitFanOutDelivery"/> exists to
+    /// bound, charged here per topic actually about to be replayed rather than pre-computed as one lump
+    /// sum, so a budget exhausted partway through stops the remaining frames from ever being built —
+    /// not merely from being sent.
+    /// </remarks>
+    private void ReplayRetainedTopicMessages(ClientConnection connection, string pattern)
+    {
+        if (_retainedTopics.IsEmpty)
+        {
+            return;
+        }
+
+        string[] patternSegments;
+        try
+        {
+            // Split and validated once here rather than once per retained topic inside the loop below —
+            // the pattern itself never changes across iterations, only the topic being tested against it
+            // does, so re-parsing it on every one of up to Protocol.MaxRetainedTopicCount iterations
+            // would be pure waste.
+            patternSegments = TopicSubscriptionTrie.SplitAndValidatePattern(pattern);
+        }
+        catch (ArgumentException)
+        {
+            // Already validated at the SubscribeTopic dispatch site before this is reached; this should
+            // never throw, but a sender-reachable path must never propagate an exception regardless.
+            return;
+        }
+
+        // Snapshotted rather than enumerated live: _retainedTopics can be mutated by a concurrent publish
+        // while this runs, and a torn enumeration of a ConcurrentDictionary never throws, but a snapshot
+        // keeps the set of topics considered here consistent with itself for the duration of this call.
+        foreach (KeyValuePair<string, (Guid SenderId, byte[] Body)> entry in _retainedTopics.ToArray())
+        {
+            bool matches;
+            try
+            {
+                matches = TopicSubscriptionTrie.PatternMatches(patternSegments, entry.Key);
+            }
+            catch (ArgumentException)
+            {
+                // A stored topic key is always concrete and was validated when it was retained; this
+                // should never throw either, but the same defensive rule applies.
+                continue;
+            }
+
+            if (!matches)
+            {
+                continue;
+            }
+
+            if (!connection.RateLimiter.TryAdmitFanOutDelivery(1))
+            {
+                if (_rateLimitLogThrottle.ShouldLog())
+                {
+                    _logger.LogWarning(
+                        "Client {ClientId} exceeded its fan-out delivery-volume rate limit; the "
+                        + "remainder of its retained topic replay for pattern {Pattern} was dropped",
+                        connection.Id,
+                        ForLog(pattern));
+                }
+
+                return;
+            }
+
+            ReplayRetainedTopicMessage(connection, entry.Key, entry.Value.SenderId, entry.Value.Body);
+        }
+    }
+
+    /// <summary>
+    /// Delivers a single retained topic value to a newly subscribed client. Mirrors
+    /// <see cref="ReplayRetainedGroupMessage"/>'s frame-building exactly, but for a topic frame shape.
+    /// </summary>
+    private void ReplayRetainedTopicMessage(ClientConnection connection, string topic, Guid senderId, byte[] body)
+    {
+        byte[] topicBytes = Encoding.UTF8.GetBytes(topic);
+
+        byte[] frame;
+        int frameLength;
+        if (connection.NegotiatedProtocolVersion >= Protocol.HeaderEnvelopeMinVersion)
+        {
+            var headers = new MessageHeaders(
+            [
+                new KeyValuePair<string, string>(RetainHeaderKeys.Retain, "1"),
+            ]);
+            int headerLength = HeaderEnvelope.GetEncodedLength(headers);
+            var headerBlock = new byte[headerLength];
+            HeaderEnvelope.Write(headers, headerBlock);
+
+            frameLength = 1 + 16 + 2 + topicBytes.Length + 2 + headerBlock.Length + body.Length;
+            if (ExceedsFrameCap(frameLength))
+            {
+                DropOversizeFanOut(senderId, frameLength, "retained topic message replay");
+                return;
+            }
+
+            frame = BuildDeliverTopicMessageWithHeaders(senderId, topicBytes, headerBlock, body);
+        }
+        else
+        {
+            frameLength = 1 + 16 + 2 + topicBytes.Length + body.Length;
+            if (ExceedsFrameCap(frameLength))
+            {
+                DropOversizeFanOut(senderId, frameLength, "retained topic message replay");
+                return;
+            }
+
+            frame = BuildDeliverTopicMessage(senderId, topicBytes, body);
+        }
+
+        if (!connection.OutboundQueue.TryEnqueue(MessagePriority.Normal, frame))
+        {
+            _logger.LogWarning(
+                "Outbound queue for {ClientId} is full, retained topic message for {Topic} dropped",
+                connection.Id,
+                topic);
         }
     }
 
@@ -5643,6 +6051,13 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         public Lock Lock { get; } = new();
         public HashSet<Guid> Members { get; } = new();
         public bool Removed { get; set; }
+
+        // The group's last-value message, set and cleared under Lock exactly like Members. How many
+        // groups may hold one of these at once is bounded separately, by Protocol.MaxRetainedGroupCount
+        // via _retainedGroupCount — see SetRetainedGroupMessage — since a retained value is a materially
+        // larger amplification than the few hundred bytes _groups itself is already unbounded by
+        // precedent for (see KI-63).
+        public (Guid SenderId, byte[] Body)? Retained { get; set; }
     }
 
     // A single peer hub link. Mirrors ClientConnection's own shape deliberately — an outbound queue and

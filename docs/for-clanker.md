@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 34028d8 (feature/scale-out-backplane — issue #41, scale-out backplane, on top of the merged issue #40 hub-federation work on main)
+reconciled-to-commit: ff2d8be (feature/retained-messages — issue #42, retained/last-value messages for groups and topics, on top of the merged issue #41 scale-out-backplane work on main; tracked as PR #146, open and unmerged at the time of this pass)
 reconciled-to-date: 2026-07-31
 mode: update
 -->
@@ -12,7 +12,66 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree, latest pass:** issue #41 landed on `feature/scale-out-backplane` (branched from
+> **Documented tree, latest pass:** issue #42 landed on `feature/retained-messages` (branched from `main`
+> after issue #41's scale-out-backplane work merged as `a769dbf`), two commits (`c88b367`, `ff2d8be`) —
+> tracked as **PR #146, open and unmerged** at the time of this pass; do not document anything below as
+> merged into `main`. `git diff main...HEAD --stat`: 9 files, 1172 insertions, 3 deletions — `MeshHub.cs`
+> (+421), a new `Messages/RetainHeaderKeys.cs` (20 lines), `Messages/Protocol.cs` (+33, three new
+> constants), `TopicSubscriptionTrie.cs` (+86, two new public static pattern-matching helpers plus their
+> private implementation), `IMeshClient.cs` (+63) and `MeshClient.cs` (+42), and test growth across
+> `MeshClientTests.cs` (+94), a new `RetainedMessageTests.cs` (351 lines) and
+> `TopicSubscriptionTrieTests.cs` (+65). The second commit is a fix to the first, not a separate feature:
+> "fix: close retained-message race and bound its amplification" moves the topic-side retained-value store
+> ahead of the recipient-matching snapshot (see KI-73 below) and adds the two new count caps
+> (`Protocol.MaxRetainedGroupCount`/`MaxRetainedTopicCount`) alongside the size cap the first commit
+> shipped with.
+>
+> **This branch adds an opt-in, MQTT-style last-value message per group and per topic** — a `retain` flag
+> on an already-header-bearing group send or topic publish that asks the hub to keep it and replay it once
+> to whoever joins the group, or subscribes with a matching pattern, next. Built the same "fourth route"
+> way as priority, backpressure, expiry and delivery acknowledgement before it: no new opcode, no protocol
+> version bump, entirely inside the existing header envelope via one new well-known key,
+> `RetainHeaderKeys.Retain` (`"mesh.retain"`). Two new client-side convenience overloads —
+> `SendToGroupAsync`/`PublishAsync` with a trailing `bool retain` — mirror the shape
+> `SendToGroupAsync(..., MessagePriority, ...)` already established. An empty body clears the retained
+> value rather than storing one, mirroring MQTT's own semantics; a retained value is capped independently
+> by size (`Protocol.MaxRetainedMessageBytes`, 64 KiB) and by count
+> (`Protocol.MaxRetainedGroupCount`/`MaxRetainedTopicCount`, 10,000 each) — the latter a materially larger
+> amplification than the pre-existing, never-capped group-membership and topic-subscription counts (KI-63)
+> that a retained value could otherwise ride on unbounded. Full write-up in
+> [hub.md](for-clanker/hub.md#retained-messages), [client.md](for-clanker/client.md#retained-messages) and
+> [protocol.md](for-clanker/protocol.md#retained-message-header-issue-42).
+>
+> **One known, deliberately disclosed trade-off, substantiated directly against the code: group-side
+> retention is fully race-free, topic-side is not, and cannot be without a disproportionate cost.**
+> `AddToGroup` snapshots a group's retained value inside the *same* lock that adds the new member, so a
+> join can never land in the gap between the recipient snapshot and the retained-value read. A topic has
+> no equivalent shared lock between publishing and subscribing, so `PublishToTopicWithHeaders` stores the
+> retained value *before* matching subscribers — a deliberate choice that eliminates a silent, permanent
+> miss but leaves a narrower window where a subscribe racing a retained publish receives a duplicate
+> delivery of the same content, never a loss. Recorded as new
+> **[known-issues.md](for-clanker/known-issues.md) KI-73** (low, correctness, open — by design).
+>
+> **A second, related behavioural change is not itself a known issue — it is the fix, not the gap.**
+> `SubscribeTopic` now participates in the same fan-out-frequency rate-limit gate as
+> `BroadcastMessage`/`GroupMessage`/`PublishTopicMessage`/`FindClientsRequest`, since a successful
+> subscribe now scans every retained topic for a match; a subscribe's own retained-topic replay is
+> separately charged against the fan-out delivery-volume budget, per topic as it is replayed, so a
+> wildcard subscription matching a large number of retained topics stops building further frames once the
+> budget is exhausted rather than building all of them regardless. See
+> [hub.md](for-clanker/hub.md#rate-limiting).
+>
+> **Files touched this pass:** [for-clanker.md](../for-clanker.md) (this file — freshness stamp, this
+> blockquote), [known-issues.md](for-clanker/known-issues.md) (summary table, new KI-73 detailed entry),
+> [hub.md](for-clanker/hub.md) (new Retained messages section, Rate limiting section, Routing helpers
+> table rows for `AddToGroup`/`SendToGroupWithHeaders`/`PublishToTopicWithHeaders`),
+> [client.md](for-clanker/client.md) (new Retained messages section, Public surface table rows for both
+> retain overloads), and [protocol.md](for-clanker/protocol.md) (new Retained message header section). No
+> file outside `./docs/` was modified.
+>
+> ---
+>
+> **Documented tree (prior pass):** issue #41 landed on `feature/scale-out-backplane` (branched from
 > `main` after issue #40's hub-federation work merged as `0f715e3`) — commit `34028d8` adds
 > `IHubBackplane`/`InMemoryHubBackplane`/`BackplaneMessage` (core library) and a new
 > `AdamSalisbury.Meshworx.Backplane.Redis` package (`RedisHubBackplane`), a new `backplane` constructor
@@ -1163,6 +1222,7 @@ use the manual sequence directly; they do not go through the DI package.
 | Subscribe / unsubscribe to a topic pattern | `SubscribeAsync(pattern)` / `UnsubscribeAsync(pattern)` | Issue #37; MQTT-style `+`/`#` wildcards; **no authorisation seam and no refusal** — a successful call is final; validates the pattern's shape (`ArgumentException`) and requires protocol version 8+ (`NotSupportedException` below it, commit `fb2f9a0`), see KI-61 (fixed)/KI-62; see [client.md](for-clanker/client.md#topic-based-publishsubscribe) |
 | Publish to a topic | `PublishAsync(topic, payload[, headers])` | Issue #37; every matching subscriber receives it via `TopicMessageReceived`; **no subscription of the publisher's own required**, unlike `SendToGroupAsync`; requires protocol version 8+ regardless of headers, and the headers overload additionally has the same `Protocol.HeaderEnvelopeMinVersion` requirement as the direct/group headers overloads, plus distributed-trace propagation since commit `fb2f9a0`; see [client.md](for-clanker/client.md#topic-based-publishsubscribe) |
 | Learn a topic message arrived | `TopicMessageReceived` event | Issue #37; carries the concrete topic published to (never the subscriber's own pattern), sender id, payload and headers |
+| Retain a group/topic send as the last-value message | `SendToGroupAsync(name, payload, retain: true)` / `PublishAsync(topic, payload, retain: true)` | Issue #42; the hub replays it once to whoever joins the group, or subscribes with a matching pattern, next. Built the same header-envelope "fourth route" as priority above — no new opcode, no version bump. An empty body clears the retained value. Capped by size (`Protocol.MaxRetainedMessageBytes`, 64 KiB) and independently by count (`Protocol.MaxRetainedGroupCount`/`MaxRetainedTopicCount`, 10,000 each). Group-side replay is race-free; topic-side has a narrow, disclosed duplicate-delivery window, see KI-73; see [client.md](for-clanker/client.md#retained-messages) |
 
 ---
 
@@ -1677,6 +1737,14 @@ there is no publish step in CI — CI only builds and tests.
   subscriptions must re-`SubscribeAsync` itself from a `Reconnected` handler. KI-64. **The hub's own
   native session resumption has the identical gap, for a different reason** — a resumed client's topic
   subscriptions are lost too, with nothing in the `SessionResumed` reply to say so. KI-65.
+- **Retained messages (issue #42) are race-free for groups, not for topics.** A group join can never miss
+  a group's retained value nor duplicate it — the recipient snapshot and the retained-value read happen
+  inside the same lock. A topic subscribe can, rarely, receive a duplicate of a retained publish that
+  races it (never a loss) — a topic has no equivalent shared lock, and the store-before-match ordering
+  chosen to avoid a silent miss leaves this narrower window instead. KI-73. An empty `retain: true` body
+  clears the retained value rather than storing one; a retained value is capped independently by size
+  (`Protocol.MaxRetainedMessageBytes`, 64 KiB) and by count (`Protocol.MaxRetainedGroupCount`/
+  `MaxRetainedTopicCount`, 10,000 each). See [client.md](for-clanker/client.md#retained-messages).
 - **Version negotiation is now actually used, but only for one capability.** The hub picks the highest
   wire-protocol version common to its own range and the connecting client's, so a range mismatch fails
   gracefully instead of the old hard refuse-on-mismatch. PR #74's message-header envelope is the first

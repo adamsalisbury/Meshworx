@@ -37,6 +37,7 @@ up peers, manages group membership, and raises events for inbound traffic and di
 | `SendToGroupAsync` | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, CancellationToken=default)` — compatibility overload, forwards to the headers overload with `MessageHeaders.Empty` | `MeshClient.cs:659` |
 | `SendToGroupAsync` (headers) | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); see [Sending headers](#sending-headers) | `MeshClient.cs:668` |
 | `SendToGroupAsync` (priority) | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, MessagePriority priority, CancellationToken=default)` — priority lanes (`ab16567`); `Normal` short-circuits to the headerless overload, anything else takes the header-bearing path; see [Message priority](#message-priority) | `MeshClient.cs:1093-1111` |
+| `SendToGroupAsync` (retain) | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, bool retain, CancellationToken=default)` — issue #42; `retain: false` short-circuits to the headerless overload, `true` builds a single-header `MessageHeaders` and takes the header-bearing path; see [Retained messages](#retained-messages) | `MeshClient.cs:1142-1160` |
 | `SendLargeAsync` | `Task SendLargeAsync(Guid recipientId, ReadOnlyMemory<byte>, MessageHeaders? headers=null, CancellationToken=default)` — chunking (feat #93); requires protocol version 5+ (throws `NotSupportedException` below it); no `DeliveryOptions`/priority/ack support; see [Large-message chunking](#large-message-chunking) | `MeshClient.cs:891-895` |
 | `GetClientIdByNameAsync` | `Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken=default)` | `MeshClient.cs:820` |
 | `RequestAsync` | `Task<ReadOnlyMemory<byte>> RequestAsync(Guid recipientId, ReadOnlyMemory<byte>, TimeSpan timeout, CancellationToken=default)` — PR #83; correlated request/reply over a direct message, see [Request/response (RPC)](#request-response) | `MeshClient.cs:869` |
@@ -44,6 +45,7 @@ up peers, manages group membership, and raises events for inbound traffic and di
 | `SubscribeAsync` / `UnsubscribeAsync` | `Task ...(string pattern, CancellationToken=default)` — issue #37; **optimistic**, mirroring `JoinGroupAsync`/`LeaveGroupAsync`, except there is no refusal to react to — no authorisation seam exists at all. `SubscribeAsync` records the pattern in `SubscribedTopics` before sending and rolls the record back if the send itself throws. Both validate the pattern's shape (`ArgumentException`) and require protocol version `Protocol.TopicPubSubMinVersion` (`8`, `NotSupportedException` below it — commit `fb2f9a0`); see [Topic-based publish/subscribe](#topic-based-publishsubscribe) | `MeshClient.cs:1133` / `:1170` |
 | `PublishAsync` | `Task PublishAsync(string topic, ReadOnlyMemory<byte>, CancellationToken=default)` — issue #37; compatibility overload, forwards to the headers overload with `MessageHeaders.Empty`. **No subscription of the publisher's own required.** Throws `ArgumentException` for an invalid topic shape (wildcard segment, empty segment, over the 128-segment cap, or exceeding `ushort.MaxValue` UTF-8 bytes) and `NotSupportedException` below protocol version `8` | `MeshClient.cs:1187` |
 | `PublishAsync` (headers) | `Task PublishAsync(string topic, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — issue #37; same version requirement as the direct/group headers overloads (`RequireHeaderEnvelopeSupport`) when `headers` is non-empty, plus the topic pub/sub gate above; starts a `Producer` trace activity since commit `fb2f9a0` (see [Distributed tracing](#distributed-tracing)); see [Topic-based publish/subscribe](#topic-based-publishsubscribe) | `MeshClient.cs:1194` |
+| `PublishAsync` (retain) | `Task PublishAsync(string topic, ReadOnlyMemory<byte>, bool retain, CancellationToken=default)` — issue #42; `retain: false` short-circuits to the headerless overload, `true` builds a single-header `MessageHeaders` and takes the header-bearing path, mirroring `SendToGroupAsync` (retain); see [Retained messages](#retained-messages) | `MeshClient.cs:1283-1301` |
 | `MessageReceived` | `event EventHandler<MessageReceivedEventArgs>` — direct **and** broadcast; `Headers` populated when the sender attached any (PR #74); `CorrelationId` set when the message is a request awaiting a reply (PR #83) | `MeshClient.cs:164` |
 | `GroupMessageReceived` | `event EventHandler<GroupMessageReceivedEventArgs>` — carries group name; `Headers` populated when the sender attached any (PR #74) | `MeshClient.cs:167` |
 | `TopicMessageReceived` | `event EventHandler<TopicMessageReceivedEventArgs>` — issue #37; carries the concrete topic (never a pattern) plus sender id, data and headers; see [Topic-based publish/subscribe](#topic-based-publishsubscribe) | `MeshClient.cs:253` |
@@ -470,6 +472,66 @@ version-gate gap this section previously described is fixed**: commit `fb2f9a0` 
 `RequireTopicPubSubSupport(NegotiatedProtocolVersion)` before sending, throwing `NotSupportedException` on
 a connection negotiated below it — see [known-issues.md](known-issues.md) KI-61 (fixed) and
 [protocol.md](protocol.md#versioning) for the pattern this now follows.
+
+<a id="retained-messages"></a>
+
+### Retained messages
+
+Added for issue #42. An opt-in last-value message per group and per topic: pass `retain: true` to
+`SendToGroupAsync`/`PublishAsync` and the hub keeps that send as the group's or topic's retained value,
+replayed once to a client that joins the group — or subscribes with a matching pattern — afterwards. Full
+hub-side mechanics in [hub.md](hub.md#retained-messages); wire layout in
+[protocol.md](protocol.md#retained-message-header-issue-42).
+
+```csharp
+// Publish the current state as the topic's retained value:
+await sensor.PublishAsync("devices.sensor-1.status", Encoding.UTF8.GetBytes("online"), retain: true);
+
+// A client that subscribes afterwards receives it immediately, via the ordinary event:
+await dashboard.SubscribeAsync("devices.+.status");
+dashboard.TopicMessageReceived += (_, e) =>
+    Console.WriteLine($"{e.Topic}: {Encoding.UTF8.GetString(e.Data.Span)}");
+
+// Retaining an empty body clears it:
+await sensor.PublishAsync("devices.sensor-1.status", ReadOnlyMemory<byte>.Empty, retain: true);
+```
+
+**`SendToGroupAsync(string, ReadOnlyMemory<byte>, bool retain, CancellationToken)` and
+`PublishAsync(string, ReadOnlyMemory<byte>, bool retain, CancellationToken)`** (`MeshClient.cs:1142-1160`,
+`:1283-1301`) both follow the exact shape `SendToGroupAsync(..., MessagePriority, ...)` already established
+for a bool/enum convenience overload: `retain: false` short-circuits to the plain headerless overload —
+byte-for-byte identical to a send that never mentions retention at all — and `retain: true` builds a
+single-entry `MessageHeaders` carrying `RetainHeaderKeys.Retain = "mesh.retain"` and forwards to the
+corresponding headers overload. There is no separate `retain` parameter on the headers overloads
+themselves — a caller that wants to combine retention with its own headers on
+`SendToGroupAsync`/`PublishAsync` sets `"mesh.retain"` directly. **Unlike request/reply, acknowledgement,
+expiry, backpressure and priority, `RetainHeaderKeys.Retain` is not in `ReservedHeaderKeys`
+(`MeshClient.cs:868-891`)** — `ThrowIfReservedHeaderKeyPresent` is only ever called from `SendAsync`'s
+headers overload and the request/reply/chunking machinery built on it, never from `SendToGroupAsync`'s or
+`PublishAsync`'s headers overloads, which have never guarded any reserved key (see
+[Sending headers](#sending-headers) below) — so this is consistent with, not an exception to, the existing
+gap, not a new one this feature introduces.
+
+**Retaining an empty body clears the retained value rather than storing an empty one** — mirroring MQTT's
+own retained-message semantics; there is no separate "clear" call. A retained group send still requires
+group membership, exactly like any other `SendToGroupAsync`; a retained topic publish still requires no
+subscription of the publisher's own, exactly like any other `PublishAsync`.
+
+**Both overloads throw `NotSupportedException` when `retain: true` on a connection negotiated below
+`Protocol.HeaderEnvelopeMinVersion`** — the same `RequireHeaderEnvelopeSupport` guard every other
+header-bearing send already goes through — rather than silently sending an unretained message. A *replay*
+delivered to an older client (negotiated below the header envelope) is not affected by this — the hub
+still sends the retained body, just without the `mesh.retain` marker, since the client cannot understand
+a header block at all; see [hub.md](hub.md#retained-messages).
+
+**A retained value is bounded independently of any existing group/topic-count limit.** A body over
+`Protocol.MaxRetainedMessageBytes` (64 KiB) is refused by the hub and logged, never stored — this surfaces
+as the send simply never being retained, not as an exception on the caller's `SendToGroupAsync`/
+`PublishAsync` itself, since retention piggybacks on an otherwise-ordinary fire-and-forget send. See
+[hub.md](hub.md#retained-messages) for the count caps (`Protocol.MaxRetainedGroupCount`/
+`MaxRetainedTopicCount`, 10,000 each) and [known-issues.md](known-issues.md) KI-73 for the one disclosed
+race — a subscribe landing in a narrow window around a retained topic publish can receive a duplicate
+delivery of the same content, never a loss.
 
 <a id="sending-headers"></a>
 

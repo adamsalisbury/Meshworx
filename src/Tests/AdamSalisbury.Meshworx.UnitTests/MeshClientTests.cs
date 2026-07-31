@@ -2131,6 +2131,100 @@ public sealed class MeshClientTests
     }
 
     /// <summary>
+    /// SendToGroupAsync's retain overload writes the reserved retain header, mirroring its priority
+    /// overload, so the hub knows to keep this send as the group's last-value message.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendToGroupAsync_WithRetainTrue_SendsRetainHeader()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.SendToGroupAsync("group-a", new byte[] { 1 }, retain: true);
+
+        Assert.NotNull(sentData);
+        Assert.Equal((byte)MessageType.GroupMessageWithHeaders, sentData[0]);
+        int nameLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(1, 2));
+        int headerLengthOffset = 3 + nameLength;
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(headerLengthOffset, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(sentData.AsSpan(headerLengthOffset + 2), headerLength);
+        Assert.Equal("1", decoded[RetainHeaderKeys.Retain]);
+    }
+
+    /// <summary>
+    /// SendToGroupAsync's retain overload is equivalent to the plain overload when retain is false — no
+    /// header block is written at all, mirroring the priority overload's own Normal fast path.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task SendToGroupAsync_WithRetainFalse_SendsPlainFrameWithNoHeaderBlock()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.SendToGroupAsync("group-a", new byte[] { 1 }, retain: false);
+
+        Assert.NotNull(sentData);
+        Assert.Equal((byte)MessageType.GroupMessage, sentData[0]);
+    }
+
+    /// <summary>
+    /// PublishAsync's retain overload writes the reserved retain header, mirroring
+    /// SendToGroupAsync's retain overload for the same wire behaviour on a topic publish.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task PublishAsync_WithRetainTrue_SendsRetainHeader()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.PublishAsync("orders.created", new byte[] { 1 }, retain: true);
+
+        Assert.NotNull(sentData);
+        Assert.Equal((byte)MessageType.PublishTopicMessageWithHeaders, sentData[0]);
+        int topicLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(1, 2));
+        int headerLengthOffset = 3 + topicLength;
+        int headerLength = BinaryPrimitives.ReadUInt16BigEndian(sentData.AsSpan(headerLengthOffset, 2));
+        MessageHeaders decoded = HeaderEnvelope.Read(sentData.AsSpan(headerLengthOffset + 2), headerLength);
+        Assert.Equal("1", decoded[RetainHeaderKeys.Retain]);
+    }
+
+    /// <summary>
+    /// PublishAsync's retain overload is equivalent to the plain overload when retain is false — no
+    /// header block is written at all.
+    /// </summary>
+    [Fact(Timeout = 1000)]
+    public async Task PublishAsync_WithRetainFalse_SendsPlainFrameWithNoHeaderBlock()
+    {
+        var fixture = new MeshClientFixture();
+        await fixture.ConnectAsync();
+
+        byte[]? sentData = null;
+        fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) => sentData = data.ToArray())
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.PublishAsync("orders.created", new byte[] { 1 }, retain: false);
+
+        Assert.NotNull(sentData);
+        Assert.Equal((byte)MessageType.PublishTopicMessage, sentData[0]);
+    }
+
+    /// <summary>
     /// A QueueSaturated control frame from the hub raises SendRejected, naming the recipient whose queue
     /// was full, so an application can observe a drop the hub was configured to report.
     /// </summary>
