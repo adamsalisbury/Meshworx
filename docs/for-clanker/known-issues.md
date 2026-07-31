@@ -79,6 +79,8 @@ the risk to a change, not a claim that the code is defective.
 | KI-68 | An admitted peer link is trusted to report sender identity truthfully — a forwarded message's claimed senderId is never verified against the peer's own client set | `MeshHub.cs` (`HandlePeerDeliverMessage`, `HandlePeerDeliverGroupMessage`, `HandlePeerDeliverTopicMessage`) | high (security) | open — **by design**, the federation trust boundary; see full entry below |
 | KI-69 | Structured headers (and everything built on them — TTL, priority, `DeliveryOptions.RequireAck`, `RequestAsync`/`ReplyAsync`) do not cross a federation boundary; a header-bearing send to a recipient that turns out to be on a peer hub falls back to the offline store or drops, rather than silently losing the headers | `MeshHub.cs` (`RouteMessageWithHeaders` has no peer-forward fallback; `SendToGroupWithHeaders`/`PublishToTopicWithHeaders` are not hooked into `ForwardGroupMessageToPeers`/`ForwardTopicMessageToPeers`) | medium (correctness) | open — **deliberately deferred**, disclosed in issue #40's PR; see full entry below |
 | KI-70 | Federation has no transitive multi-hop routing — a route learned from one peer is never re-advertised to another, so reaching a client on hub C from hub A requires a direct A↔C link, not just A↔B↔C | `MeshHub.cs` (`HandlePeerRouteAdvertise` only ever adds to local tables, never re-broadcasts; `HandlePeerDeliverMessage`/`HandlePeerDeliverGroupMessage`/`HandlePeerDeliverTopicMessage` only ever deliver locally, never re-forward) | medium (correctness), by design | open — **by design**, this is also what makes the topology loop-free without needing a hop-count budget; see full entry below |
+| KI-71 | A direct send published to the backplane for an unknown-local recipient is always treated as handled, even though the backplane gives no confirmation any instance actually holds the recipient — it never also falls back to the offline store | `MeshHub.cs` (`TryPublishDirectToBackplane`, called from `RouteMessage` before the offline-store fallback) | medium (correctness), by design | open — **by design**, see full entry below |
+| KI-72 | Structured headers do not cross a backplane, mirroring KI-69's identical limitation for federation | `MeshHub.cs` (`RouteMessageWithHeaders`, `SendToGroupWithHeaders`, `PublishToTopicWithHeaders` are not wired into backplane publishing) | medium (correctness) | open — **deliberately deferred**, disclosed in issue #41's PR; see full entry below |
 
 ---
 
@@ -2088,6 +2090,41 @@ above assert; see [hub.md](hub.md#session-resumption) for where they're describe
   full mesh) rather than assuming a chain or a hub-and-spoke topology will transit. `N` hubs need up to
   `N × (N − 1) / 2` links for full reachability. A future issue could add transitive routing on top of
   this — the single-hop version is a safe, complete substrate to build it on, not a dead end.
+
+### KI-71 — A backplane-published direct send is always treated as handled, with no delivery confirmation
+- **Where:** `MeshHub.cs` — `TryPublishDirectToBackplane`, called from `RouteMessage` after the
+  federation fallback (`TryForwardToPeer`) and before the offline-store fallback.
+- **Severity:** medium (correctness), by design.
+- **Why it bites:** federation's `_remoteIdsToPeer` directory only forwards a message when this hub
+  already knows, from a `PeerRouteAdvertise` it received, that a specific peer owns the recipient — so a
+  federated forward is only ever attempted when it can actually land somewhere. A backplane offers no
+  equivalent certainty: `IHubBackplane.PublishAsync` is fire-and-hope, since nothing in the interface
+  tells the publishing instance whether *any* other instance sharing it currently holds the recipient.
+  `TryPublishDirectToBackplane` still returns `true` (handled) whenever a backplane is configured, so
+  `RouteMessage` never falls through to the offline store for a direct send once a backplane exists — a
+  message for a recipient that is not actually connected to *any* instance is published into the void and
+  silently dropped by everyone, rather than being held for later delivery.
+- **What to do:** a deployment that needs guaranteed store-and-forward for a genuinely offline recipient
+  alongside a backplane should not assume the offline store is ever consulted for a direct send once
+  `backplane` is configured — it is not, for any recipient this hub cannot find locally. This is a
+  reasonable trade-off for the common case (the recipient is very likely connected to *some* instance,
+  since a backplane's whole purpose is treating the fleet as one hub) but is a real gap for the "client is
+  actually offline" case specifically.
+
+### KI-72 — Structured headers do not cross a backplane
+- **Where:** `MeshHub.cs` — `RouteMessageWithHeaders` has no backplane-fallback counterpart to
+  `TryPublishDirectToBackplane`; `SendToGroupWithHeaders`/`PublishToTopicWithHeaders` are not hooked into
+  backplane publishing the way `SendToGroup`/`PublishToTopic` are.
+- **Severity:** medium (correctness), deliberately deferred.
+- **Why it bites:** identical reasoning to KI-69 (federation's equivalent limitation) — silently
+  stripping headers to publish the body alone would break `RequestAsync`/`ReplyAsync`,
+  `DeliveryOptions.RequireAck`, TTL and priority in confusing ways rather than failing honestly, so the
+  header-bearing send paths were deliberately left unmodified. A header-bearing send to a recipient that
+  turns out to be on a different instance falls back to the offline store or drops, exactly as it would
+  without a backplane configured at all.
+- **What to do:** as KI-69 — plain `SendAsync`/`SendToGroupAsync`/`PublishAsync` (no headers) and
+  `BroadcastAsync` are unaffected; anything built on the header envelope is not reachable across
+  instances via the backplane in this version.
 
 ---
 
