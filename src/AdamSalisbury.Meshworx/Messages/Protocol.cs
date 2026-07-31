@@ -126,11 +126,23 @@ internal static class Protocol
     /// The maximum number of distinct topics the hub will hold a retained value for at once.
     /// </summary>
     /// <remarks>
-    /// Needed only for topics, not groups: a group's retained value piggybacks on the already-unbounded-
-    /// by-precedent <c>_groups</c> dictionary (see KI-63), so it adds no new dimension of growth. A
-    /// topic's retained value has no such existing container to ride alongside — <c>_retainedTopics</c> is
-    /// a new top-level dictionary that could otherwise grow without bound purely from retained publishes,
-    /// even with zero live subscribers to any of them.
+    /// <c>_retainedTopics</c> is a new top-level dictionary with no existing container to ride alongside
+    /// — unlike a group's retained value, which piggybacks on the already-unbounded-by-precedent
+    /// <c>_groups</c> dictionary (see KI-63) — so it could otherwise grow without bound purely from
+    /// retained publishes, even with zero live subscribers to any of them. See also
+    /// <see cref="MaxRetainedGroupCount"/>, which bounds the equivalent amplification for groups.
     /// </remarks>
     internal const int MaxRetainedTopicCount = 10_000;
+
+    /// <summary>
+    /// The maximum number of groups that may simultaneously hold a retained value.
+    /// </summary>
+    /// <remarks>
+    /// A group's own membership is already unbounded by precedent (see KI-63), but only by a few hundred
+    /// bytes of overhead each. A retained value turns that same unbounded count into up to
+    /// <see cref="MaxRetainedMessageBytes"/> each — a materially larger amplification than the pre-
+    /// existing gap, so it is bounded independently of group count itself, mirroring
+    /// <see cref="MaxRetainedTopicCount"/> for topics.
+    /// </remarks>
+    internal const int MaxRetainedGroupCount = 10_000;
 }

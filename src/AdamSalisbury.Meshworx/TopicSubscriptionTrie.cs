@@ -158,7 +158,36 @@ internal sealed class TopicSubscriptionTrie : IDisposable
     /// </exception>
     internal static bool PatternMatches(string pattern, string topic)
     {
-        string[] patternSegments = SplitAndValidate(pattern, isPattern: true, nameof(pattern));
+        return PatternMatches(SplitAndValidatePattern(pattern), topic);
+    }
+
+    /// <summary>
+    /// Splits and validates a subscription pattern for repeated use with
+    /// <see cref="PatternMatches(string[], string)"/>, without testing it against any particular topic.
+    /// </summary>
+    /// <remarks>
+    /// Intended for a caller that tests one pattern against many topics in a loop — replaying every
+    /// retained topic a new subscription matches, notably — so the pattern itself is split and validated
+    /// once rather than being re-parsed on every iteration; only the topic side still varies per call.
+    /// </remarks>
+    /// <param name="pattern">The subscription pattern to split and validate.</param>
+    /// <returns>The pattern's segments, ready to pass to <see cref="PatternMatches(string[], string)"/>.</returns>
+    /// <exception cref="ArgumentException"><paramref name="pattern"/> is not a valid pattern.</exception>
+    internal static string[] SplitAndValidatePattern(string pattern)
+    {
+        return SplitAndValidate(pattern, isPattern: true, nameof(pattern));
+    }
+
+    /// <summary>
+    /// Tests whether a pattern, already split via <see cref="SplitAndValidatePattern"/>, matches a single
+    /// concrete topic.
+    /// </summary>
+    /// <param name="patternSegments">A pattern's segments, as returned by <see cref="SplitAndValidatePattern"/>.</param>
+    /// <param name="topic">The concrete topic to test it against.</param>
+    /// <returns><see langword="true"/> if the pattern matches <paramref name="topic"/>.</returns>
+    /// <exception cref="ArgumentException"><paramref name="topic"/> is not a valid concrete topic.</exception>
+    internal static bool PatternMatches(string[] patternSegments, string topic)
+    {
         string[] topicSegments = SplitAndValidate(topic, isPattern: false, nameof(topic));
 
         return SegmentsMatch(patternSegments, 0, topicSegments, 0);

@@ -290,4 +290,62 @@ public sealed class RetainedMessageTests
 
         await hub.StopAsync();
     }
+
+    /// <summary>
+    /// A single subscribe matching several retained topics at once is bounded by the same fan-out
+    /// delivery-volume budget an equivalent live publish would be — a wildcard pattern cannot force the
+    /// hub into unlimited replay just because it originates from one small inbound frame.
+    /// </summary>
+    [Fact(Timeout = 10000)]
+    public async Task EndToEnd_SubscribeMatchingManyRetainedTopics_IsBoundedByDeliveryVolumeBudget()
+    {
+        var listener = new InMemoryTransportListener();
+        await using var hub = new MeshHub(
+            new Mock<ILogger<MeshHub>>().Object,
+            listener,
+            maxFanOutMessagesPerSecond: 100,
+            maxFanOutDeliveriesPerSecond: 3);
+        await hub.StartAsync();
+
+        await using var publisher = CreateClient();
+        await publisher.ConnectAsync(listener.Connect(), "Publisher");
+
+        // Five retained topics, all matching the wildcard pattern the subscriber below uses. Published
+        // before anyone subscribes, so none of this spends the publisher's own delivery-volume budget —
+        // that budget is only charged for an actual recipient, and there are none yet.
+        for (int i = 0; i < 5; i++)
+        {
+            await publisher.PublishAsync(
+                $"orders.region{i}.created", Encoding.UTF8.GetBytes($"order {i}"), retain: true);
+        }
+
+        await publisher.GetClientIdByNameAsync("Publisher"); // barrier: all five retained
+
+        await using var subscriber = CreateClient();
+        await subscriber.ConnectAsync(listener.Connect(), "Subscriber");
+
+        var received = new List<string>();
+        subscriber.TopicMessageReceived += (_, e) =>
+        {
+            lock (received)
+            {
+                received.Add(e.Topic);
+            }
+        };
+
+        await subscriber.SubscribeAsync("orders.#");
+        // Barrier: replay runs synchronously within the hub's own handling of the subscribe frame, on
+        // the subscriber's own connection, so a round trip on that same connection guarantees replay —
+        // whatever the budget allowed of it — has already happened by the time this returns.
+        await subscriber.GetClientIdByNameAsync("Publisher");
+
+        lock (received)
+        {
+            // A budget of 3 admits exactly three of the five matching retained topics; the rest are
+            // dropped rather than built and enqueued regardless.
+            Assert.Equal(3, received.Count);
+        }
+
+        await hub.StopAsync();
+    }
 }

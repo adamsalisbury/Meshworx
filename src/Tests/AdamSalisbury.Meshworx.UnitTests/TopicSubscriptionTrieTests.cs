@@ -239,10 +239,33 @@ public sealed class TopicSubscriptionTrieTests
         // proved here by checking the two never disagree for the same inputs already exercised above.
         Assert.Equal(expectMatch, TopicSubscriptionTrie.PatternMatches(pattern, topic));
 
+        // The pre-split overload, used by a caller testing one pattern against many topics, must agree
+        // with the single-call convenience overload for the exact same inputs.
+        string[] patternSegments = TopicSubscriptionTrie.SplitAndValidatePattern(pattern);
+        Assert.Equal(expectMatch, TopicSubscriptionTrie.PatternMatches(patternSegments, topic));
+
         var trie = new TopicSubscriptionTrie();
         Guid subscriber = Guid.NewGuid();
         trie.Subscribe(pattern, subscriber);
         Assert.Equal(expectMatch, trie.Match(topic).Contains(subscriber));
+    }
+
+    [Fact]
+    public void SplitAndValidatePattern_MalformedPattern_ThrowsArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() => TopicSubscriptionTrie.SplitAndValidatePattern("orders."));
+    }
+
+    [Fact]
+    public void SplitAndValidatePattern_SplitOnce_ReusedAcrossManyTopics()
+    {
+        // The whole point of the pre-split overload: split and validate once, then test it against
+        // several different topics without re-parsing the pattern for each one.
+        string[] patternSegments = TopicSubscriptionTrie.SplitAndValidatePattern("orders.#");
+
+        Assert.True(TopicSubscriptionTrie.PatternMatches(patternSegments, "orders.eu.created"));
+        Assert.True(TopicSubscriptionTrie.PatternMatches(patternSegments, "orders.us.created"));
+        Assert.False(TopicSubscriptionTrie.PatternMatches(patternSegments, "invoices.eu.created"));
     }
 
     [Fact]
