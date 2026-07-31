@@ -1,7 +1,7 @@
 <!-- for-clanker:freshness
 repo: Meshworx (github.com/adamsalisbury/Meshworx)
 scope: full
-reconciled-to-commit: 9ad380f (feature/hub-federation — issue #40, hub-to-hub federation, on top of the merged issue #39 presence/roster work on main)
+reconciled-to-commit: 34028d8 (feature/scale-out-backplane — issue #41, scale-out backplane, on top of the merged issue #40 hub-federation work on main)
 reconciled-to-date: 2026-07-31
 mode: update
 -->
@@ -12,7 +12,16 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
-> **Documented tree, this pass:** issue #39 landed on `feature/presence-roster` (branched from `main`
+> **Documented tree, latest pass:** issue #41 landed on `feature/scale-out-backplane` (branched from
+> `main` after issue #40's hub-federation work merged as `0f715e3`) — commit `34028d8` adds
+> `IHubBackplane`/`InMemoryHubBackplane`/`BackplaneMessage` (core library) and a new
+> `AdamSalisbury.Meshworx.Backplane.Redis` package (`RedisHubBackplane`), a new `backplane` constructor
+> parameter on `MeshHub`, and wires publish/directory fallbacks into `RouteMessage`,
+> `ClientLookupRequest`, `SendToGroup` and `PublishToTopic` (headerless only — see KI-72). The prose
+> below this point, describing issue #39's own pass, is retained as history rather than rewritten; the
+> freshness stamp above and the capabilities table are what is current.
+>
+> **Earlier pass:** issue #39 landed on `feature/presence-roster` (branched from `main`
 > after issue #38's client-attributes work merged as `b03a72d`) — commit `a3d20a3` adds
 > `SubscribePresence`/`UnsubscribePresence`/`PresenceChanged` (opcodes `0x22`–`0x24`),
 > `IMeshClient.GetClientsAsync`/`SubscribePresenceAsync`/`UnsubscribePresenceAsync`/`PresenceChanged`, a
@@ -1217,6 +1226,7 @@ itself, builds a shared `[DeliverTopicMessage][senderId(16)][topicLen(2)][topic]
 | Client attributes & directory queries | `AttributeQuery`, `ClientDescriptor`, `IMeshClient.UpdateAttributesAsync`/`FindClientsAsync`, opcodes `0x1F`–`0x21` (issue #38) | [client.md](for-clanker/client.md#client-attributes--directory-queries), [hub.md](for-clanker/hub.md#client-attributes--directory-queries), [protocol.md](for-clanker/protocol.md#client-attribute-frames-issue-38) |
 | Presence / roster | `PresenceChangeType`, `IMeshClient.GetClientsAsync`/`SubscribePresenceAsync`/`UnsubscribePresenceAsync`/`PresenceChanged`, `enablePresence`, opcodes `0x22`–`0x24` (issue #39) | [client.md](for-clanker/client.md#presence--roster), [hub.md](for-clanker/hub.md#presence--roster), [protocol.md](for-clanker/protocol.md#presence-frames-issue-39) |
 | Hub-to-hub federation | `IMeshHub.LinkPeerAsync`/`HubId`/`LinkedPeerCount`, `PeerAuthenticator`, `allowIncomingPeerLinks`, opcodes `0x25`–`0x2B` on an independent version range (issue #40) | [hub.md](for-clanker/hub.md#hub-to-hub-federation), [protocol.md](for-clanker/protocol.md#peer-link-frames-issue-40) |
+| Scale-out backplane | `IHubBackplane`, `InMemoryHubBackplane`, `BackplaneMessage`/`BackplaneMessageKind` (core library); `RedisHubBackplane`, `BackplaneMessageSerializer` (`AdamSalisbury.Meshworx.Backplane.Redis`, issue #41) | [hub.md](for-clanker/hub.md#scale-out-backplane) |
 | Message priority lanes | `MessagePriority`, `PriorityOutboundQueue`, `DeliveryOptions.AtPriority`/`.WithPriority` (`ab16567`) | [client.md](for-clanker/client.md#message-priority), [hub.md](for-clanker/hub.md#priority-lanes), [protocol.md](for-clanker/protocol.md#priority-header) |
 | Per-client inbound rate limiting | `ClientRateLimiter`, `TokenBucket` (issue #69) | [hub.md](for-clanker/hub.md#rate-limiting) |
 | Distributed tracing propagation | `MeshworxActivitySource`, `TraceContextHeaderKeys` (feat #92) | [client.md](for-clanker/client.md#distributed-tracing), [protocol.md](for-clanker/protocol.md#trace-context-headers) |

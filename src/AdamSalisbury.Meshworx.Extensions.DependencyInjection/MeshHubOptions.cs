@@ -162,4 +162,16 @@ public sealed class MeshHubOptions
     /// <see cref="AllowIncomingPeerLinks"/> is set.
     /// </summary>
     public PeerAuthenticator? PeerAuthenticator { get; set; }
+
+    /// <summary>
+    /// Gets or sets the shared backplane that lets several hub instances behave as one logical hub.
+    /// Left unset, the single-instance path is unchanged.
+    /// </summary>
+    public Backplane.IHubBackplane? Backplane { get; set; }
+
+    /// <summary>
+    /// Gets or sets how long a single backplane operation is given before this hub gives up on it.
+    /// Defaults to 10 seconds when unset. Ignored when <see cref="Backplane"/> is unset.
+    /// </summary>
+    public TimeSpan? BackplaneTimeout { get; set; }
 }

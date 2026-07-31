@@ -1258,6 +1258,52 @@ awaiting the write, and `ITransport.SendAsync` is not safe to call concurrently.
 
 ---
 
+### Scale-out backplane
+
+Added for issue #41. Where federation (issue #40) links autonomous hubs as peers, a backplane makes
+several **interchangeable** instances of the same hub — typically several processes behind a load
+balancer — behave as one. `IHubBackplane` (`AdamSalisbury.Meshworx.Backplane`) is the seam: publish a
+`BackplaneMessage` so every instance sharing it can materialise whatever local delivery it addresses
+(`StartAsync`/`PublishAsync`), and a shared directory mapping a client's name to its id
+(`RegisterClientAsync`/`UnregisterClientAsync`/`TryResolveClientAsync`). Passed to `MeshHub` via the
+`backplane` constructor parameter; left unset, the single-instance path is entirely unchanged.
+
+**A backplane is shared by design, so `MeshHub` never disposes the one it is given.** Many hub instances
+start against the same object (`InMemoryHubBackplane`) or the same underlying store (`RedisHubBackplane`
+instances sharing a server, channel and directory key). Each hub only ever calls `StopAsync(HubId)` on
+its own stop — `HubId` is reused as the backplane's own instance id — leaving the object's actual
+lifecycle, `DisposeAsync`, to whichever caller constructed it, once every hub sharing it is done.
+
+**Every send path composes with, rather than replaces, the existing fallbacks.** `RouteMessage` tries a
+local recipient, then a federated peer (`TryForwardToPeer`), then the backplane
+(`TryPublishDirectToBackplane`), then the offline store, in that order — a hub can have federation,
+a backplane, both, or neither, and each configured mechanism is simply one more thing tried before
+falling through to the next. `SendToGroup`/`PublishToTopic` deliver locally as they always have and,
+independently, forward to every linked peer **and** publish to the backplane, if either is configured —
+neither is exclusive of the other.
+
+**A publish to the backplane has no way of knowing in advance whether any instance holds the recipient**
+— unlike federation's `_remoteIdsToPeer` directory, which only forwards when it already knows the
+answer, `TryPublishDirectToBackplane` always publishes when a backplane is configured and treats the send
+as handled either way, rather than also falling back to the offline store. See
+[known-issues.md](known-issues.md) for this trade-off.
+
+**Trust is total between instances sharing a backplane, by design** — more so than federation, where two
+different hub operators might choose to trust each other only partially. Every instance sharing a
+backplane is assumed to be a fungible part of the same logical hub, so a `senderId` on a backplane
+message is never checked against anything; unlike federation's equivalent (KI-68), this is not treated as
+a disclosed gap so much as the whole point of the abstraction — interchangeable instances trusting each
+other completely is what "behave as one hub" means.
+
+**`RedisHubBackplane`** (`AdamSalisbury.Meshworx.Backplane.Redis`, a separate package — the core library
+takes no Redis dependency) is the default cross-process implementation the issue asks for: one Redis
+pub/sub channel for messages, one Redis hash for the directory. It does not own or dispose the
+`IConnectionMultiplexer` it is constructed with, for the same shared-ownership reason `MeshHub` does not
+dispose the backplane itself. `BackplaneMessageSerializer` is a compact binary format private to this
+package for the pub/sub payload — never seen outside a Redis `PUBLISH`/`SUBSCRIBE` call.
+
+---
+
 <a id="metrics"></a>
 
 ### Metrics

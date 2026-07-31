@@ -11,6 +11,21 @@ jobs:
     name: Build and test
     runs-on: ubuntu-latest
 
+    services:
+      # The scale-out backplane's Redis package (AdamSalisbury.Meshworx.Backplane.Redis) tests against a
+      # real Redis server rather than a mock, so one is available for the whole job on the default port —
+      # exactly the "install what a test suite actually needs, don't assume it" discipline libmsquic
+      # below already established for the QUIC transport.
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6

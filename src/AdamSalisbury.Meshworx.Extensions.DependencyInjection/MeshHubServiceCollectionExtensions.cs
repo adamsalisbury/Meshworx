@@ -134,6 +134,8 @@ public static class MeshHubServiceCollectionExtensions
             options.EnablePresence,
             options.HubId,
             options.AllowIncomingPeerLinks,
-            options.PeerAuthenticator);
+            options.PeerAuthenticator,
+            options.Backplane,
+            options.BackplaneTimeout);
     }
 }
