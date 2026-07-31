@@ -131,6 +131,9 @@ public static class MeshHubServiceCollectionExtensions
             options.MaxInboundBytesPerSecond,
             options.MaxFanOutMessagesPerSecond,
             options.MaxFanOutDeliveriesPerSecond,
-            options.EnablePresence);
+            options.EnablePresence,
+            options.HubId,
+            options.AllowIncomingPeerLinks,
+            options.PeerAuthenticator);
     }
 }

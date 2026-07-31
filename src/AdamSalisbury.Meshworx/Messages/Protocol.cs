@@ -88,4 +88,28 @@ internal static class Protocol
     /// The maximum length, in UTF-8 bytes, of a single attribute value.
     /// </summary>
     internal const int MaxClientAttributeValueLength = 512;
+
+    /// <summary>
+    /// The lowest peer-link protocol version this build of <see cref="MeshHub"/> will negotiate down to
+    /// when federating with another hub. Deliberately a separate range from
+    /// <see cref="MinSupportedVersion"/>/<see cref="MaxSupportedVersion"/>: a peer link
+    /// (<see cref="MessageType.PeerHello"/> onward) is a distinct protocol spoken only between two
+    /// <see cref="MeshHub"/> instances, never by <see cref="MeshClient"/>, so it has no reason to share a
+    /// version number with the client-facing protocol or to move in step with it.
+    /// </summary>
+    internal const byte MinFederationVersion = 1;
+
+    /// <summary>
+    /// The highest peer-link protocol version this build of <see cref="MeshHub"/> supports.
+    /// </summary>
+    internal const byte MaxFederationVersion = 1;
+
+    /// <summary>
+    /// The maximum number of routes a single hub will accept as advertised by one peer. Bounds the
+    /// memory a misbehaving or compromised peer link can force a hub to commit to remote routing state —
+    /// a peer is trusted once its link is admitted (see <see cref="MeshHub"/>'s <c>peerAuthenticator</c>
+    /// and <c>allowIncomingPeerLinks</c>), but trusted is not the same as unbounded. Generous for any
+    /// real federated deployment; pass nothing to accept the default.
+    /// </summary>
+    internal const int MaxRemoteRoutesPerPeer = 100_000;
 }

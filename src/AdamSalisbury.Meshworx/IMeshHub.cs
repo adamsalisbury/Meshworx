@@ -119,4 +119,49 @@ public interface IMeshHub : IAsyncDisposable
     /// <param name="clientId">The unique identifier of the client to look up.</param>
     /// <returns><see langword="true"/> if the client is registered; otherwise, <see langword="false"/>.</returns>
     bool IsClientRegistered(Guid clientId);
+
+    /// <summary>
+    /// Gets this hub's own identifier on a peer link.
+    /// </summary>
+    Guid HubId { get; }
+
+    /// <summary>
+    /// Gets the number of peer hubs currently linked, in either direction.
+    /// </summary>
+    /// <remarks>The value is a point-in-time snapshot; peer links may connect or drop concurrently.</remarks>
+    int LinkedPeerCount { get; }
+
+    /// <summary>
+    /// Links this hub to a peer hub over an already-connected transport, so a client on either hub can
+    /// address a client, group or topic that exists only on the other transparently.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The hub takes ownership of <paramref name="transport"/>, exactly as
+    /// <see cref="IMeshClient.ConnectAsync"/> does — it is disposed when the link ends, and the caller
+    /// must not use or dispose it afterwards. Establishing the connection itself (dialling the peer's
+    /// listener) is the caller's responsibility; this method performs only the peer handshake and the
+    /// link's ongoing lifecycle from that point on.
+    /// </para>
+    /// <para>
+    /// A link is single-hop: a route this hub learns from one peer is never re-advertised to another, and
+    /// a message forwarded across one peer link is never forwarded again across a second. Reaching a
+    /// client on a hub this one is not directly linked to requires a direct link to that hub too — there
+    /// is no transitive routing through an intermediate peer. This is what makes the topology loop-free
+    /// by construction rather than by a hop-count budget alone.
+    /// </para>
+    /// <para>
+    /// Returns once the initial handshake and the first route exchange have completed; the link then
+    /// runs on its own background tasks for the rest of its life, exactly like a client connection.
+    /// </para>
+    /// </remarks>
+    /// <param name="transport">A connected transport to use for the peer link. Ownership is transferred to the hub.</param>
+    /// <param name="credential">
+    /// An opaque credential presented to the peer's <c>peerAuthenticator</c>, if it configured one.
+    /// Empty by default.
+    /// </param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <exception cref="InvalidOperationException">The hub is not running.</exception>
+    Task LinkPeerAsync(
+        ITransport transport, ReadOnlyMemory<byte> credential = default, CancellationToken cancellationToken = default);
 }
