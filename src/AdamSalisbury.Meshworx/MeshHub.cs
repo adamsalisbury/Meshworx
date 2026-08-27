@@ -1045,6 +1045,121 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         return _clients.ContainsKey(clientId);
     }
 
+    /// <inheritdoc/>
+    public IReadOnlyList<ConnectedClientInfo> GetClients()
+    {
+        // Built by inverting _groups' own per-group membership — each read under that group's own Lock,
+        // exactly as every fan-out already reads it — rather than by reading ClientConnection.Groups
+        // directly. That set is deliberately unsynchronised: it is safe only because it is otherwise
+        // touched exclusively by the connection's own receive loop and its teardown. An admin snapshot is
+        // read from an arbitrary calling thread, so it must not share that assumption.
+        var groupsByClient = new Dictionary<Guid, List<string>>();
+        foreach (KeyValuePair<string, Group> entry in _groups)
+        {
+            lock (entry.Value.Lock)
+            {
+                foreach (Guid memberId in entry.Value.Members)
+                {
+                    if (!groupsByClient.TryGetValue(memberId, out List<string>? memberGroups))
+                    {
+                        memberGroups = new List<string>();
+                        groupsByClient[memberId] = memberGroups;
+                    }
+
+                    memberGroups.Add(entry.Key);
+                }
+            }
+        }
+
+        var snapshot = new List<ConnectedClientInfo>(_clients.Count);
+        foreach (ClientConnection connection in _clients.Values)
+        {
+            IReadOnlyList<string> clientGroups = groupsByClient.TryGetValue(connection.Id, out List<string>? found)
+                ? found
+                : [];
+
+            snapshot.Add(new ConnectedClientInfo(
+                connection.Id,
+                connection.Name,
+                clientGroups,
+                connection.OutboundQueue.Count,
+                connection.ConnectedAt));
+        }
+
+        return snapshot;
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyList<GroupInfo> GetGroups()
+    {
+        var snapshot = new List<GroupInfo>(_groups.Count);
+        foreach (KeyValuePair<string, Group> entry in _groups)
+        {
+            lock (entry.Value.Lock)
+            {
+                // A group is taken out of _groups under this same lock the moment its last member
+                // leaves — see RemoveMemberFromGroup — but a ConcurrentDictionary's enumerator tolerates
+                // concurrent modification and can still yield an entry mid-removal; this guards the
+                // narrow window rather than trusting enumeration alone to have already reflected it.
+                if (entry.Value.Members.Count == 0)
+                {
+                    continue;
+                }
+
+                var memberIds = new Guid[entry.Value.Members.Count];
+                entry.Value.Members.CopyTo(memberIds);
+                snapshot.Add(new GroupInfo(entry.Key, memberIds));
+            }
+        }
+
+        return snapshot;
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyList<TopicSubscriptionInfo> GetTopics()
+    {
+        IReadOnlyList<(string Pattern, IReadOnlyList<Guid> SubscriberIds)> subscriptions = _topics.Snapshot();
+        var snapshot = new List<TopicSubscriptionInfo>(subscriptions.Count);
+
+        foreach ((string pattern, IReadOnlyList<Guid> subscriberIds) in subscriptions)
+        {
+            snapshot.Add(new TopicSubscriptionInfo(pattern, subscriberIds));
+        }
+
+        return snapshot;
+    }
+
+    /// <inheritdoc/>
+    public bool DisconnectClient(Guid clientId, string? reason = null)
+    {
+        if (!_clients.TryGetValue(clientId, out ClientConnection? connection))
+        {
+            return false;
+        }
+
+        // Set before cancelling, and read back once teardown raises ClientDisconnected — see
+        // ClientConnection.DisconnectReason's own remarks. Harmless if a concurrent ordinary disconnect
+        // (the client's own Disconnect frame, or a transport fault) is already tearing the same
+        // connection down: whichever reason happens to land, the connection is going away regardless,
+        // and teardown itself is idempotent and only ever runs once.
+        connection.DisconnectReason = reason;
+
+        try
+        {
+            connection.DisconnectRequested.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The connection was already tearing down via a different path and had already disposed
+            // this source by the time this ran — a narrow window between that teardown cancelling it
+            // and removing the connection from _clients (see HandleClientAsync's finally block, where
+            // the two happen in that order). It is disconnecting either way, so this is not reported to
+            // the caller as a failure to find or affect a connected client.
+        }
+
+        return true;
+    }
+
     /// <summary>
     /// Gets the resolved interval the idle/heartbeat monitor uses, or <see langword="null"/> if idle
     /// eviction is disabled.
@@ -1441,6 +1556,13 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                 return;
             }
 
+            // Created here, ahead of SendLoopAsync's own use of it below, so it can be handed to
+            // ClientConnection immediately: DisconnectClient looks a connection up via _clients and
+            // cancels this same source to tear it down, and _clients.TryAdd a few lines below is the
+            // moment a connection becomes visible to that lookup. Creating it any later would leave a
+            // window where a freshly-added connection has nothing for DisconnectClient to cancel yet.
+            clientCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
             connection = new ClientConnection(
                 clientId,
                 clientName,
@@ -1450,7 +1572,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     _maxInboundMessagesPerSecond,
                     _maxInboundBytesPerSecond,
                     _maxFanOutMessagesPerSecond,
-                    _maxFanOutDeliveriesPerSecond));
+                    _maxFanOutDeliveriesPerSecond),
+                clientCts);
             _clients.TryAdd(clientId, connection);
             _connectedClientsCounter.Add(1);
 
@@ -1482,7 +1605,6 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             _logger.LogInformation("Client {ClientId} ({ClientName}) connected", clientId, clientName);
             RaiseClientEvent(ClientConnected, clientId, clientName, nameof(ClientConnected), PresenceChangeType.Joined);
 
-            clientCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             sendLoopTask = SendLoopAsync(connection, clientCts);
 
             // A single monitor per connection probes liveness off a PeriodicTimer, so the receive
@@ -1918,8 +2040,24 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
             if (connection is not null)
             {
                 await connection.DisposeAsync().ConfigureAwait(false);
-                _logger.LogInformation("Client {ClientId} disconnected", clientId);
-                RaiseClientEvent(ClientDisconnected, connection.Id, connection.Name, nameof(ClientDisconnected), PresenceChangeType.Left);
+
+                if (connection.DisconnectReason is { } reason)
+                {
+                    _logger.LogInformation(
+                        "Client {ClientId} disconnected (reason: {Reason})", clientId, reason);
+                }
+                else
+                {
+                    _logger.LogInformation("Client {ClientId} disconnected", clientId);
+                }
+
+                RaiseClientEvent(
+                    ClientDisconnected,
+                    connection.Id,
+                    connection.Name,
+                    nameof(ClientDisconnected),
+                    PresenceChangeType.Left,
+                    connection.DisconnectReason);
             }
             else
             {
@@ -3288,13 +3426,16 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         Guid clientId,
         string clientName,
         string eventName,
-        PresenceChangeType presenceChangeType)
+        PresenceChangeType presenceChangeType,
+        string? reason = null)
     {
         if (handler is not null)
         {
             try
             {
-                handler(this, new ClientConnectionEventArgs { ClientId = clientId, ClientName = clientName });
+                handler(
+                    this,
+                    new ClientConnectionEventArgs { ClientId = clientId, ClientName = clientName, Reason = reason });
             }
             catch (Exception ex)
             {
@@ -6103,7 +6244,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         string name,
         ITransport transport,
         byte negotiatedProtocolVersion,
-        ClientRateLimiter rateLimiter)
+        ClientRateLimiter rateLimiter,
+        CancellationTokenSource disconnectRequested)
         : IAsyncDisposable
     {
         // Internal rather than private so MeshHub.OutboundQueueCapacityForTesting can expose it to a
@@ -6125,6 +6267,30 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
 
         public string Name { get; } = name;
         public ITransport Transport { get; } = transport;
+
+        /// <summary>
+        /// The moment this connection was registered, for administrative inspection via
+        /// <see cref="MeshHub.GetClients"/>.
+        /// </summary>
+        public DateTimeOffset ConnectedAt { get; } = DateTimeOffset.UtcNow;
+
+        /// <summary>
+        /// Cancelled to tear this connection down from outside its own receive loop — the same source
+        /// <see cref="MeshHub.HandleClientAsync"/> already cancels on every ordinary teardown path (a
+        /// client-initiated disconnect, a transport fault, or hub shutdown). <see cref="MeshHub.DisconnectClient"/>
+        /// cancels it directly, so a "kick" reuses exactly the same teardown code path as every other
+        /// disconnect reason rather than duplicating any of it.
+        /// </summary>
+        public CancellationTokenSource DisconnectRequested { get; } = disconnectRequested;
+
+        /// <summary>
+        /// The reason given for this disconnection, when it was initiated by
+        /// <see cref="MeshHub.DisconnectClient"/>; otherwise <see langword="null"/>. Set before
+        /// <see cref="DisconnectRequested"/> is cancelled and read back once teardown raises
+        /// <see cref="MeshHub.ClientDisconnected"/>, so a subscriber can distinguish an administrative
+        /// kick from an ordinary disconnect and see why.
+        /// </summary>
+        public string? DisconnectReason { get; set; }
 
         /// <summary>
         /// The hash of the resumption token currently outstanding for this connection, or

@@ -121,6 +121,60 @@ public interface IMeshHub : IAsyncDisposable
     bool IsClientRegistered(Guid clientId);
 
     /// <summary>
+    /// Gets a point-in-time snapshot of every client currently connected to the hub, for administrative
+    /// inspection.
+    /// </summary>
+    /// <remarks>
+    /// Costs nothing when never called — this walks the hub's own registries only in response to a call,
+    /// never on the routing hot path. Each client's <see cref="ConnectedClientInfo.Groups"/> is built by
+    /// reading every group's own membership rather than the client's private view of it, so this never
+    /// competes with, or is skewed by, the group traffic the client is concurrently sending and
+    /// receiving. The snapshot is immediately stale the moment it is taken; clients may connect,
+    /// disconnect, join or leave groups concurrently.
+    /// </remarks>
+    /// <returns>A snapshot of every connected client, in no particular order.</returns>
+    IReadOnlyList<ConnectedClientInfo> GetClients();
+
+    /// <summary>
+    /// Gets a point-in-time snapshot of every group that currently has at least one member, for
+    /// administrative inspection.
+    /// </summary>
+    /// <remarks>Costs nothing when never called, mirroring <see cref="GetClients"/>.</remarks>
+    /// <returns>A snapshot of every non-empty group, in no particular order.</returns>
+    IReadOnlyList<GroupInfo> GetGroups();
+
+    /// <summary>
+    /// Gets a point-in-time snapshot of every distinct topic subscription pattern currently held by at
+    /// least one client, for administrative inspection.
+    /// </summary>
+    /// <remarks>Costs nothing when never called, mirroring <see cref="GetClients"/>.</remarks>
+    /// <returns>A snapshot of every subscribed pattern, in no particular order.</returns>
+    IReadOnlyList<TopicSubscriptionInfo> GetTopics();
+
+    /// <summary>
+    /// Forcibly disconnects a connected client, closing its connection cleanly.
+    /// </summary>
+    /// <remarks>
+    /// Reuses exactly the same teardown path as any other disconnect — the client is removed from every
+    /// group and topic it held, its outbound queue is completed, its transport is disposed, and
+    /// <see cref="ClientDisconnected"/> is raised — just triggered from here rather than from the
+    /// client's own receive loop noticing a closed connection or a <c>Disconnect</c> frame. Returns as
+    /// soon as the disconnection has been requested; teardown itself completes asynchronously on the
+    /// client's own handler task; do not assume it has finished by the time this returns.
+    /// </remarks>
+    /// <param name="clientId">The unique identifier of the client to disconnect.</param>
+    /// <param name="reason">
+    /// An optional, opaque reason recorded for observability. Never sent to the client itself, or to any
+    /// other client — the disconnect is unexplained on the wire, exactly as a hub-initiated eviction
+    /// already is for every other reason (a saturated slot, an unsupported protocol version, and so on).
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> if a client with that identifier was connected and disconnection was
+    /// requested; <see langword="false"/> if no such client was connected.
+    /// </returns>
+    bool DisconnectClient(Guid clientId, string? reason = null);
+
+    /// <summary>
     /// Gets this hub's own identifier on a peer link.
     /// </summary>
     Guid HubId { get; }
