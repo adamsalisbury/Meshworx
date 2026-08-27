@@ -121,6 +121,38 @@ builder.Services.AddMeshClient("Alice", options =>
 var client = serviceProvider.GetRequiredKeyedService<IMeshClient>("Alice");
 ```
 
+### `MeshClientOptions.CompressionStrategies` — the one get-only option (issue #75)
+
+Every other `MeshClientOptions` property is `{ get; set; }`. This one is
+`public CompressionStrategyRegistry CompressionStrategies { get; } = CompressionStrategyRegistry.CreateDefault();`
+and a configure delegate mutates it rather than assigning it:
+
+```csharp
+builder.Services.AddMeshClient("Alice", options =>
+{
+    options.CompressionStrategies.Register(new ZstdCompressionStrategy());   // alongside the built-ins
+    // options.CompressionStrategies.Clear().Register(new ZstdCompressionStrategy());  // instead of them
+});
+```
+
+Get-only because a strategy is code, not a setting: the configuration binder has no way to produce one,
+and a settable property would be exactly the "binder silently leaves it empty" trap that
+`MeshClientOptions.Credential`'s `byte[]` declaration already exists to avoid — except here the failure
+would be silent loss of an algorithm rather than of a credential.
+
+Reaches the client through `CreateClient`, which passes it as `MeshClient`'s `compressionStrategies`
+constructor parameter (note the explicit `timeProvider: null` in that call — `compressionStrategies` sits
+after the `timeProvider` testing seam in the constructor's parameter order). Each named client gets its
+own options instance and therefore its own `CreateDefault()` registry, so registries never leak between
+clients.
+
+`MeshClientOptions_EveryProperty_MirrorsAMeshClientOrMeshClientReconnectorConstructorParameter` covers
+this by reflection, as it does every other option — the property name and the constructor parameter name
+have to keep matching.
+
+There is deliberately **no** hub-side equivalent. Compression is endpoint-to-endpoint; the hub routes a
+compressed body without knowing it is one, so `MeshHubOptions` has nothing to configure.
+
 ### The keyed-service model
 
 `clientName` is used twice, for two different purposes, and `AddMeshClientCore` keeps them in step

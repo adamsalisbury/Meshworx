@@ -1,3 +1,4 @@
+using AdamSalisbury.Meshworx.Compression;
 using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.Transport.Tcp;
 
@@ -102,6 +103,20 @@ public sealed class MeshClientOptions
     /// </summary>
     /// <remarks>Only used when <see cref="UseReconnector"/> is <see langword="true"/>. Defaults to <see langword="true"/>.</remarks>
     public bool RestoreGroupMembership { get; set; } = true;
+
+    /// <summary>
+    /// Gets the compression strategies the client can compress and decompress with.
+    /// </summary>
+    /// <remarks>
+    /// Get-only and pre-populated with the built-in Brotli and Deflate strategies, so a configure delegate
+    /// adds to it rather than replacing it:
+    /// <c>options.CompressionStrategies.Register(new ZstdCompressionStrategy())</c>. Registering under an
+    /// id that is already present substitutes that strategy in place, and
+    /// <see cref="CompressionStrategyRegistry.Clear"/> drops the built-ins for an endpoint that wants only
+    /// its own. Not bindable from configuration — a strategy is code, not a setting — which is why this is
+    /// a mutable registry rather than a settable property the binder would quietly leave empty.
+    /// </remarks>
+    public CompressionStrategyRegistry CompressionStrategies { get; } = CompressionStrategyRegistry.CreateDefault();
 
     /// <summary>
     /// Gets or sets the maximum total size, in bytes, the client holds while reassembling a chunked

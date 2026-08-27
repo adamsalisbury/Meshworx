@@ -1,3 +1,4 @@
+using AdamSalisbury.Meshworx.Compression;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 
@@ -70,6 +71,19 @@ public interface IMeshClient : IAsyncDisposable
     /// when the property is read.
     /// </remarks>
     IReadOnlyCollection<string> SubscribedTopics { get; }
+
+    /// <summary>
+    /// Gets the compression strategies this endpoint can compress with and, more importantly, decompress
+    /// with — the set an algorithm id arriving on a message is resolved against.
+    /// </summary>
+    /// <remarks>
+    /// Endpoint state, not connection state: it is not cleared by a disconnect and is not negotiated with
+    /// the hub, which never learns that a body was compressed at all. Populated with the built-in Brotli
+    /// and Deflate strategies unless the client was given a registry of its own, and mutable afterwards —
+    /// registering a strategy here is what lets two endpoints agree on an algorithm this library has never
+    /// heard of.
+    /// </remarks>
+    ICompressionStrategyRegistry CompressionStrategies { get; }
 
     /// <summary>
     /// Connects to a hub via the specified transport and completes the registration handshake.

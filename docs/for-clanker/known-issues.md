@@ -82,6 +82,7 @@ the risk to a change, not a claim that the code is defective.
 | KI-71 | A direct send published to the backplane for an unknown-local recipient is always treated as handled, even though the backplane gives no confirmation any instance actually holds the recipient — it never also falls back to the offline store | `MeshHub.cs` (`TryPublishDirectToBackplane`, called from `RouteMessage` before the offline-store fallback) | medium (correctness), by design | open — **by design**, see full entry below |
 | KI-72 | Structured headers do not cross a backplane, mirroring KI-69's identical limitation for federation | `MeshHub.cs` (`RouteMessageWithHeaders`, `SendToGroupWithHeaders`, `PublishToTopicWithHeaders` are not wired into backplane publishing) | medium (correctness) | open — **deliberately deferred**, disclosed in issue #41's PR; see full entry below |
 | KI-73 | Topic retention stores the retained value before matching subscribers, so a subscribe racing a retained publish can receive a live delivery and its own replay of the same content | `MeshHub.cs` (`PublishToTopicWithHeaders`, `SetRetainedTopicMessage`, `ReplayRetainedTopicMessages`) | low (correctness) | open — **by design**, see full entry below |
+| KI-74 | A truncated compressed body decompresses to a silent prefix of the original instead of raising an error — the strategy layer has no expected length to check against | `Compression/StreamCompression.cs` (`Decompress`), both built-in strategies | low (correctness) | open — inherent to the layer, ruled out in practice by `StreamFramer`; close it in #33/#76 with a length header |
 
 ---
 
@@ -2155,6 +2156,29 @@ above assert; see [hub.md](hub.md#session-resumption) for where they're describe
   Do not "fix" this by reordering the store after `Match` — that reintroduces the strictly worse silent-
   miss case this ordering was deliberately chosen to avoid. Group-side retention
   (`SetRetainedGroupMessage`, `:4933`) has no equivalent window and needs no such caveat.
+
+---
+
+### KI-74 — A truncated compressed body decompresses to a silent prefix rather than an error
+
+- **Where:** `Compression/StreamCompression.cs` — `Decompress`'s read loop; reached from
+  `BrotliCompressionStrategy.Decompress` and `DeflateCompressionStrategy.Decompress`.
+- **Severity:** low (correctness), open — inherent to the layer, mitigated elsewhere.
+- **Why it bites:** both `BrotliStream` and `DeflateStream` read a truncated body as a stream that simply
+  ended. Half a compressed payload therefore returns a **prefix of the original** with no exception at
+  all, where corrupt bytes would have thrown. Nothing at this layer can tell the two apart: a strategy is
+  handed a `ReadOnlyMemory<byte>` and has no idea how many bytes it was supposed to produce, and the
+  decompressor's own trailing checks do not fire when the input just stops. Pinned deliberately by
+  `BuiltInCompressionStrategyTests.Decompress_TruncatedBody_ReturnsAPrefixRatherThanThrowing`, which
+  asserts the prefix behaviour rather than an exception, so a future framework change that starts throwing
+  shows up as a test failure instead of a silent semantics shift.
+- **What to do:** in practice the transport's length-prefixed framing (`StreamFramer`) already rules
+  truncation out before a body reaches a strategy — a short frame is a framing error long before it is a
+  compression one — so this is a latent gap, not a live one. Do not try to close it inside
+  `ICompressionStrategy`: the fix needs the uncompressed length, which belongs with the message. Issue #33,
+  which introduces the compression header, should carry it and verify the restored length against it;
+  issue #76's chunked/streamed mode should do the same per logical message. Note this before either lands
+  rather than discovering it afterwards.
 
 ---
 

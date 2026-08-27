@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Reflection;
+using AdamSalisbury.Meshworx.Compression;
 using AdamSalisbury.Meshworx.Transport;
 using AdamSalisbury.Meshworx.Transport.InMemory;
 using Microsoft.Extensions.Configuration;
@@ -209,6 +210,68 @@ public sealed class MeshClientServiceCollectionExtensionsTests
         IMeshClient client = provider.GetRequiredKeyedService<IMeshClient>("Carol");
 
         Assert.IsType<MeshClient>(client);
+    }
+
+    [Fact(Timeout = 1000)]
+    public async Task AddMeshClient_NoConfiguration_ClientHoldsTheBuiltInCompressionStrategies()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddMeshClient("Carol");
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        IMeshClient client = provider.GetRequiredKeyedService<IMeshClient>("Carol");
+
+        Assert.Equal(
+            [CompressionAlgorithms.Brotli, CompressionAlgorithms.Deflate],
+            client.CompressionStrategies.AlgorithmIds);
+    }
+
+    [Fact(Timeout = 1000)]
+    public async Task AddMeshClient_CompressionStrategyRegisteredInConfigure_ReachesTheClient()
+    {
+        // The end-to-end shape of "register your own algorithm without touching library code": a
+        // configure delegate adds a strategy, and the client the container builds resolves it.
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddMeshClient("Carol", options => options.CompressionStrategies.Register(new StubCompressionStrategy()));
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        IMeshClient client = provider.GetRequiredKeyedService<IMeshClient>("Carol");
+
+        Assert.Equal(
+            [CompressionAlgorithms.Brotli, CompressionAlgorithms.Deflate, "x-stub"],
+            client.CompressionStrategies.AlgorithmIds);
+        Assert.IsType<StubCompressionStrategy>(client.CompressionStrategies.Resolve("x-stub"));
+    }
+
+    [Fact(Timeout = 1000)]
+    public async Task AddMeshClient_CompressionStrategiesCleared_LeavesTheClientWithOnlyItsOwn()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddMeshClient(
+            "Carol",
+            options => options.CompressionStrategies.Clear().Register(new StubCompressionStrategy()));
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+        IMeshClient client = provider.GetRequiredKeyedService<IMeshClient>("Carol");
+
+        Assert.Equal(["x-stub"], client.CompressionStrategies.AlgorithmIds);
+    }
+
+    [Fact(Timeout = 1000)]
+    public async Task AddMeshClient_TwoClients_HaveIndependentCompressionRegistries()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddMeshClient("Carol", options => options.CompressionStrategies.Register(new StubCompressionStrategy()));
+        services.AddMeshClient("Dave");
+
+        await using ServiceProvider provider = services.BuildServiceProvider();
+
+        Assert.True(provider.GetRequiredKeyedService<IMeshClient>("Carol").CompressionStrategies.Contains("x-stub"));
+        Assert.False(provider.GetRequiredKeyedService<IMeshClient>("Dave").CompressionStrategies.Contains("x-stub"));
     }
 
     [Fact(Timeout = 1000)]
@@ -696,5 +759,18 @@ public sealed class MeshClientServiceCollectionExtensionsTests
         Assert.False(client.IsConnected);
 
         await hub.StopAsync();
+    }
+
+    /// <summary>
+    /// Stands in for a consumer's own compression algorithm. Never asked to compress anything here — the
+    /// point is only that a strategy registered in a configure delegate reaches the built client.
+    /// </summary>
+    private sealed class StubCompressionStrategy : ICompressionStrategy
+    {
+        public string AlgorithmId => "x-stub";
+
+        public ReadOnlyMemory<byte> Compress(ReadOnlyMemory<byte> payload) => payload;
+
+        public ReadOnlyMemory<byte> Decompress(ReadOnlyMemory<byte> payload, int maxDecompressedBytes) => payload;
     }
 }

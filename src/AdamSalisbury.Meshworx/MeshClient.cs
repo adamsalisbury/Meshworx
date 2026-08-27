@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net.Sockets;
 using System.Text;
+using AdamSalisbury.Meshworx.Compression;
 using AdamSalisbury.Meshworx.Diagnostics;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
@@ -145,6 +146,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// The clock used to age out incomplete chunked transfers. Defaults to
     /// <see cref="TimeProvider.System"/>; supply one to control time in a test.
     /// </param>
+    /// <param name="compressionStrategies">
+    /// The compression strategies this endpoint can compress and decompress with, exposed afterwards as
+    /// <see cref="CompressionStrategies"/>. Defaults to
+    /// <see cref="CompressionStrategyRegistry.CreateDefault"/>'s built-in Brotli and Deflate; supply one
+    /// to add a strategy of your own, or an empty <see cref="CompressionStrategyRegistry"/> to have this
+    /// endpoint understand nothing but what you put in it.
+    /// </param>
     public MeshClient(
         ILogger<MeshClient> logger,
         TimeSpan? idleTimeout = null,
@@ -153,7 +161,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         TimeSpan? sendRetryDelay = null,
         int? maxReassemblyBytes = null,
         TimeSpan? chunkTransferTimeout = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        ICompressionStrategyRegistry? compressionStrategies = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
 
@@ -199,6 +208,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         _maxSendAttempts = maxSendAttempts;
         _sendRetryDelay = sendRetryDelay ?? DefaultSendRetryDelay;
         _reassembler = new ChunkReassembler(maxReassemblyBytes, chunkTransferTimeout, timeProvider);
+        CompressionStrategies = compressionStrategies ?? CompressionStrategyRegistry.CreateDefault();
     }
 
     /// <inheritdoc/>
@@ -248,6 +258,9 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             }
         }
     }
+
+    /// <inheritdoc/>
+    public ICompressionStrategyRegistry CompressionStrategies { get; }
 
     /// <inheritdoc/>
     public event EventHandler<MessageReceivedEventArgs>? MessageReceived;

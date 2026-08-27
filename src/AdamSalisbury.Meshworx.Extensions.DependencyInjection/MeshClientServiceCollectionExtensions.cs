@@ -167,7 +167,9 @@ public static class MeshClientServiceCollectionExtensions
             options.MaxSendAttempts,
             options.SendRetryDelay,
             options.MaxReassemblyBytes,
-            options.ChunkTransferTimeout);
+            options.ChunkTransferTimeout,
+            timeProvider: null,
+            options.CompressionStrategies);
     }
 
     private static MeshClientReconnector CreateReconnector(IServiceProvider serviceProvider, string clientName)

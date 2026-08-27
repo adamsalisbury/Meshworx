@@ -145,4 +145,17 @@ internal static class Protocol
     /// <see cref="MaxRetainedTopicCount"/> for topics.
     /// </remarks>
     internal const int MaxRetainedGroupCount = 10_000;
+
+    /// <summary>
+    /// The maximum length, in characters, of a compression algorithm id registered with an
+    /// <see cref="Compression.ICompressionStrategyRegistry"/>.
+    /// </summary>
+    /// <remarks>
+    /// The id travels between the two endpoints as a header value and, once endpoints advertise their
+    /// registered set to one another, as a repeated one — so it is bounded at the shape of a content-
+    /// coding name rather than left to grow into a payload of its own. Nothing in the hub reads it; the
+    /// bound exists so an endpoint cannot be talked into holding an arbitrarily long id on a peer's
+    /// behalf.
+    /// </remarks>
+    internal const int MaxCompressionAlgorithmIdLength = 32;
 }
