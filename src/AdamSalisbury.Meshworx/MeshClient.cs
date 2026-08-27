@@ -110,11 +110,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     // How much payload one chunk carries. A frame must fit the transport's 1 MiB cap once the message
     // type, recipient id, header-length prefix and the header block itself are added, so the budget is
     // the cap less a reserve for all of that. The three chunk headers cost about 110 bytes at their
-    // longest (a 36-character GUID plus two four-digit numbers, with their keys); 4 KiB leaves room for
-    // an application's own headers to travel on a chunked send as well, which they must, since
-    // SendLargeAsync copies the caller's headers onto every chunk. A caller whose headers exceed that
-    // reserve gets the same ArgumentException from the framer that any oversized frame would produce,
-    // rather than a silently truncated transfer.
+    // longest (a 36-character GUID plus two four-digit numbers, with their keys), and a compressed chunk
+    // adds about 50 more for the two compression headers; 4 KiB leaves room for an application's own
+    // headers to travel on a chunked send as well, which they must, since SendLargeAsync copies the
+    // caller's headers onto every chunk. A caller whose headers exceed that reserve gets the same
+    // ArgumentException from the framer that any oversized frame would produce, rather than a silently
+    // truncated transfer. Compression never threatens the budget from the other direction: a compressed
+    // body is only sent when it came out smaller than the slice it replaced.
     private const int ChunkFrameOverheadReserve = 4 * 1024;
 
     private const int MaxChunkBodySize =
@@ -949,28 +951,78 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             return message;
         }
 
-        IReadOnlyList<string>? peerAlgorithmIds =
-            await TryGetPeerCompressionAlgorithmsAsync(recipientId, cancellationToken).ConfigureAwait(false);
+        ICompressionStrategy? strategy = await ResolveCompressionStrategyAsync(
+            recipientId, options, cancellationToken).ConfigureAwait(false);
 
-        ICompressionStrategy? strategy = SelectCompressionStrategy(recipientId, options, peerAlgorithmIds);
+        ReadOnlyMemory<byte> body = CompressBody(strategy, message, out string? algorithmId);
 
-        if (strategy is null)
+        if (algorithmId is not null)
         {
-            return message;
+            headerEntries.Add(new KeyValuePair<string, string>(
+                CompressionHeaderKeys.Algorithm, algorithmId));
+            headerEntries.Add(new KeyValuePair<string, string>(
+                CompressionHeaderKeys.UncompressedLength,
+                message.Length.ToString(CultureInfo.InvariantCulture)));
         }
 
-        ReadOnlyMemory<byte> compressed = strategy.Compress(message);
+        return body;
+    }
 
-        if (compressed.Length >= message.Length)
+    /// <summary>
+    /// Establishes what the recipient can read and picks the algorithm a compressing send to it should
+    /// use, or <see langword="null"/> to send uncompressed.
+    /// </summary>
+    /// <remarks>
+    /// Separated from <see cref="CompressBody"/> because a chunked send resolves once and compresses many
+    /// times: the capability query, and the failure a named-but-unusable algorithm raises, belong to the
+    /// message rather than to each of its chunks. Resolving up front is also what makes such a send fail
+    /// before any of its chunks reach the wire rather than after the first one has.
+    /// </remarks>
+    private async Task<ICompressionStrategy?> ResolveCompressionStrategyAsync(
+        Guid recipientId, DeliveryOptions options, CancellationToken cancellationToken)
+    {
+        PeerCompressionCapabilities? peer =
+            await TryGetPeerCapabilitiesAsync(recipientId, cancellationToken).ConfigureAwait(false);
+
+        return SelectCompressionStrategy(recipientId, options, peer?.AlgorithmIds);
+    }
+
+    /// <summary>
+    /// Compresses one body with an already-resolved strategy, when doing so is worth it.
+    /// </summary>
+    /// <param name="strategy">The chosen strategy, or <see langword="null"/> to send uncompressed.</param>
+    /// <param name="body">The body to compress.</param>
+    /// <param name="algorithmId">
+    /// The algorithm the returned body was compressed with, or <see langword="null"/> when it was
+    /// returned untouched and must carry no compression headers.
+    /// </param>
+    /// <returns>The compressed body, or <paramref name="body"/> itself when compressing it did not help.</returns>
+    /// <remarks>
+    /// Opting in can never make a body larger. One below <see cref="Protocol.MinimumCompressionSize"/> is
+    /// returned untouched without an attempt, and one whose compressed form is not smaller is returned
+    /// untouched too — in both cases without an algorithm id, so the recipient sees an ordinary body
+    /// rather than one it has to decompress back to where it started. Decided per body, which on a chunked
+    /// send means per chunk: an incompressible tail does not have to be sent compressed because the head
+    /// of the same message was.
+    /// </remarks>
+    private static ReadOnlyMemory<byte> CompressBody(
+        ICompressionStrategy? strategy, ReadOnlyMemory<byte> body, out string? algorithmId)
+    {
+        algorithmId = null;
+
+        if (strategy is null || body.Length < Protocol.MinimumCompressionSize)
         {
-            return message;
+            return body;
         }
 
-        headerEntries.Add(new KeyValuePair<string, string>(
-            CompressionHeaderKeys.Algorithm, strategy.AlgorithmId));
-        headerEntries.Add(new KeyValuePair<string, string>(
-            CompressionHeaderKeys.UncompressedLength,
-            message.Length.ToString(CultureInfo.InvariantCulture)));
+        ReadOnlyMemory<byte> compressed = strategy.Compress(body);
+
+        if (compressed.Length >= body.Length)
+        {
+            return body;
+        }
+
+        algorithmId = strategy.AlgorithmId;
 
         return compressed;
     }
@@ -1077,7 +1129,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// rather than an empty list. The caller's own cancellation is never swallowed: only the failures that
     /// belong to the query itself are.
     /// </remarks>
-    private async Task<IReadOnlyList<string>?> TryGetPeerCompressionAlgorithmsAsync(
+    private async Task<PeerCompressionCapabilities?> TryGetPeerCapabilitiesAsync(
         Guid recipientId, CancellationToken cancellationToken)
     {
         if (NegotiatedProtocolVersion < Protocol.CompressionNegotiationMinVersion)
@@ -1090,13 +1142,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         if (_peerCompressionAlgorithms.TryGetValue(recipientId, out CachedPeerCapabilities? cached)
             && cached.ExpiresAt > now)
         {
-            return cached.AlgorithmIds;
+            return cached.Capabilities;
         }
 
         try
         {
-            IReadOnlyList<string> fetched =
-                await FetchPeerCompressionAlgorithmsAsync(recipientId, cancellationToken).ConfigureAwait(false);
+            PeerCompressionCapabilities fetched =
+                await FetchPeerCapabilitiesAsync(recipientId, cancellationToken).ConfigureAwait(false);
 
             _peerCompressionAlgorithms[recipientId] =
                 new CachedPeerCapabilities(fetched, now + CompressionCapabilityCacheLifetime);
@@ -1126,7 +1178,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// outstanding query at a time makes an unmatched or late reply trivially identifiable rather than
     /// something to reconcile.
     /// </remarks>
-    private async Task<IReadOnlyList<string>> FetchPeerCompressionAlgorithmsAsync(
+    private async Task<PeerCompressionCapabilities> FetchPeerCapabilitiesAsync(
         Guid subjectId, CancellationToken cancellationToken)
     {
         ITransport transport = GetConnectedTransport();
@@ -1135,7 +1187,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         try
         {
             int correlationId = unchecked(_compressionCapabilityCorrelationId++);
-            var completion = new TaskCompletionSource<IReadOnlyList<string>>(
+            var completion = new TaskCompletionSource<PeerCompressionCapabilities>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             _pendingCapabilityRequest = new PendingCapabilityRequest(correlationId, completion);
 
@@ -1175,10 +1227,23 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         }
     }
 
-    private sealed record CachedPeerCapabilities(IReadOnlyList<string> AlgorithmIds, DateTimeOffset ExpiresAt);
+    /// <summary>
+    /// What a peer can read, and in what shapes: the algorithms it advertised, and the protocol version
+    /// its own link to the hub negotiated.
+    /// </summary>
+    /// <param name="AlgorithmIds">The algorithms the peer advertised, in its own preference order.</param>
+    /// <param name="ProtocolVersion">
+    /// The peer's negotiated version, or <c>0</c> when the hub did not report one — an older hub, or a
+    /// subject it does not hold. Zero means unknown, and every gate treats it as such rather than as "too
+    /// old", so a feature is withheld rather than a message being sent in a shape the peer may not read.
+    /// </param>
+    private sealed record PeerCompressionCapabilities(IReadOnlyList<string> AlgorithmIds, byte ProtocolVersion);
+
+    private sealed record CachedPeerCapabilities(
+        PeerCompressionCapabilities Capabilities, DateTimeOffset ExpiresAt);
 
     private sealed record PendingCapabilityRequest(
-        int CorrelationId, TaskCompletionSource<IReadOnlyList<string>> Completion);
+        int CorrelationId, TaskCompletionSource<PeerCompressionCapabilities> Completion);
 
     /// <summary>
     /// Restores a compressed body, or refuses it.
@@ -1393,11 +1458,21 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <inheritdoc/>
+    public Task SendLargeAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders? headers = null,
+        CancellationToken cancellationToken = default)
+    {
+        return SendLargeAsync(recipientId, message, headers, DeliveryOptions.None, cancellationToken);
+    }
+
     /// <inheritdoc/>
     public async Task SendLargeAsync(
         Guid recipientId,
         ReadOnlyMemory<byte> message,
-        MessageHeaders? headers = null,
+        MessageHeaders? headers,
+        DeliveryOptions options,
         CancellationToken cancellationToken = default)
     {
         headers ??= MessageHeaders.Empty;
@@ -1422,6 +1497,17 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 nameof(message));
         }
 
+        // Resolved once for the whole transfer, then applied a chunk at a time. The chunk count is
+        // deliberately worked out from the uncompressed length above rather than from what compression
+        // achieves: a chunk carries a compressed slice of the message, not a slice of the compressed
+        // message, so how many there are is known before a single byte has been compressed — which is
+        // what lets the count travel in every chunk's headers, and what keeps a sender from having to
+        // hold the whole compressed result to find out.
+        ICompressionStrategy? strategy = options.Compress
+            ? await ResolveChunkCompressionStrategyAsync(recipientId, options, cancellationToken)
+                .ConfigureAwait(false)
+            : null;
+
         var chunkId = Guid.NewGuid();
 
         for (int index = 0; index < chunkCount; index++)
@@ -1429,7 +1515,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             int offset = index * MaxChunkBodySize;
             int length = Math.Min(MaxChunkBodySize, message.Length - offset);
 
-            var chunkHeaders = new Dictionary<string, string>(headers.Count + 3, StringComparer.Ordinal);
+            ReadOnlyMemory<byte> body = CompressBody(
+                strategy, message.Slice(offset, length), out string? algorithmId);
+
+            var chunkHeaders = new Dictionary<string, string>(headers.Count + 5, StringComparer.Ordinal);
 
             foreach (KeyValuePair<string, string> header in headers)
             {
@@ -1440,13 +1529,78 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             chunkHeaders[ChunkHeaderKeys.Index] = index.ToString(CultureInfo.InvariantCulture);
             chunkHeaders[ChunkHeaderKeys.Count] = chunkCount.ToString(CultureInfo.InvariantCulture);
 
+            if (algorithmId is not null)
+            {
+                chunkHeaders[CompressionHeaderKeys.Algorithm] = algorithmId;
+                chunkHeaders[CompressionHeaderKeys.UncompressedLength] =
+                    length.ToString(CultureInfo.InvariantCulture);
+            }
+
             await SendCoreAsync(
                     recipientId,
-                    message.Slice(offset, length),
+                    body,
                     MessageHeaders.FromOwnedDictionary(chunkHeaders),
                     cancellationToken)
                 .ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// Picks the algorithm a compressing chunked send should use, or <see langword="null"/> to send the
+    /// chunks uncompressed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Stricter than <see cref="ResolveCompressionStrategyAsync"/>, which the unchunked path uses, and for
+    /// a reason that has nothing to do with which algorithms the recipient holds. A chunked compressed
+    /// message is compressed a chunk at a time, so its recipient has to decompress each frame before
+    /// reassembling it; a recipient below <see cref="Protocol.ChunkedCompressionMinVersion"/> reassembles
+    /// first and would decompress the concatenation of the chunks instead — usually caught by the declared
+    /// length and dropped, but indistinguishable from a whole message when the payload happens to be an
+    /// exact multiple of the chunk size. So the recipient's own version has to be known, not assumed.
+    /// </para>
+    /// <para>
+    /// Unknown counts as too old, which is the opposite of the posture
+    /// <see cref="SelectCompressionStrategy"/> takes towards an unknown algorithm set — deliberately. Not
+    /// knowing which algorithms a peer holds costs a send nothing worse than a message it drops and logs;
+    /// not knowing whether it decompresses before or after reassembly risks one it accepts and mangles.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="NotSupportedException">
+    /// The send named an algorithm and the recipient cannot be established to read chunked compressed
+    /// messages at all. A named algorithm is a requirement rather than a preference, so it fails here
+    /// exactly as it fails when the recipient advertises no support for it.
+    /// </exception>
+    private async Task<ICompressionStrategy?> ResolveChunkCompressionStrategyAsync(
+        Guid recipientId, DeliveryOptions options, CancellationToken cancellationToken)
+    {
+        PeerCompressionCapabilities? peer =
+            await TryGetPeerCapabilitiesAsync(recipientId, cancellationToken).ConfigureAwait(false);
+
+        if (peer is null || peer.ProtocolVersion < Protocol.ChunkedCompressionMinVersion)
+        {
+            if (options.CompressionAlgorithmId is { } requestedAlgorithmId)
+            {
+                throw new NotSupportedException(
+                    $"Cannot send a chunked message compressed with '{requestedAlgorithmId}' to "
+                    + $"{recipientId}: that needs protocol version "
+                    + $"{Protocol.ChunkedCompressionMinVersion}, and the recipient "
+                    + (peer is null
+                        ? "did not report one."
+                        : $"reported version {peer.ProtocolVersion}."));
+            }
+
+            _logger.LogDebug(
+                "Sending a chunked message to {RecipientId} uncompressed: chunked compression needs "
+                + "protocol version {RequiredVersion}, and the recipient reported {ReportedVersion}",
+                recipientId,
+                Protocol.ChunkedCompressionMinVersion,
+                peer is null ? "no version" : peer.ProtocolVersion.ToString(CultureInfo.InvariantCulture));
+
+            return null;
+        }
+
+        return SelectCompressionStrategy(recipientId, options, peer.AlgorithmIds);
     }
 
     /// <inheritdoc/>
@@ -2499,6 +2653,32 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         {
                             ReadOnlyMemory<byte> messageData = data.AsMemory(19 + headerBlockLength);
 
+                            // Decompression comes first, and chunking sits on top of it: the two
+                            // compression headers describe the body of the frame they arrived on, so on a
+                            // chunked send they describe that chunk rather than the message it belongs
+                            // to. That is what keeps compression bounded on a large transfer — neither
+                            // endpoint ever compresses or decompresses more than one chunk at a time —
+                            // and it means the reassembler accumulates the bytes it will actually hand
+                            // over, so maxReassemblyBytes bounds what is really held rather than its
+                            // compressed form. An unchunked message reaches the same place by the same
+                            // route; there is one ordering here, not one per shape of message.
+                            if (CompressionHeaderKeys.TryReadCompressionHeaders(
+                                    headers, out string algorithmId, out int uncompressedLength))
+                            {
+                                if (!TryDecompress(
+                                        senderId,
+                                        algorithmId,
+                                        uncompressedLength,
+                                        messageData,
+                                        out ReadOnlyMemory<byte> decompressed))
+                                {
+                                    continue;
+                                }
+
+                                messageData = decompressed;
+                                headers = CompressionHeaderKeys.WithoutCompressionHeaders(headers);
+                            }
+
                             // A chunk is not a message yet. It is absorbed here and raises nothing
                             // until its last sibling arrives, at which point the reassembled whole is
                             // raised once — so a subscriber sees large messages exactly as it sees
@@ -2526,26 +2706,6 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                                 {
                                     continue;
                                 }
-                            }
-
-                            // Decompressed after reassembly and before anything reads the body, so a
-                            // subscriber — and the request/reply and acknowledgement paths below —
-                            // sees the bytes the sender passed in, never the compressed form.
-                            if (CompressionHeaderKeys.TryReadCompressionHeaders(
-                                    headers, out string algorithmId, out int uncompressedLength))
-                            {
-                                if (!TryDecompress(
-                                        senderId,
-                                        algorithmId,
-                                        uncompressedLength,
-                                        messageData,
-                                        out ReadOnlyMemory<byte> decompressed))
-                                {
-                                    continue;
-                                }
-
-                                messageData = decompressed;
-                                headers = CompressionHeaderKeys.WithoutCompressionHeaders(headers);
                             }
 
                             if (!TryCompletePendingAck(senderId, headers)
@@ -2789,6 +2949,15 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     int correlationId = BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(1, 4));
                     PendingCapabilityRequest? pendingCapability = _pendingCapabilityRequest;
 
+                    // The subject's own protocol version rides between the found byte and the envelope,
+                    // but only from ChunkedCompressionMinVersion. Which shape to expect is read off this
+                    // connection's negotiated version rather than guessed from the frame's length, since
+                    // the version byte and an envelope's count byte are indistinguishable by inspection.
+                    bool carriesSubjectVersion =
+                        NegotiatedProtocolVersion >= Protocol.ChunkedCompressionMinVersion;
+                    int envelopeOffset = carriesSubjectVersion ? 7 : 6;
+                    byte subjectVersion = carriesSubjectVersion ? data[6] : (byte)0;
+
                     if (pendingCapability is null || pendingCapability.CorrelationId != correlationId)
                     {
                         // Stale or unsolicited response (e.g. from a query that already timed out);
@@ -2798,13 +2967,15 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                             + "{CorrelationId}",
                             correlationId);
                     }
-                    else if (CompressionCapabilityEnvelope.TryRead(
-                        data.AsSpan(6), out IReadOnlyList<string> advertised))
+                    else if (data.Length >= envelopeOffset
+                        && CompressionCapabilityEnvelope.TryRead(
+                            data.AsSpan(envelopeOffset), out IReadOnlyList<string> advertised))
                     {
                         // A "not found" answer (byte 5 == 0) resolves as an empty set rather than as a
                         // failure: the hub genuinely knows this client supports nothing it can name, and
                         // an uncompressed send is the right outcome — not a fall back to guessing.
-                        pendingCapability.Completion.TrySetResult(advertised);
+                        pendingCapability.Completion.TrySetResult(
+                            new PeerCompressionCapabilities(advertised, subjectVersion));
                     }
                     else
                     {

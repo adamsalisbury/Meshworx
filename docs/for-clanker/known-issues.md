@@ -82,8 +82,10 @@ the risk to a change, not a claim that the code is defective.
 | KI-71 | A direct send published to the backplane for an unknown-local recipient is always treated as handled, even though the backplane gives no confirmation any instance actually holds the recipient — it never also falls back to the offline store | `MeshHub.cs` (`TryPublishDirectToBackplane`, called from `RouteMessage` before the offline-store fallback) | medium (correctness), by design | open — **by design**, see full entry below |
 | KI-72 | Structured headers do not cross a backplane, mirroring KI-69's identical limitation for federation | `MeshHub.cs` (`RouteMessageWithHeaders`, `SendToGroupWithHeaders`, `PublishToTopicWithHeaders` are not wired into backplane publishing) | medium (correctness) | open — **deliberately deferred**, disclosed in issue #41's PR; see full entry below |
 | KI-73 | Topic retention stores the retained value before matching subscribers, so a subscribe racing a retained publish can receive a live delivery and its own replay of the same content | `MeshHub.cs` (`PublishToTopicWithHeaders`, `SetRetainedTopicMessage`, `ReplayRetainedTopicMessages`) | low (correctness) | open — **by design**, see full entry below |
-| KI-74 | A truncated compressed body decompresses to a silent prefix of the original instead of raising an error — the strategy layer has no expected length to check against | `Compression/StreamCompression.cs` (`Decompress`), both built-in strategies | low (correctness) | **mitigated** by issue #33's `mesh.compression.length` header on every path the library itself decompresses on; still true for a direct `ICompressionStrategy` caller |
-| KI-75 | A peer that resumes its session, keeping its client id, having changed which compression strategies it registers can be sent one message it cannot read, until the sender's five-minute capability cache expires | `MeshClient.cs` (`TryGetPeerCompressionAlgorithmsAsync`, `CompressionCapabilityCacheLifetime`) | low (correctness) | open — bounded and self-correcting; the receiver drops and logs |
+| KI-74 | A truncated compressed body decompresses to a silent prefix of the original instead of raising an error — the strategy layer has no expected length to check against | `Compression/StreamCompression.cs` (`Decompress`), both built-in strategies | low (correctness) | **mitigated** by issue #33's `mesh.compression.length` header on every path the library itself decompresses on — since issue #76 that includes each chunk of a compressed large transfer, which declares its own length; still true for a direct `ICompressionStrategy` caller |
+| KI-75 | A peer that resumes its session, keeping its client id, having changed which compression strategies it registers can be sent one message it cannot read, until the sender's five-minute capability cache expires | `MeshClient.cs` (`TryGetPeerCapabilitiesAsync`, `CompressionCapabilityCacheLifetime`) | low (correctness) | open — bounded and self-correcting; the receiver drops and logs |
+| KI-76 | The same five-minute cache also holds the peer's protocol version, so a peer that resumes its session onto a hub negotiating a *lower* version can be sent one chunked compressed transfer it reassembles before decompressing | `MeshClient.cs` (`TryGetPeerCapabilitiesAsync`, `ResolveChunkCompressionStrategyAsync`) | low (correctness) | open — same window and same fix as KI-75; usually caught by the per-chunk declared length, see full entry below |
+| KI-77 | Chunked compression is never used towards a client reachable only through a federation link or a backplane, because the hub reports no protocol version for one | `MeshHub.cs` (`SendCompressionCapabilityResponseAsync` looks only in `_clients`) | low (performance) | open — **by design**; unknown means uncompressed, which is the safe direction |
 
 ---
 
@@ -2191,7 +2193,7 @@ above assert; see [hub.md](hub.md#session-resumption) for where they're describe
 
 ### KI-75 — A resumed session that changed its compression registry can be sent one unreadable message
 
-- **Where:** `MeshClient.cs` — `TryGetPeerCompressionAlgorithmsAsync` caches a peer's advertised set per
+- **Where:** `MeshClient.cs` — `TryGetPeerCapabilitiesAsync` caches a peer's advertised set per
   peer id for `CompressionCapabilityCacheLifetime` (5 minutes); `SelectCompressionStrategy` chooses from
   the cached set.
 - **Severity:** low (correctness), open — bounded, self-correcting, and disclosed in issue #77's PR.
@@ -2212,6 +2214,47 @@ above assert; see [hub.md](hub.md#session-resumption) for where they're describe
   whatever the cache holds and degrades to an uncompressed send, where a named algorithm throws. Do not
   shorten the lifetime as a "fix"; it trades one bounded window for a hub round trip on the send path.
   A sender's own reconnect clears the whole cache, so this never survives one.
+
+### KI-76 — A resumed session that negotiated a lower version can be sent one chunked compressed transfer
+
+- **Where:** `MeshClient.cs` — `TryGetPeerCapabilitiesAsync` caches a `PeerCompressionCapabilities` per
+  peer id for `CompressionCapabilityCacheLifetime` (5 minutes), and since issue #76 that record carries the
+  peer's negotiated protocol version as well as its algorithms;
+  `ResolveChunkCompressionStrategyAsync` gates chunked compression on that version.
+- **Severity:** low (correctness), open — bounded, self-correcting, and disclosed in issue #76's PR.
+- **Why it bites:** exactly KI-75's mechanism, applied to a different field. The ordinary reconnect case is
+  safe for free, because a reconnecting client gets a new id and misses the cache. **Session resumption is
+  the exception**: a resumed client reclaims its previous id, so a cached entry saying "version 12" can
+  outlive the connection it was read from. If that client resumes onto a hub that negotiates version 11 —
+  a rolled-back hub, or a different instance behind a load balancer — a sender in the window still believes
+  it can read a per-chunk compressed transfer, and it cannot: it reassembles before decompressing, so it
+  decompresses the concatenation of the chunks.
+- **Why it is usually harmless anyway:** the receiver compares the restored length against the declared
+  one and drops the message, because the declared length is *one chunk's* and the concatenation restores to
+  something else. It is only indistinguishable from a whole message when the payload is an exact multiple
+  of the chunk size, in which case the receiver raises a message that is the first chunk's content.
+- **Why it is not closed:** the same reason KI-75 is not. Closing it needs the hub to push invalidations,
+  or a capability fetch on every send. Both are disproportionate to a five-minute window on a rare event.
+- **What to do:** nothing routine. If a deployment mixes protocol versions across hub instances *and*
+  relies on session resumption, avoid `SendLargeAsync`'s compressing overload until the rollout has settled.
+  Do not shorten the cache lifetime as a "fix".
+
+---
+
+### KI-77 — Chunked compression never engages across a federation link or a backplane
+
+- **Where:** `MeshHub.cs` — `SendCompressionCapabilityResponseAsync` resolves the subject against `_clients`
+  only, so a client on a peer hub, or one reachable through the backplane, answers `found = 0` with a
+  version of `0`.
+- **Severity:** low (performance), open — **by design**.
+- **Why it bites:** `ResolveChunkCompressionStrategyAsync` treats an unknown version as unsupported, so a
+  `SendLargeAsync` towards such a client sends its chunks uncompressed. A named algorithm throws
+  `NotSupportedException` rather than silently downgrading.
+- **Why that is the right direction:** the alternative is guessing, and guessing wrong here produces a
+  transfer the recipient accepts and mangles rather than one it drops. This is the same federation gap
+  KI-69 and KI-72 record for structured headers, with a strictly safe failure mode rather than a lossy one.
+- **What to do:** if it matters, close the gap where the others are closed — by relaying capabilities
+  across peer links — rather than by loosening the version gate.
 
 ---
 

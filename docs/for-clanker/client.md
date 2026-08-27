@@ -38,7 +38,8 @@ up peers, manages group membership, and raises events for inbound traffic and di
 | `SendToGroupAsync` (headers) | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, MessageHeaders headers, CancellationToken=default)` — PR #74 (issue #32); see [Sending headers](#sending-headers) | `MeshClient.cs:668` |
 | `SendToGroupAsync` (priority) | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, MessagePriority priority, CancellationToken=default)` — priority lanes (`ab16567`); `Normal` short-circuits to the headerless overload, anything else takes the header-bearing path; see [Message priority](#message-priority) | `MeshClient.cs:1093-1111` |
 | `SendToGroupAsync` (retain) | `Task SendToGroupAsync(string groupName, ReadOnlyMemory<byte>, bool retain, CancellationToken=default)` — issue #42; `retain: false` short-circuits to the headerless overload, `true` builds a single-header `MessageHeaders` and takes the header-bearing path; see [Retained messages](#retained-messages) | `MeshClient.cs:1142-1160` |
-| `SendLargeAsync` | `Task SendLargeAsync(Guid recipientId, ReadOnlyMemory<byte>, MessageHeaders? headers=null, CancellationToken=default)` — chunking (feat #93); requires protocol version 5+ (throws `NotSupportedException` below it); no `DeliveryOptions`/priority/ack support; see [Large-message chunking](#large-message-chunking) | `MeshClient.cs:891-895` |
+| `SendLargeAsync` | `Task SendLargeAsync(Guid recipientId, ReadOnlyMemory<byte>, MessageHeaders? headers=null, CancellationToken=default)` — chunking (feat #93); requires protocol version 5+ (throws `NotSupportedException` below it); no priority/ack support; see [Large-message chunking](#large-message-chunking) | `MeshClient.cs` |
+| `SendLargeAsync` | `Task SendLargeAsync(Guid recipientId, ReadOnlyMemory<byte>, MessageHeaders? headers, DeliveryOptions options, CancellationToken=default)` — chunking with per-chunk compression (issue #76); only `Compress`/`CompressionAlgorithmId` are read from the options; see [Chunked compression](#chunked-compression-issue-76) | `MeshClient.cs` |
 | `GetClientIdByNameAsync` | `Task<Guid?> GetClientIdByNameAsync(string name, CancellationToken=default)` | `MeshClient.cs:820` |
 | `RequestAsync` | `Task<ReadOnlyMemory<byte>> RequestAsync(Guid recipientId, ReadOnlyMemory<byte>, TimeSpan timeout, CancellationToken=default)` — PR #83; correlated request/reply over a direct message, see [Request/response (RPC)](#request-response) | `MeshClient.cs:869` |
 | `ReplyAsync` | `Task ReplyAsync(MessageReceivedEventArgs request, ReadOnlyMemory<byte>, CancellationToken=default)` — PR #83; answers a request received via `MessageReceived`, see [Request/response (RPC)](#request-response) | `MeshClient.cs:926` |
@@ -1100,19 +1101,30 @@ Points worth knowing before you build on it:
 ### Per-message compression (issue #33)
 
 Opt in with `DeliveryOptions.Compressed()` / `Compressed(string)` / `.WithCompression(string?)`, on the
-**only** send overload that takes `DeliveryOptions` — `SendAsync(Guid, ReadOnlyMemory<byte>,
-DeliveryOptions, CancellationToken)`. Group, topic, broadcast and `SendLargeAsync` do not compress;
-chunked compression is issue #76.
+`DeliveryOptions`-taking send overloads: `SendAsync(Guid, ReadOnlyMemory<byte>, DeliveryOptions,
+CancellationToken)` and, since issue #76, `SendLargeAsync(Guid, ReadOnlyMemory<byte>, MessageHeaders?,
+DeliveryOptions, CancellationToken)` — see [Chunked compression](#chunked-compression-issue-76). Group,
+topic and broadcast sends do not compress.
 
 **Send** — `MeshClient.ApplyCompressionAsync`, called from both arms of the `DeliveryOptions` overload (the
-plain-header arm and the acknowledgement arm), appending to the same header list each already builds:
+plain-header arm and the acknowledgement arm), appending to the same header list each already builds. It is
+the composition of two halves, split out by issue #76 so a chunked send can resolve once and compress many
+times:
+
+- **`ResolveCompressionStrategyAsync`** — the capability query plus `SelectCompressionStrategy`. Async, and
+  the only half that can throw.
+- **`CompressBody`** — static, per body: returns the body untouched (and a `null` algorithm id) when there
+  is no strategy, when the body is `< Protocol.MinimumCompressionSize` (256), or when the compressed form
+  is not smaller. **Opting in can never grow a message.**
+
+Together:
 
 1. Not requested, or body `< Protocol.MinimumCompressionSize` (256) → returned untouched.
 2. `CompressionAlgorithmId` set → `Resolve` it. **Throws** `UnknownCompressionAlgorithmException` if it
    is not registered, before anything reaches the wire. Named is a requirement.
 3. Otherwise → `AlgorithmIds[0]`, the first registered. Empty registry → returned untouched. Best
    available is a preference.
-4. Compressed form not smaller → returned untouched. **Opting in can never grow a message.**
+4. Compressed form not smaller → returned untouched.
 5. Otherwise → two headers appended: `mesh.compression` (the algorithm id) and
    `mesh.compression.length` (the uncompressed length).
 
@@ -1121,8 +1133,9 @@ Note the fast path at the top of that overload — the one that short-circuits t
 send silently loses its compression.
 
 **Receive** — `MeshClient.TryDecompress`, in the `DeliverMessageWithHeaders` branch of the receive loop,
-placed **after** chunk reassembly and **before** `TryCompletePendingAck` / `TryCompletePendingRequest` /
-`IsExpired`, so every one of those sees the real body rather than the compressed one. Four ways it
+placed **before** chunk reassembly (issue #76 moved it there; up to protocol version 11 it ran after) and
+**before** `TryCompletePendingAck` / `TryCompletePendingRequest` / `IsExpired`, so every one of those sees
+the real body rather than the compressed one. Four ways it
 refuses, each dropping the single message and logging without touching the connection:
 
 | Refusal | Why it is checked here |
@@ -1137,10 +1150,11 @@ for the same reason chunk keys are: a subscriber sees the headers the sender sen
 headers back onto a reply must not send the far side off decompressing an ordinary body. Both keys are in
 `ReservedHeaderKeys`, so an application cannot set them by hand.
 
-**No new protocol version.** Compression rides the existing header envelope like priority, expiry,
-backpressure and retention before it. A pre-v5 connection already throws out of `SendCoreAsync` on any
-header-bearing send, so a compressing send on one fails the same way every other header-borne feature
-does — no special case, and none needed.
+**No new protocol version** *for issue #33 itself*. Compression rides the existing header envelope like
+priority, expiry, backpressure and retention before it. A pre-v5 connection already throws out of
+`SendCoreAsync` on any header-bearing send, so a compressing send on one fails the same way every other
+header-borne feature does — no special case, and none needed. Issue #76 later did bump the version, but
+for the receive-loop **ordering** rather than for anything the header block carries.
 
 `_maxDecompressedBytes` comes from the `maxDecompressedBytes` constructor parameter, defaulting to
 `Protocol.DefaultMaxDecompressedMessageBytes` (64 MiB, matching the reassembly ceiling deliberately).
@@ -1169,11 +1183,13 @@ advertising nothing at all.
 that does not land costs peers their knowledge of what this client reads, which degrades to
 pre-negotiation behaviour — not to a refusal to connect. Do not "tighten" this into a throw.
 
-**Looking a peer up** — `TryGetPeerCompressionAlgorithmsAsync` → `FetchPeerCompressionAlgorithmsAsync`,
+**Looking a peer up** — `TryGetPeerCapabilitiesAsync` → `FetchPeerCapabilitiesAsync`,
 serialised by `_compressionCapabilityLock` through a single `_pendingCapabilityRequest` slot, exactly as
 `FindClientsAsync` is. Bounded by `CompressionCapabilityTimeout` (5 s) because it sits **inline on a
 send**. Results are cached per peer id for `CompressionCapabilityCacheLifetime` (5 min), read through the
-client's `TimeProvider`, and the whole cache is cleared wherever connection state resets.
+client's `TimeProvider`, and the whole cache is cleared wherever connection state resets. Since issue #76
+the cached value is a `PeerCompressionCapabilities` record — the advertised ids **and** the peer's own
+negotiated protocol version, which the hub reports from version 12 onwards.
 
 **`null` means "unknown", never "supports nothing".** Every path that cannot answer — an older connection,
 a failed or timed-out query — returns `null`, and `SelectCompressionStrategy` treats that as licence to
@@ -1194,6 +1210,51 @@ older hubs or silently stop compressing against peers that never advertised.
 The load-bearing invariant, worth preserving through any future change here: **negotiation is an
 optimisation over what a compressing send already did, never a precondition for it.** Only a query that
 succeeds and shows no overlap changes an outcome.
+
+### Chunked compression (issue #76)
+
+`SendLargeAsync`'s `DeliveryOptions` overload compresses a chunked transfer. The whole design is one
+sentence: **a chunk carries a compressed slice of the message, not a slice of the compressed message.**
+
+**Send** — after the chunk count is worked out (from the *uncompressed* length, so it is known before a
+byte is compressed):
+
+1. `ResolveChunkCompressionStrategyAsync` runs **once** for the transfer. That is what makes a named
+   algorithm the recipient cannot use fail before any chunk reaches the wire, and what keeps the capability
+   query off the per-chunk path.
+2. Each chunk body goes through `CompressBody` on its own, and gets `mesh.compression` /
+   `mesh.compression.length` written into *that chunk's* header dictionary when it helped. The length is
+   the chunk's, not the message's.
+
+**Receive** — nothing chunk-specific. The receive loop decompresses the frame, then offers it to the
+reassembler, which is why the ordering had to move (see [Per-message compression](#per-message-compression-issue-33)).
+
+**The version gate is the part to be careful with.** `ResolveChunkCompressionStrategyAsync` is stricter
+than `ResolveCompressionStrategyAsync`, and not about algorithms:
+
+| Recipient's reported version | Best available | Named algorithm |
+|---|---|---|
+| `>= Protocol.ChunkedCompressionMinVersion` (12) | `SelectCompressionStrategy` as usual | as usual |
+| `< 12` | uncompressed, logged at debug | **throws** `NotSupportedException` |
+| unknown (`0` — older hub, unanswered query, subject the hub does not hold) | uncompressed, logged at debug | **throws** `NotSupportedException` |
+
+**Unknown counts as unsupported here, which inverts the rule the unchunked path follows.** Do not
+"harmonise" the two. Not knowing which algorithms a peer holds costs a send nothing worse than a message
+the peer drops and logs; not knowing which order it applies decompression in risks one it *accepts and
+mangles*, because a version-11 receiver decompresses the concatenation of the chunks and only the declared
+length usually catches that.
+
+**Memory.** The compression machinery never sees more than one chunk, on either side —
+`MeshClientChunkedCompressionTests.SendLargeAsync_Compressed_NeverHandsAStrategyMoreThanOneChunk` pins that
+at 8 MiB by recording the largest buffer a strategy is handed. And because decompression precedes
+reassembly, `maxReassemblyBytes` now bounds the *restored* size of a transfer rather than its compressed
+size: a peer cannot compress its way past a receiver's budget and expand once admitted.
+
+Sources: `MeshClient.cs` (`SendLargeAsync`'s `DeliveryOptions` overload,
+`ResolveChunkCompressionStrategyAsync`, `CompressBody`, the receive loop's `DeliverMessageWithHeaders`
+branch), `Messages/Protocol.cs` (`ChunkedCompressionMinVersion`), `MeshHub.cs`
+(`SendCompressionCapabilityResponseAsync`). Tests:
+`src/Tests/AdamSalisbury.Meshworx.UnitTests/Compression/MeshClientChunkedCompressionTests.cs`.
 
 ### Large-message chunking
 
@@ -1223,7 +1284,9 @@ await alice.SendLargeAsync(bobId, file);
   (`Messages/ChunkHeaderKeys.cs`): `Id` (`"mesh.chunk.id"`, a fresh `Guid.NewGuid()` per `SendLargeAsync`
   call, GUID "D" format), `Index` (`"mesh.chunk.index"`, zero-based) and `Count`
   (`"mesh.chunk.count"`). **The hub has no awareness of chunking at all** — it routes each chunk as an
-  ordinary opaque header-bearing frame; reassembly is purely an endpoint concern.
+  ordinary opaque header-bearing frame; reassembly is purely an endpoint concern. Since issue #76 a chunk may
+  additionally carry the two compression keys, describing that chunk's own body — see
+  [Chunked compression](#chunked-compression-issue-76).
 - Recipient-side reassembly is `ChunkReassembler` (`ChunkReassembler.cs`), not thread-safe by design —
   only ever touched from the single-threaded receive loop. Chunks are placed by their declared `index`, so
   out-of-order delivery reassembles correctly. Transfers are keyed by `(senderId, messageId)`, so

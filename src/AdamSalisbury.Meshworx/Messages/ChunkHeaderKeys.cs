@@ -84,7 +84,7 @@ internal static class ChunkHeaderKeys
     /// </summary>
     /// <remarks>
     /// The chunk keys are internal reassembly bookkeeping, present on every individual chunk but
-    /// meaningless once reassembly is done — <see cref="IMeshClient.SendLargeAsync"/>'s contract is that
+    /// meaningless once reassembly is done — <see cref="IMeshClient.SendLargeAsync(Guid, ReadOnlyMemory{byte}, MessageHeaders, CancellationToken)"/>'s contract is that
     /// a subscriber sees the headers it was sent, needing no code of its own to distinguish a chunked
     /// message from an ordinary one. Left in, they would also break the common pattern of echoing
     /// received headers back onto a reply: the far side's receive loop would read them as real chunk

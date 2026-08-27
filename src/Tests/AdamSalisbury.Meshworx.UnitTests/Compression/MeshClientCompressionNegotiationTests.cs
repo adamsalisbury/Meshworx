@@ -313,6 +313,73 @@ public sealed class MeshClientCompressionNegotiationTests
 
     // Helpers
 
+    /// <summary>
+    /// Issue #76 moved the subject's protocol version into the capability reply, ahead of the envelope.
+    /// A connection negotiated below <see cref="Protocol.ChunkedCompressionMinVersion"/> still gets the
+    /// older shape and must still read it — which shape to expect is taken from this connection's own
+    /// negotiated version, since a version byte and an envelope's count byte cannot be told apart by
+    /// inspection.
+    /// </summary>
+    [Fact(Timeout = 15000)]
+    public async Task Compressed_OnAPreChunkedCompressionConnection_ReadsTheOlderResponseShape()
+    {
+        var fixture = new MeshClientFixture();
+        var sentFrames = new List<byte[]>();
+
+        fixture.SetupSuccessfulRegistrationWithNegotiatedVersion(Protocol.CompressionNegotiationMinVersion);
+        await fixture.Client.ConnectAsync(fixture.Transport.Object, "Sender");
+
+        fixture.Transport
+            .Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((frame, _) =>
+            {
+                byte[] sent = frame.ToArray();
+
+                if (sent.Length >= 21 && sent[0] == (byte)MessageType.CompressionCapabilityRequest)
+                {
+                    fixture.Inbound!.TryWrite(BuildLegacyCapabilityResponse(
+                        BinaryPrimitives.ReadInt32BigEndian(sent.AsSpan(1, 4)), ["deflate"]));
+
+                    return;
+                }
+
+                if (sent[0] is (byte)MessageType.SendMessage or (byte)MessageType.SendMessageWithHeaders)
+                {
+                    lock (sentFrames)
+                    {
+                        sentFrames.Add(sent);
+                    }
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        await fixture.Client.SendAsync(Guid.NewGuid(), Payload(), DeliveryOptions.Compressed());
+
+        MessageHeaders headers = ReadHeaders(Assert.Single(sentFrames));
+        await fixture.Client.DisconnectAsync();
+
+        // Deflate rather than this client's first preference, which is only true if the advertised set
+        // was read out of the older frame shape correctly.
+        Assert.Equal(CompressionAlgorithms.Deflate, headers[CompressionHeaderKeys.Algorithm]);
+    }
+
+    /// <summary>
+    /// The reply a hub sends a connection below <see cref="Protocol.ChunkedCompressionMinVersion"/>:
+    /// <c>[opcode][correlationId u32][found u8][envelope]</c>, with no version field.
+    /// </summary>
+    private static byte[] BuildLegacyCapabilityResponse(
+        int correlationId, IReadOnlyList<string> algorithmIds)
+    {
+        int blockLength = CompressionCapabilityEnvelope.GetEncodedLength(algorithmIds);
+        var response = new byte[6 + blockLength];
+        response[0] = (byte)MessageType.CompressionCapabilityResponse;
+        BinaryPrimitives.WriteInt32BigEndian(response.AsSpan(1, 4), correlationId);
+        response[5] = 0x01;
+        CompressionCapabilityEnvelope.Write(algorithmIds, response.AsSpan(6));
+
+        return response;
+    }
+
     private static ReadOnlyMemory<byte> Payload()
     {
         return Encoding.UTF8.GetBytes(new string('a', 4096));
@@ -413,14 +480,22 @@ public sealed class MeshClientCompressionNegotiationTests
         return HeaderEnvelope.Read(sendFrame.AsSpan(19), headerBlockLength);
     }
 
-    private static byte[] BuildCapabilityResponse(int correlationId, IReadOnlyList<string> algorithmIds)
+    /// <summary>
+    /// Builds the reply a hub at <see cref="Protocol.ChunkedCompressionMinVersion"/> or above sends:
+    /// <c>[opcode][correlationId u32][found u8][subjectVersion u8][envelope]</c>.
+    /// </summary>
+    private static byte[] BuildCapabilityResponse(
+        int correlationId,
+        IReadOnlyList<string> algorithmIds,
+        byte subjectVersion = Protocol.MaxSupportedVersion)
     {
         int blockLength = CompressionCapabilityEnvelope.GetEncodedLength(algorithmIds);
-        var response = new byte[6 + blockLength];
+        var response = new byte[7 + blockLength];
         response[0] = (byte)MessageType.CompressionCapabilityResponse;
         BinaryPrimitives.WriteInt32BigEndian(response.AsSpan(1, 4), correlationId);
         response[5] = 0x01;
-        CompressionCapabilityEnvelope.Write(algorithmIds, response.AsSpan(6));
+        response[6] = subjectVersion;
+        CompressionCapabilityEnvelope.Write(algorithmIds, response.AsSpan(7));
 
         return response;
     }

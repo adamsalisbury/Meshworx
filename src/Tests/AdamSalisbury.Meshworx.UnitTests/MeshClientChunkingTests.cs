@@ -230,7 +230,7 @@ public class MeshClientChunkingTests
 
     /// <summary>
     /// The three chunk header keys are just as reserved as any other built-in helper's — a caller
-    /// setting one by hand must be rejected up front, on any send, not just <see cref="IMeshClient.SendLargeAsync"/>
+    /// setting one by hand must be rejected up front, on any send, not just <see cref="IMeshClient.SendLargeAsync(Guid, ReadOnlyMemory{byte}, MessageHeaders, CancellationToken)"/>
     /// (issue #107).
     /// </summary>
     [Theory]

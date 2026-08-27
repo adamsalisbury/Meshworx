@@ -24,12 +24,16 @@ internal sealed class MeshClientFixture
         TimeSpan? idleTimeout = null,
         ICompressionStrategyRegistry? compressionStrategies = null,
         int? maxDecompressedBytes = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        int? maxReassemblyBytes = null,
+        TimeSpan? chunkTransferTimeout = null)
     {
         var logger = new Mock<ILogger<MeshClient>>();
         Client = new MeshClient(
             logger.Object,
             idleTimeout,
+            maxReassemblyBytes: maxReassemblyBytes,
+            chunkTransferTimeout: chunkTransferTimeout,
             timeProvider: timeProvider,
             compressionStrategies: compressionStrategies,
             maxDecompressedBytes: maxDecompressedBytes);

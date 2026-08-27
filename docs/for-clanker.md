@@ -12,6 +12,35 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
+> **Not yet reconciled — issue #76, compression for chunked transfers.** Closes M6, on top of #77, #33
+> and #75 below. `SendLargeAsync` gains a `DeliveryOptions` overload and compresses **per chunk**: a chunk
+> carries a compressed slice of the message, not a slice of the compressed message. `MeshClient`'s receive
+> loop therefore **decompresses before it reassembles**, where it used to do the reverse — one ordering for
+> every shape of message.
+>
+> **That ordering change is a wire-behaviour change, which is what the version bump is for.**
+> `MaxSupportedVersion` 11 → 12, new `Protocol.ChunkedCompressionMinVersion = 12`. No new opcode and no new
+> header key. A sender cannot gate on its *own* negotiated version — that is its agreement with the hub,
+> not with the recipient — so `CompressionCapabilityResponse` now carries the subject's own negotiated
+> version, which the hub already tracks per connection. Below version 12 the reply stays byte-identical;
+> which shape it takes is decided by the **asking** connection's version.
+>
+> **The gate inverts #77's posture on unknowns, deliberately.** An unknown *algorithm* set means "choose on
+> local information"; an unknown *version* means "do not compress". Not knowing which algorithms a peer
+> holds costs a message it drops and logs; not knowing which order it decompresses in risks one it accepts
+> and mangles. A named algorithm throws `NotSupportedException` rather than downgrading.
+>
+> **Do not "fix" this into whole-message compression.** The reasoning against it — chunk count not knowable
+> up front, no push-shaped deflate decompressor, memory scaling with the message, and `maxReassemblyBytes`
+> ceasing to bound what is actually held — is written out in
+> [protocol.md](for-clanker/protocol.md#chunked-compression-issue-76). New **KI-76** (cache staleness around
+> session resumption, KI-75's mechanism applied to the version field) and **KI-77** (federation and
+> backplane never engage chunked compression, by design). Also written up in
+> [client.md](for-clanker/client.md#chunked-compression-issue-76), [hub.md](for-clanker/hub.md),
+> [types.md](for-clanker/types.md) and [known-issues.md](for-clanker/known-issues.md).
+>
+> ---
+>
 > **Not yet reconciled — issue #77, compression capability negotiation.** Completes the endpoint-facing
 > half of M6, on top of #75 and #33 below (both now merged, as `8ad006e` and `42f98dc`). Three new opcodes
 > — `AdvertiseCompression` (`0x2C`), `CompressionCapabilityRequest` (`0x2D`),

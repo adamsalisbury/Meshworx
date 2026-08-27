@@ -327,7 +327,9 @@ two wire keys — `mesh.compression` and `mesh.compression.length` — plus `Try
 `CompressionCapabilityEnvelope` (`internal static`, `Messages/CompressionCapabilityEnvelope.cs`, issue
 #77) encodes the ordered algorithm-id list carried by `AdvertiseCompression` and
 `CompressionCapabilityResponse`. Not the `HeaderEnvelope` codec, deliberately: that encodes a map, and
-order is the payload here. See [protocol.md](protocol.md#compression-capability-frames-issue-77).
+order is the payload here. See [protocol.md](protocol.md#compression-capability-frames-issue-77). The
+subject's protocol version that issue #76 added to `CompressionCapabilityResponse` sits **outside** this
+envelope, ahead of it, so the codec is unchanged and still rejects trailing bytes.
 
 `UnknownCompressionAlgorithmException` gained a `PeerId` and a `(algorithmId, peerId, peerAlgorithmIds)`
 constructor with #77 — the same exception type for "this endpoint has no strategy" and "the peer has not

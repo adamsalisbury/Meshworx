@@ -1908,7 +1908,12 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     var subjectId = new Guid(data.AsSpan(5, 16));
 
                     await SendCompressionCapabilityResponseAsync(
-                        transport, correlationId, subjectId, clientCts.Token).ConfigureAwait(false);
+                            transport,
+                            correlationId,
+                            subjectId,
+                            connection.NegotiatedProtocolVersion,
+                            clientCts.Token)
+                        .ConfigureAwait(false);
                 }
                 else if (data.Length >= 5
                     && (MessageType)data[0] == MessageType.ClientLookupRequest)
@@ -6151,19 +6156,50 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// capabilities this hub does not hold — answers <c>found = 0</c> with an empty set rather than
     /// staying silent, so the asking client resolves the request instead of waiting out its timeout.
     /// </para>
+    /// <para>
+    /// From <see cref="Protocol.ChunkedCompressionMinVersion"/> the reply also carries the subject's own
+    /// negotiated protocol version, because what a sender needs to know about a recipient is not only
+    /// which algorithms it can read but which shapes of compressed message it can read them in — and its
+    /// own negotiated version answers only for its link to this hub. Written only when the *asking*
+    /// connection is at that version too, so the reply stays byte-identical to what version
+    /// <see cref="Protocol.CompressionNegotiationMinVersion"/> produces for a client that negotiated it.
+    /// </para>
     /// </remarks>
+    /// <param name="transport">The asking client's transport.</param>
+    /// <param name="correlationId">The correlation id from the request, echoed back on the reply.</param>
+    /// <param name="subjectId">The client whose capabilities were asked about.</param>
+    /// <param name="askerProtocolVersion">
+    /// The version the asking connection negotiated, which decides whether the reply carries the
+    /// subject's version.
+    /// </param>
+    /// <param name="cancellationToken">A token to cancel the send.</param>
     private async Task SendCompressionCapabilityResponseAsync(
-        ITransport transport, int correlationId, Guid subjectId, CancellationToken cancellationToken)
+        ITransport transport,
+        int correlationId,
+        Guid subjectId,
+        byte askerProtocolVersion,
+        CancellationToken cancellationToken)
     {
         bool found = _clients.TryGetValue(subjectId, out ClientConnection? subject);
         IReadOnlyList<string> algorithmIds = found ? subject!.CompressionAlgorithms : [];
+        bool carriesSubjectVersion = askerProtocolVersion >= Protocol.ChunkedCompressionMinVersion;
 
         int blockLength = CompressionCapabilityEnvelope.GetEncodedLength(algorithmIds);
-        var response = new byte[1 + 4 + 1 + blockLength];
+        var response = new byte[1 + 4 + 1 + (carriesSubjectVersion ? 1 : 0) + blockLength];
         response[0] = (byte)MessageType.CompressionCapabilityResponse;
         BinaryPrimitives.WriteInt32BigEndian(response.AsSpan(1, 4), correlationId);
         response[5] = found ? (byte)0x01 : (byte)0x00;
-        CompressionCapabilityEnvelope.Write(algorithmIds, response.AsSpan(6, blockLength));
+        int offset = 6;
+
+        if (carriesSubjectVersion)
+        {
+            // Zero for a subject this hub does not hold, which is the same thing found = 0 already says:
+            // no version is known, so the asker treats it as unknown rather than as "too old".
+            response[offset] = found ? subject!.NegotiatedProtocolVersion : (byte)0;
+            offset++;
+        }
+
+        CompressionCapabilityEnvelope.Write(algorithmIds, response.AsSpan(offset, blockLength));
 
         try
         {

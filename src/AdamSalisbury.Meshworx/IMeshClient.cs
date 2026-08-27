@@ -298,6 +298,58 @@ public interface IMeshClient : IAsyncDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Sends a message of any size to a single recipient under delivery options, compressing it as it is
+    /// split into chunks when the options ask for compression.
+    /// </summary>
+    /// <param name="recipientId">The id of the recipient.</param>
+    /// <param name="message">The message to send. May exceed the transport's single-frame cap.</param>
+    /// <param name="headers">
+    /// Headers to send with the message, or <see langword="null"/> for none. They are copied onto every
+    /// chunk and delivered once, with the reassembled message.
+    /// </param>
+    /// <param name="options">
+    /// The delivery options for the send. Only <see cref="DeliveryOptions.Compress"/> and
+    /// <see cref="DeliveryOptions.CompressionAlgorithmId"/> are read; acknowledgement, backpressure and
+    /// priority are per-frame concerns that do not have a defined meaning across a transfer made of many
+    /// frames, and are ignored.
+    /// </param>
+    /// <param name="cancellationToken">A token to cancel the operation.</param>
+    /// <returns>A task that completes once every chunk has been handed to the transport.</returns>
+    /// <remarks>
+    /// <para>
+    /// Each chunk is compressed on its own, and carries its own compression headers, so neither endpoint
+    /// ever compresses or decompresses more than one chunk at a time however large the message is. The
+    /// recipient still raises <see cref="MessageReceived"/> exactly once, with the whole message restored
+    /// and no compression or chunking headers on it — as with the uncompressed overload, a subscriber
+    /// needs no code of its own to tell any of this apart from an ordinary message.
+    /// </para>
+    /// <para>
+    /// Compressing is a request, not a guarantee. A chunk that does not come out smaller is sent as it
+    /// was, and the whole transfer is sent uncompressed when the recipient cannot be established to
+    /// support chunked compression — see the <see cref="NotSupportedException"/> below for the one case
+    /// where that is an error instead.
+    /// </para>
+    /// </remarks>
+    /// <exception cref="NotSupportedException">
+    /// The connection negotiated a protocol version below the one that supports message headers, which
+    /// chunking requires to carry its reassembly metadata; or <paramref name="options"/> named a
+    /// compression algorithm and the recipient could not be established to support chunked compression.
+    /// </exception>
+    /// <exception cref="ArgumentException">
+    /// The message needs more chunks than a single logical message may be split into.
+    /// </exception>
+    /// <exception cref="UnknownCompressionAlgorithmException">
+    /// <paramref name="options"/> named a compression algorithm this client holds no strategy for, or one
+    /// the recipient has advertised no support for.
+    /// </exception>
+    Task SendLargeAsync(
+        Guid recipientId,
+        ReadOnlyMemory<byte> message,
+        MessageHeaders? headers,
+        DeliveryOptions options,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Joins the named group, so that messages sent to the group are delivered to this client.
     /// </summary>
     /// <remarks>

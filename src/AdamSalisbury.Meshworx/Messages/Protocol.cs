@@ -11,7 +11,7 @@ internal static class Protocol
     /// The highest wire-protocol version this build of the hub and client supports, and the version
     /// advertised when there is no reason to negotiate down.
     /// </summary>
-    internal const byte MaxSupportedVersion = 11;
+    internal const byte MaxSupportedVersion = 12;
 
     /// <summary>
     /// The lowest negotiated protocol version at which the structured message-header envelope
@@ -74,6 +74,24 @@ internal static class Protocol
     /// read it. Negotiation is an optimisation over that, never a precondition for it.
     /// </remarks>
     internal const byte CompressionNegotiationMinVersion = 11;
+
+    /// <summary>
+    /// The lowest protocol version at which a chunked message's body may be compressed, and the lowest
+    /// at which a <see cref="MessageType.CompressionCapabilityResponse"/> carries the subject client's
+    /// own negotiated version.
+    /// </summary>
+    /// <remarks>
+    /// The two are one version because the first needs the second. A chunked compressed message is
+    /// compressed a chunk at a time, so its receiver must decompress each frame before reassembling it —
+    /// where a receiver from <see cref="CompressionNegotiationMinVersion"/> reassembles first and
+    /// decompresses after, and would therefore try to decompress the concatenation of the chunks rather
+    /// than each of them. A sender cannot tell which of those a recipient does from its own negotiated
+    /// version, which is its agreement with the hub rather than with the recipient, so the hub reports the
+    /// recipient's version alongside the algorithms it advertised and the sender gates on that. A
+    /// recipient below this version, or one whose version cannot be established, is sent uncompressed
+    /// chunks.
+    /// </remarks>
+    internal const byte ChunkedCompressionMinVersion = 12;
 
     /// <summary>
     /// The most compression algorithms one client may advertise.
