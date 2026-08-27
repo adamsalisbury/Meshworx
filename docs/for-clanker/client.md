@@ -1063,11 +1063,9 @@ await alice.SendAsync(bobId, payload); // now carries traceparent/tracestate aut
 `compressionStrategies` constructor parameter, defaulting to `CompressionStrategyRegistry.CreateDefault()`
 (Brotli then Deflate).
 
-**This is the seam only. Nothing in the client currently compresses or decompresses anything.** No send
-path consults the registry and no receive path resolves an algorithm id, because the header flag and the
-`DeliveryOptions` opt-in that would drive it are issue #33, and capability advertisement is issue #77. If
-you are looking for where compression happens, it does not happen yet — do not go hunting for a call site
-that is not there.
+Consumed by `ApplyCompression` on the send side and `TryDecompress` on the receive side — see
+[Per-message compression](#per-message-compression-issue-33) below. Capability advertisement, so a sender
+knows what its peer holds, is still issue #77.
 
 Points worth knowing before you build on it:
 
@@ -1099,10 +1097,59 @@ Points worth knowing before you build on it:
   built-ins surface `InvalidDataException` either way. Truncation is *not* detected — see
   [known-issues.md](known-issues.md) KI-74.
 
+### Per-message compression (issue #33)
+
+Opt in with `DeliveryOptions.Compressed()` / `Compressed(string)` / `.WithCompression(string?)`, on the
+**only** send overload that takes `DeliveryOptions` — `SendAsync(Guid, ReadOnlyMemory<byte>,
+DeliveryOptions, CancellationToken)`. Group, topic, broadcast and `SendLargeAsync` do not compress;
+chunked compression is issue #76.
+
+**Send** — `MeshClient.ApplyCompression`, called from both arms of the `DeliveryOptions` overload (the
+plain-header arm and the acknowledgement arm), appending to the same header list each already builds:
+
+1. Not requested, or body `< Protocol.MinimumCompressionSize` (256) → returned untouched.
+2. `CompressionAlgorithmId` set → `Resolve` it. **Throws** `UnknownCompressionAlgorithmException` if it
+   is not registered, before anything reaches the wire. Named is a requirement.
+3. Otherwise → `AlgorithmIds[0]`, the first registered. Empty registry → returned untouched. Best
+   available is a preference.
+4. Compressed form not smaller → returned untouched. **Opting in can never grow a message.**
+5. Otherwise → two headers appended: `mesh.compression` (the algorithm id) and
+   `mesh.compression.length` (the uncompressed length).
+
+Note the fast path at the top of that overload — the one that short-circuits to the plain
+`SendAsync(recipientId, message, ct)` — now also tests `!options.Compress`. Miss that and a compressing
+send silently loses its compression.
+
+**Receive** — `MeshClient.TryDecompress`, in the `DeliverMessageWithHeaders` branch of the receive loop,
+placed **after** chunk reassembly and **before** `TryCompletePendingAck` / `TryCompletePendingRequest` /
+`IsExpired`, so every one of those sees the real body rather than the compressed one. Four ways it
+refuses, each dropping the single message and logging without touching the connection:
+
+| Refusal | Why it is checked here |
+|---|---|
+| Declared length `> maxDecompressedBytes` | The length is a peer's assertion; checked before a byte is decompressed so a small frame cannot ask for a huge buffer. |
+| No strategy registered for the id | A configuration difference between two endpoints, not a protocol violation. |
+| `InvalidDataException` from the strategy | Corrupt body; the strategy layer already normalises Brotli's and Deflate's disagreement into this one type. |
+| Restored length `!= ` declared length | **This is what makes truncation detectable** — see KI-74; the strategy layer alone returns a prefix and cannot tell. |
+
+On success the two compression keys are stripped with `CompressionHeaderKeys.WithoutCompressionHeaders`,
+for the same reason chunk keys are: a subscriber sees the headers the sender sent, and echoing received
+headers back onto a reply must not send the far side off decompressing an ordinary body. Both keys are in
+`ReservedHeaderKeys`, so an application cannot set them by hand.
+
+**No new protocol version.** Compression rides the existing header envelope like priority, expiry,
+backpressure and retention before it. A pre-v5 connection already throws out of `SendCoreAsync` on any
+header-bearing send, so a compressing send on one fails the same way every other header-borne feature
+does — no special case, and none needed.
+
+`_maxDecompressedBytes` comes from the `maxDecompressedBytes` constructor parameter, defaulting to
+`Protocol.DefaultMaxDecompressedMessageBytes` (64 MiB, matching the reassembly ceiling deliberately).
+
 Sources: `Compression/ICompressionStrategy.cs`, `Compression/ICompressionStrategyRegistry.cs`,
 `Compression/CompressionStrategyRegistry.cs`, `Compression/BrotliCompressionStrategy.cs`,
 `Compression/DeflateCompressionStrategy.cs`, `Compression/StreamCompression.cs`,
-`Compression/CompressionAlgorithms.cs`, `Compression/UnknownCompressionAlgorithmException.cs`. Tests:
+`Compression/CompressionAlgorithms.cs`, `Compression/UnknownCompressionAlgorithmException.cs`,
+`Messages/CompressionHeaderKeys.cs`, and `MeshClient.cs` (`ApplyCompression`, `TryDecompress`). Tests:
 `src/Tests/AdamSalisbury.Meshworx.UnitTests/Compression/`.
 
 ### Large-message chunking

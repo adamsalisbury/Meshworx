@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Threading.Channels;
+using AdamSalisbury.Meshworx.Compression;
 using AdamSalisbury.Meshworx.Messages;
 using AdamSalisbury.Meshworx.Transport;
 using Microsoft.Extensions.Logging;
@@ -13,10 +14,17 @@ internal sealed class MeshClientFixture
     public MeshClient Client { get; }
     public Guid AssignedId { get; } = Guid.NewGuid();
 
-    public MeshClientFixture(TimeSpan? idleTimeout = null)
+    public MeshClientFixture(
+        TimeSpan? idleTimeout = null,
+        ICompressionStrategyRegistry? compressionStrategies = null,
+        int? maxDecompressedBytes = null)
     {
         var logger = new Mock<ILogger<MeshClient>>();
-        Client = new MeshClient(logger.Object, idleTimeout);
+        Client = new MeshClient(
+            logger.Object,
+            idleTimeout,
+            compressionStrategies: compressionStrategies,
+            maxDecompressedBytes: maxDecompressedBytes);
         Transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
     }
 

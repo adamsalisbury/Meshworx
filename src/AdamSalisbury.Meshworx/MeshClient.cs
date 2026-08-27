@@ -101,6 +101,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private readonly TimeSpan? _sendTimeout;
     private readonly int _maxSendAttempts;
     private readonly TimeSpan _sendRetryDelay;
+    private readonly int _maxDecompressedBytes;
 
     // Holds the chunks of every part-received large message until each is whole. Only ever touched from
     // the receive loop, which processes one frame at a time, so it needs no lock of its own.
@@ -153,6 +154,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// to add a strategy of your own, or an empty <see cref="CompressionStrategyRegistry"/> to have this
     /// endpoint understand nothing but what you put in it.
     /// </param>
+    /// <param name="maxDecompressedBytes">
+    /// The ceiling on what a single compressed message from a peer may decompress to. The uncompressed
+    /// length travels in a header the peer wrote, so it is checked against this before a byte is
+    /// decompressed and the message is dropped if it overruns — otherwise a small frame could ask this
+    /// client to allocate an arbitrarily large buffer. Defaults to 64 MiB, matching
+    /// <paramref name="maxReassemblyBytes"/>: both bound memory held on a peer's behalf.
+    /// </param>
     public MeshClient(
         ILogger<MeshClient> logger,
         TimeSpan? idleTimeout = null,
@@ -162,7 +170,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         int? maxReassemblyBytes = null,
         TimeSpan? chunkTransferTimeout = null,
         TimeProvider? timeProvider = null,
-        ICompressionStrategyRegistry? compressionStrategies = null)
+        ICompressionStrategyRegistry? compressionStrategies = null,
+        int? maxDecompressedBytes = null)
     {
         ArgumentNullException.ThrowIfNull(logger);
 
@@ -207,8 +216,15 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         _sendTimeout = sendTimeout;
         _maxSendAttempts = maxSendAttempts;
         _sendRetryDelay = sendRetryDelay ?? DefaultSendRetryDelay;
+        if (maxDecompressedBytes is { } decompressedBytes && decompressedBytes <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxDecompressedBytes), "The maximum decompressed bytes must be positive.");
+        }
+
         _reassembler = new ChunkReassembler(maxReassemblyBytes, chunkTransferTimeout, timeProvider);
         CompressionStrategies = compressionStrategies ?? CompressionStrategyRegistry.CreateDefault();
+        _maxDecompressedBytes = maxDecompressedBytes ?? Protocol.DefaultMaxDecompressedMessageBytes;
     }
 
     /// <inheritdoc/>
@@ -703,13 +719,14 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     {
         if (!options.RequireAcknowledgement)
         {
-            if (!options.AwaitCapacity && options.Priority == MessagePriority.Normal)
+            if (!options.AwaitCapacity && options.Priority == MessagePriority.Normal && !options.Compress)
             {
                 await SendAsync(recipientId, message, cancellationToken).ConfigureAwait(false);
                 return;
             }
 
             List<KeyValuePair<string, string>> plainHeaderEntries = [];
+            ReadOnlyMemory<byte> plainBody = ApplyCompression(message, options, plainHeaderEntries);
 
             if (options.AwaitCapacity)
             {
@@ -724,7 +741,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
             var plainHeaders = new MessageHeaders(plainHeaderEntries);
 
-            await SendCoreAsync(recipientId, message, plainHeaders, cancellationToken).ConfigureAwait(false);
+            await SendCoreAsync(recipientId, plainBody, plainHeaders, cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -757,9 +774,10 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     MessagePriorityHeaderKeys.Priority, MessagePriorityHeaderKeys.ToHeaderValue(options.Priority)));
             }
 
+            ReadOnlyMemory<byte> body = ApplyCompression(message, options, headerEntries);
             var headers = new MessageHeaders(headerEntries);
 
-            await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+            await SendCoreAsync(recipientId, body, headers, cancellationToken).ConfigureAwait(false);
 
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeoutCts.CancelAfter(options.AcknowledgementTimeout!.Value);
@@ -805,6 +823,154 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         ]);
 
         await SendCoreAsync(recipientId, message, headers, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Compresses a body when the send asked for it and compressing it actually helps, appending the two
+    /// headers the recipient needs to read it back.
+    /// </summary>
+    /// <remarks>
+    /// Opting in can never make a message larger. A body below
+    /// <see cref="Protocol.MinimumCompressionSize"/> is returned untouched without an attempt, and a body
+    /// whose compressed form is not smaller is returned untouched too — in both cases without the
+    /// headers, so the recipient sees an ordinary message rather than one it has to decompress back to
+    /// where it started.
+    /// <para>
+    /// Naming an algorithm and asking for the best available are treated differently on purpose. A named
+    /// algorithm is a requirement: an id this client has no strategy for throws out of
+    /// <see cref="ICompressionStrategyRegistry.Resolve"/> here, before anything reaches the wire, rather
+    /// than being quietly downgraded to a different algorithm or to none. Asking for the best available
+    /// is a preference, so an empty registry sends uncompressed instead of failing — the same posture
+    /// capability negotiation will take when two endpoints turn out to share no algorithm at all.
+    /// </para>
+    /// </remarks>
+    private ReadOnlyMemory<byte> ApplyCompression(
+        ReadOnlyMemory<byte> message,
+        DeliveryOptions options,
+        List<KeyValuePair<string, string>> headerEntries)
+    {
+        if (!options.Compress || message.Length < Protocol.MinimumCompressionSize)
+        {
+            return message;
+        }
+
+        ICompressionStrategy strategy;
+
+        if (options.CompressionAlgorithmId is { } algorithmId)
+        {
+            strategy = CompressionStrategies.Resolve(algorithmId);
+        }
+        else
+        {
+            IReadOnlyList<string> available = CompressionStrategies.AlgorithmIds;
+
+            if (available.Count == 0)
+            {
+                return message;
+            }
+
+            // Registration order is preference order, so the first entry is this endpoint's best.
+            strategy = CompressionStrategies.Resolve(available[0]);
+        }
+
+        ReadOnlyMemory<byte> compressed = strategy.Compress(message);
+
+        if (compressed.Length >= message.Length)
+        {
+            return message;
+        }
+
+        headerEntries.Add(new KeyValuePair<string, string>(
+            CompressionHeaderKeys.Algorithm, strategy.AlgorithmId));
+        headerEntries.Add(new KeyValuePair<string, string>(
+            CompressionHeaderKeys.UncompressedLength,
+            message.Length.ToString(CultureInfo.InvariantCulture)));
+
+        return compressed;
+    }
+
+    /// <summary>
+    /// Restores a compressed body, or refuses it.
+    /// </summary>
+    /// <remarks>
+    /// Everything this is given comes from a peer and none of it is validated by the hub, so each way it
+    /// can go wrong is handled rather than allowed to throw into the receive loop: a declared length past
+    /// this client's ceiling, an algorithm it holds no strategy for, a body that is not valid output of
+    /// that algorithm, and a body that decompresses to a different length than was declared. The last of
+    /// those is what makes a truncated body an error here rather than a silently short message — the
+    /// strategy layer alone cannot tell the two apart.
+    /// <para>
+    /// A refusal drops the one message and logs; it does not tear down the connection. An algorithm
+    /// mismatch is a configuration difference between two endpoints, not a protocol violation, and the
+    /// rest of the traffic between them is still perfectly readable. The sender is not told — that needs
+    /// capability advertisement, which is a separate concern from being robust when it is absent.
+    /// </para>
+    /// </remarks>
+    private bool TryDecompress(
+        Guid senderId,
+        string algorithmId,
+        int uncompressedLength,
+        ReadOnlyMemory<byte> body,
+        out ReadOnlyMemory<byte> decompressed)
+    {
+        decompressed = default;
+
+        if (uncompressedLength > _maxDecompressedBytes)
+        {
+            _logger.LogError(
+                "Dropped a message from {SenderId}: it declares {DeclaredLength} decompressed bytes, "
+                + "past this client's {MaxDecompressedBytes}-byte ceiling",
+                senderId,
+                uncompressedLength,
+                _maxDecompressedBytes);
+
+            return false;
+        }
+
+        if (!CompressionStrategies.TryResolve(algorithmId, out ICompressionStrategy? strategy))
+        {
+            _logger.LogError(
+                "Dropped a message from {SenderId}: it was compressed with '{AlgorithmId}', for which no "
+                + "compression strategy is registered on this client. Registered: {RegisteredAlgorithmIds}",
+                senderId,
+                algorithmId,
+                string.Join(", ", CompressionStrategies.AlgorithmIds));
+
+            return false;
+        }
+
+        ReadOnlyMemory<byte> restored;
+
+        try
+        {
+            restored = strategy!.Decompress(body, uncompressedLength);
+        }
+        catch (InvalidDataException ex)
+        {
+            _logger.LogError(
+                ex,
+                "Dropped a message from {SenderId}: its body is not valid '{AlgorithmId}' compressed data",
+                senderId,
+                algorithmId);
+
+            return false;
+        }
+
+        if (restored.Length != uncompressedLength)
+        {
+            _logger.LogError(
+                "Dropped a message from {SenderId}: it declared {DeclaredLength} decompressed bytes but "
+                + "produced {ActualLength}, so the body was truncated or does not match its headers",
+                senderId,
+                uncompressedLength,
+                restored.Length);
+
+            return false;
+        }
+
+        decompressed = restored;
+
+        return true;
     }
 
     /// <summary>
@@ -904,6 +1070,13 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         ChunkHeaderKeys.Id,
         ChunkHeaderKeys.Index,
         ChunkHeaderKeys.Count,
+
+        // Reserved for the same reason as the chunk keys, and with a sharper failure mode: the receive
+        // loop acts on these before a message is raised, so an application header literally named
+        // mesh.compression would send the receiver off to decompress a body that was never compressed —
+        // dropping the message outright rather than merely mangling it.
+        CompressionHeaderKeys.Algorithm,
+        CompressionHeaderKeys.UncompressedLength,
     ];
 
     /// <summary>
@@ -920,7 +1093,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             {
                 throw new ArgumentException(
                     $"The header key '{reservedKey}' is reserved for a built-in helper (request/response, "
-                    + "delivery acknowledgement, time-to-live, backpressure, or priority) and cannot be set "
+                    + "delivery acknowledgement, time-to-live, backpressure, priority, chunking, or "
+                    + "compression) and cannot be set "
                     + "directly.",
                     nameof(headers));
             }
@@ -2060,6 +2234,26 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                                 {
                                     continue;
                                 }
+                            }
+
+                            // Decompressed after reassembly and before anything reads the body, so a
+                            // subscriber — and the request/reply and acknowledgement paths below —
+                            // sees the bytes the sender passed in, never the compressed form.
+                            if (CompressionHeaderKeys.TryReadCompressionHeaders(
+                                    headers, out string algorithmId, out int uncompressedLength))
+                            {
+                                if (!TryDecompress(
+                                        senderId,
+                                        algorithmId,
+                                        uncompressedLength,
+                                        messageData,
+                                        out ReadOnlyMemory<byte> decompressed))
+                                {
+                                    continue;
+                                }
+
+                                messageData = decompressed;
+                                headers = CompressionHeaderKeys.WithoutCompressionHeaders(headers);
                             }
 
                             if (!TryCompletePendingAck(senderId, headers)

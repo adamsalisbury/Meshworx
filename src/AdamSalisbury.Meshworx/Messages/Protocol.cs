@@ -158,4 +158,28 @@ internal static class Protocol
     /// behalf.
     /// </remarks>
     internal const int MaxCompressionAlgorithmIdLength = 32;
+
+    /// <summary>
+    /// The smallest body a compressing send will even attempt to compress.
+    /// </summary>
+    /// <remarks>
+    /// Below this, every algorithm's own container overhead is a meaningful fraction of the payload and
+    /// the attempt is more likely to grow the message than shrink it — so the work is skipped rather
+    /// than done and thrown away. A fixed floor rather than a knob: the useful range is narrow, and the
+    /// send already falls back to the uncompressed body whenever compression fails to help, which is the
+    /// general guard this is merely a cheap shortcut past.
+    /// </remarks>
+    internal const int MinimumCompressionSize = 256;
+
+    /// <summary>
+    /// The default ceiling on what a single compressed message may decompress to.
+    /// </summary>
+    /// <remarks>
+    /// The uncompressed length arrives in a header written by the peer, so it is an assertion before it
+    /// is a fact: a receiver that trusted it would let a small frame ask it to allocate an arbitrarily
+    /// large buffer. The declared length is checked against this before a byte is decompressed. Matches
+    /// the default reassembly ceiling deliberately — both bound memory held on a peer's behalf, and a
+    /// consumer who has reasoned about one has already reasoned about the other.
+    /// </remarks>
+    internal const int DefaultMaxDecompressedMessageBytes = 64 * 1024 * 1024;
 }

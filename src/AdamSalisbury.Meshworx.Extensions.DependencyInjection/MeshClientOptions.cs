@@ -131,6 +131,16 @@ public sealed class MeshClientOptions
     public TimeSpan? ChunkTransferTimeout { get; set; }
 
     /// <summary>
+    /// Gets or sets the ceiling on what a single compressed message from a peer may decompress to.
+    /// </summary>
+    /// <remarks>
+    /// The uncompressed length arrives in a header the peer wrote, so it is checked against this before
+    /// any of it is believed. Defaults to 64 MiB, matching <see cref="MaxReassemblyBytes"/> — both bound
+    /// memory this client holds on a peer's behalf.
+    /// </remarks>
+    public int? MaxDecompressedBytes { get; set; }
+
+    /// <summary>
     /// Gets or sets how long a single attempt at the client's initial connection, made when the host
     /// starts, may take before it is abandoned and retried.
     /// </summary>
