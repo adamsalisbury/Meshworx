@@ -1063,9 +1063,9 @@ await alice.SendAsync(bobId, payload); // now carries traceparent/tracestate aut
 `compressionStrategies` constructor parameter, defaulting to `CompressionStrategyRegistry.CreateDefault()`
 (Brotli then Deflate).
 
-Consumed by `ApplyCompression` on the send side and `TryDecompress` on the receive side — see
-[Per-message compression](#per-message-compression-issue-33) below. Capability advertisement, so a sender
-knows what its peer holds, is still issue #77.
+Consumed by `ApplyCompressionAsync` on the send side and `TryDecompress` on the receive side — see
+[Per-message compression](#per-message-compression-issue-33) below — and advertised to the hub on connect,
+see [Capability negotiation](#capability-negotiation-issue-77).
 
 Points worth knowing before you build on it:
 
@@ -1104,7 +1104,7 @@ Opt in with `DeliveryOptions.Compressed()` / `Compressed(string)` / `.WithCompre
 DeliveryOptions, CancellationToken)`. Group, topic, broadcast and `SendLargeAsync` do not compress;
 chunked compression is issue #76.
 
-**Send** — `MeshClient.ApplyCompression`, called from both arms of the `DeliveryOptions` overload (the
+**Send** — `MeshClient.ApplyCompressionAsync`, called from both arms of the `DeliveryOptions` overload (the
 plain-header arm and the acknowledgement arm), appending to the same header list each already builds:
 
 1. Not requested, or body `< Protocol.MinimumCompressionSize` (256) → returned untouched.
@@ -1151,6 +1151,49 @@ Sources: `Compression/ICompressionStrategy.cs`, `Compression/ICompressionStrateg
 `Compression/CompressionAlgorithms.cs`, `Compression/UnknownCompressionAlgorithmException.cs`,
 `Messages/CompressionHeaderKeys.cs`, and `MeshClient.cs` (`ApplyCompression`, `TryDecompress`). Tests:
 `src/Tests/AdamSalisbury.Meshworx.UnitTests/Compression/`.
+
+### Capability negotiation (issue #77)
+
+Two endpoints no longer have to be configured in lockstep. The client tells the hub what it can
+decompress, and a sender asks before it compresses.
+
+**Advertising** — `AdvertiseCompressionAsync`, called from `ConnectAsync` after the receive loop is
+running and **after** session resumption, so the advertisement is filed against whichever id the
+connection ends up holding. Sends `AdvertiseCompression` (`0x2C`) carrying `AlgorithmIds` in order.
+Skipped entirely below `Protocol.CompressionNegotiationMinVersion` (11) or with an empty registry. More
+than `Protocol.MaxAdvertisedCompressionAlgorithms` (16) registered ids are **truncated** to the first 16
+with a warning, rather than sent whole and rejected wholesale by the hub, which would leave this client
+advertising nothing at all.
+
+**A failed advertisement never fails the connection.** The send is wrapped and swallowed: an advertisement
+that does not land costs peers their knowledge of what this client reads, which degrades to
+pre-negotiation behaviour — not to a refusal to connect. Do not "tighten" this into a throw.
+
+**Looking a peer up** — `TryGetPeerCompressionAlgorithmsAsync` → `FetchPeerCompressionAlgorithmsAsync`,
+serialised by `_compressionCapabilityLock` through a single `_pendingCapabilityRequest` slot, exactly as
+`FindClientsAsync` is. Bounded by `CompressionCapabilityTimeout` (5 s) because it sits **inline on a
+send**. Results are cached per peer id for `CompressionCapabilityCacheLifetime` (5 min), read through the
+client's `TimeProvider`, and the whole cache is cleared wherever connection state resets.
+
+**`null` means "unknown", never "supports nothing".** Every path that cannot answer — an older connection,
+a failed or timed-out query — returns `null`, and `SelectCompressionStrategy` treats that as licence to
+choose on local information alone. An *empty list* is a different answer: the peer is known to support
+nothing, and a best-available send goes uncompressed. Conflating the two would either break sends against
+older hubs or silently stop compressing against peers that never advertised.
+
+**Choosing** — `SelectCompressionStrategy`:
+
+| Request | Peer known | Outcome |
+|---|---|---|
+| Named | — | Resolved locally first; a local miss throws regardless of the peer. |
+| Named | yes, and lacks it | **Throws** `UnknownCompressionAlgorithmException` (peer constructor) before sending. |
+| Best available | no | First local strategy — pre-negotiation behaviour. |
+| Best available | yes | First **local** id the peer also advertises. Local order wins the tie. |
+| Best available | yes, no overlap | `null` → uncompressed, logged at debug. Not an error. |
+
+The load-bearing invariant, worth preserving through any future change here: **negotiation is an
+optimisation over what a compressing send already did, never a precondition for it.** Only a query that
+succeeds and shows no overlap changes an outcome.
 
 ### Large-message chunking
 

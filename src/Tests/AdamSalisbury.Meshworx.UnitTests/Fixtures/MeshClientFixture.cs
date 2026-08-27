@@ -11,18 +11,26 @@ namespace AdamSalisbury.Meshworx.UnitTests.Fixtures;
 internal sealed class MeshClientFixture
 {
     public Mock<ITransport> Transport { get; } = new();
+
+    /// <summary>
+    /// Writes further frames into the receive loop after setup, for a test that has to answer something
+    /// the client sends rather than only script what it reads.
+    /// </summary>
+    public ChannelWriter<byte[]?>? Inbound { get; private set; }
     public MeshClient Client { get; }
     public Guid AssignedId { get; } = Guid.NewGuid();
 
     public MeshClientFixture(
         TimeSpan? idleTimeout = null,
         ICompressionStrategyRegistry? compressionStrategies = null,
-        int? maxDecompressedBytes = null)
+        int? maxDecompressedBytes = null,
+        TimeProvider? timeProvider = null)
     {
         var logger = new Mock<ILogger<MeshClient>>();
         Client = new MeshClient(
             logger.Object,
             idleTimeout,
+            timeProvider: timeProvider,
             compressionStrategies: compressionStrategies,
             maxDecompressedBytes: maxDecompressedBytes);
         Transport.Setup(t => t.DisposeAsync()).Returns(ValueTask.CompletedTask);
@@ -139,6 +147,7 @@ internal sealed class MeshClientFixture
         // uncompleted deliberately: returning null would now be interpreted as a lost
         // connection and trigger teardown.
         var channel = Channel.CreateUnbounded<byte[]?>();
+        Inbound = channel.Writer;
         channel.Writer.TryWrite(CreateRegistrationResponse(negotiatedVersion));
 
         foreach (byte[] message in receiveLoopMessages)
@@ -184,12 +193,14 @@ internal sealed class MeshClientFixture
     public void SetupWithLookupResponse(byte[] lookupResponse)
     {
         var lookupTcs = new TaskCompletionSource<byte[]?>();
-        int sendCount = 0;
 
+        // Triggered by the lookup's own opcode rather than by a send count. Connecting is not a fixed
+        // number of frames — it sends a compression capability advertisement of its own — and an ordinal
+        // here answers whichever send happens to land second, which is a race rather than a choice.
         Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
-            .Callback<ReadOnlyMemory<byte>, CancellationToken>((_, _) =>
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
             {
-                if (Interlocked.Increment(ref sendCount) == 2)
+                if ((MessageType)data.Span[0] == MessageType.ClientLookupRequest)
                 {
                     lookupTcs.TrySetResult(lookupResponse);
                 }

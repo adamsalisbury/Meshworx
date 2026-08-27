@@ -550,7 +550,37 @@ Gotchas when writing an authenticator:
 - `maxConcurrentAuthentications` is **ignored when no authenticator is supplied**; a non-positive value
   throws `ArgumentOutOfRangeException` (`MeshHub.cs:284-289`).
 
-### Rate limiting
+### Compression capabilities (issue #77)
+
+The hub's whole part in compression: it holds what each client advertised and hands it back on request.
+It never interprets an algorithm id, never compresses or decompresses anything, and cannot tell a
+compressed message from any other one.
+
+- **State:** `ClientConnection.CompressionAlgorithms` — an `IReadOnlyList<string>`, empty until the client
+  advertises. Replaced wholesale behind `Volatile.Read`/`Write`, never mutated in place, for exactly the
+  reason `ClientConnection.Attributes` is: a capability query arriving on a *different* connection's
+  receive loop reads the reference once and gets a consistent snapshot without a lock.
+- **`SetCompressionAlgorithms`** decodes `AdvertiseCompression` (`0x2C`) via
+  `CompressionCapabilityEnvelope.TryRead` and rejects a malformed or oversized block in its entirety,
+  silently. Mirrors `SetClientAttributes` exactly — that frame has no reply either, and a partial
+  advertisement would leave peers believing a client supports a set it never claimed.
+- **`SendCompressionCapabilityResponseAsync`** answers `CompressionCapabilityRequest` (`0x2D`) with a
+  single `_clients` lookup. **Not** charged against the fan-out rate limiter: it follows
+  `ClientLookupRequest`'s precedent, not `FindClientsRequest`'s, because it is a lookup rather than a scan.
+  An unknown id answers `found = 0` with an empty set rather than staying silent, so the asking client
+  resolves rather than waiting out its timeout.
+- **Both frames are gated** behind `Protocol.CompressionNegotiationMinVersion = 11`; an older connection
+  gets the unrecognised-opcode treatment (KI-9), not a reply.
+- **Capabilities die with the connection.** They live on `ClientConnection`, so a disconnect discards them
+  with everything else — there is no separate lifetime to reason about.
+- `GetAdvertisedCompressionAlgorithmsForTesting` exists because `AdvertiseCompression` has no reply, so a
+  test otherwise has nothing to wait on to know the hub processed one.
+
+Federation does **not** relay capabilities: a client on a peer hub answers `found = 0`, so a sender
+addressing one falls back to choosing on local information. Worth knowing before assuming negotiation
+works across a federated link.
+
+## Rate limiting
 
 Added by issue #69, to bound the amplification a single client can force through a broadcast or group
 send. A `ClientRateLimiter` (`RateLimiting/ClientRateLimiter.cs`) is constructed **per connection**, only

@@ -50,4 +50,22 @@ internal enum MessageType : byte
     PeerDeliverMessage = 0x29,
     PeerDeliverGroupMessage = 0x2A,
     PeerDeliverTopicMessage = 0x2B,
+
+    /// <summary>
+    /// Client → hub. Advertises the compression algorithms this client can decompress, so a peer sending
+    /// to it can pick one it will actually be able to read. Sent immediately after registration rather
+    /// than inside it: the registration frame's credential consumes everything after the name, leaving
+    /// nowhere to splice this in.
+    /// </summary>
+    AdvertiseCompression = 0x2C,
+
+    /// <summary>
+    /// Client → hub. Asks what compression algorithms another client has advertised.
+    /// </summary>
+    CompressionCapabilityRequest = 0x2D,
+
+    /// <summary>
+    /// Hub → client. Answers a <see cref="CompressionCapabilityRequest"/>.
+    /// </summary>
+    CompressionCapabilityResponse = 0x2E,
 }

@@ -51,10 +51,16 @@ public sealed class TopicPubSubClientTests
 
         await Assert.ThrowsAsync<ArgumentException>(() => fixture.Client.SubscribeAsync("orders."));
 
-        // Only the registration frame that ConnectAsync itself sent should ever have gone out; the
-        // malformed subscribe must be rejected before anything else reaches the transport.
+        // No SubscribeTopic frame at all: the malformed pattern must be rejected before anything reaches
+        // the transport. Asserted against that opcode rather than against a total send count, which
+        // would also fold in whatever ConnectAsync itself sends — registration, and a compression
+        // capability advertisement.
         fixture.Transport.Verify(
-            t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()), Times.Once);
+            t => t.SendAsync(
+                It.Is<ReadOnlyMemory<byte>>(
+                    f => f.Length > 0 && f.ToArray()[0] == (byte)MessageType.SubscribeTopic),
+                It.IsAny<CancellationToken>()),
+            Times.Never);
     }
 
     [Fact]

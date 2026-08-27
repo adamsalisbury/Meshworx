@@ -31,6 +31,27 @@ public sealed class UnknownCompressionAlgorithmException : Exception
     }
 
     /// <summary>
+    /// Initialises a new instance of the <see cref="UnknownCompressionAlgorithmException"/> class for an
+    /// algorithm a <i>peer</i> has not advertised support for.
+    /// </summary>
+    /// <param name="algorithmId">The algorithm id the peer cannot read.</param>
+    /// <param name="peerId">The peer that has not advertised it.</param>
+    /// <param name="peerAlgorithmIds">What the peer did advertise.</param>
+    /// <remarks>
+    /// The same exception type as the local case on purpose: a caller that named an algorithm wants to
+    /// know its message could not be compressed the way it asked, and which side of the connection is
+    /// missing the strategy does not change what it has to do about it. The message says which, for
+    /// anyone reading a log.
+    /// </remarks>
+    public UnknownCompressionAlgorithmException(
+        string algorithmId, Guid peerId, IReadOnlyList<string> peerAlgorithmIds)
+        : base(BuildPeerMessage(algorithmId, peerId, peerAlgorithmIds))
+    {
+        AlgorithmId = algorithmId;
+        PeerId = peerId;
+    }
+
+    /// <summary>
     /// Initialises a new instance of the <see cref="UnknownCompressionAlgorithmException"/> class with a
     /// custom message.
     /// </summary>
@@ -57,6 +78,12 @@ public sealed class UnknownCompressionAlgorithmException : Exception
     /// </summary>
     public string? AlgorithmId { get; }
 
+    /// <summary>
+    /// Gets the peer that had not advertised support for <see cref="AlgorithmId"/>, or
+    /// <see langword="null"/> when it was this endpoint that held no strategy for it.
+    /// </summary>
+    public Guid? PeerId { get; }
+
     private static string BuildMessage(string algorithmId, IReadOnlyList<string> registeredAlgorithmIds)
     {
         ArgumentNullException.ThrowIfNull(registeredAlgorithmIds);
@@ -66,5 +93,17 @@ public sealed class UnknownCompressionAlgorithmException : Exception
             : string.Join(", ", registeredAlgorithmIds);
 
         return $"No compression strategy is registered for algorithm '{algorithmId}'. Registered: {registered}.";
+    }
+
+    private static string BuildPeerMessage(string algorithmId, Guid peerId, IReadOnlyList<string> peerAlgorithmIds)
+    {
+        ArgumentNullException.ThrowIfNull(peerAlgorithmIds);
+
+        string advertised = peerAlgorithmIds.Count == 0
+            ? "none"
+            : string.Join(", ", peerAlgorithmIds);
+
+        return $"Client {peerId} has not advertised support for compression algorithm '{algorithmId}', "
+            + $"so it could not read a message compressed with it. It advertised: {advertised}.";
     }
 }

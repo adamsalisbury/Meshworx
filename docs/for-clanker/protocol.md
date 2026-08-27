@@ -112,6 +112,9 @@ Everything in the tables below is the **message payload** (i.e. after the transp
 | `SubscribePresence` | `0x22` | client → hub | none |
 | `UnsubscribePresence` | `0x23` | client → hub | none |
 | `PresenceChanged` | `0x24` | hub → client | change type (1; `0x01` joined, `0x02` left), client id (16), name length (2, BE), UTF-8 name |
+| `AdvertiseCompression` | `0x2C` | client → hub | the algorithms this client can decompress, in preference order (issue #77) |
+| `CompressionCapabilityRequest` | `0x2D` | client → hub | correlation id (4, BE), subject client id (16) |
+| `CompressionCapabilityResponse` | `0x2E` | hub → client | correlation id (4, BE), found (1), the subject's advertised algorithms |
 
 `0x24` is the highest opcode in use; the next new one is `0x25`. Topic-based publish/subscribe (issue
 #37) is covered in full in [Topic pub/sub frames](#topic-pubsub-frames-issue-37) below and
@@ -538,6 +541,48 @@ message when they differ. It is also the decompression bound, checked against th
 
 Both keys are in `MeshClient.ReservedHeaderKeys`, so an application cannot set them by hand and cannot
 send the receiver off decompressing a body that was never compressed.
+
+### Compression capability frames (issue #77)
+
+Three opcodes, gated behind `Protocol.CompressionNegotiationMinVersion = 11` from the outset — the
+discipline issues #38 and #39 applied, not #37's. `Protocol.MaxSupportedVersion` goes 10 → 11.
+
+```
+client → hub : [0x2C AdvertiseCompression][algorithmBlock...]                                   # needs len ≥ 1
+client → hub : [0x2D CompressionCapabilityRequest][correlationId 4][subjectId 16]               # needs len ≥ 21
+hub → client : [0x2E CompressionCapabilityResponse][correlationId 4][found 1][algorithmBlock]   # needs len ≥ 7
+```
+
+The `algorithmBlock` is `[count u8][len u8][utf8 id]...` — `Messages/CompressionCapabilityEnvelope.cs`.
+Both prefixes are single bytes because both are already bounded far below 256:
+`Protocol.MaxAdvertisedCompressionAlgorithms` (16) ids of at most
+`Protocol.MaxCompressionAlgorithmIdLength` (32) characters. **Deliberately not the `HeaderEnvelope` codec
+that client attributes reuse** — that encodes a key/value map, and this is an ordered list whose order *is*
+the payload: the advertising endpoint's preference order, which a map would not preserve.
+
+**Why this is not part of the registration handshake, despite issue #77 saying so.** It cannot be.
+`RegistrationRequest` is `[0x04][versionMin][versionMax][nameLen][name][credential...]` and **the
+credential is everything after the name** — its length is implied by the frame length, so anything
+appended is handed to the `ClientAuthenticator` as credential bytes. This is the same wall issue #43 hit
+with the resumption token, and that issue's fix — a conditional tail on the *reply* — does not transfer,
+because this data flows client → hub. `MeshClient` therefore sends `AdvertiseCompression` immediately
+after registration, from inside `ConnectAsync`, once the receive loop is running and after any session
+resumption has settled (so it is filed against whichever id the connection ends up holding).
+
+**`AdvertiseCompression` has no reply.** A malformed or oversized block is rejected in its entirety and
+silently, exactly as `SetClientAttributes` is — see
+[Length-guard behaviour](#length-guard-behaviour-why-malformed-frames-do-nothing). Partial acceptance
+would leave peers believing a client supports a set it never claimed.
+
+**`CompressionCapabilityRequest`/`Response` follow `ClientLookupRequest`/`ClientLookupResponse`'s
+correlation-id shape,** and like that pair — and unlike `FindClientsRequest`, which scans every
+connection — answering is a single dictionary lookup, so it is **not** charged against the fan-out rate
+limiter. An unknown subject id answers `found = 0` with an empty block rather than staying silent, so the
+asking client resolves its request instead of waiting out its own timeout.
+
+**The hub never interprets an algorithm id.** It stores what a client advertised and hands it back; it
+cannot compress or decompress anything and does not try. This is not an exception to "the hub only ever
+reads a header block's length, never its content" — no header block is involved.
 
 ### Session resumption (issue #43, extended by PR #135/issue #109)
 

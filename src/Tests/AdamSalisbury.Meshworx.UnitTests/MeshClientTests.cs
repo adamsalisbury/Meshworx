@@ -558,10 +558,21 @@ public sealed class MeshClientTests
     /// every send through <paramref name="onSend"/>. The first send is the registration request (send
     /// number 1); subsequent numbers are the sends the test drives.
     /// </summary>
+    /// <summary>
+    /// Connects a client over a transport whose sends are scripted by opcode.
+    /// </summary>
+    /// <param name="client">The client to connect.</param>
+    /// <param name="transport">The transport mock to script.</param>
+    /// <param name="onSend">
+    /// Given each outgoing frame's opcode. Matching on the opcode rather than on how many sends have
+    /// happened matters: connecting is not a fixed number of frames, and has not been since capability
+    /// advertisement was added, so an ordinal here would silently retarget the next time connecting grows
+    /// a step.
+    /// </param>
     private static async Task ConnectWithScriptedSendAsync(
         MeshClient client,
         Mock<ITransport> transport,
-        Func<int, CancellationToken, Task> onSend)
+        Func<MessageType, CancellationToken, Task> onSend)
     {
         var assignedId = Guid.NewGuid();
         var registrationResponse = new byte[18];
@@ -576,9 +587,9 @@ public sealed class MeshClientTests
         transport.Setup(t => t.ReceiveAsync(It.IsAny<CancellationToken>()))
             .Returns<CancellationToken>(async ct => await channel.Reader.ReadAsync(ct));
 
-        int sendCount = 0;
         transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
-            .Returns<ReadOnlyMemory<byte>, CancellationToken>((_, ct) => onSend(Interlocked.Increment(ref sendCount), ct));
+            .Returns<ReadOnlyMemory<byte>, CancellationToken>(
+                (frame, ct) => onSend((MessageType)frame.Span[0], ct));
 
         await client.ConnectAsync(transport.Object, "TestClient");
     }
@@ -596,11 +607,12 @@ public sealed class MeshClientTests
             maxSendAttempts: 3,
             sendRetryDelay: TimeSpan.FromMilliseconds(1));
 
-        // Send 1 is registration. Data sends are 2, 3, 4: the first two fail transiently, the third works.
+        // Only the caller's own data sends fail, and only the first two of them; registration,
+        // capability advertisement and the teardown disconnect all succeed.
         int dataSendCount = 0;
-        await ConnectWithScriptedSendAsync(client, transport, (send, _) =>
+        await ConnectWithScriptedSendAsync(client, transport, (opcode, _) =>
         {
-            if (send == 1)
+            if (opcode is not MessageType.SendMessage)
             {
                 return Task.CompletedTask;
             }
@@ -626,10 +638,10 @@ public sealed class MeshClientTests
         await using var client = new MeshClient(new Mock<ILogger<MeshClient>>().Object);
 
         int dataSendCount = 0;
-        await ConnectWithScriptedSendAsync(client, transport, (send, _) =>
+        await ConnectWithScriptedSendAsync(client, transport, (opcode, _) =>
         {
-            // Fail only the caller's data send (send 2), not registration or the teardown disconnect.
-            if (send != 2)
+            // Fail only the caller's data send, not registration, advertisement or teardown.
+            if (opcode is not MessageType.SendMessage)
             {
                 return Task.CompletedTask;
             }
@@ -654,12 +666,14 @@ public sealed class MeshClientTests
             new Mock<ILogger<MeshClient>>().Object,
             sendTimeout: TimeSpan.FromMilliseconds(100));
 
-        // The data send (send 2) stalls but honours cancellation, so the timeout cancels it; other sends
-        // (registration, teardown disconnect) complete normally.
+        // The data send stalls but honours cancellation, so the timeout cancels it; every other send
+        // (registration, capability advertisement, teardown disconnect) completes normally.
         await ConnectWithScriptedSendAsync(
             client,
             transport,
-            (send, ct) => send == 2 ? Task.Delay(Timeout.Infinite, ct) : Task.CompletedTask);
+            (opcode, ct) => opcode is MessageType.SendMessage
+                ? Task.Delay(Timeout.Infinite, ct)
+                : Task.CompletedTask);
 
         await Assert.ThrowsAsync<TimeoutException>(() => client.SendAsync(Guid.NewGuid(), new byte[] { 1 }));
     }
@@ -678,11 +692,13 @@ public sealed class MeshClientTests
             maxSendAttempts: 3,
             sendRetryDelay: TimeSpan.FromMilliseconds(1));
 
-        // The data send (send 2) stalls but honours cancellation; other sends complete normally.
+        // The data send stalls but honours cancellation; every other send completes normally.
         await ConnectWithScriptedSendAsync(
             client,
             transport,
-            (send, ct) => send == 2 ? Task.Delay(Timeout.Infinite, ct) : Task.CompletedTask);
+            (opcode, ct) => opcode is MessageType.SendMessage
+                ? Task.Delay(Timeout.Infinite, ct)
+                : Task.CompletedTask);
 
         using var cts = new CancellationTokenSource();
         Task sendTask = client.SendAsync(Guid.NewGuid(), new byte[] { 1 }, cts.Token);
@@ -1205,8 +1221,11 @@ public sealed class MeshClientTests
         fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
             .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
             {
-                if (Interlocked.Increment(ref sendCount) == 2)
+                // Matched on the opcode, not on being the second send: connecting sends a capability
+                // advertisement of its own now, and an ordinal would have picked that up instead.
+                if ((MessageType)data.Span[0] == MessageType.ClientLookupRequest)
                 {
+                    Interlocked.Increment(ref sendCount);
                     lookupPayload = data.ToArray();
                     lookupTcs.TrySetResult(MeshClientFixture.CreateLookupNotFoundResponse());
                 }
@@ -1941,9 +1960,19 @@ public sealed class MeshClientTests
             senderId, headers, new byte[] { 1 });
         fixture.SetupSuccessfulRegistration(payload);
 
-        int sendCount = 0;
+        // Counts only what an acknowledgement would be sent as, rather than every frame: connecting
+        // sends a registration request and a capability advertisement, neither of which this test is
+        // about, and both of which an unqualified count would fold in.
+        int messageSendCount = 0;
         fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
-            .Callback(() => Interlocked.Increment(ref sendCount))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
+            {
+                if ((MessageType)data.Span[0]
+                    is MessageType.SendMessage or MessageType.SendMessageWithHeaders)
+                {
+                    Interlocked.Increment(ref messageSendCount);
+                }
+            })
             .Returns(Task.CompletedTask);
 
         var receivedTcs = new TaskCompletionSource<MessageReceivedEventArgs>();
@@ -1953,9 +1982,8 @@ public sealed class MeshClientTests
 
         await receivedTcs.Task.WaitAsync(TimeSpan.FromSeconds(1));
 
-        // Only the registration request itself should have been sent; nothing else in reaction to a
-        // plain message.
-        Assert.Equal(1, sendCount);
+        // Nothing at all is sent in reaction to a plain message.
+        Assert.Equal(0, messageSendCount);
     }
 
     // SendAsync(DeliveryOptions.AwaitCapacity) / QueueSaturated (#30)
@@ -2773,12 +2801,13 @@ public sealed class MeshClientTests
         var receiveChannel = Channel.CreateUnbounded<byte[]?>();
         receiveChannel.Writer.TryWrite(fixture.CreateRegistrationResponse());
 
-        int sendCount = 0;
         fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
-            .Callback<ReadOnlyMemory<byte>, CancellationToken>((_, _) =>
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
             {
-                // The first lookup of a fresh client uses correlation id 0.
-                if (Interlocked.Increment(ref sendCount) == 2)
+                // Matched on the lookup's opcode rather than a send count: connecting also sends a
+                // compression capability advertisement, so an ordinal answers whichever frame lands
+                // second. The first lookup of a fresh client uses correlation id 0.
+                if ((MessageType)data.Span[0] == MessageType.ClientLookupRequest)
                 {
                     receiveChannel.Writer.TryWrite(MeshClientFixture.CreateLookupFoundResponse(Guid.NewGuid(), correlationId: 99));
                     receiveChannel.Writer.TryWrite(MeshClientFixture.CreateLookupFoundResponse(expectedId, correlationId: 0));
@@ -2807,13 +2836,13 @@ public sealed class MeshClientTests
         var receiveChannel = Channel.CreateUnbounded<byte[]?>();
         receiveChannel.Writer.TryWrite(fixture.CreateRegistrationResponse());
 
-        int sendCount = 0;
         fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
-            .Callback<ReadOnlyMemory<byte>, CancellationToken>((_, _) =>
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
             {
-                // When the lookup request is sent, simulate the hub closing the connection
-                // (null frame) before any lookup response is returned.
-                if (Interlocked.Increment(ref sendCount) == 2)
+                // When the lookup request is sent — matched by its opcode, not by being the second send,
+                // since connecting also sends a compression capability advertisement — simulate the hub
+                // closing the connection (null frame) before any lookup response is returned.
+                if ((MessageType)data.Span[0] == MessageType.ClientLookupRequest)
                 {
                     receiveChannel.Writer.TryWrite(null);
                 }
@@ -2862,12 +2891,13 @@ public sealed class MeshClientTests
         fixture.SetupSuccessfulRegistration(pingFrame);
 
         var pongTcs = new TaskCompletionSource<byte[]>();
-        int sendCount = 0;
         fixture.Transport.Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
             .Callback<ReadOnlyMemory<byte>, CancellationToken>((data, _) =>
             {
-                // The first send is the registration request; the next is the Pong reply.
-                if (Interlocked.Increment(ref sendCount) >= 2)
+                // Matched on the Pong opcode rather than on being the second send: connecting sends a
+                // registration request and a compression capability advertisement, so an ordinal would
+                // capture the advertisement and assert against it instead.
+                if ((MessageType)data.Span[0] == MessageType.Pong)
                 {
                     pongTcs.TrySetResult(data.ToArray());
                 }
