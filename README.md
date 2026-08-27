@@ -998,10 +998,52 @@ from a peer is attacker-controlled, and a few kilobytes on the wire can otherwis
 memory. Resolving an algorithm id nothing is registered for throws
 `UnknownCompressionAlgorithmException`, naming the id and listing what *is* registered.
 
-> **Nothing is compressed automatically yet.** This is the seam, not the feature: `MeshClient` holds a
-> registry and resolves against it, but no send currently consults one. Opting an individual message into
-> compression, and advertising an endpoint's registered algorithms so a sender can pick one both sides
-> understand, are the following changes in this milestone.
+### Compressing a message
+
+Compression is opt-in per send, through `DeliveryOptions`:
+
+```csharp
+// The best algorithm this client has registered — Brotli, by default.
+await client.SendAsync(recipientId, telemetryBatch, DeliveryOptions.Compressed());
+
+// A specific one.
+await client.SendAsync(recipientId, telemetryBatch, DeliveryOptions.Compressed("zstd"));
+
+// Combined with anything else DeliveryOptions carries.
+await client.SendAsync(
+    recipientId,
+    telemetryBatch,
+    DeliveryOptions.RequireAck(TimeSpan.FromSeconds(5)).WithCompression());
+```
+
+The recipient decompresses before raising `MessageReceived`, so a subscriber sees the bytes that were
+sent and needs no code to tell a compressed message from an ordinary one — the compression headers are
+stripped along with the compression.
+
+**Opting in can never make a message larger.** A body under 256 bytes is sent as-is without an attempt,
+and a body whose compressed form is not actually smaller is sent uncompressed too. Neither case is an
+error, and neither changes what the recipient sees.
+
+The two halves of "which algorithm" behave differently on purpose:
+
+| Request | Not available locally |
+|---|---|
+| `Compressed()` — best available | Sends uncompressed. A preference, not a requirement. |
+| `Compressed("zstd")` — named | Throws `UnknownCompressionAlgorithmException` before anything is sent. |
+
+On the receiving side, a message compressed with an algorithm this client has no strategy for is
+**dropped and logged**, and the connection carries on — an algorithm mismatch is a configuration
+difference between two endpoints, not a protocol violation. Advertising each endpoint's registered
+algorithms so a sender can avoid the mismatch in the first place is the next change in this milestone.
+
+The sender puts the uncompressed length in a header alongside the algorithm id. The receiver bounds
+decompression at exactly that length, refuses a declared length past `maxDecompressedBytes` (64 MiB by
+default) before decompressing anything, and drops a body that restores to a different length than was
+declared — which is what makes a truncated body an error rather than a silently short message.
+
+Compression applies to the direct `SendAsync` overload that takes `DeliveryOptions`. Group, topic and
+broadcast sends, and `SendLargeAsync`'s chunked transfers, are not compressed; chunked compression is a
+later change in this milestone.
 
 ## Typed messages
 

@@ -150,6 +150,10 @@ clients.
 this by reflection, as it does every other option — the property name and the constructor parameter name
 have to keep matching.
 
+`MeshClientOptions.MaxDecompressedBytes` (issue #33) is an ordinary settable `int?` alongside it, since
+that one genuinely is a setting: it becomes `MeshClient`'s `maxDecompressedBytes`, the ceiling a peer's
+declared uncompressed length is checked against. Defaults to 64 MiB.
+
 There is deliberately **no** hub-side equivalent. Compression is endpoint-to-endpoint; the hub routes a
 compressed body without knowing it is one, so `MeshHubOptions` has nothing to configure.
 

@@ -18,12 +18,16 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
         bool requireAcknowledgement,
         TimeSpan? acknowledgementTimeout,
         bool awaitCapacity,
-        MessagePriority priority)
+        MessagePriority priority,
+        bool compress = false,
+        string? compressionAlgorithmId = null)
     {
         RequireAcknowledgement = requireAcknowledgement;
         AcknowledgementTimeout = acknowledgementTimeout;
         AwaitCapacity = awaitCapacity;
         Priority = priority;
+        Compress = compress;
+        CompressionAlgorithmId = compressionAlgorithmId;
     }
 
     /// <summary>
@@ -63,6 +67,30 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// existed before priority lanes did.
     /// </summary>
     public MessagePriority Priority { get; }
+
+    /// <summary>
+    /// Gets a value indicating whether the sender asked for this message's body to be compressed before
+    /// it goes on the wire.
+    /// </summary>
+    /// <remarks>
+    /// A request, not a guarantee. A body below <c>256</c> bytes is sent as-is without an attempt, and a
+    /// body that does not actually get smaller is sent uncompressed too — opting in can therefore never
+    /// make a message larger. Either way the recipient sees the same bytes it would have seen without
+    /// this set.
+    /// </remarks>
+    public bool Compress { get; }
+
+    /// <summary>
+    /// Gets the id of the compression algorithm to use, or <see langword="null"/> to use the best one
+    /// this client has registered.
+    /// </summary>
+    /// <remarks>
+    /// Resolved against the sending client's own <see cref="IMeshClient.CompressionStrategies"/>. A named
+    /// algorithm that is not registered there throws before anything is sent; <see langword="null"/>
+    /// takes the first registered strategy, which is why registration order is preference order, and
+    /// falls back to sending uncompressed if there are none.
+    /// </remarks>
+    public string? CompressionAlgorithmId { get; }
 
     /// <summary>
     /// Requests a delivery acknowledgement: the send completes once the recipient's client has handed
@@ -117,6 +145,76 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     }
 
     /// <summary>
+    /// Requests that this send's body be compressed with the best algorithm this client has registered,
+    /// leaving the recipient to decompress it before its application sees it.
+    /// </summary>
+    /// <remarks>
+    /// "Best" means the first strategy registered with the sending client's
+    /// <see cref="IMeshClient.CompressionStrategies"/>, which by default is Brotli. If that registry is
+    /// empty the message is sent uncompressed rather than failing: the caller asked for compression, not
+    /// for the send to depend on it. Name an algorithm with <see cref="Compressed(string)"/> when the
+    /// choice actually matters.
+    /// </remarks>
+    public static DeliveryOptions Compressed()
+    {
+        return new DeliveryOptions(
+            requireAcknowledgement: false,
+            acknowledgementTimeout: null,
+            awaitCapacity: false,
+            priority: default,
+            compress: true);
+    }
+
+    /// <summary>
+    /// Requests that this send's body be compressed with a specific registered algorithm.
+    /// </summary>
+    /// <param name="algorithmId">
+    /// The id of a strategy registered with the sending client's
+    /// <see cref="IMeshClient.CompressionStrategies"/>.
+    /// </param>
+    /// <exception cref="ArgumentException"><paramref name="algorithmId"/> is empty or whitespace.</exception>
+    /// <remarks>
+    /// Unlike <see cref="Compressed()"/>, this fails rather than falling back: an algorithm the sending
+    /// client has no strategy for throws a
+    /// <see cref="Compression.UnknownCompressionAlgorithmException"/> at send time, before anything goes
+    /// on the wire. Naming an algorithm is taken as a requirement, where asking for the best available is
+    /// taken as a preference.
+    /// </remarks>
+    public static DeliveryOptions Compressed(string algorithmId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(algorithmId);
+
+        return new DeliveryOptions(
+            requireAcknowledgement: false,
+            acknowledgementTimeout: null,
+            awaitCapacity: false,
+            priority: default,
+            compress: true,
+            compressionAlgorithmId: algorithmId);
+    }
+
+    /// <summary>
+    /// Returns a copy of these options with compression also requested, so a single send can combine it
+    /// with an acknowledgement, a priority and/or an await-capacity request.
+    /// </summary>
+    /// <param name="algorithmId">
+    /// The id of a registered strategy, or <see langword="null"/> for the best available. Carries the
+    /// same fail-fast versus fall-back distinction as <see cref="Compressed(string)"/> and
+    /// <see cref="Compressed()"/>.
+    /// </param>
+    /// <exception cref="ArgumentException"><paramref name="algorithmId"/> is non-null but empty or whitespace.</exception>
+    public DeliveryOptions WithCompression(string? algorithmId = null)
+    {
+        if (algorithmId is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(algorithmId);
+        }
+
+        return new DeliveryOptions(
+            RequireAcknowledgement, AcknowledgementTimeout, AwaitCapacity, Priority, compress: true, algorithmId);
+    }
+
+    /// <summary>
     /// Returns a copy of these options with <see cref="AwaitCapacity"/> also set, so a single send can
     /// both require an acknowledgement and await capacity on the recipient's queue.
     /// </summary>
@@ -132,7 +230,8 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// </remarks>
     public DeliveryOptions WithAwaitCapacity()
     {
-        return new DeliveryOptions(RequireAcknowledgement, AcknowledgementTimeout, awaitCapacity: true, Priority);
+        return new DeliveryOptions(
+            RequireAcknowledgement, AcknowledgementTimeout, awaitCapacity: true, Priority, Compress, CompressionAlgorithmId);
     }
 
     /// <summary>
@@ -142,7 +241,8 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// <param name="priority">The priority to queue this send at.</param>
     public DeliveryOptions WithPriority(MessagePriority priority)
     {
-        return new DeliveryOptions(RequireAcknowledgement, AcknowledgementTimeout, AwaitCapacity, priority);
+        return new DeliveryOptions(
+            RequireAcknowledgement, AcknowledgementTimeout, AwaitCapacity, priority, Compress, CompressionAlgorithmId);
     }
 
     /// <inheritdoc/>
@@ -151,7 +251,9 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
         return RequireAcknowledgement == other.RequireAcknowledgement
             && AcknowledgementTimeout == other.AcknowledgementTimeout
             && AwaitCapacity == other.AwaitCapacity
-            && Priority == other.Priority;
+            && Priority == other.Priority
+            && Compress == other.Compress
+            && string.Equals(CompressionAlgorithmId, other.CompressionAlgorithmId, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <inheritdoc/>
@@ -163,7 +265,13 @@ public readonly struct DeliveryOptions : IEquatable<DeliveryOptions>
     /// <inheritdoc/>
     public override int GetHashCode()
     {
-        return HashCode.Combine(RequireAcknowledgement, AcknowledgementTimeout, AwaitCapacity, Priority);
+        return HashCode.Combine(
+            RequireAcknowledgement,
+            AcknowledgementTimeout,
+            AwaitCapacity,
+            Priority,
+            Compress,
+            CompressionAlgorithmId is null ? 0 : StringComparer.OrdinalIgnoreCase.GetHashCode(CompressionAlgorithmId));
     }
 
     /// <summary>

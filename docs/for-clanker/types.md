@@ -319,6 +319,11 @@ Named `Resolve` throws `UnknownCompressionAlgorithmException` listing what *is* 
 form returns `false`. Both throw `ArgumentException` (or `ArgumentNullException`, for `null`) on an empty id
 before looking anything up.
 
+`CompressionHeaderKeys` (`internal static`, `Messages/CompressionHeaderKeys.cs`, issue #33) carries the
+two wire keys — `mesh.compression` and `mesh.compression.length` — plus `TryReadCompressionHeaders` and
+`WithoutCompressionHeaders`, mirroring `ChunkHeaderKeys` exactly. See
+[protocol.md](protocol.md#compression-headers-issue-33).
+
 `StreamCompression` (`internal static`, `StreamCompression.cs`) is the shared stream plumbing behind both
 built-ins — the bounded read loop, and the normalisation of `BrotliStream`'s `InvalidOperationException`
 and `DeflateStream`'s `InvalidDataException` into the single `InvalidDataException` the contract names.

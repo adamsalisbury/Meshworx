@@ -138,4 +138,89 @@ public sealed class DeliveryOptionsTests
         Assert.False(first == second);
         Assert.True(first != second);
     }
+
+    [Fact]
+    public void None_RequestsNoCompression()
+    {
+        Assert.False(DeliveryOptions.None.Compress);
+        Assert.Null(DeliveryOptions.None.CompressionAlgorithmId);
+    }
+
+    [Fact]
+    public void Compressed_NoAlgorithm_RequestsTheBestAvailable()
+    {
+        DeliveryOptions options = DeliveryOptions.Compressed();
+
+        Assert.True(options.Compress);
+        Assert.Null(options.CompressionAlgorithmId);
+        Assert.False(options.RequireAcknowledgement);
+        Assert.False(options.AwaitCapacity);
+        Assert.Equal(MessagePriority.Normal, options.Priority);
+    }
+
+    [Fact]
+    public void Compressed_NamedAlgorithm_CarriesTheId()
+    {
+        DeliveryOptions options = DeliveryOptions.Compressed("zstd");
+
+        Assert.True(options.Compress);
+        Assert.Equal("zstd", options.CompressionAlgorithmId);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Compressed_EmptyAlgorithm_ThrowsArgumentException(string algorithmId)
+    {
+        Assert.Throws<ArgumentException>(() => DeliveryOptions.Compressed(algorithmId));
+    }
+
+    [Fact]
+    public void Compressed_NullAlgorithm_ThrowsArgumentNullException()
+    {
+        Assert.Throws<ArgumentNullException>(() => DeliveryOptions.Compressed(null!));
+    }
+
+    [Fact]
+    public void WithCompression_CombinesWithEveryOtherOption()
+    {
+        DeliveryOptions options = DeliveryOptions
+            .RequireAck(TimeSpan.FromSeconds(5))
+            .WithAwaitCapacity()
+            .WithPriority(MessagePriority.High)
+            .WithCompression("zstd");
+
+        Assert.True(options.RequireAcknowledgement);
+        Assert.Equal(TimeSpan.FromSeconds(5), options.AcknowledgementTimeout);
+        Assert.True(options.AwaitCapacity);
+        Assert.Equal(MessagePriority.High, options.Priority);
+        Assert.True(options.Compress);
+        Assert.Equal("zstd", options.CompressionAlgorithmId);
+    }
+
+    [Fact]
+    public void WithAwaitCapacityAndWithPriority_PreserveCompression()
+    {
+        // Both predate compression, so both had to be taught to carry it forward rather than reset it.
+        DeliveryOptions options = DeliveryOptions.Compressed("zstd").WithAwaitCapacity().WithPriority(MessagePriority.Low);
+
+        Assert.True(options.Compress);
+        Assert.Equal("zstd", options.CompressionAlgorithmId);
+    }
+
+    [Fact]
+    public void WithCompression_EmptyAlgorithm_ThrowsArgumentException()
+    {
+        Assert.Throws<ArgumentException>(() => DeliveryOptions.None.WithCompression("  "));
+    }
+
+    [Fact]
+    public void Equality_DistinguishesCompressionButIgnoresAlgorithmIdCasing()
+    {
+        Assert.NotEqual(DeliveryOptions.None, DeliveryOptions.Compressed());
+        Assert.NotEqual(DeliveryOptions.Compressed(), DeliveryOptions.Compressed("br"));
+        Assert.Equal(DeliveryOptions.Compressed("br"), DeliveryOptions.Compressed("BR"));
+        Assert.Equal(
+            DeliveryOptions.Compressed("br").GetHashCode(), DeliveryOptions.Compressed("BR").GetHashCode());
+    }
 }

@@ -12,6 +12,26 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
+> **Not yet reconciled — issue #33, per-message payload compression.** Builds directly on #75 below.
+> Two new wire keys in `Messages/CompressionHeaderKeys.cs` (`mesh.compression`, `mesh.compression.length`,
+> both reserved), `DeliveryOptions` gains `Compress`/`CompressionAlgorithmId` plus `Compressed()` /
+> `Compressed(string)` / `WithCompression(string?)`, `MeshClient` gains `ApplyCompression` and
+> `TryDecompress` and a `maxDecompressedBytes` constructor parameter (with
+> `MeshClientOptions.MaxDecompressedBytes` behind it), and `Protocol` gains `MinimumCompressionSize` and
+> `DefaultMaxDecompressedMessageBytes`. **No new opcode and no version bump** — it rides the existing
+> header envelope like priority, expiry, backpressure and retention. Scope is the one `SendAsync` overload
+> that takes `DeliveryOptions`; group, topic, broadcast and `SendLargeAsync` do not compress, and chunked
+> compression is issue #76. Two behaviours worth knowing before reading the code: opting in can never make
+> a message larger (below a 256-byte floor, or when compression does not actually help, the original is
+> sent and the headers are omitted), and naming an algorithm fails fast while asking for the best
+> available falls back to uncompressed. Written up in
+> [client.md](for-clanker/client.md#per-message-compression-issue-33),
+> [protocol.md](for-clanker/protocol.md#compression-headers-issue-33) and
+> [known-issues.md](for-clanker/known-issues.md) (KI-74 downgraded to mitigated — the length header closes
+> it on every path the library decompresses on).
+>
+> ---
+>
 > **Not yet reconciled — issue #75, the M6 compression seam.** A new
 > `AdamSalisbury.Meshworx.Compression` namespace in the core library (eight files:
 > `ICompressionStrategy`, `ICompressionStrategyRegistry`, `CompressionStrategyRegistry`,
@@ -19,9 +39,8 @@ rather than read directly, it says so.
 > `UnknownCompressionAlgorithmException`, and the internal `StreamCompression`), one new
 > `Protocol.MaxCompressionAlgorithmIdLength` constant, an optional `compressionStrategies` constructor
 > parameter and `CompressionStrategies` property on `MeshClient`/`IMeshClient`, and a get-only
-> `MeshClientOptions.CompressionStrategies`. **It is a seam, not a feature: nothing compresses or
-> decompresses a message yet** — the header flag and `DeliveryOptions` opt-in are issue #33, capability
-> advertisement is issue #77. Written up in
+> `MeshClientOptions.CompressionStrategies`. A seam rather than a feature in its own right — issue #33
+> above is what consumes it, and capability advertisement is still issue #77. Written up in
 > [types.md](for-clanker/types.md#compression-types-issue-75),
 > [client.md](for-clanker/client.md#compression-strategies-issue-75),
 > [dependency-injection.md](for-clanker/dependency-injection.md#meshclientoptionscompressionstrategies--the-one-get-only-option-issue-75)

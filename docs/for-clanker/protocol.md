@@ -509,6 +509,36 @@ unstripped. Both were fixed by the follow-up `144ab0b` (issue #107): the three k
 
 <a id="session-resumption"></a>
 
+### Compression headers (issue #33)
+
+Per-message compression (see [client.md](client.md#per-message-compression-issue-33)) rides the same
+header-envelope route as everything above — **no new opcode, no protocol version bump.** Two new
+well-known keys, `Messages/CompressionHeaderKeys.cs` (`internal`):
+
+| Key | Value | Wire string | Present on |
+|---|---|---|---|
+| `CompressionHeaderKeys.Algorithm` | the `ICompressionStrategy.AlgorithmId` the body was compressed with, at most 32 chars | `"mesh.compression"` | a `SendMessageWithHeaders` (`0x11`) frame whose body was compressed, and the `DeliverMessageWithHeaders` (`0x12`) the hub forwards it as |
+| `CompressionHeaderKeys.UncompressedLength` | the body's pre-compression length, invariant-culture integer, `> 0` | `"mesh.compression.length"` | the same frames, always as a pair with the above |
+
+**The hub does not read either key** — unlike expiry, backpressure, priority and retention, this is not an
+exception to "the hub only ever reads a header block's length, never its content". Compression is
+endpoint-to-endpoint: the hub forwards the compressed bytes as any other body and cannot tell a compressed
+message from an ordinary one.
+
+Both keys must be present and well-formed or the message is **not treated as compressed at all** and is
+delivered as the ordinary message it otherwise appears to be — the same posture
+`ChunkHeaderKeys.TryReadChunkHeaders` takes toward a malformed chunk. A missing key, an empty or
+over-long algorithm id, a non-numeric length or a non-positive one all fall into that case.
+
+The length is what makes truncation detectable, and is the reason there are two keys rather than one. Both
+built-in decompressors read a truncated body as a stream that simply ended and return a prefix of the
+original without error; the receiver compares the restored length against the declared one and drops the
+message when they differ. It is also the decompression bound, checked against the receiver's own
+`maxDecompressedBytes` ceiling before any of it is believed.
+
+Both keys are in `MeshClient.ReservedHeaderKeys`, so an application cannot set them by hand and cannot
+send the receiver off decompressing a body that was never compressed.
+
 ### Session resumption (issue #43, extended by PR #135/issue #109)
 
 Three opcodes and one conditional field, gated on `Protocol.SessionResumptionMinVersion` (`6`). This is
