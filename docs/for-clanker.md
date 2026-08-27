@@ -12,6 +12,30 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
+> **Not yet reconciled — issue #77, compression capability negotiation.** Completes the endpoint-facing
+> half of M6, on top of #75 and #33 below (both now merged, as `8ad006e` and `42f98dc`). Three new opcodes
+> — `AdvertiseCompression` (`0x2C`), `CompressionCapabilityRequest` (`0x2D`),
+> `CompressionCapabilityResponse` (`0x2E`) — gated behind a new
+> `Protocol.CompressionNegotiationMinVersion = 11`, with `MaxSupportedVersion` 10 → 11. New
+> `Messages/CompressionCapabilityEnvelope.cs` (an ordered list codec, deliberately not `HeaderEnvelope`),
+> `ClientConnection.CompressionAlgorithms` plus two handlers on the hub, and advertising, a per-peer cache
+> and algorithm selection on the client.
+>
+> **Read the protocol note before assuming this lives in the handshake.** Issue #77 says to extend the
+> registration handshake and *that is not possible*: `RegistrationRequest`'s credential is everything
+> after the client name, so anything appended reaches the `ClientAuthenticator` as credential bytes — the
+> same wall issue #43 hit. The advertisement is a separate frame sent immediately after registering.
+>
+> Two invariants worth not breaking: **negotiation never makes a send fail that would otherwise have
+> worked** (an older hub, or a query that cannot be answered, falls back to pre-#77 behaviour), and
+> **`null` peer capabilities mean "unknown", never "supports nothing"** — the two lead to different
+> choices. New **KI-75** records the one residual staleness window, around session resumption. Written up
+> in [protocol.md](for-clanker/protocol.md#compression-capability-frames-issue-77),
+> [hub.md](for-clanker/hub.md), [client.md](for-clanker/client.md#capability-negotiation-issue-77),
+> [types.md](for-clanker/types.md) and [known-issues.md](for-clanker/known-issues.md).
+>
+> ---
+>
 > **Not yet reconciled — issue #33, per-message payload compression.** Builds directly on #75 below.
 > Two new wire keys in `Messages/CompressionHeaderKeys.cs` (`mesh.compression`, `mesh.compression.length`,
 > both reserved), `DeliveryOptions` gains `Compress`/`CompressionAlgorithmId` plus `Compressed()` /

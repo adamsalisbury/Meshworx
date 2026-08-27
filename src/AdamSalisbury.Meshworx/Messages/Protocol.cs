@@ -11,7 +11,7 @@ internal static class Protocol
     /// The highest wire-protocol version this build of the hub and client supports, and the version
     /// advertised when there is no reason to negotiate down.
     /// </summary>
-    internal const byte MaxSupportedVersion = 10;
+    internal const byte MaxSupportedVersion = 11;
 
     /// <summary>
     /// The lowest negotiated protocol version at which the structured message-header envelope
@@ -63,6 +63,28 @@ internal static class Protocol
     /// <see cref="TopicPubSubMinVersion"/> and <see cref="ClientAttributesMinVersion"/>.
     /// </summary>
     internal const byte PresenceMinVersion = 10;
+
+    /// <summary>
+    /// The lowest protocol version that can advertise and query compression algorithm support.
+    /// </summary>
+    /// <remarks>
+    /// Gated from the outset, as client attributes and presence were. A connection below this negotiates
+    /// no capabilities at all, and a compressing send on it behaves exactly as it did before negotiation
+    /// existed — the sender uses its own best algorithm and the receiver drops the message if it cannot
+    /// read it. Negotiation is an optimisation over that, never a precondition for it.
+    /// </remarks>
+    internal const byte CompressionNegotiationMinVersion = 11;
+
+    /// <summary>
+    /// The most compression algorithms one client may advertise.
+    /// </summary>
+    /// <remarks>
+    /// A ceiling on what a peer can assert before any of it is held: the advertised set is kept per
+    /// connection for as long as that connection lives, and handed back to anyone who asks. Sixteen is far
+    /// past the number of genuinely distinct compressors any endpoint has reason to register, while
+    /// leaving no room to use the advertisement as a place to park data.
+    /// </remarks>
+    internal const int MaxAdvertisedCompressionAlgorithms = 16;
 
     /// <summary>
     /// The length, in bytes, of a session resumption token. 32 bytes of cryptographically secure

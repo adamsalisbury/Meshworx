@@ -1031,10 +1031,35 @@ The two halves of "which algorithm" behave differently on purpose:
 | `Compressed()` — best available | Sends uncompressed. A preference, not a requirement. |
 | `Compressed("zstd")` — named | Throws `UnknownCompressionAlgorithmException` before anything is sent. |
 
+### Negotiation
+
+Endpoints do not have to be configured in lockstep. Each client tells the hub which algorithms it can
+decompress, and a sender asks before it compresses — so two clients with overlapping registries settle on
+a shared algorithm automatically, with no configuration on either side:
+
+| Situation | What happens |
+|---|---|
+| Both hold `br` and `deflate` | The sender's own first choice is used — registration order is preference order. |
+| The recipient holds only `deflate` | `deflate` is used, even though the sender prefers `br`. |
+| No algorithm in common | The message is sent **uncompressed**, and the reason is logged. Not an error. |
+| `Compressed("zstd")` and the recipient has no `zstd` | Throws `UnknownCompressionAlgorithmException` before anything is sent. |
+
+The asymmetry is the same one that governs the sender's own registry: naming an algorithm is a
+requirement, asking for the best available is a preference.
+
+**Negotiation never makes a send fail that would otherwise have worked.** Against a hub too old to relay
+capabilities, or when the query cannot be answered in time, the sender falls back to choosing on its own
+registry alone — exactly what it did before negotiation existed. Only a query that succeeds and shows no
+overlap changes an outcome.
+
+A peer's advertised set is cached for five minutes and forgotten when the connection resets, so a
+reconnecting client that has changed its registered strategies is picked up again rather than addressed
+on stale information.
+
 On the receiving side, a message compressed with an algorithm this client has no strategy for is
 **dropped and logged**, and the connection carries on — an algorithm mismatch is a configuration
-difference between two endpoints, not a protocol violation. Advertising each endpoint's registered
-algorithms so a sender can avoid the mismatch in the first place is the next change in this milestone.
+difference between two endpoints, not a protocol violation. With negotiation in place this is a safety
+net rather than the normal path.
 
 The sender puts the uncompressed length in a header alongside the algorithm id. The receiver bounds
 decompression at exactly that length, refuses a declared length past `maxDecompressedBytes` (64 MiB by

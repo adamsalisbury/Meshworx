@@ -324,6 +324,15 @@ two wire keys — `mesh.compression` and `mesh.compression.length` — plus `Try
 `WithoutCompressionHeaders`, mirroring `ChunkHeaderKeys` exactly. See
 [protocol.md](protocol.md#compression-headers-issue-33).
 
+`CompressionCapabilityEnvelope` (`internal static`, `Messages/CompressionCapabilityEnvelope.cs`, issue
+#77) encodes the ordered algorithm-id list carried by `AdvertiseCompression` and
+`CompressionCapabilityResponse`. Not the `HeaderEnvelope` codec, deliberately: that encodes a map, and
+order is the payload here. See [protocol.md](protocol.md#compression-capability-frames-issue-77).
+
+`UnknownCompressionAlgorithmException` gained a `PeerId` and a `(algorithmId, peerId, peerAlgorithmIds)`
+constructor with #77 — the same exception type for "this endpoint has no strategy" and "the peer has not
+advertised one", because a caller that named an algorithm does the same thing about either.
+
 `StreamCompression` (`internal static`, `StreamCompression.cs`) is the shared stream plumbing behind both
 built-ins — the bounded read loop, and the normalisation of `BrotliStream`'s `InvalidOperationException`
 and `DeflateStream`'s `InvalidDataException` into the single `InvalidDataException` the contract names.

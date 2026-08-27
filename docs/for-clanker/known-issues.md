@@ -83,6 +83,7 @@ the risk to a change, not a claim that the code is defective.
 | KI-72 | Structured headers do not cross a backplane, mirroring KI-69's identical limitation for federation | `MeshHub.cs` (`RouteMessageWithHeaders`, `SendToGroupWithHeaders`, `PublishToTopicWithHeaders` are not wired into backplane publishing) | medium (correctness) | open — **deliberately deferred**, disclosed in issue #41's PR; see full entry below |
 | KI-73 | Topic retention stores the retained value before matching subscribers, so a subscribe racing a retained publish can receive a live delivery and its own replay of the same content | `MeshHub.cs` (`PublishToTopicWithHeaders`, `SetRetainedTopicMessage`, `ReplayRetainedTopicMessages`) | low (correctness) | open — **by design**, see full entry below |
 | KI-74 | A truncated compressed body decompresses to a silent prefix of the original instead of raising an error — the strategy layer has no expected length to check against | `Compression/StreamCompression.cs` (`Decompress`), both built-in strategies | low (correctness) | **mitigated** by issue #33's `mesh.compression.length` header on every path the library itself decompresses on; still true for a direct `ICompressionStrategy` caller |
+| KI-75 | A peer that resumes its session, keeping its client id, having changed which compression strategies it registers can be sent one message it cannot read, until the sender's five-minute capability cache expires | `MeshClient.cs` (`TryGetPeerCompressionAlgorithmsAsync`, `CompressionCapabilityCacheLifetime`) | low (correctness) | open — bounded and self-correcting; the receiver drops and logs |
 
 ---
 
@@ -2185,6 +2186,32 @@ above assert; see [hub.md](hub.md#session-resumption) for where they're describe
   proves the chunks arrived, not that the compressed stream they carry is complete. In practice the
   transport's length-prefixed framing (`StreamFramer`) already rules truncation out before a body reaches
   a strategy at all, so this was latent even before #33.
+
+---
+
+### KI-75 — A resumed session that changed its compression registry can be sent one unreadable message
+
+- **Where:** `MeshClient.cs` — `TryGetPeerCompressionAlgorithmsAsync` caches a peer's advertised set per
+  peer id for `CompressionCapabilityCacheLifetime` (5 minutes); `SelectCompressionStrategy` chooses from
+  the cached set.
+- **Severity:** low (correctness), open — bounded, self-correcting, and disclosed in issue #77's PR.
+- **Why it bites:** the cache is keyed by the peer's client id, and the ordinary reconnect case is
+  therefore safe for free — a reconnecting client is assigned a *new* id, so a sender misses the cache and
+  fetches afresh. **Session resumption is the exception**: a resumed client reclaims its previous id
+  (issue #43), so a sender's cached entry still matches while the set behind it may have changed. In that
+  window a best-available send can pick an algorithm the peer no longer registers, or a named send can
+  pass a check that is no longer true. The message is dropped and logged at the receiver (issue #33's
+  `TryDecompress`), so it is a lost message, not a corrupt one, and the next fetch after the window
+  corrects it.
+- **Why it is not closed:** closing it properly needs the hub to push an invalidation to everyone who has
+  asked about a client that re-advertises, which means the hub tracking who-asked-about-whom and a fan-out
+  on every advertisement — disproportionate to a five-minute window on a rare event. The alternative,
+  fetching per send, puts a hub round trip on every compressed message.
+- **What to do:** if a deployment both relies on session resumption *and* changes registered strategies at
+  runtime, prefer `DeliveryOptions.Compressed()` over naming an algorithm — best-available re-derives from
+  whatever the cache holds and degrades to an uncompressed send, where a named algorithm throws. Do not
+  shorten the lifetime as a "fix"; it trades one bounded window for a hub round trip on the send path.
+  A sender's own reconnect clears the whole cache, so this never survives one.
 
 ---
 

@@ -1170,6 +1170,21 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     /// <see cref="Timeout.InfiniteTimeSpan"/> opt-out — without waiting out a real interval to observe
     /// the behaviour indirectly.
     /// </remarks>
+    /// <summary>
+    /// The compression algorithms one registered client last advertised, or <see langword="null"/> if no
+    /// such client is registered.
+    /// </summary>
+    /// <remarks>
+    /// A test hook. <see cref="MessageType.AdvertiseCompression"/> has no reply, so there is otherwise
+    /// nothing to wait on to know the hub has processed one.
+    /// </remarks>
+    internal IReadOnlyList<string>? GetAdvertisedCompressionAlgorithmsForTesting(Guid clientId)
+    {
+        return _clients.TryGetValue(clientId, out ClientConnection? client)
+            ? client.CompressionAlgorithms
+            : null;
+    }
+
     internal TimeSpan? GetHeartbeatIntervalForTesting()
     {
         return _heartbeatInterval;
@@ -1878,6 +1893,22 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
                     && (MessageType)data[0] == MessageType.UnsubscribePresence)
                 {
                     _presenceSubscribers.TryRemove(connection.Id, out _);
+                }
+                else if (data.Length >= 1
+                    && connection.NegotiatedProtocolVersion >= Protocol.CompressionNegotiationMinVersion
+                    && (MessageType)data[0] == MessageType.AdvertiseCompression)
+                {
+                    SetCompressionAlgorithms(connection, data.AsSpan(1));
+                }
+                else if (data.Length >= 21
+                    && connection.NegotiatedProtocolVersion >= Protocol.CompressionNegotiationMinVersion
+                    && (MessageType)data[0] == MessageType.CompressionCapabilityRequest)
+                {
+                    int correlationId = BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(1, 4));
+                    var subjectId = new Guid(data.AsSpan(5, 16));
+
+                    await SendCompressionCapabilityResponseAsync(
+                        transport, correlationId, subjectId, clientCts.Token).ConfigureAwait(false);
                 }
                 else if (data.Length >= 5
                     && (MessageType)data[0] == MessageType.ClientLookupRequest)
@@ -6083,6 +6114,69 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
     }
 
     /// <summary>
+    /// Decodes a <see cref="MessageType.AdvertiseCompression"/> frame and, if it is well formed and within
+    /// bounds, replaces the connection's advertised algorithm set wholesale.
+    /// </summary>
+    /// <remarks>
+    /// Rejected in its entirety rather than partially applied, and silently, mirroring
+    /// <see cref="SetClientAttributes"/> exactly: this frame has no reply either, and a partial
+    /// advertisement would leave peers believing this client supports a set it never claimed. The ids
+    /// themselves are never inspected beyond their length — what they mean is a matter between the two
+    /// endpoints, and the hub has no opinion about it.
+    /// </remarks>
+    private void SetCompressionAlgorithms(ClientConnection connection, ReadOnlySpan<byte> algorithmBlock)
+    {
+        if (!CompressionCapabilityEnvelope.TryRead(algorithmBlock, out IReadOnlyList<string> algorithmIds))
+        {
+            _logger.LogDebug(
+                "Client {ClientId} sent a malformed or oversized compression advertisement; it was ignored",
+                connection.Id);
+
+            return;
+        }
+
+        connection.CompressionAlgorithms = algorithmIds;
+    }
+
+    /// <summary>
+    /// Answers a <see cref="MessageType.CompressionCapabilityRequest"/> with whatever the subject client
+    /// last advertised.
+    /// </summary>
+    /// <remarks>
+    /// A single dictionary lookup, so it follows <see cref="MessageType.ClientLookupRequest"/>'s precedent
+    /// and is not charged against the fan-out rate limiter the way
+    /// <see cref="MessageType.FindClientsRequest"/>, which scans every connection, has to be.
+    /// <para>
+    /// An unknown id — never registered, already disconnected, or a client on a federated peer whose
+    /// capabilities this hub does not hold — answers <c>found = 0</c> with an empty set rather than
+    /// staying silent, so the asking client resolves the request instead of waiting out its timeout.
+    /// </para>
+    /// </remarks>
+    private async Task SendCompressionCapabilityResponseAsync(
+        ITransport transport, int correlationId, Guid subjectId, CancellationToken cancellationToken)
+    {
+        bool found = _clients.TryGetValue(subjectId, out ClientConnection? subject);
+        IReadOnlyList<string> algorithmIds = found ? subject!.CompressionAlgorithms : [];
+
+        int blockLength = CompressionCapabilityEnvelope.GetEncodedLength(algorithmIds);
+        var response = new byte[1 + 4 + 1 + blockLength];
+        response[0] = (byte)MessageType.CompressionCapabilityResponse;
+        BinaryPrimitives.WriteInt32BigEndian(response.AsSpan(1, 4), correlationId);
+        response[5] = found ? (byte)0x01 : (byte)0x00;
+        CompressionCapabilityEnvelope.Write(algorithmIds, response.AsSpan(6, blockLength));
+
+        try
+        {
+            await transport.SendAsync(response, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException)
+        {
+            // The asking connection is going away; its own teardown handles the rest.
+            _logger.LogDebug(ex, "Failed to send a compression capability response");
+        }
+    }
+
+    /// <summary>
     /// Answers a <see cref="MessageType.FindClientsRequest"/> by scanning every currently-registered
     /// client for one whose attribute bag satisfies every criterion in the query.
     /// </summary>
@@ -6258,6 +6352,8 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         private static readonly IReadOnlyDictionary<string, string> EmptyAttributes =
             new Dictionary<string, string>(0, StringComparer.Ordinal);
 
+        private static readonly IReadOnlyList<string> EmptyCompressionAlgorithms = [];
+
         /// <summary>
         /// The id this connection is registered under. Assigned fresh at registration and, for a
         /// connection that goes on to resume a previous session, replaced once by the reclaimed id —
@@ -6411,6 +6507,25 @@ public sealed class MeshHub : IMeshHub, IAsyncDisposable
         {
             get => Volatile.Read(ref _attributes);
             set => Volatile.Write(ref _attributes, value);
+        }
+
+        private IReadOnlyList<string> _compressionAlgorithms = EmptyCompressionAlgorithms;
+
+        /// <summary>
+        /// The compression algorithms this client last advertised, in its own preference order. Empty
+        /// until it advertises, which it does once, immediately after registering.
+        /// </summary>
+        /// <remarks>
+        /// Replaced wholesale, never mutated in place, for exactly the reason <see cref="Attributes"/> is:
+        /// a capability query arriving on a <em>different</em> connection's receive loop reads the
+        /// reference once and gets a consistent snapshot without a lock. The hub does not interpret these
+        /// ids in any way — it cannot compress or decompress anything and never tries to. It holds them
+        /// only so one endpoint can find out what another will be able to read.
+        /// </remarks>
+        public IReadOnlyList<string> CompressionAlgorithms
+        {
+            get => Volatile.Read(ref _compressionAlgorithms);
+            set => Volatile.Write(ref _compressionAlgorithms, value);
         }
 #pragma warning restore IDE0032
 

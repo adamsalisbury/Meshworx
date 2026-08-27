@@ -102,7 +102,7 @@ public sealed class MeshClientPayloadCompressionTests
         var fixture = new MeshClientFixture();
         var sentFrames = new List<byte[]>();
 
-        await ConnectAndCaptureAsync(fixture, sentFrames);
+        await ConnectAndCaptureAsync(fixture, sentFrames, AllAlgorithms);
 
         await Assert.ThrowsAsync<UnknownCompressionAlgorithmException>(
             () => fixture.Client.SendAsync(
@@ -281,15 +281,24 @@ public sealed class MeshClientPayloadCompressionTests
 
     // Helpers
 
+    /// <summary>
+    /// Every algorithm any test here sends with. The default peer set, so a test about compression
+    /// mechanics is not also a test about negotiation — the two are separated deliberately, and the
+    /// negotiation tests below pass their own set.
+    /// </summary>
+    private static readonly string[] AllAlgorithms =
+        [CompressionAlgorithms.Brotli, CompressionAlgorithms.Deflate, RunLengthCompressionStrategy.Id];
+
     private static async Task<byte[]> CaptureSentFrameAsync(
         ReadOnlyMemory<byte> payload,
         DeliveryOptions options,
-        ICompressionStrategyRegistry? registry = null)
+        ICompressionStrategyRegistry? registry = null,
+        IReadOnlyList<string>? peerAlgorithmIds = null)
     {
         var fixture = new MeshClientFixture(compressionStrategies: registry);
         var sentFrames = new List<byte[]>();
 
-        await ConnectAndCaptureAsync(fixture, sentFrames);
+        await ConnectAndCaptureAsync(fixture, sentFrames, peerAlgorithmIds ?? AllAlgorithms);
         await fixture.Client.SendAsync(Guid.NewGuid(), payload, options);
 
         // Read before disconnecting: teardown writes a frame of its own, which would otherwise land in
@@ -309,15 +318,67 @@ public sealed class MeshClientPayloadCompressionTests
             await CaptureSentFrameAsync(payload, DeliveryOptions.None));
     }
 
-    private static async Task ConnectAndCaptureAsync(MeshClientFixture fixture, List<byte[]> sentFrames)
+    /// <summary>
+    /// Connects, then captures the frames the client sends — while standing in for the hub's side of
+    /// capability negotiation, since a compressing send now asks what its recipient supports before
+    /// choosing an algorithm.
+    /// </summary>
+    /// <param name="fixture">The sending client's fixture.</param>
+    /// <param name="sentFrames">Receives every message frame the client sends.</param>
+    /// <param name="peerAlgorithmIds">
+    /// What the hub should report the recipient supports. <see langword="null"/> means the hub never
+    /// answers at all, which is how a test models an unreachable or silent capability query.
+    /// </param>
+    private static async Task ConnectAndCaptureAsync(
+        MeshClientFixture fixture, List<byte[]> sentFrames, IReadOnlyList<string>? peerAlgorithmIds)
     {
         fixture.SetupSuccessfulRegistration();
         await fixture.Client.ConnectAsync(fixture.Transport.Object, "Sender");
 
         fixture.Transport
             .Setup(t => t.SendAsync(It.IsAny<ReadOnlyMemory<byte>>(), It.IsAny<CancellationToken>()))
-            .Callback<ReadOnlyMemory<byte>, CancellationToken>((frame, _) => sentFrames.Add(frame.ToArray()))
+            .Callback<ReadOnlyMemory<byte>, CancellationToken>((frame, _) =>
+            {
+                byte[] sent = frame.ToArray();
+
+                if (sent.Length >= 21 && sent[0] == (byte)MessageType.CompressionCapabilityRequest)
+                {
+                    if (peerAlgorithmIds is not null)
+                    {
+                        fixture.Inbound!.TryWrite(
+                            BuildCapabilityResponse(
+                                BinaryPrimitives.ReadInt32BigEndian(sent.AsSpan(1, 4)), peerAlgorithmIds));
+                    }
+
+                    // Never captured: a capability query is negotiation, not one of the message frames
+                    // these tests are counting and decoding.
+                    return;
+                }
+
+                sentFrames.Add(sent);
+            })
             .Returns(Task.CompletedTask);
+    }
+
+    private static byte[] BuildCapabilityResponse(int correlationId, IReadOnlyList<string> algorithmIds)
+    {
+        int blockLength = 1 + algorithmIds.Sum(id => 1 + Encoding.UTF8.GetByteCount(id));
+        var response = new byte[6 + blockLength];
+        response[0] = (byte)MessageType.CompressionCapabilityResponse;
+        BinaryPrimitives.WriteInt32BigEndian(response.AsSpan(1, 4), correlationId);
+        response[5] = 0x01;
+        response[6] = (byte)algorithmIds.Count;
+
+        int offset = 7;
+
+        foreach (string id in algorithmIds)
+        {
+            int written = Encoding.UTF8.GetBytes(id, response.AsSpan(offset + 1));
+            response[offset] = (byte)written;
+            offset += 1 + written;
+        }
+
+        return response;
     }
 
     private static async Task<byte[]> ReceiveAsync(

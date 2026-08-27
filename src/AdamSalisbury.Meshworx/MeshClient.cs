@@ -84,6 +84,29 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
     private static readonly TimeSpan DefaultSendRetryDelay = TimeSpan.FromMilliseconds(100);
 
+    /// <summary>
+    /// How long a peer's advertised compression algorithms are trusted before they are fetched again.
+    /// </summary>
+    /// <remarks>
+    /// A fixed window rather than a knob. The cache exists only to keep a round trip off the send path,
+    /// and the one case it can be wrong about — a peer that resumes its session, keeping its id, having
+    /// changed which strategies it registers — is rare, self-correcting, and costs at most one dropped
+    /// message. See known issue KI-75. Read through the client's <see cref="TimeProvider"/>, so a test
+    /// can age the cache without waiting.
+    /// </remarks>
+    private static readonly TimeSpan CompressionCapabilityCacheLifetime = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// How long a capability query may take before the send that prompted it gives up and proceeds
+    /// without knowing what the peer supports.
+    /// </summary>
+    /// <remarks>
+    /// Bounded because this sits inline on a send. Expiring is not an error: the send falls back to
+    /// choosing an algorithm on local information alone, which is exactly what it did before negotiation
+    /// existed.
+    /// </remarks>
+    private static readonly TimeSpan CompressionCapabilityTimeout = TimeSpan.FromSeconds(5);
+
     // How much payload one chunk carries. A frame must fit the transport's 1 MiB cap once the message
     // type, recipient id, header-length prefix and the header block itself are added, so the budget is
     // the cap less a reserve for all of that. The three chunk headers cost about 110 bytes at their
@@ -102,6 +125,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     private readonly int _maxSendAttempts;
     private readonly TimeSpan _sendRetryDelay;
     private readonly int _maxDecompressedBytes;
+    private readonly TimeProvider _timeProvider;
+    private readonly ConcurrentDictionary<Guid, CachedPeerCapabilities> _peerCompressionAlgorithms = new();
+    private readonly SemaphoreSlim _compressionCapabilityLock = new(1, 1);
+    private PendingCapabilityRequest? _pendingCapabilityRequest;
+    private int _compressionCapabilityCorrelationId;
 
     // Holds the chunks of every part-received large message until each is whole. Only ever touched from
     // the receive loop, which processes one frame at a time, so it needs no lock of its own.
@@ -222,6 +250,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 nameof(maxDecompressedBytes), "The maximum decompressed bytes must be positive.");
         }
 
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _reassembler = new ChunkReassembler(maxReassemblyBytes, chunkTransferTimeout, timeProvider);
         CompressionStrategies = compressionStrategies ?? CompressionStrategyRegistry.CreateDefault();
         _maxDecompressedBytes = maxDecompressedBytes ?? Protocol.DefaultMaxDecompressedMessageBytes;
@@ -418,6 +447,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             {
                 await TryResumeSessionAsync(resumptionToken, cancellationToken).ConfigureAwait(false);
             }
+
+            // After resumption rather than before it, so the advertisement is filed against whichever id
+            // this connection ends up holding. A reconnect runs this again, which is what keeps the hub's
+            // view current when a client's registered strategies have changed in between.
+            await AdvertiseCompressionAsync(transport, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception exception)
         {
@@ -685,6 +719,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             // ids are only meaningful within the session that issued them, so holding them past
             // disconnect would keep memory for a completion that can never arrive.
             _reassembler.Clear();
+
+            // A peer's advertised algorithms were learned over the connection that is ending, and the
+            // ids they are keyed by are only meaningful within it. Holding them past a reconnect would
+            // let a stale set decide how the next connection's first sends are compressed.
+            _peerCompressionAlgorithms.Clear();
         }
     }
 
@@ -726,7 +765,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             }
 
             List<KeyValuePair<string, string>> plainHeaderEntries = [];
-            ReadOnlyMemory<byte> plainBody = ApplyCompression(message, options, plainHeaderEntries);
+            ReadOnlyMemory<byte> plainBody = await ApplyCompressionAsync(
+                recipientId, message, options, plainHeaderEntries, cancellationToken).ConfigureAwait(false);
 
             if (options.AwaitCapacity)
             {
@@ -774,7 +814,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                     MessagePriorityHeaderKeys.Priority, MessagePriorityHeaderKeys.ToHeaderValue(options.Priority)));
             }
 
-            ReadOnlyMemory<byte> body = ApplyCompression(message, options, headerEntries);
+            ReadOnlyMemory<byte> body = await ApplyCompressionAsync(
+                recipientId, message, options, headerEntries, cancellationToken).ConfigureAwait(false);
             var headers = new MessageHeaders(headerEntries);
 
             await SendCoreAsync(recipientId, body, headers, cancellationToken).ConfigureAwait(false);
@@ -826,8 +867,68 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     }
 
     /// <summary>
-    /// Compresses a body when the send asked for it and compressing it actually helps, appending the two
-    /// headers the recipient needs to read it back.
+    /// Tells the hub which compression algorithms this client can decompress, so a peer sending to it can
+    /// pick one it will actually be able to read.
+    /// </summary>
+    /// <remarks>
+    /// Sent immediately after registration rather than as part of it: the registration frame's credential
+    /// is everything after the client name, so there is nowhere to splice this in without changing what
+    /// the authenticator is handed. Fire-and-forget, with no reply — a hub that ignores it leaves peers
+    /// knowing nothing about this client, which degrades to exactly the pre-negotiation behaviour rather
+    /// than to a failure.
+    /// </remarks>
+    private async Task AdvertiseCompressionAsync(ITransport transport, CancellationToken cancellationToken)
+    {
+        if (NegotiatedProtocolVersion < Protocol.CompressionNegotiationMinVersion)
+        {
+            return;
+        }
+
+        IReadOnlyList<string> algorithmIds = CompressionStrategies.AlgorithmIds;
+
+        if (algorithmIds.Count == 0)
+        {
+            return;
+        }
+
+        if (algorithmIds.Count > Protocol.MaxAdvertisedCompressionAlgorithms)
+        {
+            // Truncated rather than sent whole and rejected wholesale by the hub, which would leave this
+            // client advertising nothing at all. Registration order is preference order, so the ones kept
+            // are the ones this endpoint would rather peers used anyway.
+            _logger.LogWarning(
+                "Advertising only the first {Advertised} of {Registered} registered compression "
+                + "algorithms; the protocol allows at most {Maximum}",
+                Protocol.MaxAdvertisedCompressionAlgorithms,
+                algorithmIds.Count,
+                Protocol.MaxAdvertisedCompressionAlgorithms);
+
+            algorithmIds = [.. algorithmIds.Take(Protocol.MaxAdvertisedCompressionAlgorithms)];
+        }
+
+        int blockLength = CompressionCapabilityEnvelope.GetEncodedLength(algorithmIds);
+        var payload = new byte[1 + blockLength];
+        payload[0] = (byte)MessageType.AdvertiseCompression;
+        CompressionCapabilityEnvelope.Write(algorithmIds, payload.AsSpan(1));
+
+        try
+        {
+            await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or OperationCanceledException
+            && !cancellationToken.IsCancellationRequested)
+        {
+            // Never fail a connection over this. An advertisement that does not land costs peers their
+            // knowledge of what this client can read, which degrades to the behaviour that existed before
+            // negotiation — a working connection whose compressed sends are chosen on local information.
+            // Failing ConnectAsync instead would turn an optimisation into a reason not to connect at all.
+            _logger.LogDebug(ex, "Could not advertise compression support; peers will not learn of it");
+        }
+    }
+
+    /// <summary>
+    /// Compresses a body when the send asked for it, an algorithm the recipient can read is available,
+    /// and compressing it actually helps — appending the two headers the recipient needs to read it back.
     /// </summary>
     /// <remarks>
     /// Opting in can never make a message larger. A body below
@@ -835,42 +936,27 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
     /// whose compressed form is not smaller is returned untouched too — in both cases without the
     /// headers, so the recipient sees an ordinary message rather than one it has to decompress back to
     /// where it started.
-    /// <para>
-    /// Naming an algorithm and asking for the best available are treated differently on purpose. A named
-    /// algorithm is a requirement: an id this client has no strategy for throws out of
-    /// <see cref="ICompressionStrategyRegistry.Resolve"/> here, before anything reaches the wire, rather
-    /// than being quietly downgraded to a different algorithm or to none. Asking for the best available
-    /// is a preference, so an empty registry sends uncompressed instead of failing — the same posture
-    /// capability negotiation will take when two endpoints turn out to share no algorithm at all.
-    /// </para>
     /// </remarks>
-    private ReadOnlyMemory<byte> ApplyCompression(
+    private async Task<ReadOnlyMemory<byte>> ApplyCompressionAsync(
+        Guid recipientId,
         ReadOnlyMemory<byte> message,
         DeliveryOptions options,
-        List<KeyValuePair<string, string>> headerEntries)
+        List<KeyValuePair<string, string>> headerEntries,
+        CancellationToken cancellationToken)
     {
         if (!options.Compress || message.Length < Protocol.MinimumCompressionSize)
         {
             return message;
         }
 
-        ICompressionStrategy strategy;
+        IReadOnlyList<string>? peerAlgorithmIds =
+            await TryGetPeerCompressionAlgorithmsAsync(recipientId, cancellationToken).ConfigureAwait(false);
 
-        if (options.CompressionAlgorithmId is { } algorithmId)
+        ICompressionStrategy? strategy = SelectCompressionStrategy(recipientId, options, peerAlgorithmIds);
+
+        if (strategy is null)
         {
-            strategy = CompressionStrategies.Resolve(algorithmId);
-        }
-        else
-        {
-            IReadOnlyList<string> available = CompressionStrategies.AlgorithmIds;
-
-            if (available.Count == 0)
-            {
-                return message;
-            }
-
-            // Registration order is preference order, so the first entry is this endpoint's best.
-            strategy = CompressionStrategies.Resolve(available[0]);
+            return message;
         }
 
         ReadOnlyMemory<byte> compressed = strategy.Compress(message);
@@ -888,6 +974,211 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
 
         return compressed;
     }
+
+    /// <summary>
+    /// Chooses the algorithm a compressing send should use, or <see langword="null"/> to send the body
+    /// uncompressed.
+    /// </summary>
+    /// <param name="recipientId">Who the message is for.</param>
+    /// <param name="options">The send's options, carrying the requested algorithm if there is one.</param>
+    /// <param name="peerAlgorithmIds">
+    /// What the recipient advertised, or <see langword="null"/> when that is not known — an older
+    /// connection, or a query that failed or timed out.
+    /// </param>
+    /// <exception cref="UnknownCompressionAlgorithmException">
+    /// The send named an algorithm this client holds no strategy for, or one the recipient has advertised
+    /// no support for.
+    /// </exception>
+    /// <remarks>
+    /// <para>
+    /// Naming an algorithm and asking for the best available are treated differently, on both sides of
+    /// the connection. A named algorithm is a requirement, so it fails — locally, before the message is
+    /// sent — whether it is this endpoint or the recipient that cannot handle it. Asking for the best
+    /// available is a preference, so no shared algorithm means an uncompressed send rather than an error.
+    /// </para>
+    /// <para>
+    /// <b>Not knowing what the peer supports is not the same as knowing it supports nothing.</b> When
+    /// <paramref name="peerAlgorithmIds"/> is <see langword="null"/> this falls back to choosing on local
+    /// information alone, which is exactly what a compressing send did before negotiation existed:
+    /// negotiation is an optimisation over that behaviour, never a precondition for it, so a hub too old
+    /// to relay capabilities — or one that simply did not answer in time — costs a send nothing.
+    /// </para>
+    /// </remarks>
+    private ICompressionStrategy? SelectCompressionStrategy(
+        Guid recipientId, DeliveryOptions options, IReadOnlyList<string>? peerAlgorithmIds)
+    {
+        if (options.CompressionAlgorithmId is { } requestedAlgorithmId)
+        {
+            // Resolved locally first: an algorithm this client does not hold is this client's error,
+            // whether or not the recipient could have read it.
+            ICompressionStrategy requested = CompressionStrategies.Resolve(requestedAlgorithmId);
+
+            if (peerAlgorithmIds is not null && !Advertises(peerAlgorithmIds, requested.AlgorithmId))
+            {
+                throw new UnknownCompressionAlgorithmException(
+                    requested.AlgorithmId, recipientId, peerAlgorithmIds);
+            }
+
+            return requested;
+        }
+
+        IReadOnlyList<string> localAlgorithmIds = CompressionStrategies.AlgorithmIds;
+
+        if (localAlgorithmIds.Count == 0)
+        {
+            return null;
+        }
+
+        if (peerAlgorithmIds is null)
+        {
+            return CompressionStrategies.Resolve(localAlgorithmIds[0]);
+        }
+
+        // Local order wins the tie: registration order is this endpoint's preference order, and walking
+        // it means the best algorithm *this* client has that the peer can also read.
+        for (int i = 0; i < localAlgorithmIds.Count; i++)
+        {
+            if (Advertises(peerAlgorithmIds, localAlgorithmIds[i]))
+            {
+                return CompressionStrategies.Resolve(localAlgorithmIds[i]);
+            }
+        }
+
+        _logger.LogDebug(
+            "Sending to {RecipientId} uncompressed: no algorithm in common. This client has "
+            + "{LocalAlgorithmIds}; that one advertised {PeerAlgorithmIds}",
+            recipientId,
+            string.Join(", ", localAlgorithmIds),
+            peerAlgorithmIds.Count == 0 ? "none" : string.Join(", ", peerAlgorithmIds));
+
+        return null;
+    }
+
+    private static bool Advertises(IReadOnlyList<string> algorithmIds, string algorithmId)
+    {
+        for (int i = 0; i < algorithmIds.Count; i++)
+        {
+            if (string.Equals(algorithmIds[i], algorithmId, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Returns what a peer has advertised, from cache when it is fresh and from the hub otherwise, or
+    /// <see langword="null"/> when it cannot be established.
+    /// </summary>
+    /// <remarks>
+    /// <see langword="null"/> means "unknown", never "supports nothing" — the two lead to different
+    /// choices in <see cref="SelectCompressionStrategy"/>, so every path that cannot answer returns null
+    /// rather than an empty list. The caller's own cancellation is never swallowed: only the failures that
+    /// belong to the query itself are.
+    /// </remarks>
+    private async Task<IReadOnlyList<string>?> TryGetPeerCompressionAlgorithmsAsync(
+        Guid recipientId, CancellationToken cancellationToken)
+    {
+        if (NegotiatedProtocolVersion < Protocol.CompressionNegotiationMinVersion)
+        {
+            return null;
+        }
+
+        DateTimeOffset now = _timeProvider.GetUtcNow();
+
+        if (_peerCompressionAlgorithms.TryGetValue(recipientId, out CachedPeerCapabilities? cached)
+            && cached.ExpiresAt > now)
+        {
+            return cached.AlgorithmIds;
+        }
+
+        try
+        {
+            IReadOnlyList<string> fetched =
+                await FetchPeerCompressionAlgorithmsAsync(recipientId, cancellationToken).ConfigureAwait(false);
+
+            _peerCompressionAlgorithms[recipientId] =
+                new CachedPeerCapabilities(fetched, now + CompressionCapabilityCacheLifetime);
+
+            return fetched;
+        }
+        catch (Exception ex)
+            when (ex is TimeoutException or IOException or InvalidOperationException or ObjectDisposedException
+                or OperationCanceledException
+                && !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogDebug(
+                ex,
+                "Could not establish what {RecipientId} supports; compressing on local information alone",
+                recipientId);
+
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Asks the hub what one client has advertised, and waits for the answer.
+    /// </summary>
+    /// <remarks>
+    /// Serialised by <see cref="_compressionCapabilityLock"/> and correlated through a single pending
+    /// slot, exactly as <see cref="FindClientsAsync"/> is — the same shape, for the same reason: one
+    /// outstanding query at a time makes an unmatched or late reply trivially identifiable rather than
+    /// something to reconcile.
+    /// </remarks>
+    private async Task<IReadOnlyList<string>> FetchPeerCompressionAlgorithmsAsync(
+        Guid subjectId, CancellationToken cancellationToken)
+    {
+        ITransport transport = GetConnectedTransport();
+
+        await _compressionCapabilityLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            int correlationId = unchecked(_compressionCapabilityCorrelationId++);
+            var completion = new TaskCompletionSource<IReadOnlyList<string>>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingCapabilityRequest = new PendingCapabilityRequest(correlationId, completion);
+
+            var payload = new byte[1 + 4 + 16];
+            payload[0] = (byte)MessageType.CompressionCapabilityRequest;
+            BinaryPrimitives.WriteInt32BigEndian(payload.AsSpan(1, 4), correlationId);
+            subjectId.TryWriteBytes(payload.AsSpan(5));
+
+            await transport.SendAsync(payload, cancellationToken).ConfigureAwait(false);
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(CompressionCapabilityTimeout);
+
+            try
+            {
+                return await completion.Task.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+                when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"No compression capability response was received within {CompressionCapabilityTimeout}.");
+            }
+        }
+        finally
+        {
+            _pendingCapabilityRequest = null;
+
+            try
+            {
+                _compressionCapabilityLock.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+                // The semaphore was disposed during a concurrent DisposeAsync call.
+            }
+        }
+    }
+
+    private sealed record CachedPeerCapabilities(IReadOnlyList<string> AlgorithmIds, DateTimeOffset ExpiresAt);
+
+    private sealed record PendingCapabilityRequest(
+        int CorrelationId, TaskCompletionSource<IReadOnlyList<string>> Completion);
 
     /// <summary>
     /// Restores a compressed body, or refuses it.
@@ -2038,6 +2329,7 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
         await DisconnectAsync().ConfigureAwait(false);
         _lookupLock.Dispose();
         _findClientsLock.Dispose();
+        _compressionCapabilityLock.Dispose();
     }
 
     private async Task CleanUpAsync()
@@ -2491,6 +2783,34 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                         _logger.LogWarning("Discarding a malformed find-clients response");
                     }
                 }
+                else if (data.Length >= 7
+                    && (MessageType)data[0] == MessageType.CompressionCapabilityResponse)
+                {
+                    int correlationId = BinaryPrimitives.ReadInt32BigEndian(data.AsSpan(1, 4));
+                    PendingCapabilityRequest? pendingCapability = _pendingCapabilityRequest;
+
+                    if (pendingCapability is null || pendingCapability.CorrelationId != correlationId)
+                    {
+                        // Stale or unsolicited response (e.g. from a query that already timed out);
+                        // discard rather than resolve a request that is no longer waiting.
+                        _logger.LogDebug(
+                            "Discarding compression capability response with unmatched correlation id "
+                            + "{CorrelationId}",
+                            correlationId);
+                    }
+                    else if (CompressionCapabilityEnvelope.TryRead(
+                        data.AsSpan(6), out IReadOnlyList<string> advertised))
+                    {
+                        // A "not found" answer (byte 5 == 0) resolves as an empty set rather than as a
+                        // failure: the hub genuinely knows this client supports nothing it can name, and
+                        // an uncompressed send is the right outcome — not a fall back to guessing.
+                        pendingCapability.Completion.TrySetResult(advertised);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("Discarding a malformed compression capability response");
+                    }
+                }
                 else if (data.Length >= 20
                     && (MessageType)data[0] == MessageType.PresenceChanged)
                 {
@@ -2621,6 +2941,8 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
                 new InvalidOperationException("The connection was closed before the lookup completed."));
 
             // Likewise the only thing that completes a pending FindClientsAsync query.
+            _pendingCapabilityRequest?.Completion.TrySetException(
+                new InvalidOperationException("The connection was lost before the hub answered."));
             _pendingFindClients?.Completion.TrySetException(
                 new InvalidOperationException("The connection was closed before the query completed."));
 
@@ -2697,6 +3019,11 @@ public sealed class MeshClient : IMeshClient, IAsyncDisposable
             // ids are only meaningful within the session that issued them, so holding them past
             // disconnect would keep memory for a completion that can never arrive.
             _reassembler.Clear();
+
+            // A peer's advertised algorithms were learned over the connection that is ending, and the
+            // ids they are keyed by are only meaningful within it. Holding them past a reconnect would
+            // let a stale set decide how the next connection's first sends are compressed.
+            _peerCompressionAlgorithms.Clear();
 
             // Take the decision to raise under the same lock that publishes the disconnected state,
             // so a DisconnectAsync racing this teardown either claims it before this point or finds
