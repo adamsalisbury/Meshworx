@@ -12,6 +12,25 @@ This is the entry point. Read it in full before touching the code, then jump to 
 whatever you are changing. Every claim here is grounded in the source; where something is inferred
 rather than read directly, it says so.
 
+> **Not yet reconciled — issue #75, the M6 compression seam.** A new
+> `AdamSalisbury.Meshworx.Compression` namespace in the core library (eight files:
+> `ICompressionStrategy`, `ICompressionStrategyRegistry`, `CompressionStrategyRegistry`,
+> `BrotliCompressionStrategy`, `DeflateCompressionStrategy`, `CompressionAlgorithms`,
+> `UnknownCompressionAlgorithmException`, and the internal `StreamCompression`), one new
+> `Protocol.MaxCompressionAlgorithmIdLength` constant, an optional `compressionStrategies` constructor
+> parameter and `CompressionStrategies` property on `MeshClient`/`IMeshClient`, and a get-only
+> `MeshClientOptions.CompressionStrategies`. **It is a seam, not a feature: nothing compresses or
+> decompresses a message yet** — the header flag and `DeliveryOptions` opt-in are issue #33, capability
+> advertisement is issue #77. Written up in
+> [types.md](for-clanker/types.md#compression-types-issue-75),
+> [client.md](for-clanker/client.md#compression-strategies-issue-75),
+> [dependency-injection.md](for-clanker/dependency-injection.md#meshclientoptionscompressionstrategies--the-one-get-only-option-issue-75)
+> and [known-issues.md](for-clanker/known-issues.md) (new KI-74, a truncated compressed body decompressing
+> to a silent prefix). The freshness stamp above is owned by a reconcile pass and is deliberately left
+> alone here; it is stale for this change and for everything merged into `main` since `ff2d8be`.
+>
+> ---
+>
 > **Documented tree, latest pass:** issue #42 landed on `feature/retained-messages` (branched from `main`
 > after issue #41's scale-out-backplane work merged as `a769dbf`), two commits (`c88b367`, `ff2d8be`) —
 > tracked as **PR #146, open and unmerged** at the time of this pass; do not document anything below as

@@ -947,6 +947,62 @@ below protocol version 5 cannot send one. That throws rather than degrading quie
 context, which is an optional extra; here the caller has explicitly asked to send something that cannot
 go any other way.
 
+## Compression
+
+Compression is an agreement between two **endpoints**. The hub routes a compressed body exactly as it
+routes any other and never learns that a body was compressed at all — the same arrangement the codec
+layer already has.
+
+Which algorithms an endpoint understands is a registry rather than a fixed enum, so a consumer can use
+an algorithm this library has never heard of without waiting for a release:
+
+```csharp
+public sealed class ZstdCompressionStrategy : ICompressionStrategy
+{
+    public string AlgorithmId => "zstd";
+
+    public ReadOnlyMemory<byte> Compress(ReadOnlyMemory<byte> payload) => /* ... */;
+
+    public ReadOnlyMemory<byte> Decompress(ReadOnlyMemory<byte> payload, int maxDecompressedBytes) => /* ... */;
+}
+```
+
+Register it on the client, alongside the built-ins:
+
+```csharp
+var client = new MeshClient(logger);
+((CompressionStrategyRegistry)client.CompressionStrategies).Register(new ZstdCompressionStrategy());
+```
+
+or through `AddMeshClient`:
+
+```csharp
+services.AddMeshClient("Alice", options =>
+    options.CompressionStrategies.Register(new ZstdCompressionStrategy()));
+```
+
+Every client starts with two built-in strategies, registered under their HTTP content-coding names:
+
+| Algorithm id | Strategy | Notes |
+|---|---|---|
+| `br` | `BrotliCompressionStrategy` | Registered first, and so preferred: it compresses this library's typical payloads better. |
+| `deflate` | `DeflateCompressionStrategy` | Cheaper per byte and understood by essentially everything, which matters when the peer is not a .NET process. |
+
+Registration order is the preference order. Registering under an id that is already present replaces
+that strategy **in place**, keeping its position, so a built-in can be swapped for a tuned version of the
+same algorithm; `Remove` drops one, and `Clear` leaves an endpoint understanding only what you put in it.
+
+`Decompress` takes an explicit output ceiling and throws `InvalidDataException` once the output exceeds
+it. That is deliberately part of the contract rather than left to each implementation: a compressed body
+from a peer is attacker-controlled, and a few kilobytes on the wire can otherwise expand to gigabytes in
+memory. Resolving an algorithm id nothing is registered for throws
+`UnknownCompressionAlgorithmException`, naming the id and listing what *is* registered.
+
+> **Nothing is compressed automatically yet.** This is the seam, not the feature: `MeshClient` holds a
+> registry and resolves against it, but no send currently consults one. Opting an individual message into
+> compression, and advertising an endpoint's registered algorithms so a sender can pick one both sides
+> understand, are the following changes in this milestone.
+
 ## Typed messages
 
 The core library is byte-oriented and stays that way — the hub routes opaque bodies and takes no

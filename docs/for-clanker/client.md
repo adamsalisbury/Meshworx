@@ -1056,6 +1056,55 @@ await alice.SendAsync(bobId, payload); // now carries traceparent/tracestate aut
   registration is process-wide and would otherwise perturb timing-sensitive tests elsewhere in the suite —
   follow the same isolation if you add tests that register a listener.
 
+### Compression strategies (issue #75)
+
+`ICompressionStrategyRegistry CompressionStrategies { get; }` (`IMeshClient.cs`, implementation
+`MeshClient.cs` — set once in the constructor, never reassigned). Supplied by the optional
+`compressionStrategies` constructor parameter, defaulting to `CompressionStrategyRegistry.CreateDefault()`
+(Brotli then Deflate).
+
+**This is the seam only. Nothing in the client currently compresses or decompresses anything.** No send
+path consults the registry and no receive path resolves an algorithm id, because the header flag and the
+`DeliveryOptions` opt-in that would drive it are issue #33, and capability advertisement is issue #77. If
+you are looking for where compression happens, it does not happen yet — do not go hunting for a call site
+that is not there.
+
+Points worth knowing before you build on it:
+
+- **Endpoint state, not connection state.** It is not cleared by `ResetConnectionState`, not renegotiated
+  on reconnect, and not part of the handshake. The hub never learns of it. Two `MeshClient` instances in
+  one process have independent registries, including via `AddMeshClient` — `MeshClientOptions` creates its
+  own `CreateDefault()` per named client.
+- **The property's declared type is the interface; the instance is `CompressionStrategyRegistry`.** Mutating
+  it after construction means casting (`(CompressionStrategyRegistry)client.CompressionStrategies`). That
+  asymmetry is deliberate — resolution is the contract, mutation is configuration — but it means a consumer
+  who wants to register post-construction has to cast, which is worth remembering if #77 gives the client a
+  reason to expose registration directly.
+- **Registration order is the preference order,** and is preserved on purpose: #77's "best mutually
+  supported algorithm" needs both sides ranking candidates. Registering under an existing id substitutes in
+  place and keeps both the position *and* the originally-registered id casing, so an id already advertised
+  to peers cannot be restyled underneath them. Lookup is `OrdinalIgnoreCase`.
+- **Copy-on-write, not a `ConcurrentDictionary`.** `Register`/`Remove`/`Clear` take a `Lock` and publish a
+  whole new snapshot to a `volatile` field; `Resolve`/`TryResolve`/`Contains`/`AlgorithmIds` take no lock.
+  Registration is config-time, resolution is per-message. `AlgorithmIds` is therefore a snapshot: it does
+  not change under an enumerator when another thread registers.
+- **Algorithm ids are validated at `Register` time**, not at send time — non-empty, ≤ 32 characters
+  (`Protocol.MaxCompressionAlgorithmIdLength`), ASCII letters/digits/`-`/`+`/`.`/`_`. An id that could not
+  survive a header round-trip is a startup mistake and fails like one.
+- **`Decompress` carries the output ceiling in its signature.** An implementation cannot opt out of being
+  asked to bound its output — the decompression-bomb defence is contractual, mirroring the client's existing
+  `maxReassemblyBytes` posture toward memory held on a peer's behalf.
+- **`StreamCompression` (internal) normalises the framework's inconsistency:** `BrotliStream` raises
+  `InvalidOperationException` for corrupt data while `DeflateStream` raises `InvalidDataException`. Both
+  built-ins surface `InvalidDataException` either way. Truncation is *not* detected — see
+  [known-issues.md](known-issues.md) KI-74.
+
+Sources: `Compression/ICompressionStrategy.cs`, `Compression/ICompressionStrategyRegistry.cs`,
+`Compression/CompressionStrategyRegistry.cs`, `Compression/BrotliCompressionStrategy.cs`,
+`Compression/DeflateCompressionStrategy.cs`, `Compression/StreamCompression.cs`,
+`Compression/CompressionAlgorithms.cs`, `Compression/UnknownCompressionAlgorithmException.cs`. Tests:
+`src/Tests/AdamSalisbury.Meshworx.UnitTests/Compression/`.
+
 ### Large-message chunking
 
 `SendLargeAsync(Guid recipientId, ReadOnlyMemory<byte> message, MessageHeaders? headers=null,

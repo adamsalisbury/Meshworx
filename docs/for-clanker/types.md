@@ -297,6 +297,32 @@ each exposed as a `Default*` constant. Non-positive values throw `ArgumentOutOfR
 - **The name cap counts distinct names holding something**, checked only when a genuinely new name is
   about to be added; a name already in the store is never refused by it. Draining a name frees its slot.
 
+## Compression types (issue #75)
+
+`namespace AdamSalisbury.Meshworx.Compression`, all in `src/AdamSalisbury.Meshworx/Compression/`. Endpoint
+concern only — no hub code references any of them, and none of them touches the wire yet (see
+[client.md](client.md#compression-strategies-issue-75) for why nothing calls these).
+
+| Type | Members | Source |
+|---|---|---|
+| `ICompressionStrategy` | `string AlgorithmId`, `ReadOnlyMemory<byte> Compress(ReadOnlyMemory<byte>)`, `ReadOnlyMemory<byte> Decompress(ReadOnlyMemory<byte>, int maxDecompressedBytes)` | `ICompressionStrategy.cs` |
+| `ICompressionStrategyRegistry` | `IReadOnlyList<string> AlgorithmIds`, `bool Contains(string)`, `bool TryResolve(string, out ICompressionStrategy?)`, `ICompressionStrategy Resolve(string)` | `ICompressionStrategyRegistry.cs` |
+| `CompressionStrategyRegistry` | the above plus `static CreateDefault()`, `Register(ICompressionStrategy)`, `Remove(string)`, `Clear()` (`Register`/`Clear` return `this` for chaining) | `CompressionStrategyRegistry.cs` |
+| `BrotliCompressionStrategy` | `static readonly Default`, `ctor()`, `ctor(CompressionLevel)` | `BrotliCompressionStrategy.cs` |
+| `DeflateCompressionStrategy` | `static readonly Default`, `ctor()`, `ctor(CompressionLevel)` | `DeflateCompressionStrategy.cs` |
+| `CompressionAlgorithms` | `const string Brotli = "br"`, `const string Deflate = "deflate"` | `CompressionAlgorithms.cs` |
+| `UnknownCompressionAlgorithmException` | `string? AlgorithmId` + four ctors (three of them only to satisfy `CA1032`, as with `RegistrationRefusedException`) | `UnknownCompressionAlgorithmException.cs` |
+
+`Resolve`/`TryResolve` rather than `Get`/`TryGet` because `CA1716` rejects `Get` on an interface member.
+
+Named `Resolve` throws `UnknownCompressionAlgorithmException` listing what *is* registered; the `TryResolve`
+form returns `false`. Both throw `ArgumentException` (or `ArgumentNullException`, for `null`) on an empty id
+before looking anything up.
+
+`StreamCompression` (`internal static`, `StreamCompression.cs`) is the shared stream plumbing behind both
+built-ins — the bounded read loop, and the normalisation of `BrotliStream`'s `InvalidOperationException`
+and `DeflateStream`'s `InvalidDataException` into the single `InvalidDataException` the contract names.
+
 ## Exception
 
 `RegistrationRefusedException : Exception` (`sealed`, namespace `AdamSalisbury.Meshworx`,
