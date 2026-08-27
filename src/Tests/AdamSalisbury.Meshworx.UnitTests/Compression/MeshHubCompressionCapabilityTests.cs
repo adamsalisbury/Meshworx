@@ -25,13 +25,13 @@ public sealed class MeshHubCompressionCapabilityTests
         asker.EnqueueMessage(BuildCapabilityRequest(correlationId: 7, subject.Id));
 
         byte[] response = await frames
-            .WaitForAsync(f => f.Length >= 7 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
+            .WaitForAsync(f => f.Length >= 8 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
             .WaitAsync(TestTimeouts.Wait);
 
         Assert.Equal(7, BinaryPrimitives.ReadInt32BigEndian(response.AsSpan(1, 4)));
         Assert.Equal(0x01, response[5]);
         Assert.True(CompressionCapabilityEnvelope.TryRead(
-            response.AsSpan(6), out IReadOnlyList<string> advertised));
+            response.AsSpan(7), out IReadOnlyList<string> advertised));
         Assert.Equal(["br", "deflate", "x-rle"], advertised);
     }
 
@@ -49,11 +49,11 @@ public sealed class MeshHubCompressionCapabilityTests
         asker.EnqueueMessage(BuildCapabilityRequest(correlationId: 1, subject.Id));
 
         byte[] response = await frames
-            .WaitForAsync(f => f.Length >= 7 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
+            .WaitForAsync(f => f.Length >= 8 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
             .WaitAsync(TestTimeouts.Wait);
 
         Assert.Equal(0x01, response[5]);
-        Assert.True(CompressionCapabilityEnvelope.TryRead(response.AsSpan(6), out IReadOnlyList<string> advertised));
+        Assert.True(CompressionCapabilityEnvelope.TryRead(response.AsSpan(7), out IReadOnlyList<string> advertised));
         Assert.Empty(advertised);
     }
 
@@ -69,13 +69,94 @@ public sealed class MeshHubCompressionCapabilityTests
         asker.EnqueueMessage(BuildCapabilityRequest(correlationId: 3, Guid.NewGuid()));
 
         byte[] response = await frames
-            .WaitForAsync(f => f.Length >= 7 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
+            .WaitForAsync(f => f.Length >= 8 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
             .WaitAsync(TestTimeouts.Wait);
 
         Assert.Equal(3, BinaryPrimitives.ReadInt32BigEndian(response.AsSpan(1, 4)));
         Assert.Equal(0x00, response[5]);
-        Assert.True(CompressionCapabilityEnvelope.TryRead(response.AsSpan(6), out IReadOnlyList<string> advertised));
+        Assert.True(CompressionCapabilityEnvelope.TryRead(response.AsSpan(7), out IReadOnlyList<string> advertised));
         Assert.Empty(advertised);
+    }
+
+    /// <summary>
+    /// Issue #76: the reply carries the subject's own negotiated version, because what a sender needs to
+    /// know about a recipient is not only which algorithms it can read but which shapes of compressed
+    /// message it can read them in — and a sender's own negotiated version answers only for its link to
+    /// this hub.
+    /// </summary>
+    [Fact(Timeout = 15000)]
+    public async Task CapabilityResponse_CarriesTheSubjectsNegotiatedVersion()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        byte subjectVersion = (byte)(Protocol.ChunkedCompressionMinVersion - 1);
+        MultiMessageRegisteredClient subject = await RegisterAsync(fixture, "Subject", subjectVersion);
+        (MultiMessageRegisteredClient asker, FrameRecorder frames) = await RegisterWithRecorderAsync(fixture, "Asker");
+
+        asker.EnqueueMessage(BuildCapabilityRequest(correlationId: 11, subject.Id));
+
+        byte[] response = await frames
+            .WaitForAsync(f => f.Length >= 8 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
+            .WaitAsync(TestTimeouts.Wait);
+
+        Assert.Equal(0x01, response[5]);
+
+        // The subject's version, not the asker's — the two differ here deliberately.
+        Assert.Equal(subjectVersion, response[6]);
+    }
+
+    /// <summary>
+    /// A subject the hub does not hold has no version to report, so the byte is zero. Zero means unknown
+    /// rather than "too old", which is the same thing <c>found = 0</c> already says.
+    /// </summary>
+    [Fact(Timeout = 15000)]
+    public async Task CapabilityResponse_ForAnUnknownClient_ReportsNoVersion()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        (MultiMessageRegisteredClient asker, FrameRecorder frames) = await RegisterWithRecorderAsync(fixture, "Asker");
+
+        asker.EnqueueMessage(BuildCapabilityRequest(correlationId: 12, Guid.NewGuid()));
+
+        byte[] response = await frames
+            .WaitForAsync(f => f.Length >= 8 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
+            .WaitAsync(TestTimeouts.Wait);
+
+        Assert.Equal(0x00, response[5]);
+        Assert.Equal(0, response[6]);
+    }
+
+    /// <summary>
+    /// An asker below <see cref="Protocol.ChunkedCompressionMinVersion"/> gets the reply its version
+    /// defines, byte for byte: no version field, and the envelope where it has always been. Which shape a
+    /// reply takes is decided by the asking connection's version rather than by the subject's, since the
+    /// asker has no other way to know how to read it.
+    /// </summary>
+    [Fact(Timeout = 15000)]
+    public async Task CapabilityResponse_ToAnAskerBelowTheMinVersion_KeepsTheOlderShape()
+    {
+        var fixture = new MeshHubFixture();
+        await fixture.Hub.StartAsync();
+
+        MultiMessageRegisteredClient subject = await RegisterAsync(fixture, "Subject");
+        (MultiMessageRegisteredClient asker, FrameRecorder frames) = await RegisterWithRecorderAsync(
+            fixture, "Asker", (byte)(Protocol.ChunkedCompressionMinVersion - 1));
+
+        subject.EnqueueMessage(BuildAdvertisement(["br", "deflate"]));
+        await WaitForAdvertisementAsync(fixture, subject.Id, expectedCount: 2);
+
+        asker.EnqueueMessage(BuildCapabilityRequest(correlationId: 13, subject.Id));
+
+        byte[] response = await frames
+            .WaitForAsync(f => f.Length >= 7 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
+            .WaitAsync(TestTimeouts.Wait);
+
+        Assert.Equal(0x01, response[5]);
+        Assert.True(CompressionCapabilityEnvelope.TryRead(
+            response.AsSpan(6), out IReadOnlyList<string> advertised));
+        Assert.Equal(["br", "deflate"], advertised);
     }
 
     [Fact(Timeout = 15000)]
@@ -96,10 +177,10 @@ public sealed class MeshHubCompressionCapabilityTests
         asker.EnqueueMessage(BuildCapabilityRequest(correlationId: 9, subject.Id));
 
         byte[] response = await frames
-            .WaitForAsync(f => f.Length >= 7 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
+            .WaitForAsync(f => f.Length >= 8 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
             .WaitAsync(TestTimeouts.Wait);
 
-        Assert.True(CompressionCapabilityEnvelope.TryRead(response.AsSpan(6), out IReadOnlyList<string> advertised));
+        Assert.True(CompressionCapabilityEnvelope.TryRead(response.AsSpan(7), out IReadOnlyList<string> advertised));
         Assert.Equal(["zstd"], advertised);
     }
 
@@ -128,10 +209,10 @@ public sealed class MeshHubCompressionCapabilityTests
         asker.EnqueueMessage(BuildCapabilityRequest(correlationId: 11, subject.Id));
 
         byte[] response = await frames
-            .WaitForAsync(f => f.Length >= 7 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
+            .WaitForAsync(f => f.Length >= 8 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
             .WaitAsync(TestTimeouts.Wait);
 
-        Assert.True(CompressionCapabilityEnvelope.TryRead(response.AsSpan(6), out IReadOnlyList<string> advertised));
+        Assert.True(CompressionCapabilityEnvelope.TryRead(response.AsSpan(7), out IReadOnlyList<string> advertised));
         Assert.Equal(["br", "deflate", "x-rle"], advertised);
     }
 
@@ -154,10 +235,10 @@ public sealed class MeshHubCompressionCapabilityTests
         asker.EnqueueMessage(BuildCapabilityRequest(correlationId: 13, subject.Id));
 
         byte[] response = await frames
-            .WaitForAsync(f => f.Length >= 7 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
+            .WaitForAsync(f => f.Length >= 8 && f[0] == (byte)MessageType.CompressionCapabilityResponse)
             .WaitAsync(TestTimeouts.Wait);
 
-        Assert.True(CompressionCapabilityEnvelope.TryRead(response.AsSpan(6), out IReadOnlyList<string> advertised));
+        Assert.True(CompressionCapabilityEnvelope.TryRead(response.AsSpan(7), out IReadOnlyList<string> advertised));
         Assert.Equal(["br"], advertised);
     }
 

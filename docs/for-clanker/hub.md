@@ -568,7 +568,13 @@ compressed message from any other one.
   single `_clients` lookup. **Not** charged against the fan-out rate limiter: it follows
   `ClientLookupRequest`'s precedent, not `FindClientsRequest`'s, because it is a lookup rather than a scan.
   An unknown id answers `found = 0` with an empty set rather than staying silent, so the asking client
-  resolves rather than waiting out its timeout.
+  resolves rather than waiting out its timeout. From
+  `Protocol.ChunkedCompressionMinVersion` (12) the reply also carries the **subject's** own
+  `NegotiatedProtocolVersion` (issue #76), or `0` for a subject the hub does not hold. Whether that byte is
+  written is decided by the **asking** connection's version, not the subject's — the asker has no other way
+  to know how to read the reply, so below 12 the frame stays byte-identical to what version 11 produced.
+  This is the hub's only part in chunked compression: it reports a number it already tracks and still never
+  interprets anything.
 - **Both frames are gated** behind `Protocol.CompressionNegotiationMinVersion = 11`; an older connection
   gets the unrecognised-opcode treatment (KI-9), not a reply.
 - **Capabilities die with the connection.** They live on `ClientConnection`, so a disconnect discards them

@@ -947,6 +947,9 @@ below protocol version 5 cannot send one. That throws rather than degrading quie
 context, which is an optional extra; here the caller has explicitly asked to send something that cannot
 go any other way.
 
+A chunked transfer can be compressed, through the `SendLargeAsync` overload that takes
+`DeliveryOptions` — see [Compression](#compression) below.
+
 ## Compression
 
 Compression is an agreement between two **endpoints**. The hub routes a compressed body exactly as it
@@ -1066,9 +1069,27 @@ decompression at exactly that length, refuses a declared length past `maxDecompr
 default) before decompressing anything, and drops a body that restores to a different length than was
 declared — which is what makes a truncated body an error rather than a silently short message.
 
-Compression applies to the direct `SendAsync` overload that takes `DeliveryOptions`. Group, topic and
-broadcast sends, and `SendLargeAsync`'s chunked transfers, are not compressed; chunked compression is a
-later change in this milestone.
+### Compressing a large transfer
+
+`SendLargeAsync` has an overload taking `DeliveryOptions`, so a chunked transfer can be compressed too:
+
+```csharp
+await client.SendLargeAsync(recipientId, fortyMegabytes, headers: null, DeliveryOptions.Compressed());
+```
+
+Each chunk is compressed **on its own**: a chunk carries a compressed slice of the message, not a slice
+of the compressed message. Neither endpoint ever compresses or decompresses more than one chunk at a time,
+however large the transfer is, and the receiving client decompresses each chunk before reassembling it —
+so `maxReassemblyBytes` bounds what is actually held rather than its compressed form. The recipient still
+raises `MessageReceived` exactly once, with the whole message restored and none of the machinery visible
+on it.
+
+Compressing is decided per chunk, so an incompressible chunk is sent as it was even when the chunks around
+it compressed well. A recipient that cannot be established to support chunked compression — one below
+protocol version 12, or one whose version the hub does not report — is sent the transfer uncompressed;
+naming an algorithm explicitly throws instead, as it does on any other send.
+
+Group, topic and broadcast sends are not compressed.
 
 ## Typed messages
 

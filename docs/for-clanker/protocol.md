@@ -8,7 +8,7 @@ document/verify carefully when you touch it. Everything here is read from
 sites in `MeshHub.cs` / `MeshClient.cs`.
 
 - **Protocol version is a negotiated range** (`Protocol.MinSupportedVersion` = `4`,
-  `Protocol.MaxSupportedVersion` = `10`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
+  `Protocol.MaxSupportedVersion` = `12`, `Messages/Protocol.cs:8`, `:14`). The client advertises the range
   it can speak; the hub picks the highest version common to both sides — see
   [Registration handshake](#registration-handshake). Negotiation itself was introduced by PR #73
   (issue #47); PR #74 (issue #32) is the **first thing to actually widen the range and branch on the
@@ -42,7 +42,15 @@ sites in `MeshHub.cs` / `MeshClient.cs`.
   [Client attribute frames](#client-attribute-frames-issue-38) below. **Issue #39 is the sixth widening**,
   raising `MaxSupportedVersion` from `9` to `10` and adding `Protocol.PresenceMinVersion = 10` to gate
   `SubscribePresence`/`UnsubscribePresence` — again gated from the outset — see
-  [Presence frames](#presence-frames-issue-39) below.
+  [Presence frames](#presence-frames-issue-39) below. **Issue #77 is the seventh widening**,
+  raising `MaxSupportedVersion` from `10` to `11` and adding
+  `Protocol.CompressionNegotiationMinVersion = 11` to gate the three compression capability opcodes — see
+  [Compression capability frames](#compression-capability-frames-issue-77) below. **Issue #76 is the
+  eighth widening**, raising `MaxSupportedVersion` from `11` to `12` and adding
+  `Protocol.ChunkedCompressionMinVersion = 12`. It adds no opcode: it changes the *order* in which a
+  receiver applies decompression and reassembly, and appends the subject's own negotiated version to the
+  capability reply so a sender can tell which order a recipient uses — see
+  [Chunked compression](#chunked-compression-issue-76) below.
 - **`MessageType` and `Protocol` are `internal`** — opcodes are not visible outside the assembly.
 - **Byte order:** big-endian for all multi-byte integers (`BinaryPrimitives.*BigEndian`). Ids are
   16-byte `Guid`s written with `Guid.TryWriteBytes` / read with `new Guid(span)`.
@@ -114,7 +122,7 @@ Everything in the tables below is the **message payload** (i.e. after the transp
 | `PresenceChanged` | `0x24` | hub → client | change type (1; `0x01` joined, `0x02` left), client id (16), name length (2, BE), UTF-8 name |
 | `AdvertiseCompression` | `0x2C` | client → hub | the algorithms this client can decompress, in preference order (issue #77) |
 | `CompressionCapabilityRequest` | `0x2D` | client → hub | correlation id (4, BE), subject client id (16) |
-| `CompressionCapabilityResponse` | `0x2E` | hub → client | correlation id (4, BE), found (1), the subject's advertised algorithms |
+| `CompressionCapabilityResponse` | `0x2E` | hub → client | correlation id (4, BE), found (1), the subject's negotiated version (1, from version 12 only), the subject's advertised algorithms |
 
 `0x24` is the highest opcode in use; the next new one is `0x25`. Topic-based publish/subscribe (issue
 #37) is covered in full in [Topic pub/sub frames](#topic-pubsub-frames-issue-37) below and
@@ -550,8 +558,17 @@ discipline issues #38 and #39 applied, not #37's. `Protocol.MaxSupportedVersion`
 ```
 client → hub : [0x2C AdvertiseCompression][algorithmBlock...]                                   # needs len ≥ 1
 client → hub : [0x2D CompressionCapabilityRequest][correlationId 4][subjectId 16]               # needs len ≥ 21
-hub → client : [0x2E CompressionCapabilityResponse][correlationId 4][found 1][algorithmBlock]   # needs len ≥ 7
+hub → client : [0x2E CompressionCapabilityResponse][correlationId 4][found 1][algorithmBlock]   # needs len ≥ 7, versions 11
+             | [0x2E CompressionCapabilityResponse][correlationId 4][found 1][subjectVersion 1]
+                                                   [algorithmBlock]                            # needs len ≥ 8, version 12+
 ```
+
+The `subjectVersion` field is issue #76's; see [Chunked compression](#chunked-compression-issue-76). Which
+of the two shapes a reply takes is decided by the **asking** connection's negotiated version, not the
+subject's — the asker has no other way to know how to read it, and a version byte and an
+`algorithmBlock`'s count byte cannot be told apart by inspection. Both ends read it off
+`NegotiatedProtocolVersion` (`MeshHub.SendCompressionCapabilityResponseAsync`, and the
+`CompressionCapabilityResponse` branch of `MeshClient`'s receive loop).
 
 The `algorithmBlock` is `[count u8][len u8][utf8 id]...` — `Messages/CompressionCapabilityEnvelope.cs`.
 Both prefixes are single bytes because both are already bounded far below 256:
@@ -583,6 +600,56 @@ asking client resolves its request instead of waiting out its own timeout.
 **The hub never interprets an algorithm id.** It stores what a client advertised and hands it back; it
 cannot compress or decompress anything and does not try. This is not an exception to "the hub only ever
 reads a header block's length, never its content" — no header block is involved.
+
+### Chunked compression (issue #76)
+
+`Protocol.MaxSupportedVersion` goes 11 → 12, adding `Protocol.ChunkedCompressionMinVersion = 12`. **No new
+opcode, and no new header key** — this version exists to gate a change in *ordering*, plus the one field
+that makes the gate checkable.
+
+**What changed.** A chunked message (`SendLargeAsync`) may now be compressed, and it is compressed **per
+chunk**: each chunk carries a compressed slice of the message, not a slice of the compressed message.
+Every chunk therefore carries its own `mesh.compression`/`mesh.compression.length` pair alongside its
+`mesh.chunk.*` trio, and the length describes *that chunk's* body.
+
+Consequently `MeshClient`'s receive loop now **decompresses before it reassembles**, where up to version
+11 it reassembled first and decompressed after. There is one ordering for every shape of message, chunked
+or not — an unchunked message reaches the same place by the same route.
+
+**Why per chunk rather than per message.** The alternative — compress the whole payload as one stream,
+then chunk the result — costs more than it buys:
+
+- The chunk count would not be knowable until compression finished, so either the sender holds the entire
+  compressed blob to learn it, or `mesh.chunk.count` becomes a last-chunk flag. The count-not-terminator
+  design in `ChunkHeaderKeys` is deliberate; see the type's own remarks.
+- Decompressing a chunk stream incrementally needs a *push*-shaped decompressor, and `DeflateStream` in
+  decompress mode can only be read from, never written to. That means a pump task or a hand-rolled decoder
+  per algorithm.
+- Memory would scale with the message on both sides. Per chunk, the compression machinery never sees more
+  than one chunk — `MeshClientChunkedCompressionTests.SendLargeAsync_Compressed_NeverHandsAStrategyMoreThanOneChunk`
+  pins that at 8 MiB by recording the largest buffer a strategy is handed.
+- `maxReassemblyBytes` starts bounding what is actually held, because the reassembler now accumulates
+  *uncompressed* bytes. Under whole-message compression a compression bomb spread across chunks would pass
+  the reassembly budget compressed and expand past it only afterwards.
+
+The cost is a slightly worse ratio, since no compression context carries across a chunk boundary. At
+roughly 1 MiB per chunk that is small.
+
+**Why the version had to be bumped, and why `NegotiatedProtocolVersion` alone could not gate it.** A peer
+running version 11 reassembles before it decompresses, so handed a per-chunk compressed transfer it would
+try to decompress the *concatenation* of the chunks. That is usually caught by the declared length and
+dropped — but not when the payload is an exact multiple of the chunk size, where it is indistinguishable
+from a whole message. So the sender must know the recipient's version, and its own negotiated version is
+its agreement with the **hub**, not with the recipient. Hence `subjectVersion` on the capability reply: the
+hub already tracks `ClientConnection.NegotiatedProtocolVersion` per connection and simply reports it.
+
+**Unknown counts as unsupported here** — the opposite of the posture `SelectCompressionStrategy` takes
+towards an unknown *algorithm* set, and deliberately so. Not knowing which algorithms a peer holds costs a
+send nothing worse than a message it drops and logs; not knowing which order it applies decompression in
+risks one it accepts and mangles. A `subjectVersion` of `0` (an older hub, or a subject this hub does not
+hold — including a client reachable only through a federated peer link) therefore means uncompressed
+chunks. A send that *named* an algorithm throws `NotSupportedException` instead, since a named algorithm is
+a requirement rather than a preference — the same rule the unchunked path follows.
 
 ### Session resumption (issue #43, extended by PR #135/issue #109)
 
